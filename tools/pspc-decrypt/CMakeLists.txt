@@ -65,7 +65,13 @@ add_executable(pspc-decrypt src/main.cpp)
 target_link_libraries(pspc-decrypt PRIVATE pspc_decrypt_core)
 
 if(PSPC_BUILD_TESTS)
-	# The root enables testing only after src/ and tools/ are added, so do it here as well.
+	# The root enables testing only after src/ and tools/ are added, so ctest run from the build
+	# root wouldn't descend to here on its own. Enable it here and have the root include our test
+	# file - unless a parent already enabled testing, in which case ctest finds us anyway.
+	if(NOT CMAKE_TESTING_ENABLED AND NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+		set_property(DIRECTORY ${CMAKE_SOURCE_DIR} APPEND PROPERTY TEST_INCLUDE_FILES
+			${CMAKE_CURRENT_BINARY_DIR}/CTestTestfile.cmake)
+	endif()
 	enable_testing()
 	file(GLOB PSPC_DECRYPT_TEST_SOURCES CONFIGURE_DEPENDS
 		${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp

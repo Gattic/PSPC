@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// Placeholder until the real implementation lands; delete this file when adding it.
+// sceUtility. Being implemented.
 #include "runtime/hle/modules/modules.h"
 
 void Register_sceUtility() {}

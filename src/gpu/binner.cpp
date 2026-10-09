@@ -225,7 +225,8 @@ AddrRange FramebufferWriteRange() {
 	const PixelState &ps = states[0].pix;
 	const u32 bpp = ps.fbFormat == GE_FORMAT_8888 ? 4 : 2;
 	const u32 start = VRAM_BASE + ps.fbOffset + (u32)batchMinRow * ps.fbStride * bpp;
-	const u32 end = VRAM_BASE + ps.fbOffset + (u32)(batchMaxRow + 1) * ps.fbStride * bpp + 1024 * bpp;
+	// Pixels past the stride make the batch single-threaded, so rows are exact.
+	const u32 end = VRAM_BASE + ps.fbOffset + (u32)(batchMaxRow + 1) * ps.fbStride * bpp;
 	return { start, end };
 }
 
@@ -234,7 +235,7 @@ AddrRange DepthWriteRange() {
 		return { 0, 0 };
 	const PixelState &ps = states[0].pix;
 	const u32 start = VRAM_BASE + ps.zbOffset + (u32)batchMinRow * ps.zbStride * 2;
-	const u32 end = VRAM_BASE + ps.zbOffset + (u32)(batchMaxRow + 1) * ps.zbStride * 2 + 2048;
+	const u32 end = VRAM_BASE + ps.zbOffset + (u32)(batchMaxRow + 1) * ps.zbStride * 2;
 	return { start, end };
 }
 
@@ -274,7 +275,9 @@ void Push(PrimType type, const Range &rawRange, const RVertex *v, int nv) {
 	g_stats.prims++;
 	g_stats.pixels += area;
 	// Pixels past the stride land in the next row, which another band may be drawing.
-	if (range.x2 / SUBPIX >= current.pix.fbStride || range.x2 / SUBPIX >= current.pix.zbStride)
+	const PixelState &ps = current.pix;
+	const bool usesDepth = ps.depthWrite || ps.depthTestFunc != GE_COMP_ALWAYS || (ps.clearMode && ps.depthClear);
+	if (range.x2 / SUBPIX >= ps.fbStride || (usesDepth && range.x2 / SUBPIX >= ps.zbStride))
 		batchSingleThread = true;
 	if (prims.size() >= MAX_PRIMS)
 		binner::Flush();

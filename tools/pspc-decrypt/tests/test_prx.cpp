@@ -98,6 +98,14 @@ TEST(prx_cfw_packed_and_plain) {
 	CHECK(r.cfwPacked);
 	CHECK(!r.encrypted);
 	CHECK(r.output == elf);
+	// The same packing around something that isn't an ELF (a CFW-packed reboot.bin, say): the tag
+	// is a real one, KIRK says no, and the verified gzip stream is what's left.
+	const Bytes blob = PseudoRandom(3000, 12);
+	r = Decode(MakePspModule(blob, "rebootex", TestPacking::CfwGzip, 0x4C9414F0, "gzip", 1));
+	CHECK(r.status == DecodeStatus::Ok);
+	CHECK(r.cfwPacked);
+	CHECK(r.output == blob);
+	CHECK(!r.warnings.empty());
 	// A ~PSP header in front of a plain ELF.
 	r = Decode(MakePspModule(elf, "Plain", TestPacking::CfwGzip, 0x4C9414F0, "none", 1));
 	CHECK(r.status == DecodeStatus::Ok);

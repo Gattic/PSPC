@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "gpu/ge_state.h"
+#include "gpu/gemath_simd.h"
 #include "gpu/render.h"
 #include "gpu/vertex.h"
 
@@ -87,7 +88,9 @@ struct TransformState {
 	bool fogGE;
 	float fogEnd, fogSlope;
 	float screenScale[3], screenAdd[3];
-	float tgen[12];
+	alignas(16) float tgenRows[4][4];     // texture matrix rows, padded
+	alignas(16) float worldRows[3][4];    // world matrix rows (normals), padded
+	alignas(16) float negWorldRows[4][4]; // negated world rows, the light vector
 	bool enableTransform, enableLighting, enableFog, negateNormals, depthClip;
 	int uvGenMode;
 	bool geUVScale;
@@ -268,7 +271,19 @@ void ComputeTransformState(bool through, bool hasColor0) {
 	}
 	memcpy(s.light.viewDir, viewDir, sizeof(viewDir));
 
-	memcpy(s.tgen, gstate.tgenMatrix, sizeof(s.tgen));
+	for (int k = 0; k < 4; ++k) {
+		for (int c = 0; c < 3; ++c)
+			s.tgenRows[k][c] = gstate.tgenMatrix[3 * k + c];
+		s.tgenRows[k][3] = 0.0f;
+	}
+	for (int k = 0; k < 3; ++k) {
+		for (int c = 0; c < 3; ++c) {
+			s.worldRows[k][c] = gstate.worldMatrix[3 * k + c];
+			s.negWorldRows[k][c] = BitsFloat(FloatBits(gstate.worldMatrix[3 * k + c]) ^ 0x80000000);
+		}
+		s.worldRows[k][3] = 0.0f;
+		s.negWorldRows[k][3] = 0.0f;
+	}
 
 	float world[16], view[16], worldview[16];
 	Convert4x3To4x4(view, gstate.viewMatrix);
@@ -345,11 +360,30 @@ static inline void RoundToScreen(RVertex &v, const float scaled[3], const float 
 	v.z = (z >= 0.0f && z < 65536.0f) ? (int)(u16)(u32)z : 0;
 }
 
+// The screen position: each clip component times the GE's reciprocal of w, scaled and offset.
+static inline void Viewport(const float clip[4], float scaled[3]) {
+	const float w = TruncateToFloat24(clip[3]);
+	if (!std::isfinite(w) || fabsf(w) < FLT_MIN) {
+		for (int i = 0; i < 3; ++i)
+			scaled[i] = GEViewport(clip[i], clip[3], ts.screenScale[i], ts.screenAdd[i]);
+		scaled[2] = floorf(scaled[2]);
+		return;
+	}
+	const double r = GERecip(w);
+	for (int i = 0; i < 3; ++i) {
+		if (!std::isfinite(clip[i])) {
+			scaled[i] = clip[i] * ts.screenScale[i] / clip[3] + ts.screenAdd[i];
+		} else {
+			const float ndc = ProductToFloat24((double)TruncateToFloat24(clip[i]) * r);
+			scaled[i] = GEAdd(ProductToFloat24((double)ndc * ts.screenScale[i]), ts.screenAdd[i]);
+		}
+	}
+	scaled[2] = floorf(scaled[2]);
+}
+
 static inline void ClipToScreen(RVertex &v, const float clip[4], bool alwaysCheck, bool *outside) {
 	float scaled[3];
-	for (int i = 0; i < 2; ++i)
-		scaled[i] = GEViewport(clip[i], clip[3], ts.screenScale[i], ts.screenAdd[i]);
-	scaled[2] = GEScreenZ(clip[2], clip[3], ts.screenScale[2], ts.screenAdd[2]);
+	Viewport(clip, scaled);
 	RoundToScreen(v, scaled, clip, ts.depthClip, alwaysCheck, outside);
 }
 
@@ -360,11 +394,17 @@ static inline float GENormalDot(const float *v, const float *n, float nRsqrt) {
 
 // The vector from a vertex to a point light (gpu/probe exp153-158).
 static inline void GELightVector(float out[3], const float translated[3], const float modelpos[4]) {
-	const float *m = gstate.worldMatrix;
-	for (int c = 0; c < 3; ++c) {
-		const float b[4] = { -m[c], -m[3 + c], -m[6 + c], translated[c] };
-		out[c] = GERow(modelpos, b, 4);
-	}
+	alignas(16) float rows[4][4];
+	memcpy(rows, ts.negWorldRows, sizeof(float) * 12);
+	rows[3][0] = translated[0];
+	rows[3][1] = translated[1];
+	rows[3][2] = translated[2];
+	rows[3][3] = 0.0f;
+	alignas(16) float r[4];
+	GERowSum4<4>(modelpos, rows, r);
+	out[0] = r[0];
+	out[1] = r[1];
+	out[2] = r[2];
 }
 
 static float GEShadeMapCoord(int l, const float modelpos[4], const float worldnormal[3], float normalRsqrt, const float viewDir[3]) {
@@ -523,14 +563,9 @@ ClipVertex ReadVertex(const SimpleVertex &sv, bool hasUV, bool hasNormal, bool h
 	vertex.v.color1 = 0;
 
 	if (ts.enableTransform) {
-		for (int c = 0; c < 4; ++c) {
-			const float b[4] = { ts.matrix[c], ts.matrix[4 + c], ts.matrix[8 + c], ts.matrix[12 + c] };
-			vertex.clip[c] = GERow(pos, b, 4);
-		}
+		GERowSum4<4>(pos, (const float(*)[4])ts.matrix, vertex.clip);
 		float scaled[3];
-		for (int i = 0; i < 2; ++i)
-			scaled[i] = GEViewport(vertex.clip[i], vertex.clip[3], ts.screenScale[i], ts.screenAdd[i]);
-		scaled[2] = GEScreenZ(vertex.clip[2], vertex.clip[3], ts.screenScale[2], ts.screenAdd[2]);
+		Viewport(vertex.clip, scaled);
 		bool outside = false;
 		RoundToScreen(vertex.v, scaled, vertex.clip, ts.depthClip, false, &outside);
 		vertex.v.clipw = vertex.clip[3];
@@ -555,11 +590,12 @@ ClipVertex ReadVertex(const SimpleVertex &sv, bool hasUV, bool hasNormal, bool h
 		float normalRsqrt = 1.0f;
 		const bool usesWorldNormal = ts.enableLighting ? ts.light.usesWorldNormal : ts.uvGenMode == GE_TEXMAP_ENVIRONMENT_MAP;
 		if (usesWorldNormal) {
-			const float *m = gstate.worldMatrix;
-			for (int c = 0; c < 3; ++c) {
-				const float b[3] = { m[c], m[3 + c], m[6 + c] };
-				worldnormal[c] = GERow(normal, b, 3);
-			}
+			alignas(16) float wn[4];
+			const float n4[4] = { normal[0], normal[1], normal[2], 0.0f };
+			GERowSum4<3>(n4, ts.worldRows, wn);
+			worldnormal[0] = wn[0];
+			worldnormal[1] = wn[1];
+			worldnormal[2] = wn[2];
 			const float len2 = GEDot3(worldnormal, worldnormal);
 			if (len2 > 0.0f && std::isfinite(len2)) {
 				normalRsqrt = GERsqrt(len2);
@@ -587,11 +623,8 @@ ClipVertex ReadVertex(const SimpleVertex &sv, bool hasUV, bool hasNormal, bool h
 				memcpy(source, normal, sizeof(normal));
 				break;
 			}
-			float out[3];
-			for (int c = 0; c < 3; ++c) {
-				const float b[4] = { ts.tgen[c], ts.tgen[3 + c], ts.tgen[6 + c], ts.tgen[9 + c] };
-				out[c] = GERow(source, b, 4);
-			}
+			alignas(16) float out[4];
+			GERowSum4<4>(source, ts.tgenRows, out);
 			vertex.v.s = out[0];
 			vertex.v.t = out[1];
 			vertex.v.q = out[2];

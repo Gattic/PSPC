@@ -47,7 +47,8 @@ bool DecompressAny(const u8 *data, size_t size, size_t sizeHint, Bytes *out, std
 // The facts `info` prints for a ~PSP header.
 Json DescribePspHeader(const PspHeader &h);
 // Everything we can say about a file without writing anything.
-Json DescribeFile(const u8 *data, size_t size, const DecodeOptions &options);
+// `baseOffset` is where `data` sits in the file, for nested sections.
+Json DescribeFile(const u8 *data, size_t size, const DecodeOptions &options, size_t baseOffset = 0);
 
 // "~PSP" headers embedded in a larger file (M33's installer carries eleven inside its ELF,
 // loadexec carries reboot.bin). Returns their offsets; each is skipped past once found.

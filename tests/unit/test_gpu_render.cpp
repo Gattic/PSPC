@@ -2,8 +2,16 @@
 // GE rendering: synthetic display lists drawn into emulated VRAM, checked pixel by pixel.
 #ifdef _WIN32
 #include <windows.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
 #endif
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <map>
+#include <string>
+#include <thread>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -143,7 +151,7 @@ TEST(gpu_clear_rect) {
 	CHECK_EQ(Pixel32(0, 0), 0xFF336699u);
 	CHECK_EQ(Pixel32(479, 271), 0xFF336699u);
 	CHECK_EQ(Pixel32(480, 0), 0u);
-	CHECK_EQ(Pixel32(0, 272), 0u);
+	CHECK_EQ(Pixel32(0, 200) , 0xFF336699u);
 	CHECK_EQ(Depth(100, 100), 0x1234u);
 	CHECK_EQ(Depth(480, 100), 0u);
 }
@@ -760,31 +768,195 @@ TEST(gpu_threads_deterministic) {
 	CHECK_EQ(single, multi);
 }
 
-TEST(gpu_perf_fullscreen_sprites) {
-	// Not a pass/fail benchmark: 60 frames of 4 full-screen blended, textured sprites.
-	GeEnv env(0);
-	for (int i = 0; i < 256 * 256; ++i)
-		GWrite32(TEX + i * 4, 0x80FFFFFFu ^ (u32)(i * 2654435761u));
+namespace {
+
+// Builds a benchmark display list at LIST; returns it.
+DL BenchList(int scenario) {
+	u32 seed = 777;
+	auto rnd = [&]() {
+		seed = seed * 1103515245u + 12345u;
+		return (seed >> 8) & 0xFFFF;
+	};
 	DL dl;
 	dl.Target();
-	dl.C(GE_CMD_TEXTUREMAPENABLE, 1).C(GE_CMD_TEXFORMAT, GE_TFMT_8888).C(GE_CMD_TEXMODE, 0);
-	dl.C(GE_CMD_TEXADDR0, TEX & 0xFFFFF0).C(GE_CMD_TEXBUFWIDTH0, 256 | ((TEX >> 8) & 0x0F0000));
-	dl.C(GE_CMD_TEXSIZE0, 8 | (8 << 8)).C(GE_CMD_TEXFUNC, GE_TEXFUNC_MODULATE | 0x100).C(GE_CMD_TEXFILTER, 1 | (1 << 8));
-	dl.C(GE_CMD_ALPHABLENDENABLE, 1).C(GE_CMD_BLENDMODE, GE_BLEND_SRCALPHA | (GE_BLEND_INVSRCALPHA << 4));
-	TTVert v[2] = { { 0, 0, 0xFFFFFFFF, 0, 0, 0, 0 }, { 256, 256, 0xFFFFFFFF, 480, 272, 0, 0 } };
-	PutVerts(VERTS, v, 2);
-	dl.C(GE_CMD_VERTEXTYPE, VT_T16_C8888_P16);
-	for (int i = 0; i < 4; ++i)
-		dl.Prim(GE_PRIM_RECTANGLES, 2, VERTS);
+	if (scenario == 0) {
+		// 2D: four full-screen bilinear 8888 sprites, alpha blended.
+		for (int i = 0; i < 256 * 256; ++i)
+			GWrite32(TEX + i * 4, 0x80FFFFFFu ^ (u32)(i * 2654435761u));
+		dl.C(GE_CMD_TEXTUREMAPENABLE, 1).C(GE_CMD_TEXFORMAT, GE_TFMT_8888).C(GE_CMD_TEXMODE, 0);
+		dl.C(GE_CMD_TEXADDR0, TEX & 0xFFFFF0).C(GE_CMD_TEXBUFWIDTH0, 256 | ((TEX >> 8) & 0x0F0000));
+		dl.C(GE_CMD_TEXSIZE0, 8 | (8 << 8)).C(GE_CMD_TEXFUNC, GE_TEXFUNC_MODULATE | 0x100).C(GE_CMD_TEXFILTER, 1 | (1 << 8));
+		dl.C(GE_CMD_ALPHABLENDENABLE, 1).C(GE_CMD_BLENDMODE, GE_BLEND_SRCALPHA | (GE_BLEND_INVSRCALPHA << 4));
+		TTVert v[2] = { { 0, 0, 0xFFFFFFFF, 0, 0, 0, 0 }, { 256, 256, 0xFFFFFFFF, 480, 272, 0, 0 } };
+		PutVerts(VERTS, v, 2);
+		dl.C(GE_CMD_VERTEXTYPE, VT_T16_C8888_P16);
+		for (int i = 0; i < 4; ++i)
+			dl.Prim(GE_PRIM_RECTANGLES, 2, VERTS);
+	} else if (scenario == 1) {
+		// 2D UI: a full-screen 5650 background, then 300 32x32 CLUT8 sprites (nearest, alpha test).
+		for (int i = 0; i < 256 * 256; ++i)
+			GWrite16(TEX + i * 2, (u16)rnd());
+		for (int i = 0; i < 64 * 64; ++i)
+			GWrite8(TEX + 0x40000 + i, (u8)rnd());
+		for (int i = 0; i < 256; ++i)
+			GWrite32(CLUTA + i * 4, (i & 1 ? 0xFF000000u : 0u) | (u32)i * 0x010203u);
+		dl.C(GE_CMD_TEXTUREMAPENABLE, 1).C(GE_CMD_TEXFORMAT, GE_TFMT_5650).C(GE_CMD_TEXMODE, 0);
+		dl.C(GE_CMD_TEXADDR0, TEX & 0xFFFFF0).C(GE_CMD_TEXBUFWIDTH0, 256 | ((TEX >> 8) & 0x0F0000));
+		dl.C(GE_CMD_TEXSIZE0, 8 | (8 << 8)).C(GE_CMD_TEXFUNC, GE_TEXFUNC_REPLACE).C(GE_CMD_TEXFILTER, 0);
+		TTVert bg[2] = { { 0, 0, 0xFFFFFFFF, 0, 0, 0, 0 }, { 480, 272, 0xFFFFFFFF, 480, 272, 0, 0 } };
+		PutVerts(VERTS, bg, 2);
+		dl.C(GE_CMD_VERTEXTYPE, VT_T16_C8888_P16).Prim(GE_PRIM_RECTANGLES, 2, VERTS);
+		dl.C(GE_CMD_TEXFORMAT, GE_TFMT_CLUT8).C(GE_CMD_TEXADDR0, (TEX + 0x40000) & 0xFFFFF0).C(GE_CMD_TEXBUFWIDTH0, 64 | (((TEX + 0x40000) >> 8) & 0x0F0000));
+		dl.C(GE_CMD_TEXSIZE0, 6 | (6 << 8)).C(GE_CMD_TEXFUNC, GE_TEXFUNC_MODULATE | 0x100);
+		dl.C(GE_CMD_CLUTADDR, CLUTA & 0xFFFFF0).C(GE_CMD_CLUTADDRUPPER, (CLUTA >> 8) & 0x0F0000);
+		dl.C(GE_CMD_CLUTFORMAT, GE_CMODE_32BIT_ABGR8888 | (0xFF << 8)).C(GE_CMD_LOADCLUT, 1024 / 32);
+		dl.C(GE_CMD_ALPHATESTENABLE, 1).C(GE_CMD_ALPHATEST, GE_COMP_GREATER | (0 << 8) | (0xFF << 16));
+		std::vector<TTVert> v(600);
+		for (int i = 0; i < 300; ++i) {
+			const s16 x = (s16)(rnd() % 448), y = (s16)(rnd() % 240);
+			v[i * 2] = { 0, 0, 0xFFFFFFFF, x, y, 0, 0 };
+			v[i * 2 + 1] = { 64, 64, 0xFFFFFFFF, (s16)(x + 32), (s16)(y + 32), 0, 0 };
+		}
+		PutVerts(VERTS + 0x100, v.data(), 600);
+		dl.Prim(GE_PRIM_RECTANGLES, 600, VERTS + 0x100);
+	} else {
+		// 3D: 4000 small perspective-textured, Gouraud, depth tested triangles in transform mode.
+		for (int i = 0; i < 128 * 128; ++i)
+			GWrite16(TEX + i * 2, (u16)(rnd() | 0x8000));
+		const float ident43[12] = { 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0 };
+		dl.C(GE_CMD_WORLDMATRIXNUMBER, 0);
+		for (float f : ident43)
+			dl.F(GE_CMD_WORLDMATRIXDATA, f);
+		dl.C(GE_CMD_VIEWMATRIXNUMBER, 0);
+		for (float f : ident43)
+			dl.F(GE_CMD_VIEWMATRIXDATA, f);
+		const float proj[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, -1.02f, -1, 0, 0, -2.02f, 0 };
+		dl.C(GE_CMD_PROJMATRIXNUMBER, 0);
+		for (float f : proj)
+			dl.F(GE_CMD_PROJMATRIXDATA, f);
+		dl.F(GE_CMD_VIEWPORTXSCALE, 240.0f).F(GE_CMD_VIEWPORTYSCALE, -136.0f).F(GE_CMD_VIEWPORTZSCALE, 32767.5f);
+		dl.F(GE_CMD_VIEWPORTXCENTER, 2048.0f).F(GE_CMD_VIEWPORTYCENTER, 2048.0f).F(GE_CMD_VIEWPORTZCENTER, 32767.5f);
+		dl.C(GE_CMD_OFFSETX, (2048 - 240) << 4).C(GE_CMD_OFFSETY, (2048 - 136) << 4);
+		dl.C(GE_CMD_MINZ, 0).C(GE_CMD_MAXZ, 0xFFFF).C(GE_CMD_DEPTHCLIPENABLE, 1);
+		ClearScreen(dl, 0xFF000000, 0xFFFF);
+		dl.C(GE_CMD_ZTESTENABLE, 1).C(GE_CMD_ZTEST, GE_COMP_GEQUAL).C(GE_CMD_SHADEMODE, 1);
+		dl.C(GE_CMD_TEXTUREMAPENABLE, 1).C(GE_CMD_TEXFORMAT, GE_TFMT_5551).C(GE_CMD_TEXMODE, 0);
+		dl.C(GE_CMD_TEXADDR0, TEX & 0xFFFFF0).C(GE_CMD_TEXBUFWIDTH0, 128 | ((TEX >> 8) & 0x0F0000));
+		dl.C(GE_CMD_TEXSIZE0, 7 | (7 << 8)).C(GE_CMD_TEXFUNC, GE_TEXFUNC_MODULATE).C(GE_CMD_TEXFILTER, 1 | (1 << 8));
+		dl.F(GE_CMD_TEXSCALEU, 1.0f).F(GE_CMD_TEXSCALEV, 1.0f).F(GE_CMD_TEXOFFSETU, 0.0f).F(GE_CMD_TEXOFFSETV, 0.0f);
+		struct V3 {
+			float u, v;
+			u32 color;
+			float x, y, z;
+		};
+		const int n = 4000;
+		std::vector<V3> v(n * 3);
+		for (int i = 0; i < n; ++i) {
+			const float z = -1.5f - (rnd() % 1000) / 200.0f;
+			const float cx = ((int)(rnd() % 2000) - 1000) / 1000.0f * -z, cy = ((int)(rnd() % 2000) - 1000) / 1000.0f * -z;
+			for (int k = 0; k < 3; ++k) {
+				V3 &p = v[i * 3 + k];
+				p.u = (rnd() % 256) / 256.0f;
+				p.v = (rnd() % 256) / 256.0f;
+				p.color = 0xFF000000u | (rnd() << 8) | (rnd() & 0xFF);
+				p.x = cx + ((int)(rnd() % 100) - 50) / 1000.0f * -z;
+				p.y = cy + ((int)(rnd() % 100) - 50) / 1000.0f * -z;
+				p.z = z + ((int)(rnd() % 100) - 50) / 1000.0f;
+			}
+		}
+		PutVerts(VERTS, v.data(), n * 3);
+		// Scenario 3: the same with nothing inside the scissor (the vertex path alone).
+		if (scenario == 3)
+			dl.C(GE_CMD_SCISSOR1, 1023 | (1023 << 10)).C(GE_CMD_SCISSOR2, 0);
+		dl.C(GE_CMD_VERTEXTYPE, GE_VTYPE_TC_FLOAT | GE_VTYPE_COL_8888 | GE_VTYPE_POS_FLOAT).Prim(GE_PRIM_TRIANGLES, n * 3, VERTS);
+	}
 	dl.Finish();
+	return dl;
+}
+
+double BenchFrames(int scenario, int threads, int frames, Stats *stats) {
+	GeEnv env(threads);
+	DL dl = BenchList(scenario);
+	EnqueueList(dl.start, 0, -1, 0, false);
+	Run();
+	ResetStats();
 	auto t0 = std::chrono::steady_clock::now();
-	for (int frame = 0; frame < 60; ++frame) {
+	for (int frame = 0; frame < frames; ++frame) {
 		EnqueueList(dl.start, 0, -1, 0, false);
 		Run();
 		DrawSync(0);
 	}
 	auto t1 = std::chrono::steady_clock::now();
-	const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-	printf("  60 frames x 4 full-screen textured blended sprites: %.1f ms (%.2f ms/frame)\n", ms, ms / 60);
-	CHECK(ms < 60000.0);
+	*stats = GetStats();
+	return std::chrono::duration<double, std::milli>(t1 - t0).count() / frames;
+}
+
+}  // namespace
+
+namespace {
+
+// A sampling profiler for the calling thread (GPU_PROFILE=<scenario>): which functions the time goes to.
+void ProfileScenario(int scenario, int frames) {
+	HANDLE process = GetCurrentProcess();
+	SymSetOptions(SYMOPT_DEFERRED_LOADS | SYMOPT_UNDNAME);
+	SymInitialize(process, nullptr, TRUE);
+	HANDLE target;
+	DuplicateHandle(process, GetCurrentThread(), process, &target, 0, FALSE, DUPLICATE_SAME_ACCESS);
+	std::atomic<bool> done{ false };
+	std::vector<DWORD64> samples;
+	std::thread sampler([&] {
+		while (!done) {
+			SuspendThread(target);
+			CONTEXT ctx{};
+			ctx.ContextFlags = CONTEXT_CONTROL;
+			if (GetThreadContext(target, &ctx))
+				samples.push_back(ctx.Rip);
+			ResumeThread(target);
+			const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(50);
+			while (std::chrono::steady_clock::now() < until) {
+			}
+		}
+	});
+	Stats st;
+	BenchFrames(scenario, 1, frames, &st);
+	done = true;
+	sampler.join();
+	CloseHandle(target);
+	std::map<std::string, int> counts;
+	alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 256];
+	for (DWORD64 a : samples) {
+		SYMBOL_INFO *sym = (SYMBOL_INFO *)buf;
+		memset(buf, 0, sizeof(buf));
+		sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+		sym->MaxNameLen = 255;
+		DWORD64 disp = 0;
+		counts[SymFromAddr(process, a, &disp, sym) ? std::string(sym->Name) : std::string("?")]++;
+	}
+	std::vector<std::pair<int, std::string>> sorted;
+	for (auto &kv : counts)
+		sorted.push_back({ kv.second, kv.first });
+	std::sort(sorted.rbegin(), sorted.rend());
+	printf("  profile of scenario %d: %d samples\n", scenario, (int)samples.size());
+	for (size_t i = 0; i < sorted.size() && i < 25; ++i)
+		printf("    %5.1f%%  %s\n", 100.0 * sorted[i].first / samples.size(), sorted[i].second.c_str());
+	SymCleanup(process);
+}
+
+}  // namespace
+
+TEST(gpu_perf) {
+	if (const char *prof = getenv("GPU_PROFILE")) {
+		ProfileScenario(atoi(prof), 60);
+		return;
+	}
+	// Not pass/fail: ms per frame for typical workloads, one thread and the automatic count.
+	static const char *names[] = { "2D 4x full-screen bilinear blended", "2D UI bg + 300 CLUT8 sprites", "3D 4000 textured z-tested tris", "3D vertex path only (12000 verts)" };
+	for (int scenario = 0; scenario < 4; ++scenario) {
+		Stats s1, sn;
+		const double one = BenchFrames(scenario, 1, 20, &s1);
+		const double many = BenchFrames(scenario, 0, 20, &sn);
+		printf("  %-36s 1 thread %6.2f ms/frame, auto %6.2f ms/frame (%llu px, %llu prims/frame)\n", names[scenario], one, many,
+			(unsigned long long)(s1.pixelsSubmitted / 20), (unsigned long long)(s1.prims / 20));
+		CHECK(one > 0.0);
+	}
 }

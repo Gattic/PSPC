@@ -28,6 +28,7 @@ void SetStrictMemory(bool strict) { g_strict = strict; }
 
 static void ApiSyscall(Ctx *c, u32 insn, u32 pc) { hle::Syscall(c, insn, pc); }
 static void ApiInterpretFrom(Ctx *c, u32 pc, u32 ra0, u32 sp0) { interp::Run(c, pc, ra0, sp0); }
+static void ApiExecWord(Ctx *c, u32 pc) { interp::ExecOne(c, pc, GRead32(pc)); }
 
 void Init() {
 	// The magic return stub: anything that executes it by accident traps.
@@ -48,6 +49,7 @@ void Init() {
 	g_api.yieldCheck = &YieldCheck;
 	g_api.invalidInsn = &InvalidInstruction;
 	g_api.interpretFrom = &ApiInterpretFrom;
+	g_api.execWord = &ApiExecWord;
 }
 
 const PspcRuntimeApi *AotApi() { return &g_api; }

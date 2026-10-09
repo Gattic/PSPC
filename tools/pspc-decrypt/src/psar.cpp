@@ -578,6 +578,8 @@ struct Unpacker {
 	const PsarOptions *options;
 	PsarSummary *summary;
 	Json entries = Json::Array();
+	// Derived files wait here so they follow the entry they came from in the manifest.
+	std::vector<Json> derivedQueue;
 	std::map<std::string, std::string> written;  // relative path -> sha1 of what's there
 
 	bool Write(const std::string &rel, const Bytes &data, std::string *error) {
@@ -627,7 +629,7 @@ struct Unpacker {
 		} else {
 			d.Set("error", error);
 		}
-		entries.Push(d);
+		derivedQueue.push_back(d);
 	}
 
 	// loadexec carries reboot.bin as an embedded ~PSP.
@@ -654,7 +656,7 @@ struct Unpacker {
 			d.Set("kind", "derived");
 			d.Set("what", "reboot.bin from loadexec");
 			d.Set("error", r.error);
-			entries.Push(d);
+			derivedQueue.push_back(d);
 		}
 	}
 
@@ -803,6 +805,10 @@ struct Unpacker {
 			}
 		}
 		entries.Push(e);
+		for (Json &d : derivedQueue) {
+			entries.Push(std::move(d));
+		}
+		derivedQueue.clear();
 	}
 };
 

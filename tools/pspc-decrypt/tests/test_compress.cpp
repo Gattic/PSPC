@@ -220,17 +220,28 @@ TEST(kl4e_stored_stream) {
 }
 
 // Random streams through both decoders: every literal, match, distance and error path the
-// format has gets exercised, and both must produce the same bytes and the same result.
+// format has gets exercised, and both must produce the same bytes and the same result. A run of
+// literals first gives the matches that follow real history to copy from.
 TEST(kl4e_differential_vs_firmware_port) {
 	int compared = 0, ended = 0;
+	long long produced = 0;
+	const Bytes history = GenText(1500);
 	for (u32 seed = 1; seed <= 3000; seed++) {
-		Bytes input = PseudoRandom(2048, seed);
-		input[0] &= 0x7F;  // compressed streams
 		const bool kl4e = (seed & 1) != 0;
+		Bytes input;
+		if (seed % 3 == 0) {
+			input = PseudoRandom(2048, seed);
+			input[0] &= 0x7F;  // compressed, not stored
+		} else {
+			const Bytes prefix = Kl4eEncodeLiterals(Bytes(history.begin(), history.begin() + (seed % 1400) + 1), (u8)(seed & 0x1F), !kl4e, false);
+			input.assign(prefix.begin() + 4, prefix.end());
+			const Bytes tail = PseudoRandom(8 + seed % 200, seed);
+			input.insert(input.end(), tail.begin(), tail.end());
+		}
 		// Zero padding ends any stream quickly (all-ones bits are the end marker), so the
 		// reference decoder, which doesn't bound its reads, stays inside the buffer.
 		input.resize(input.size() + 0x10000, 0);
-		const int capacity = 1 << 20;
+		const int capacity = 1 << 18;
 		Bytes ours(capacity, 0);
 		const u8 *end = nullptr;
 		const int n = DecompressKL4E(ours.data(), capacity, input.data(), input.size(), &end, !kl4e);
@@ -241,17 +252,20 @@ TEST(kl4e_differential_vs_firmware_port) {
 		const int m = decompress_kle(ref.data(), capacity, input.data(), nullptr, kl4e ? 1 : 0);
 		compared++;
 		CHECK_EQ(n, m);
+		// On success and on failure alike, the same bytes were written.
+		CHECK(memcmp(ours.data(), ref.data(), capacity) == 0);
 		if (n >= 0) {
 			ended++;
-			CHECK(memcmp(ours.data(), ref.data(), n) == 0);
+			produced += n;
 		}
 		if (n != m) {
 			fprintf(stderr, "  seed %u: ours %d, reference %d\n", seed, n, m);
 			break;
 		}
 	}
-	CHECK(compared > 2000);
-	printf("  compared %d random streams (%d ran to an end marker)\n", compared, ended);
+	CHECK(compared > 2500);
+	CHECK(ended > 500);
+	printf("  compared %d streams; %d ran to an end marker, %lld bytes between them\n", compared, ended, produced);
 }
 
 TEST(lzrc_roundtrip) {

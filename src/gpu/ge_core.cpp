@@ -511,10 +511,8 @@ void Execute_MtxData(u32 op, u32 &numReg, u32 &dataReg, float *mtx, int size, u3
 		u32 *target = (u32 *)&mtx[num];
 		const u32 newVal = op << 8;
 		if (newVal != *target) {
-			binner::Flush();
 			*target = newVal;
 			TransformDirty();
-			binner::DirtyState();
 		}
 	}
 	// The CPU visible values update differently.
@@ -940,9 +938,10 @@ void ProcessDLQueue() {
 		switch (gpuState) {
 		case GPUSTATE_DONE:
 			if (list.pendingInterrupt) {
-				// The list stays at the head until its finish callback has run (InterruptEnd).
+				// The list stays at the head until its finish callback has run (InterruptEnd), which wakes
+				// the sceGeDrawSync waiters. One that comes in between doesn't wait.
 				if (dlQueue.size() == 1)
-					NotifyDrawSyncDone();
+					drawPending = false;
 				return;
 			}
 			break;

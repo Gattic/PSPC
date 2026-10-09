@@ -65,7 +65,9 @@ Bytes MakeTestElf(const std::string &name, size_t size, u32 seed, u16 attribute 
 
 // KL4E (or KL3E) and LZRC streams made of literals plus the end marker, from a mirror image of
 // the decoders' range coder. Both start with their magic ("KL4E"/"KL3E", "2RLZ").
-Bytes Kl4eEncodeLiterals(const Bytes &data, u8 flags, bool kl3e = false);
+// Without the end marker the stream just stops after the literals (for the differential test,
+// which appends random bytes to send the decoder somewhere interesting).
+Bytes Kl4eEncodeLiterals(const Bytes &data, u8 flags, bool kl3e = false, bool endMarker = true);
 Bytes LzrcEncodeLiterals(const Bytes &data, u8 lc);
 
 // KIRK CMD1 block (header + data_offset bytes + data, encrypted by CMD0) with fresh keys.

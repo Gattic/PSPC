@@ -80,6 +80,47 @@ static bool IsCompressionMagic(const u8 *p, size_t size) {
 	return IsGzipMagic(p, size) || IsKL4EMagic(p, size, &kl3e) || HasMagic(p, size, "2RLZ", 4);
 }
 
+// Decompresses a decrypted payload as the header asks (or as its magic says) into r->output.
+static bool DecompressPayload(Bytes &payload, const PspHeader &h, DecodeResult *r) {
+	const bool compressed = (h.compAttribute & 1) != 0;
+	const bool magic = IsCompressionMagic(payload.data(), payload.size());
+	if (compressed && !magic) {
+		r->error = "header says compressed, but the payload has no known compression magic";
+		return false;
+	}
+	if (!magic) {
+		r->output = std::move(payload);
+		return true;
+	}
+	Bytes out;
+	size_t consumed = 0;
+	std::string err;
+	if (!DecompressAny(payload.data(), payload.size(), h.elfSize, &out, &r->compression, &consumed, &err)) {
+		r->error = r->compression + ": " + err;
+		return false;
+	}
+	r->steps.push_back(r->compression);
+	if (!compressed) {
+		r->warnings.push_back("payload was compressed although comp_attribute says it isn't");
+	}
+	// Some firmware files carry a second stream after the first (pspdecrypt's "part 2").
+	size_t rest = consumed;
+	while (rest < payload.size() && rest < consumed + 16 && payload[rest] == 0) {
+		rest++;
+	}
+	if (rest < payload.size() && IsCompressionMagic(payload.data() + rest, payload.size() - rest)) {
+		std::string method2;
+		size_t consumed2 = 0;
+		if (DecompressAny(payload.data() + rest, payload.size() - rest, 0, &r->trailing, &method2, &consumed2, &err)) {
+			r->warnings.push_back(StringPrintf("second %s stream after the first (%zu bytes)", method2.c_str(), r->trailing.size()));
+		} else {
+			r->trailing.clear();
+		}
+	}
+	r->output = std::move(out);
+	return true;
+}
+
 static void DecodePsp(const u8 *data, size_t size, const u8 *seed, DecodeResult *r) {
 	PspHeader &h = r->psp;
 	if (!ParsePspHeader(data, size, &h)) {
@@ -98,72 +139,45 @@ static void DecodePsp(const u8 *data, size_t size, const u8 *seed, DecodeResult 
 	}
 	const u8 *body = data + PSP_HEADER_SIZE;
 	const size_t bodySize = h.pspSize - PSP_HEADER_SIZE;
-	const bool compressed = (h.compAttribute & 1) != 0;
 
 	// Custom firmware packing (M33's psp-packer and friends): the ~PSP header sits in front of a
 	// plain gzip stream with no encryption at all. The tag and oe_tag are only there to satisfy
-	// the CFW loader; the gzip magic right after the header is the tell.
+	// the CFW loader; the gzip magic right after the header is the tell. A stream that inflates
+	// (so its CRC checks out) to something other than an ELF is only a fallback: KIRK gets the
+	// first say, since ciphertext can start with the gzip magic by chance.
+	Bytes inflated;
+	bool haveInflated = false;
 	if (IsGzipMagic(body, bodySize)) {
-		Bytes out;
 		size_t consumed = 0;
 		std::string err;
-		if (InflateStream(body, bodySize, DeflateWrapper::Gzip, &out, &consumed, &err, kMaxOutput) && IsElf(out.data(), out.size())) {
-			r->cfwPacked = true;
-			r->compression = "gzip";
-			r->steps.push_back("~PSP header without encryption (custom firmware packing)");
-			r->steps.push_back("gzip");
-			r->output = std::move(out);
-		}
+		haveInflated = InflateStream(body, bodySize, DeflateWrapper::Gzip, &inflated, &consumed, &err, kMaxOutput);
 	}
-	if (!r->cfwPacked && IsElf(body, bodySize)) {
+	Bytes payload;
+	PrxDecryptInfo info;
+	if (haveInflated && IsElf(inflated.data(), inflated.size())) {
+		r->cfwPacked = true;
+	} else if (IsElf(body, bodySize)) {
 		r->steps.push_back("~PSP header in front of a plain ELF");
 		r->output.assign(body, body + bodySize);
-	} else if (!r->cfwPacked) {
-		Bytes payload;
-		PrxDecryptInfo info;
-		if (DecryptPRX(data, h.pspSize, size, &payload, seed, &info) < 0) {
-			r->status = info.error == PrxError::UnknownTag || info.error == PrxError::NeedsSeed ? DecodeStatus::NeedsKey : DecodeStatus::Failed;
-			r->error = StringPrintf("cannot decrypt ~PSP (tag 0x%08x): %s", h.tag, PrxErrorString(info.error));
-			return;
-		}
+	} else if (DecryptPRX(data, h.pspSize, size, &payload, seed, &info) >= 0) {
 		r->encrypted = true;
 		r->prxType = info.type;
 		r->steps.push_back(StringPrintf("KIRK decrypt (type %d, tag 0x%08x)", info.type, h.tag));
-
-		const bool magic = IsCompressionMagic(payload.data(), payload.size());
-		if (compressed && !magic) {
-			r->error = "header says compressed, but the payload has no known compression magic";
+		if (!DecompressPayload(payload, h, r)) {
 			return;
 		}
-		if (magic) {
-			Bytes out;
-			size_t consumed = 0;
-			std::string err;
-			if (!DecompressAny(payload.data(), payload.size(), h.elfSize, &out, &r->compression, &consumed, &err)) {
-				r->error = r->compression + ": " + err;
-				return;
-			}
-			r->steps.push_back(r->compression);
-			if (!compressed) {
-				r->warnings.push_back("payload was compressed although comp_attribute says it isn't");
-			}
-			// Some firmware files carry a second stream after the first (pspdecrypt's "part 2").
-			size_t rest = consumed;
-			while (rest < payload.size() && rest < consumed + 16 && payload[rest] == 0) {
-				rest++;
-			}
-			if (rest < payload.size() && IsCompressionMagic(payload.data() + rest, payload.size() - rest)) {
-				std::string method2;
-				size_t consumed2 = 0;
-				if (DecompressAny(payload.data() + rest, payload.size() - rest, 0, &r->trailing, &method2, &consumed2, &err)) {
-					r->warnings.push_back(StringPrintf("second %s stream after the first (%zu bytes)", method2.c_str(), r->trailing.size()));
-				} else {
-					r->trailing.clear();
-				}
-			}
-			payload = std::move(out);
-		}
-		r->output = std::move(payload);
+	} else if (haveInflated) {
+		r->cfwPacked = true;
+	} else {
+		r->status = info.error == PrxError::UnknownTag || info.error == PrxError::NeedsSeed ? DecodeStatus::NeedsKey : DecodeStatus::Failed;
+		r->error = StringPrintf("cannot decrypt ~PSP (tag 0x%08x): %s", h.tag, PrxErrorString(info.error));
+		return;
+	}
+	if (r->cfwPacked) {
+		r->compression = "gzip";
+		r->steps.push_back("~PSP header without encryption (custom firmware packing)");
+		r->steps.push_back("gzip");
+		r->output = std::move(inflated);
 	}
 
 	r->status = DecodeStatus::Ok;
@@ -378,7 +392,7 @@ static Json DescribeDecode(const u8 *data, size_t size, const DecodeOptions &opt
 	return j;
 }
 
-Json DescribeFile(const u8 *data, size_t size, const DecodeOptions &options) {
+Json DescribeFile(const u8 *data, size_t size, const DecodeOptions &options, size_t baseOffset) {
 	Json j = Json::Object();
 	const FileKind kind = SniffKind(data, size);
 	j.Set("kind", FileKindName(kind));
@@ -399,7 +413,7 @@ Json DescribeFile(const u8 *data, size_t size, const DecodeOptions &options) {
 		const u32 headerSize = size >= 8 ? rd32(data + 4) : 0;
 		j.Set("sce_header_size", Hex32(headerSize));
 		if (headerSize >= 8 && headerSize < size) {
-			j.Set("inner", DescribeFile(data + headerSize, size - headerSize, options));
+			j.Set("inner", DescribeFile(data + headerSize, size - headerSize, options, baseOffset + headerSize));
 		}
 		break;
 	}
@@ -445,7 +459,7 @@ Json DescribeFile(const u8 *data, size_t size, const DecodeOptions &options) {
 			j.Set("param_sfo", SfoToJson(sfo));
 		}
 		if (pbp.size[PbpFile::DATA_PSP]) {
-			j.Set("data_psp", DescribeFile(data + pbp.offset[PbpFile::DATA_PSP], pbp.size[PbpFile::DATA_PSP], options));
+			j.Set("data_psp", DescribeFile(data + pbp.offset[PbpFile::DATA_PSP], pbp.size[PbpFile::DATA_PSP], options, baseOffset + pbp.offset[PbpFile::DATA_PSP]));
 		}
 		if (pbp.size[PbpFile::DATA_PSAR]) {
 			const u8 *psar = data + pbp.offset[PbpFile::DATA_PSAR];
@@ -494,6 +508,9 @@ Json DescribeFile(const u8 *data, size_t size, const DecodeOptions &options) {
 				ParsePspHeader(data + off, size - off, &h);
 				Json m = Json::Object();
 				m.Set("offset", Hex32((u32)off));
+				if (baseOffset != 0) {
+					m.Set("file_offset", Hex32((u32)(baseOffset + off)));
+				}
 				m.Set("module_name", h.modname);
 				m.Set("psp_size", h.pspSize);
 				m.Set("elf_size", h.elfSize);

@@ -201,7 +201,7 @@ struct RangeEncoder {
 
 }  // namespace
 
-Bytes Kl4eEncodeLiterals(const Bytes &data, u8 flags, bool kl3e) {
+Bytes Kl4eEncodeLiterals(const Bytes &data, u8 flags, bool kl3e, bool endMarker) {
 	flags &= 0x7F;
 	const u8 seed = (u8)(0x80 - (((flags >> 3) & 3) << 4));
 	const int shift = flags & 7;
@@ -227,6 +227,12 @@ Bytes Kl4eEncodeLiterals(const Bytes &data, u8 flags, bool kl3e) {
 		rc.Bit(&countBits[idx], 0, 4, 15);
 		idx = idx > 0 ? idx - 1 : 0;
 		literal((int)pos, data[pos - 1], data[pos]);
+	}
+	if (!endMarker) {
+		Bytes stream = rc.Finish(flags);
+		Bytes out = { 'K', 'L', (u8)(kl3e ? '3' : '4'), 'E' };
+		out.insert(out.end(), stream.begin(), stream.end());
+		return out;
 	}
 	// End marker: a match whose length code is 0xFF - seven length bits, all ones.
 	rc.Bit(&countBits[idx], 1, 4, 15);

@@ -19,6 +19,9 @@ FileKind SniffKind(const u8 *data, size_t size) {
 	if (HasMagic(data, size, "KL3E", 4)) return FileKind::KL3E;
 	if (HasMagic(data, size, "2RLZ", 4)) return FileKind::LZRC;
 	if (HasMagic(data, size, "NPUMDIMG", 8)) return FileKind::NpUmdImg;
+	if (HasMagic(data, size, "\x89" "PNG", 4)) return FileKind::Png;
+	if (HasMagic(data, size, "PSMF", 4)) return FileKind::Pmf;
+	if (HasMagic(data, size, "RIFF", 4)) return FileKind::Riff;
 	if (IsGzipMagic(data, size)) return FileKind::Gzip;
 	if (size >= 2 && data[0] == 0x78 && IsZlibHeader(data, size)) return FileKind::Zlib;
 	return FileKind::Unknown;
@@ -39,6 +42,9 @@ const char *FileKindName(FileKind kind) {
 	case FileKind::KL3E: return "KL3E";
 	case FileKind::LZRC: return "2RLZ";
 	case FileKind::NpUmdImg: return "NPUMDIMG";
+	case FileKind::Png: return "PNG";
+	case FileKind::Pmf: return "PSMF";
+	case FileKind::Riff: return "RIFF";
 	default: return "unknown";
 	}
 }

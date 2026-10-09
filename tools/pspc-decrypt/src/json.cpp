@@ -113,7 +113,16 @@ void Json::TextTo(std::string &out, int depth, const std::string &prefix) const 
 		case Type::Null: return "-";
 		case Type::Bool: return j.int_ ? "yes" : "no";
 		case Type::Int: return std::to_string(j.int_);
-		case Type::String: return j.str_;
+		case Type::String: {
+			// One fact per line: keep embedded line breaks from splitting a value.
+			std::string s = j.str_;
+			for (char &c : s) {
+				if (c == '\n' || c == '\r') {
+					c = ' ';
+				}
+			}
+			return s;
+		}
 		default: return std::string();
 		}
 	};

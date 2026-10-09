@@ -23,6 +23,9 @@ if(MSVC)
 endif()
 
 add_subdirectory(src)
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tools/CMakeLists.txt)
+	add_subdirectory(tools)
+endif()
 
 if(PSPC_BUILD_TESTS)
 	enable_testing()

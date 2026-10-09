@@ -131,6 +131,11 @@ inline float GERowSum(const GERowTerm *terms, int count) {
 	}
 	if (sum == 0)
 		return 0.0f;
+	// float(sum) * 2^lsbExp: by the exponent bits while the result stays normal.
+	const u32 bits = FloatBits((float)sum);
+	const int e = (int)((bits >> 23) & 0xFF) + lsbExp;
+	if (e >= 1 && e <= 254)
+		return BitsFloat((bits + ((u32)lsbExp << 23)) & 0xFFFFFF00);
 	return TruncateToFloat24(ldexpf((float)sum, lsbExp));
 }
 

@@ -36,6 +36,9 @@ struct PspcRuntimeApi {
 	void (*invalidInsn)(Ctx *c, u32 insn, u32 pc);
 	// Continue execution in the interpreter at pc until the current guest function returns.
 	void (*interpretFrom)(Ctx *c, u32 pc, u32 ra0, u32 sp0);
+	// Execute the (non-control-flow) instruction currently stored at pc. Used for words that are
+	// patched at load time and therefore can't be compiled in (variable-import relocations).
+	void (*execWord)(Ctx *c, u32 pc);
 };
 
 typedef void (*AotFn)(Ctx *);
