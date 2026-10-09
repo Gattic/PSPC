@@ -14,6 +14,8 @@ void Shutdown();
 void Write(LogLevel level, const char *category, const char *fmt, ...);
 // Raw text written to stdout without decoration (used for guest program output).
 void GuestOutput(const char *text, size_t len);
+// Called by Fatal() after the message, before exiting (the runtime prints a host backtrace).
+void SetFatalHook(void (*hook)());
 
 }  // namespace logging
 

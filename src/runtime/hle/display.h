@@ -16,6 +16,9 @@ u32 CurrentHcount();
 void SetVblankHook(std::function<void()> fn);
 // Blocks the current thread for `count` VBlanks.
 int WaitVblankStart(int count, bool cb);
+// Pixels as R,G,B,A bytes (one u32 each, alpha forced to 255).
 void ConvertFramebuffer(u32 addr, int stride, int format, int width, int height, std::vector<u32> &out);
+// The framebuffer shown since the last VBlank; addr is 0 when the game hasn't set one.
+void CurrentFramebuffer(u32 &addr, int &stride, int &format);
 
 }  // namespace display

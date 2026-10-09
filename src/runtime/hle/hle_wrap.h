@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
 // Automatic argument/return marshalling for HLE functions following the PSP EABI:
-// integer arguments in $a0-$a3,$t0-$t3 (64-bit values in an aligned register pair),
-// float arguments in $f12-$f19, results in $v0 (+$v1) or $f0.
+// integer arguments in $a0-$a3,$t0-$t3 (64-bit values in an aligned register pair), then words
+// on the stack from $sp, float arguments in $f12-$f19, results in $v0 (+$v1) or $f0.
 //
 //   static int sceFoo(u32 a, PspPtr<SceFooParam> p, const char *name);
 //   const HleFunction table[] = { HLEFN(0x12345678, sceFoo), ... };
@@ -44,6 +44,12 @@ struct ArgState {
 	Ctx *c;
 	int gpr = 4;
 	int fpr = 12;
+	// Argument word i (4 = $a0); past $t3 they continue on the caller's stack at $sp.
+	u32 Word(int i) const {
+		if (i <= 11) return c->r[i];
+		u32 a = c->r[29] + 4 * (u32)(i - 12);
+		return mem::IsValidRange(a, 4) ? GRead32(a) : 0;
+	}
 };
 
 template <typename T>
@@ -54,12 +60,12 @@ struct ArgReader {
 			return (T)s.c->f[s.fpr++];
 		} else if constexpr (sizeof(T) == 8) {
 			if (s.gpr & 1) s.gpr++;
-			u64 lo = s.gpr <= 11 ? s.c->r[s.gpr] : 0;
-			u64 hi = s.gpr + 1 <= 11 ? s.c->r[s.gpr + 1] : 0;
+			u64 lo = s.Word(s.gpr);
+			u64 hi = s.Word(s.gpr + 1);
 			s.gpr += 2;
 			return (T)(lo | (hi << 32));
 		} else {
-			u32 v = s.gpr <= 11 ? s.c->r[s.gpr] : 0;
+			u32 v = s.Word(s.gpr);
 			s.gpr++;
 			return (T)v;
 		}
@@ -69,7 +75,7 @@ struct ArgReader {
 template <typename T>
 struct ArgReader<PspPtr<T>> {
 	static PspPtr<T> Read(ArgState &s) {
-		u32 v = s.gpr <= 11 ? s.c->r[s.gpr] : 0;
+		u32 v = s.Word(s.gpr);
 		s.gpr++;
 		return PspPtr<T>(v);
 	}
@@ -78,7 +84,7 @@ struct ArgReader<PspPtr<T>> {
 template <>
 struct ArgReader<const char *> {
 	static const char *Read(ArgState &s) {
-		u32 v = s.gpr <= 11 ? s.c->r[s.gpr] : 0;
+		u32 v = s.Word(s.gpr);
 		s.gpr++;
 		return v ? mem::GetCString(v) : nullptr;
 	}

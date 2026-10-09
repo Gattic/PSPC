@@ -2,6 +2,7 @@
 // Tests for pspc_audio: MPEG audio header parsing, MP3/ATRAC3+ decoding on the pspautotests
 // sample files (skipped when the reference tree isn't present), the VAG decoder and the sceSas
 // mixer over a fake guest memory.
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -10,6 +11,7 @@
 #include "audio/atrac_track.h"
 #include "audio/decoder.h"
 #include "audio/guest_memory.h"
+#include "audio/mf_decoder.h"
 #include "audio/sas.h"
 #include "testing.h"
 
@@ -147,8 +149,8 @@ TEST(audio_sas_vag_voice) {
 	delete sas;
 }
 
-#include "audio/mf_decoder.h"
 
+// What the Media Foundation MP3 decoder does with the first frames (Mp3Audio compensates for it).
 TEST(audio_mf_mp3_latency) {
 	std::vector<u8> file = LoadRef("mp3/sample.mp3");
 	if (file.empty()) return;
@@ -166,5 +168,73 @@ TEST(audio_mf_mp3_latency) {
 		mf.Decode(file.data() + pos, info.frameBytes, out);
 		printf("  frame %d: %d bytes in, %d samples out, %d nonzero\n", f, info.frameBytes, (int)out.size() / 2, CountNonZero(out.data(), (int)out.size()));
 		pos += info.frameBytes;
+	}
+}
+
+
+// Not a correctness test: prints what the mixers and decoders cost, for the performance notes.
+TEST(audio_perf_report) {
+	using clk = std::chrono::steady_clock;
+	audio::SetGuestMemory(&FakeGuest);
+	// SAS: 32 looping VAG voices at a 256-sample grain (a busy game).
+	const u32 vagAddr = kFakeBase + 0x1000;
+	u8 *vag = FakeGuest(vagAddr, 16 * 64);
+	for (int b = 0; b < 64; b++) {
+		vag[b * 16 + 0] = (u8)(0x10 | (b & 7));
+		vag[b * 16 + 1] = b == 0 ? 6 : (b == 63 ? 3 : 0);
+		for (int i = 2; i < 16; i++) vag[b * 16 + i] = (u8)(b * 37 + i * 11);
+	}
+	audio::SasInstance *sas = new audio::SasInstance();
+	sas->SetGrainSize(256);
+	for (int v = 0; v < 32; v++) {
+		audio::SasVoice &voice = sas->voices[v];
+		voice.type = audio::VOICETYPE_VAG;
+		voice.vagAddr = vagAddr;
+		voice.vagSize = 16 * 64;
+		voice.loop = true;
+		voice.pitch = 0x0800 + v * 0x80;
+		voice.envelope.SetSimpleEnvelope(0x000F, 0x1FC0);
+		voice.KeyOn();
+	}
+	const int mixes = 2000;
+	auto t0 = clk::now();
+	for (int i = 0; i < mixes; i++) sas->Mix(kFakeBase + 0x10000, 0, 0, 0, false);
+	const double sasUs = std::chrono::duration<double, std::micro>(clk::now() - t0).count() / mixes;
+	printf("  sceSas: 32 VAG voices, grain 256: %.1f us per mix (%.1f us per 60Hz frame)\n", sasUs, sasUs * 44100.0 / 256 / 60);
+	delete sas;
+
+	std::vector<u8> file = LoadRef("atrac/sample.at3");
+	if (!file.empty()) {
+		audio::Track track;
+		std::string error;
+		audio::AnalyzeAtracTrack(file.data(), (u32)file.size(), (u32)file.size(), &track, &error);
+		audio::AudioDecoder *dec = audio::CreateAtrac3PlusAudio(track.channels, track.bytesPerFrame);
+		std::vector<s16> pcm(2048 * 2);
+		const int frames = (int)((file.size() - track.dataByteOffset) / track.bytesPerFrame);
+		auto t1 = clk::now();
+		for (int f = 0; f < frames; f++) {
+			int consumed = 0, samples = 0;
+			dec->Decode(file.data() + track.dataByteOffset + (size_t)f * track.bytesPerFrame, track.bytesPerFrame, &consumed, 2, pcm.data(), &samples);
+		}
+		const double us = std::chrono::duration<double, std::micro>(clk::now() - t1).count() / frames;
+		printf("  ATRAC3+ stereo %d-byte frames: %.1f us per 2048-sample frame (%.2f%% of real time)\n", track.bytesPerFrame, us, us / (2048 * 1e6 / 44100) * 100);
+		delete dec;
+	}
+	file = LoadRef("mp3/sample.mp3");
+	if (!file.empty()) {
+		audio::AudioDecoder *dec = audio::CreateMp3Audio();
+		std::vector<s16> pcm(1152 * 2);
+		size_t pos = 0;
+		int frames = 0;
+		auto t2 = clk::now();
+		while (pos + 4 < file.size()) {
+			int consumed = 0, samples = 0;
+			if (!dec->Decode(file.data() + pos, (int)(file.size() - pos), &consumed, 2, pcm.data(), &samples) || consumed <= 0) break;
+			pos += consumed;
+			frames++;
+		}
+		const double us = std::chrono::duration<double, std::micro>(clk::now() - t2).count() / std::max(frames, 1);
+		printf("  MP3 (Media Foundation): %d frames, %.1f us per 1152-sample frame\n", frames, us);
+		delete dec;
 	}
 }

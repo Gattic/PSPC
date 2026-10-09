@@ -115,7 +115,7 @@ void PatchImportStubToGuest(u32 stubAddr, const std::string &library, u32 nid, u
 	GWrite32(stubAddr, 0x08000000 | ((target >> 2) & 0x03FFFFFF));  // j target
 	GWrite32(stubAddr + 4, 0);
 	if (HostFn fn = dispatch::Lookup(target)) {
-		dispatch::Register(stubAddr, fn);
+		dispatch::RegisterNative(stubAddr, fn, dispatch::LookupBody(target));
 	} else {
 		dispatch::UnregisterRange(stubAddr, 8);
 	}

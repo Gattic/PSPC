@@ -7,13 +7,19 @@
 #include "allegrex/ctx.h"
 
 using HostFn = void (*)(Ctx *);
+// Body of a recompiled function, run as part of a frame that returns to ra0 (see aot_abi.h).
+using BodyFn = void (*)(Ctx *, u32 ra0, u32 sp0);
 
 namespace dispatch {
 
 void Init();
+// A host function with call semantics only (HLE thunks); clears any body entry at addr.
 void Register(u32 addr, HostFn fn);
+// A recompiled function: call entry plus body entry for jumps.
+void RegisterNative(u32 addr, HostFn fn, BodyFn body);
 void UnregisterRange(u32 addr, u32 size);
 HostFn Lookup(u32 addr);
+BodyFn LookupBody(u32 addr);
 u32 RegisteredCount();
 
 // Call semantics: $ra already holds the return address. Runs native code if registered,

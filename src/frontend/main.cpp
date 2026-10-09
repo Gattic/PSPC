@@ -14,6 +14,40 @@
 #include "common/log.h"
 #include "runtime/runtime.h"
 
+// "<vblank>:<BUTTON[+BUTTON...]>[:<frames>]", e.g. "600:START" or "900:CROSS+UP:4".
+static bool ParsePress(const std::string &spec, runtime::Options::Press &out) {
+	static const struct {
+		const char *name;
+		u32 bit;
+	} kButtons[] = {{"SELECT", 0x1},     {"START", 0x8},     {"UP", 0x10},       {"RIGHT", 0x20},
+	                {"DOWN", 0x40},      {"LEFT", 0x80},     {"L", 0x100},       {"R", 0x200},
+	                {"TRIANGLE", 0x1000}, {"CIRCLE", 0x2000}, {"CROSS", 0x4000}, {"SQUARE", 0x8000},
+	                {"HOME", 0x10000}};
+	size_t c1 = spec.find(':');
+	if (c1 == std::string::npos) return false;
+	size_t c2 = spec.find(':', c1 + 1);
+	out.vblank = (u32)strtoul(spec.c_str(), nullptr, 10);
+	out.frames = c2 == std::string::npos ? 6 : (u32)strtoul(spec.c_str() + c2 + 1, nullptr, 10);
+	std::string names = spec.substr(c1 + 1, c2 == std::string::npos ? std::string::npos : c2 - c1 - 1);
+	out.buttons = 0;
+	size_t pos = 0;
+	while (pos <= names.size()) {
+		size_t end = names.find('+', pos);
+		std::string n = names.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+		for (char &ch : n) ch = (char)toupper((unsigned char)ch);
+		bool found = false;
+		for (const auto &b : kButtons)
+			if (n == b.name) {
+				out.buttons |= b.bit;
+				found = true;
+			}
+		if (!found) return false;
+		if (end == std::string::npos) break;
+		pos = end + 1;
+	}
+	return out.buttons != 0 && out.frames != 0;
+}
+
 static void Usage() {
 	fprintf(stderr,
 	        "Usage: pspc [options] <EBOOT.PBP | game.iso | game.cso | program.prx | program.elf>\n"
@@ -33,7 +67,9 @@ static void Usage() {
 	        "  --scale <n>          window scale (default 2)\n"
 	        "  --log <level>        trace|debug|info|warn|error (default info)\n"
 	        "  --log-file <path>    write the log to a file\n"
-	        "  --test-display       report a display to pspautotests (default: none)\n");
+	        "  --test-display       report a display to pspautotests (default: none)\n"
+	        "  --dump-frames <dir>  save the displayed frame as BMP every --dump-every VBlanks (60)\n"
+	        "  --press <v>:<B>[:n]  hold buttons B (e.g. START, CROSS+UP) for n VBlanks (6) from VBlank v\n");
 }
 
 static u32 ParseFw(const std::string &s) {
@@ -81,6 +117,17 @@ int main(int argc, char **argv) {
 		else if (a == "--fw") o.firmwareVersion = ParseFw(next());
 		else if (a == "--scale") o.windowScale = atoi(next().c_str());
 		else if (a == "--test-display") o.hasDisplayForTests = true;
+		else if (a == "--dump-frames") o.dumpFramesDir = next();
+		else if (a == "--dump-every") o.dumpEvery = atoi(next().c_str());
+		else if (a == "--press") {
+			runtime::Options::Press p;
+			std::string spec = next();
+			if (!ParsePress(spec, p)) {
+				fprintf(stderr, "bad --press %s (want <vblank>:<BUTTON[+BUTTON]>[:<frames>])\n", spec.c_str());
+				return 1;
+			}
+			o.presses.push_back(p);
+		}
 		else if (a == "--log") {
 			std::string l = next();
 			level = l == "trace" ? LogLevel::Trace

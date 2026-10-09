@@ -44,21 +44,25 @@ public:
 		// Pass 1 collects goto targets, pass 2 writes them out.
 		for (int pass = 0; pass < 2; pass++) {
 			out_.clear();
+			pending_ = 0;
 			emitting_ = pass == 1;
-			out_ += Fmt("void F_%08X(Ctx *PSPC_RESTRICT c) {\n", f_.entry);
-			out_ += "\tconst u32 ra0 = c->r[31];\n\tconst u32 sp0 = c->r[29];\n\t(void)sp0;\n";
+			out_ += Fmt("void B_%08X(Ctx *PSPC_RESTRICT c, u32 ra0, u32 sp0) {\n\t(void)sp0;\n", f_.entry);
 			if (f_.body.find(f_.entry) == f_.body.end()) {
-				out_ += Fmt("\tg_api->jumpIndirect(c, %s, ra0, sp0);\n", Pc(f_.entry).c_str());
+				out_ += Fmt("\tg_api->interpretFrom(c, %s, ra0, sp0);\n", Pc(f_.entry).c_str());
 			} else if (order_.front() != f_.entry) {
 				Goto(f_.entry, "\t");
 			}
 			for (size_t i = 0; i < order_.size(); i++) {
 				cur_ = i;
 				u32 pc = order_[i];
-				if (needed_.count(pc)) out_ += Fmt("L_%08X:;\n", pc);
+				if (needed_.count(pc)) {
+					Charge("\t");  // the fall-through path pays for what it ran before the join
+					out_ += Fmt("L_%08X:;\n", pc);
+				}
 				EmitInsn(pc);
 			}
-			out_ += "}\n\n";
+			out_ += "}\n";
+			out_ += Fmt("void F_%08X(Ctx *PSPC_RESTRICT c) { B_%08X(c, c->r[31], c->r[29]); }\n\n", f_.entry, f_.entry);
 		}
 		return out_;
 	}
@@ -82,7 +86,17 @@ private:
 	// Continue at `next` after the current instruction finished.
 	void FallThrough(u32 next) {
 		if (next == NextEmitted() && f_.body.count(next)) return;
+		Charge("\t");
 		Goto(next, "\t");
+	}
+
+	// Cycle accounting matches the interpreter: one cycle per executed instruction, delay slots
+	// included. Straight-line code accumulates a count that is paid before anything that leaves
+	// it (control transfers, syscalls, labels).
+	void Charge(const char *indent) {
+		if (pending_ == 0) return;
+		out_ += Fmt("%sc->budget -= %d;\n", indent, pending_);
+		pending_ = 0;
 	}
 
 	void Comment(u32 pc, u32 w) {
@@ -98,9 +112,18 @@ private:
 			return;
 		}
 		if (w == 0) return;  // nop
-		out_ += Fmt("%ssem_%s(c, 0x%08Xu);\n", indent, OpId(op), w);
+		out_ += Fmt("%ssem_%s%s(c, 0x%08Xu);\n", indent, OpId(op), Stale(pc, w, op), w);
 		if (op == Op::LUI && img_.relocatable && img_.hi16Relocs.count(pc) && Rt(w) != 0)
 			out_ += Fmt("%sc->r[%u] += g_delta;\n", indent, Rt(w));
+	}
+
+	// A condition reader right behind the instruction that set the condition sees the value from
+	// before it (ag::SeesStaleCondition, the same static rule the interpreter applies); the _PREV
+	// semantics read that value.
+	const char *Stale(u32 pc, u32 w, Op op) const {
+		if (!ag::MaySeeStaleCondition(op)) return "";
+		const bool stale = ag::SeesStaleCondition(op, w, img_.Read32(pc - 4), img_.Read32(pc - 8), img_.Read32(pc - 12));
+		return stale ? "_PREV" : "";
 	}
 
 	// Emits the delay slot instruction at pc (part of the preceding control transfer).
@@ -117,7 +140,7 @@ private:
 
 	void EmitCall(u32 target, u32 ret, const char *indent) {
 		if (entries_.count(target) && !img_.IsStub(target)) {
-			out_ += Fmt("%sF_%08X(c);\n", indent, target);
+			out_ += Fmt("%sB_%08X(c, c->r[31], c->r[29]);\n", indent, target);
 		} else {
 			out_ += Fmt("%sg_api->callIndirect(c, %s);\n", indent, Pc(target).c_str());
 		}
@@ -125,19 +148,17 @@ private:
 		            Pc(ret).c_str());
 	}
 
+	// The target continues our frame: it returns where we would (ra0), whatever $ra holds now.
 	void EmitTailCall(u32 target, const char *indent) {
-		out_ += Fmt("%s{ const u32 rt_ = c->r[31];\n", indent);
 		if (entries_.count(target) && !img_.IsStub(target)) {
-			out_ += Fmt("%s  F_%08X(c);\n", indent, target);
+			out_ += Fmt("%sB_%08X(c, ra0, sp0); return;\n", indent, target);
 		} else {
-			out_ += Fmt("%s  g_api->callIndirect(c, %s);\n", indent, Pc(target).c_str());
+			out_ += Fmt("%sg_api->jumpIndirect(c, %s, ra0, sp0); return;\n", indent, Pc(target).c_str());
 		}
-		out_ += Fmt("%s  if (c->unwinding || rt_ == ra0) return;\n%s  g_api->nonlocalReturn(c, rt_); return; }\n", indent,
-		            indent);
 	}
 
 	void Budget(u32 pc, u32 target, const char *indent) {
-		if (target <= pc) out_ += Fmt("%sif (--c->budget < 0) g_api->yieldCheck(c);\n", indent);
+		if (target <= pc) out_ += Fmt("%sif (c->budget < 0) g_api->yieldCheck(c);\n", indent);
 	}
 
 	void EmitInsn(u32 pc) {
@@ -145,12 +166,17 @@ private:
 		Op op = ag::Decode(w);
 		Kind k = ag::OpKind(op);
 		Comment(pc, w);
+		pending_++;
+		// Branches and jumps also run their delay slot (likely branches only when taken).
+		if (k == Kind::BR || k == Kind::BRAL || k == Kind::J || k == Kind::JAL || k == Kind::JR || k == Kind::JALR)
+			pending_++;
 		switch (k) {
 		case Kind::ALU:
 			EmitAlu(pc, w, op, "\t");
 			FallThrough(pc + 4);
 			return;
 		case Kind::SYSCALL:
+			Charge("\t");
 			out_ += Fmt("\tg_api->syscall(c, 0x%08Xu, %s);\n\tif (c->unwinding) return;\n", w, Pc(pc).c_str());
 			FallThrough(pc + 4);
 			return;
@@ -160,7 +186,8 @@ private:
 			return;
 		case Kind::BR: {
 			u32 t = BranchTarget(pc, w);
-			out_ += Fmt("\t{ const bool t_ = cond_%s(c, 0x%08Xu);\n", OpId(op), w);
+			Charge("\t");
+			out_ += Fmt("\t{ const bool t_ = cond_%s%s(c, 0x%08Xu);\n", OpId(op), Stale(pc, w, op), w);
 			EmitDelay(pc + 4, "\t  ");
 			out_ += "\t  if (t_) {\n";
 			Budget(pc, t, "\t    ");
@@ -171,7 +198,8 @@ private:
 		}
 		case Kind::BRL: {
 			u32 t = BranchTarget(pc, w);
-			out_ += Fmt("\tif (cond_%s(c, 0x%08Xu)) {\n", OpId(op), w);
+			Charge("\t");
+			out_ += Fmt("\tif (cond_%s%s(c, 0x%08Xu)) {\n\t  c->budget -= 1;\n", OpId(op), Stale(pc, w, op), w);
 			EmitDelay(pc + 4, "\t  ");
 			Budget(pc, t, "\t  ");
 			Goto(t, "\t  ");
@@ -182,12 +210,13 @@ private:
 		case Kind::BRAL:
 		case Kind::BRALL: {
 			u32 t = BranchTarget(pc, w);
+			Charge("\t");
 			out_ += Fmt("\t{ const bool t_ = cond_%s(c, 0x%08Xu);\n\t  c->r[31] = %s;\n", OpId(op), w, Pc(pc + 8).c_str());
 			if (k == Kind::BRAL) {
 				EmitDelay(pc + 4, "\t  ");
 				out_ += "\t  if (t_) {\n";
 			} else {
-				out_ += "\t  if (t_) {\n";
+				out_ += "\t  if (t_) {\n\t    c->budget -= 1;\n";
 				EmitDelay(pc + 4, "\t    ");
 			}
 			EmitCall(t, pc + 8, "\t    ");
@@ -197,6 +226,7 @@ private:
 		}
 		case Kind::J: {
 			u32 t = JumpTarget(pc, w);
+			Charge("\t");
 			EmitDelay(pc + 4, "\t");
 			if (f_.tailCalls.count(pc)) {
 				EmitTailCall(t, "\t");
@@ -208,6 +238,7 @@ private:
 		}
 		case Kind::JAL: {
 			u32 t = JumpTarget(pc, w);
+			Charge("\t");
 			out_ += Fmt("\tc->r[31] = %s;\n", Pc(pc + 8).c_str());
 			EmitDelay(pc + 4, "\t");
 			EmitCall(t, pc + 8, "\t");
@@ -216,6 +247,7 @@ private:
 		}
 		case Kind::JR: {
 			u32 rs = Rs(w);
+			Charge("\t");
 			out_ += Fmt("\t{ const u32 t_ = c->r[%u];\n", rs);
 			EmitDelay(pc + 4, "\t  ");
 			if (rs == 31) {
@@ -239,6 +271,7 @@ private:
 		}
 		case Kind::JALR: {
 			u32 rd = Rd(w);
+			Charge("\t");
 			out_ += Fmt("\t{ const u32 t_ = c->r[%u];\n", Rs(w));
 			if (rd) out_ += Fmt("\t  c->r[%u] = %s;\n", rd, Pc(pc + 8).c_str());
 			EmitDelay(pc + 4, "\t  ");
@@ -271,6 +304,7 @@ private:
 	bool comments_;
 	std::vector<u32> order_;
 	size_t cur_ = 0;
+	int pending_ = 0;  // instructions run since the last budget charge
 	std::set<u32> needed_;
 	bool emitting_ = false;
 	std::string out_;
@@ -291,17 +325,29 @@ bool Generate(const ModuleImage &img, const Analysis &an, const CodegenOptions &
 	hdr += "// Generated by pspc-recomp. Do not edit.\n#pragma once\n";
 	hdr += "#include \"allegrex/sem.h\"\n#include \"allegrex/aot_abi.h\"\n\n";
 	hdr += "extern const PspcRuntimeApi *g_api;\nextern u32 g_delta;\n\n";
-	for (u32 e : entries) hdr += Fmt("void F_%08X(Ctx *PSPC_RESTRICT c);\n", e);
+	for (u32 e : entries)
+		hdr += Fmt("void B_%08X(Ctx *PSPC_RESTRICT c, u32 ra0, u32 sp0);\nvoid F_%08X(Ctx *PSPC_RESTRICT c);\n", e, e);
 	if (!WriteTextFile(fs::path(opts.outDir) / "module.h", hdr)) {
 		if (err) *err = "cannot write module.h";
 		return false;
 	}
 
+	// A module that changes the FPU rounding mode (ctc1 to fcr31) needs the compiler to honour the
+	// dynamic mode: no constant folding under round-to-nearest. Others keep full optimisation.
+	bool setsRounding = false;
+	for (const auto &r : img.code)
+		for (u32 pc = r.first; pc + 4 <= r.second && !setsRounding; pc += 4) {
+			u32 w = img.Read32(pc);
+			if (ag::Decode(w) == Op::CTC1 && Rd(w) == 31) setsRounding = true;
+		}
+	const char *prologue = setsRounding ? "// Generated by pspc-recomp. Do not edit.\n#pragma STDC FENV_ACCESS ON\n"
+	                                    : "// Generated by pspc-recomp. Do not edit.\n";
+
 	size_t fileIndex = 0;
 	std::string body;
 	auto flush = [&]() -> bool {
 		if (body.empty()) return true;
-		std::string text = "// Generated by pspc-recomp. Do not edit.\n#include \"module.h\"\n\n" + body;
+		std::string text = std::string(prologue) + "#include \"module.h\"\n\n" + body;
 		fs::path p = fs::path(opts.outDir) / Fmt("code_%03zu.cpp", fileIndex++);
 		if (stats) stats->bytes += text.size();
 		body.clear();
@@ -326,7 +372,7 @@ bool Generate(const ModuleImage &img, const Analysis &an, const CodegenOptions &
 	glue += "u8 *g_membase = nullptr;\nu32 *g_cop0 = nullptr;\nu32 *g_intrEnabled = nullptr;\n";
 	glue += "const PspcRuntimeApi *g_api = nullptr;\nu32 g_delta = 0;\n\n";
 	glue += "static const AotFunctionEntry kFunctions[] = {\n";
-	for (u32 e : entries) glue += Fmt("\t{0x%08Xu, &F_%08X},\n", e - img.low, e);
+	for (u32 e : entries) glue += Fmt("\t{0x%08Xu, &F_%08X, &B_%08X},\n", e - img.low, e, e);
 	glue += "};\n\n";
 	glue += "static AotModuleDesc g_desc = {\n";
 	glue += Fmt("\tPSPC_AOT_ABI_VERSION, 0x%08Xu, \"%s\",\n\t{", PSPC_SEM_VERSION, img.name.c_str());

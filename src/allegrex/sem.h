@@ -52,16 +52,46 @@ PSPC_FORCEINLINE u32 F2U(float f) { return std::bit_cast<u32>(f); }
 
 // The FPU's rounding mode (fcr31 bits 0-1) and flush-to-zero (bit 24) map onto MXCSR. Each guest
 // thread is a fiber created with FIBER_FLAG_FLOAT_SWITCH, so the setting follows the thread.
+// It also clears the host's exception flags, which hold the guest FPU's (see FpuExceptionBits).
 PSPC_FORCEINLINE void ApplyFpuMode(u32 fcr31) {
 	static const unsigned rc[4] = {_MM_ROUND_NEAREST, _MM_ROUND_TOWARD_ZERO, _MM_ROUND_UP, _MM_ROUND_DOWN};
-	unsigned csr = _mm_getcsr() & ~(unsigned)(_MM_ROUND_MASK | _MM_FLUSH_ZERO_MASK | 0x40);
+	unsigned csr = _mm_getcsr() & ~(unsigned)(_MM_ROUND_MASK | _MM_FLUSH_ZERO_MASK | 0x40 | _MM_EXCEPT_MASK);
 	csr |= rc[fcr31 & 3];
 	if (fcr31 & (1u << 24)) csr |= _MM_FLUSH_ZERO_ON | 0x40;
 	_mm_setcsr(csr);
 }
 
-// FPU arithmetic produces the positive default NaN for every NaN result (cpu/fpu/fpu_nan).
-PSPC_FORCEINLINE float CanonNan(float r) { return r != r ? std::bit_cast<float>(0x7FC00000u) : r; }
+// fcr31 exception bits: the sticky flags at bits 2-6 and the cause at 12-16, both in the order
+// inexact, underflow, overflow, divide by zero, invalid.
+constexpr u32 FCR31_INVALID = (1u << 6) | (1u << 16);
+
+// The exceptions the guest FPU raised since its last ctc1 to fcr31, as fcr31 flag and cause bits
+// (cpu/fpu/fcr). They live in the host's MXCSR flags, which ctc1 clears and which follow each
+// guest thread (fibers switch the float state; HLE calls restore the guest's MXCSR). So the
+// cause field reports everything since that ctc1 rather than the last instruction only, and VFPU
+// float math is seen too. The cases where the host doesn't raise what the PSP does (a NaN
+// operand is invalid; sqrt of a negative and inf * 0 are done in software) set FCR31_INVALID in
+// fcr31 directly.
+PSPC_FORCEINLINE u32 FpuExceptionBits() {
+	const unsigned csr = _mm_getcsr();
+	u32 e = 0;
+	if (csr & _MM_EXCEPT_INEXACT) e |= 1;
+	if (csr & _MM_EXCEPT_UNDERFLOW) e |= 2;
+	if (csr & _MM_EXCEPT_OVERFLOW) e |= 4;
+	if (csr & _MM_EXCEPT_DIV_ZERO) e |= 8;
+	if (csr & _MM_EXCEPT_INVALID) e |= 16;
+	return (e << 2) | (e << 12);
+}
+
+// The result of an FPU op that came out NaN: a NaN operand comes back quieted, the first one if
+// both are (cpu/fpu/roundmode), otherwise it's the positive default NaN (cpu/fpu/fpu_nan; x86
+// makes the negative one). Either way the op was invalid.
+PSPC_FORCEINLINE u32 NanResult(Ctx *c, u32 a, u32 b) {
+	c->fcr31 |= FCR31_INVALID;
+	if ((a & 0x7FFFFFFFu) > 0x7F800000u) return a | 0x00400000u;
+	if ((b & 0x7FFFFFFFu) > 0x7F800000u) return b | 0x00400000u;
+	return 0x7FC00000u;
+}
 PSPC_FORCEINLINE float U2F(u32 u) { return std::bit_cast<float>(u); }
 
 PSPC_FORCEINLINE u32 ReverseBits32(u32 v) {
@@ -213,6 +243,12 @@ COND(BC1F) { return c->fpcond == 0; }
 COND(BC1T) { return c->fpcond != 0; }
 COND(BC1FL) { return c->fpcond == 0; }
 COND(BC1TL) { return c->fpcond != 0; }
+// The same branches right behind c.cond.s, which still see the condition from before it
+// (ag::SeesStaleCondition).
+COND(BC1F_PREV) { return c->fpcondPrev == 0; }
+COND(BC1T_PREV) { return c->fpcondPrev != 0; }
+COND(BC1FL_PREV) { return c->fpcondPrev == 0; }
+COND(BC1TL_PREV) { return c->fpcondPrev != 0; }
 
 // ---- COP0 (dummy) ----
 SEM(MFC0) { sem::SetR(c, RT_, g_cop0[RD_]); }
@@ -227,7 +263,7 @@ SEM(CFC1) {
 	u32 v = 0;
 	if (fs == 31) {
 		c->fcr31 = (c->fcr31 & ~(1u << 23)) | ((c->fpcond & 1) << 23);
-		v = c->fcr31;
+		v = c->fcr31 | sem::FpuExceptionBits();
 	} else if (fs == 0) {
 		v = sem::FCR0_VALUE;
 	}
@@ -247,25 +283,39 @@ SEM(CTC1) {
 #define FD_ c->f[insn::Fd(w)]
 #define FDI_ c->fi[insn::Fd(w)]
 
-SEM(ADD_S) { FD_ = sem::CanonNan(FS_ + FT_); }
-SEM(SUB_S) { FD_ = sem::CanonNan(FS_ - FT_); }
+#define FSI_ c->fi[insn::Fs(w)]
+#define FTI_ c->fi[insn::Ft(w)]
+// The NaN check reads the operands again, so it must run before fd (which may be one) is written.
+#define FPU_RESULT_(r)                                                \
+	do {                                                              \
+		const float r_ = (r);                                         \
+		if (PSPC_UNLIKELY(r_ != r_)) FDI_ = sem::NanResult(c, FSI_, FTI_); \
+		else FD_ = r_;                                                \
+	} while (0)
+
+SEM(ADD_S) { FPU_RESULT_(FS_ + FT_); }
+SEM(SUB_S) { FPU_RESULT_(FS_ - FT_); }
 SEM(MUL_S) {
 	float a = FS_, b = FT_;
 	if ((std::isinf(a) && b == 0.0f) || (std::isinf(b) && a == 0.0f)) {
 		FDI_ = 0x7FC00000u;
+		c->fcr31 |= sem::FCR31_INVALID;
 	} else {
-		FD_ = sem::CanonNan(a * b);
+		FPU_RESULT_(a * b);
 	}
 }
-SEM(DIV_S) { FD_ = sem::CanonNan(FS_ / FT_); }
+SEM(DIV_S) { FPU_RESULT_(FS_ / FT_); }
 SEM(SQRT_S) {
 	float a = FS_;
-	if (a < 0.0f) {
-		FDI_ = 0x7FC00000u;
+	if (a < 0.0f || a != a) {
+		FDI_ = sem::NanResult(c, FSI_, 0);
 	} else {
 		FD_ = std::sqrt(a);
 	}
 }
+#undef FPU_RESULT_
+#undef FSI_
+#undef FTI_
 SEM(ABS_S) { FD_ = std::fabs(FS_); }
 SEM(MOV_S) { c->fi[insn::Fd(w)] = c->fi[insn::Fs(w)]; }
 SEM(NEG_S) { FD_ = -FS_; }
@@ -297,6 +347,7 @@ SEM(C_COND_S) {
 	case 6: cond = a <= b; break;                 // ole / le
 	default: cond = a <= b || un; break;          // ule / ngt
 	}
+	c->fpcondPrev = c->fpcond;
 	c->fpcond = cond ? 1 : 0;
 }
 

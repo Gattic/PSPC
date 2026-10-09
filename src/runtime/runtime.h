@@ -2,6 +2,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "common/log.h"
 
@@ -29,6 +30,13 @@ struct Options {
 	u32 firmwareVersion = 0x06060010;
 	int windowScale = 2;
 	bool hasDisplayForTests = false;
+	std::string dumpFramesDir;  // write the displayed frame as BMP here every dumpEvery VBlanks
+	int dumpEvery = 60;
+	// Scripted input: hold `buttons` (PSP_CTRL_* bits) for `frames` VBlanks from VBlank `vblank`.
+	struct Press {
+		u32 vblank, buttons, frames;
+	};
+	std::vector<Press> presses;
 };
 
 // Boots the program and runs until it exits. Returns the exit code.

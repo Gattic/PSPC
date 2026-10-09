@@ -216,12 +216,15 @@ float UVPlaneGradient(const UVPlanes &planes, const SamplerState &ss, bool inTex
 	return (float)std::max(gs, gt);
 }
 
+// Where q isn't positive the GE samples the last texel, whatever the wrap mode and the signs of s and t
+// (gpu/texmtx/negq).
+constexpr float kBadQUV = 0x1.fffffep-1f;
+
 // u, v and q at a pixel from the planes' values there.
 inline void UVFromPlaneValues(const UVPlanes &planes, int64_t qs, int64_t ss, int64_t ts, float &s, float &t, float &q) {
 	q = TruncateToFloat24((float)((double)qs * planes.scaleQ));
 	if (!(q > 0.0f)) {
-		s = 0.0f;
-		t = 0.0f;
+		s = t = kBadQUV;
 		return;
 	}
 	const double r = GERecip(q);
@@ -266,14 +269,14 @@ struct UVWalker {
 		if (constQ) {
 			q = qConst;
 			if (!qValid) {
-				s = t = 0.0f;
+				s = t = kBadQUV;
 				return;
 			}
 			r = rConst;
 		} else {
 			q = TruncateToFloat24((float)((double)((qv + i * qdx) >> 14) * p.scaleQ));
 			if (!(q > 0.0f)) {
-				s = t = 0.0f;
+				s = t = kBadQUV;
 				return;
 			}
 			r = GERecip(q);
@@ -1024,8 +1027,7 @@ float LineUVComponentAt(const int64_t c[2], double scale, const RVertex &v0, con
 void LineTextureCoordinatesAt(const LineUV &uv, const RVertex &v0, const RVertex &v1, int px, int py, float &s, float &t, float &q) {
 	q = LineUVComponentAt(uv.q, uv.scaleQ, v0, v1, px, py);
 	if (!(q > 0.0f)) {
-		s = 0.0f;
-		t = 0.0f;
+		s = t = kBadQUV;
 		return;
 	}
 	const double r = GERecip(q);

@@ -20,6 +20,24 @@ namespace audiohle {
 namespace {
 
 SasInstance *g_sas = nullptr;
+u32 g_sasCore = 0;  // the game's SasCore block from sceSasInit
+
+// The firmware keeps each voice's state in the game's SasCore block (a 20-byte header, then 56
+// bytes per voice), and games and tests read it back. Mirror the envelope settings there.
+void MirrorEnvelope(int voiceNum) {
+	const u32 addr = g_sasCore + 20 + 56 * (u32)voiceNum;
+	if (!g_sasCore || !mem::IsValidRange(addr, 56)) return;
+	const ADSREnvelope &e = g_sas->voices[voiceNum].envelope;
+	GWrite32(addr + 24, (u32)e.attackRate);
+	GWrite32(addr + 28, (u32)e.decayRate);
+	GWrite32(addr + 32, (u32)e.sustainRate);
+	GWrite32(addr + 36, (u32)e.releaseRate);
+	GWrite32(addr + 40, (u32)e.sustainLevel);
+	GWrite8(addr + 44, (u8)e.attackType);
+	GWrite8(addr + 45, (u8)e.decayType);
+	GWrite8(addr + 46, (u8)e.sustainType);
+	GWrite8(addr + 47, (u8)e.releaseType);
+}
 
 SasInstance *Sas() {
 	if (!g_sas) {
@@ -44,6 +62,7 @@ u32 sceSasInit(u32 core, u32 grainSize, u32 maxVoices, u32 outputMode, u32 sampl
 	if (outputMode != 0 && outputMode != 1) return SCE_SAS_ERROR_INVALID_OUTPUT_MODE;
 	if (sampleRate != 44100) return SCE_SAS_ERROR_INVALID_SAMPLE_RATE;
 	sas->SetGrainSize((int)grainSize);
+	g_sasCore = core;
 	// maxVoices is effectively ignored.
 	sas->maxVoices = PSP_SAS_VOICES_MAX;
 	sas->outputMode = (int)outputMode;
@@ -67,6 +86,7 @@ u32 sceSasGetEndFlag(u32 core) {
 u32 _sceSasCore(u32 core, u32 outAddr) {
 	SasInstance *sas = Sas();
 	if (!mem::IsValidAddress(outAddr)) return SCE_SAS_ERROR_INVALID_PARAMETER;
+	if (sched::InInterrupt()) return SCE_KERNEL_ERROR_ILLEGAL_CONTEXT;
 	if (!sched::DispatchEnabled()) return SCE_KERNEL_ERROR_CAN_NOT_WAIT;
 	sas->Mix(outAddr, 0, 0, 0, false);
 	return DelaySasResult(0);
@@ -76,6 +96,7 @@ u32 _sceSasCoreWithMix(u32 core, u32 inoutAddr, int leftVolume, int rightVolume)
 	SasInstance *sas = Sas();
 	if (!mem::IsValidAddress(inoutAddr)) return SCE_SAS_ERROR_INVALID_PARAMETER;
 	if (sas->outputMode == PSP_SAS_OUTPUTMODE_RAW) return SCE_KERNEL_ERROR_BAD_ARGUMENT;
+	if (sched::InInterrupt()) return SCE_KERNEL_ERROR_ILLEGAL_CONTEXT;
 	if (!sched::DispatchEnabled()) return SCE_KERNEL_ERROR_CAN_NOT_WAIT;
 	sas->Mix(inoutAddr, inoutAddr, leftVolume, rightVolume, false);
 	return DelaySasResult(0);
@@ -192,6 +213,7 @@ u32 sceSasSetSL(u32 core, int voiceNum, int level) {
 	SasInstance *sas = Sas();
 	if (voiceNum >= PSP_SAS_VOICES_MAX || voiceNum < 0) return SCE_SAS_ERROR_INVALID_VOICE;
 	sas->voices[voiceNum].envelope.SetSustainLevel(level);
+	MirrorEnvelope(voiceNum);
 	return 0;
 }
 
@@ -201,6 +223,7 @@ u32 sceSasSetADSR(u32 core, int voiceNum, int flag, int a, int d, int s, int r) 
 	int invalid = (a < 0 ? 0x1 : 0) | (d < 0 ? 0x2 : 0) | (s < 0 ? 0x4 : 0) | (r < 0 ? 0x8 : 0);
 	if (invalid & flag) return SCE_SAS_ERROR_INVALID_ADSR_RATE;
 	sas->voices[voiceNum].envelope.SetRate(flag, a, d, s, r);
+	MirrorEnvelope(voiceNum);
 	return 0;
 }
 
@@ -219,6 +242,7 @@ u32 sceSasSetADSRMode(u32 core, int voiceNum, int flag, int a, int d, int s, int
 	if (r > 5 || (r & 1) != 1) invalid |= 0x8;
 	if (invalid & flag) return SCE_SAS_ERROR_INVALID_ADSR_CURVE_MODE;
 	sas->voices[voiceNum].envelope.SetEnvelope(flag, a, d, s, r);
+	MirrorEnvelope(voiceNum);
 	return 0;
 }
 
@@ -228,6 +252,7 @@ u32 sceSasSetSimpleADSR(u32 core, int voiceNum, u32 ADSREnv1, u32 ADSREnv2) {
 	// Setting this bit is an error.
 	if ((ADSREnv2 >> 13) & 1) return SCE_SAS_ERROR_INVALID_ADSR_CURVE_MODE;
 	sas->voices[voiceNum].envelope.SetSimpleEnvelope(ADSREnv1 & 0xFFFF, ADSREnv2 & 0xFFFF);
+	MirrorEnvelope(voiceNum);
 	return 0;
 }
 

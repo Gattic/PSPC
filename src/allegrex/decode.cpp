@@ -2,6 +2,7 @@
 #include "allegrex/decode.h"
 
 #include <cstdio>
+#include <initializer_list>
 
 #include "allegrex/insn.h"
 
@@ -232,5 +233,21 @@ static_assert(ArraySize(s_names) == (size_t)Op::COUNT, "name table size");
 
 Kind OpKind(Op op) { return s_kinds[(size_t)op]; }
 const char *OpName(Op op) { return s_names[(size_t)op]; }
+
+bool SeesStaleCondition(Op op, u32 w, u32 w1, u32 w2, u32 w3) {
+	constexpr u32 kCcReg = 128 + 3;  // mtvc/mfvc register number of the VFPU CC
+	if (op >= Op::BC1F && op <= Op::BC1TL) return Decode(w1) == Op::C_COND_S;
+	if (op == Op::MFVC) return (w & 0xFF) == kCcReg && Decode(w1) == Op::VCMP;
+	if (op >= Op::BVF && op <= Op::BVTL) {
+		bool mtvc = false;
+		for (u32 x : {w1, w2, w3}) {
+			const Op p = Decode(x);
+			if (p == Op::VCMP) return false;
+			if (p == Op::MTVC && (x & 0xFF) == kCcReg) mtvc = true;
+		}
+		return mtvc;
+	}
+	return false;
+}
 
 }  // namespace ag

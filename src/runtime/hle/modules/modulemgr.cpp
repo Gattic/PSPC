@@ -3,14 +3,17 @@
 #include <algorithm>
 
 #include "common/log.h"
+#include "loader/psp_header.h"
 #include "runtime/boot.h"
 #include "runtime/hle/hle_wrap.h"
 #include "runtime/hle/modules/modules.h"
 #include "runtime/io/io.h"
 #include "runtime/kernel/callbacks.h"
 #include "runtime/kernel/errors.h"
+#include "runtime/kernel/kernel_hle.h"
 #include "runtime/kernel/module.h"
 #include "runtime/kernel/scheduler.h"
+#include "runtime/kernel/sysmem.h"
 
 using namespace kernel;
 
@@ -26,7 +29,8 @@ const char *const kNativeModules[] = {
 	"sceSsl_Module", "sceMemab", "sceAvcodec_driver", "sceAudiocodec_Driver", "sceAudiocodec", "sceVideocodec_Driver",
 	"sceVideocodec", "sceMpegbase_Driver", "sceMpegbase", "scePsmf_library", "scePsmfP_library", "scePsmfPlayer",
 	"sceSAScore", "sceMp4_library", "mp4msv_module", "sceJpeg", "sceJpeg_library", "sceJpeg_Library",
-	"sceVaudio_driver", "sceUsbGps_Driver", "sceUsbCam_Driver", "sceUsbMic_Driver",
+	"sceVaudio_driver", "sceUsbGps_Driver", "sceUsbCam_Driver", "sceUsbMic_Driver", "sceCert_Loader",
+	"sceUSB_PSPComm_Driver",
 };
 
 bool IsNativeModuleName(const std::string &name) {
@@ -39,9 +43,9 @@ std::string ModuleNameOf(const std::vector<u8> &data) {
 	loader::ElfFile elf;
 	if (elf.Parse(data.data(), data.size(), nullptr) && elf.HasModuleInfo())
 		return std::string(elf.ModuleInfo().name, strnlen(elf.ModuleInfo().name, 28));
-	// ~PSP header carries the name too.
-	if (data.size() > 0x26 && memcmp(data.data(), "~PSP", 4) == 0)
-		return std::string((const char *)data.data() + 0x0A, strnlen((const char *)data.data() + 0x0A, 28));
+	// The ~PSP header (possibly behind a ~SCE wrapper) carries the name too.
+	loader::PspHeader h;
+	if (loader::ParsePspHeader(data.data(), data.size(), h)) return h.modName;
 	return "";
 }
 
@@ -80,6 +84,16 @@ int sceKernelLoadModuleDNAS(const char *path, u32 key, u32 flags, u32 optPtr) {
 	return sceKernelLoadModule(path, flags, optPtr);
 }
 
+// Loads from an open descriptor, starting at its current position (games keep modules inside
+// their own archives this way).
+int sceKernelLoadModuleByID(int fd, u32 flags, u32 optPtr) {
+	(void)flags;
+	std::vector<u8> data;
+	std::string path;
+	if (!io::ReadRestOfFd(fd, data, &path)) return (int)SCE_KERNEL_ERROR_BADF;
+	return LoadFromBytes(data, path + " (by fd)", optPtr);
+}
+
 int sceKernelLoadModuleBufferUsbWlan(u32 size, u32 buf, u32 flags, u32 optPtr) {
 	(void)flags;
 	if (!mem::IsValidRange(buf, size)) return (int)SCE_KERNEL_ERROR_ILLEGAL_ADDR;
@@ -88,7 +102,7 @@ int sceKernelLoadModuleBufferUsbWlan(u32 size, u32 buf, u32 flags, u32 optPtr) {
 }
 
 int sceKernelStartModule(SceUID id, u32 argSize, u32 argPtr, u32 statusPtr, u32 optPtr) {
-	(void)optPtr;
+	if (int r = ValidateSMOption(optPtr); r < 0) return r;
 	PspModule *m = Get<PspModule>(id);
 	if (!m) return (int)SCE_KERNEL_ERROR_UNKNOWN_MODULE;
 	if (!m->memAddr) {
@@ -97,20 +111,22 @@ int sceKernelStartModule(SceUID id, u32 argSize, u32 argPtr, u32 statusPtr, u32 
 		if (mem::IsValidRange(statusPtr, 4)) GWrite32(statusPtr, 0);
 		return id;
 	}
-	int r = StartModule(m, argSize, argPtr, statusPtr, true);
-	if (r < 0 && r != 0 && m->status != MODULE_STATUS_STARTED) return r;
-	return id;
+	if (m->status == MODULE_STATUS_STARTED) return (int)SCE_KERNEL_ERROR_ERROR;
+	int r = StartModule(m, argSize, argPtr, statusPtr, true, optPtr);
+	if (r < 0) return r;
+	return m->status == MODULE_STATUS_STARTED ? id : 0;
 }
 
 int sceKernelStopModule(SceUID id, u32 argSize, u32 argPtr, u32 statusPtr, u32 optPtr) {
-	(void)optPtr;
+	if (int r = ValidateSMOption(optPtr); r < 0) return r;
 	PspModule *m = Get<PspModule>(id);
 	if (!m) return (int)SCE_KERNEL_ERROR_UNKNOWN_MODULE;
 	if (!m->memAddr) {
+		if (mem::IsValidRange(statusPtr, 4)) GWrite32(statusPtr, 0);
 		m->status = MODULE_STATUS_STOPPED;
 		return 0;
 	}
-	return StopModule(m, argSize, argPtr, statusPtr);
+	return StopModule(m, argSize, argPtr, statusPtr, optPtr);
 }
 
 int sceKernelUnloadModule(SceUID id) {
@@ -223,6 +239,10 @@ void sceKernelExitGameWithStatus(int status) {
 }
 
 int sceKernelRegisterExitCallback(SceUID cb) {
+	if (!Get<Callback>(cb)) {
+		if (kernel::CompiledSdkVersion() >= 0x3090500) return (int)SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT;
+		return 0;
+	}
 	g_exitCallback = cb;
 	return 0;
 }
@@ -239,9 +259,21 @@ int sceKernelLoadExec(const char *path, u32 paramPtr) {
 	return 0;
 }
 
+// Updates the exit callback's parameter area (behaviour from PPSSPP, which matches
+// threads/callbacks/exit): the callback's common argument points just past {unknown1, params}.
 int LoadExecForUser_362A956B() {
-	// Notifies the exit callback (used by some games to "quit" through the HOME menu path).
-	if (g_exitCallback) NotifyCallback(g_exitCallback, 0);
+	Callback *cb = Get<Callback>(g_exitCallback);
+	if (!cb) return (int)SCE_KERNEL_ERROR_UNKNOWN_CBID;
+	u32 cbArg = cb->commonArg;
+	if (!mem::IsValidRange(cbArg - 8, 8)) return (int)SCE_KERNEL_ERROR_ILLEGAL_ADDR;
+	u32 unknown1 = GRead32(cbArg - 8);
+	if (unknown1 >= 4) return (int)SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT;
+	u32 params = GRead32(cbArg - 4);
+	if ((params & 3) || !mem::IsValidRange(params, 12)) return (int)SCE_KERNEL_ERROR_ILLEGAL_ADDR;
+	u32 size = GRead32(params);
+	if (size < 12) return (int)SCE_KERNEL_ERROR_ILLEGAL_SIZE;
+	GWrite32(params + 4, 0);
+	GWrite32(params + 8, 0xFFFFFFFF);
 	return 0;
 }
 
@@ -254,9 +286,10 @@ SceUID ExitCallback() { return g_exitCallback; }
 void Register_ModuleMgrForUser() {
 	static const hle::HleFunction funcs[] = {
 		HLEFN(0x977DE386, sceKernelLoadModule),
-		HLEFN(0x50F0C1EC, sceKernelStartModule),
+		HLEFN(0xB7F46618, sceKernelLoadModuleByID),
+		KFN(0x50F0C1EC, sceKernelStartModule, kernel::KF_NOT_IN_INTERRUPT | kernel::KF_NOT_DISPATCH_SUSPENDED),
 		HLEFN(0xD675EBB8, sceKernelSelfStopUnloadModule),
-		HLEFN(0xD1FF982A, sceKernelStopModule),
+		KFN(0xD1FF982A, sceKernelStopModule, kernel::KF_NOT_IN_INTERRUPT | kernel::KF_NOT_DISPATCH_SUSPENDED),
 		HLEFN(0x2E0911AA, sceKernelUnloadModule),
 		HLEFN(0xF9275D98, sceKernelLoadModuleBufferUsbWlan),
 		HLEFN(0x748CBED9, sceKernelQueryModuleInfo),

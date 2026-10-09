@@ -463,6 +463,11 @@ int Savedata::LoadSaveData(SavedataRequest *param, const std::string &saveDirNam
 	StrNCopy(param->saveName, saveDirName, sizeof(param->saveName));
 
 	int prevCryptMode = GetSaveCryptMode(param, saveDirName);
+	if (prevCryptMode != 0 && !secureMode) {
+		// A secure (encrypted) file can't be read without decrypting it (utility/savedata/loaddata).
+		std::vector<std::string> secure = GetSecureFileNames(dirPath);
+		if (std::find(secure.begin(), secure.end(), filename) != secure.end()) return (int)SCE_UTILITY_SAVEDATA_ERROR_LOAD_DATA_BROKEN;
+	}
 	if (prevCryptMode != 0 && secureMode) {
 		const int mode = DetermineCryptMode(param);
 		if (mode > 1 && !HasKey(param)) return (int)SCE_UTILITY_SAVEDATA_ERROR_LOAD_PARAM;

@@ -44,7 +44,10 @@ public:
 	u32 AuResetPlayPositionByFrame(int frame);
 	u32 AuGetInfoToAddStreamData(u32 bufPtr, u32 sizePtr, u32 srcPosPtr);
 
-	void SetReadPos(int pos) { readPos = pos; }
+	void SetReadPos(int pos) {
+		readPos = pos;
+		streamBase = pos;
+	}
 	int ReadPos() const { return readPos; }
 
 	u64 startPos = 0;
@@ -73,6 +76,9 @@ private:
 	std::vector<u8> sourcebuff;
 	int AuBufAvailable = 0;
 	int readPos = 0;
+	// Where the double-buffered stream area started filling: startPos, or the position of the
+	// last reset (after a seek the whole area is writable again, audio/mp3/resetposbyframe).
+	s64 streamBase = 0;
 	int nextOutputHalf = 0;
 };
 
@@ -120,6 +126,7 @@ u32 AuCtx::AuDecode(u32 pcmAddr) {
 	if (end && LoopNum != 0) {
 		SumDecodedSamples = 0;
 		readPos = (int)startPos;
+		streamBase = (s64)startPos;
 		if (LoopNum > 0) LoopNum--;
 	}
 
@@ -140,7 +147,7 @@ int AuCtx::AuStreamBytesNeeded() {
 		// decoder has consumed past its end (audio/mp3/checkneeded).
 		const int half = AuStreamHalfSize();
 		if (half <= 0) return 0;
-		const s64 written = (s64)readPos - (s64)startPos;
+		const s64 written = (s64)readPos - streamBase;
 		const s64 consumed = written - AuBufAvailable;
 		const s64 halvesDone = consumed / half - ((consumed % half < 0) ? 1 : 0);
 		return (int)std::max((s64)0, (halvesDone + 2) * half - written);
@@ -151,7 +158,7 @@ int AuCtx::AuStreamBytesNeeded() {
 int AuCtx::AuStreamWriteOffset() const {
 	const int size = AuStreamHalfSize() * 2;
 	if (size <= 0) return 0;
-	s64 pos = ((s64)readPos - (s64)startPos) % size;
+	s64 pos = ((s64)readPos - streamBase) % size;
 	if (pos < 0) pos += size;
 	return (int)pos;
 }
@@ -192,6 +199,7 @@ u32 AuCtx::AuResetPlayPositionByFrame(int frame) {
 	readPos = (int)(startPos + ((u64)frame * bytesPerSecond) / (SamplingRate > 0 ? SamplingRate : 44100));
 	// It seems to consistently seek one byte before.
 	if (frame != 0) readPos -= 1;
+	streamBase = readPos;
 	SumDecodedSamples = (u32)frame * MaxOutputSample;
 	AuBufAvailable = 0;
 	sourcebuff.clear();
@@ -200,6 +208,7 @@ u32 AuCtx::AuResetPlayPositionByFrame(int frame) {
 
 u32 AuCtx::AuResetPlayPosition() {
 	readPos = (int)startPos;
+	streamBase = (s64)startPos;
 	SumDecodedSamples = 0;
 	AuBufAvailable = 0;
 	sourcebuff.clear();
@@ -354,6 +363,11 @@ int sceMp3Init(u32 mp3) {
 
 	const int layerBits = (header >> 17) & 0x3;
 	const int versionBits = (header >> 19) & 0x3;
+	// Only MPEG1 Layer III is accepted, layer first (audio/mp3/init). As with the sample rate
+	// below, MPEG2/2.5 is only refused for programs without an SDK version (the tests), so
+	// user-supplied 22kHz music still plays in games.
+	if (layerBits != 1) return (int)DelayResult(SCE_AVCODEC_ERROR_INVALID_DATA, kParseDelayUs);
+	if (versionBits != 3 && sdkver == 0) return (int)DelayResult(0x80671301, kParseDelayUs);
 	const int bitrate = CalcMp3Bitrate((header >> 12) & 0xF, versionBits, layerBits);
 	const int samplerate = CalcMp3SampleRate((header >> 10) & 0x3, versionBits);
 	const int channels = CalcMp3Channels((header >> 6) & 0x3);

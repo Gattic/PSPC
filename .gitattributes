@@ -1,0 +1,11 @@
+# Sources are stored with LF line endings whatever the editor writes.
+* text=auto eol=lf
+# cmd.exe needs CRLF for reliable labels and goto.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.png binary
+*.bmp binary
+*.ico binary
+*.prx binary
+*.pbp binary
+*.iso binary

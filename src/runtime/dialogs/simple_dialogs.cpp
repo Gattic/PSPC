@@ -304,7 +304,8 @@ int GamedataInstallDialog::Shutdown(bool force) {
 namespace {
 constexpr int HTMLVIEWER_INIT_DELAY_US = 200000;
 constexpr int HTMLVIEWER_SHUTDOWN_DELAY_US = 40000;
-constexpr u32 kHtmlInitialUrlOffset = 0x40, kHtmlOptionsOffset = 0x4C, kHtmlHomeUrlOffset = 0x64;
+// SceUtilityHtmlViewerParam: initialUrl, options and homeUrl (the smallest request is 0x70 bytes).
+constexpr u32 kHtmlInitialUrlOffset = 0x40, kHtmlOptionsOffset = 0x4C, kHtmlHomeUrlOffset = 0x68;
 
 std::string ReadUrl(u32 addr) {
 	if (!addr) return "";

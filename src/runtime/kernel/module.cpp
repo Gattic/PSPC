@@ -75,6 +75,19 @@ bool RunDecryptTool(const std::vector<u8> &in, std::vector<u8> &out, std::string
 	return true;
 }
 
+// Where unlinked imports go: lui v0, 0x8002; jr ra; ori v0, v0, 0x013A.
+u32 NotLinkedStub() {
+	static u32 stub = 0;
+	if (!stub || GRead32(stub) != 0x3C028002) {
+		stub = AllocKernelMemory(16, "unlinked import");
+		GWrite32(stub, 0x3C028002);
+		GWrite32(stub + 4, 0x03E00008);
+		GWrite32(stub + 8, 0x3442013A);
+		GWrite32(stub + 12, 0);
+	}
+	return stub;
+}
+
 // Bind every import of `m` either to a guest export of another loaded module or to HLE.
 void ResolveImports(PspModule *m) {
 	for (const loader::ImportLib &lib : m->imports) {
@@ -91,6 +104,11 @@ void ResolveImports(PspModule *m) {
 			}
 			if (target && !hle::FindFunction(lib.name, f.nid)) {
 				hle::PatchImportStubToGuest(f.stubAddr, lib.name, f.nid, target);
+			} else if (!hle::FindFunction(lib.name, f.nid) && hle::NidName(lib.name, f.nid).rfind("unknown_", 0) == 0) {
+				// No firmware exports this: the loader leaves it unlinked, and calling it returns
+				// LIBRARY_NOT_YET_LINKED (modules/unresolved).
+				LOGW("LOADER", "%s: unresolved import %s::%08x", m->name.c_str(), lib.name.c_str(), f.nid);
+				hle::PatchImportStubToGuest(f.stubAddr, lib.name, f.nid, NotLinkedStub());
 			} else {
 				hle::PatchImportStub(f.stubAddr, lib.name, f.nid);
 			}
@@ -187,7 +205,8 @@ void RegisterAotFunctions(PspModule *m) {
 	u32 delta = m->image.relocatable ? (m->image.lowAddr - desc->recompileBase) : 0;
 	*desc->delta = delta;
 	for (u32 i = 0; i < desc->numFunctions; i++)
-		dispatch::Register(desc->recompileBase + delta + desc->functions[i].offset, desc->functions[i].fn);
+		dispatch::RegisterNative(desc->recompileBase + delta + desc->functions[i].offset, desc->functions[i].fn,
+		                         desc->functions[i].body);
 	LOGI("AOT", "%s: %u native functions (delta %08x)", m->name.c_str(), desc->numFunctions, delta);
 }
 
@@ -303,6 +322,11 @@ SceUID LoadModuleFromMemory(const std::vector<u8> &input, const std::string &pat
 				m->startThreadStack = GRead32(v.second + 8);
 				m->startThreadAttr = GRead32(v.second + 12);
 			}
+			if (v.first == loader::NID_MODULE_STOP_THREAD_PARAMETER && mem::IsValidRange(v.second, 16)) {
+				m->stopThreadPrio = GRead32(v.second + 4);
+				m->stopThreadStack = GRead32(v.second + 8);
+				m->stopThreadAttr = GRead32(v.second + 12);
+			}
 		}
 	}
 
@@ -320,55 +344,126 @@ SceUID LoadModuleFromMemory(const std::vector<u8> &input, const std::string &pat
 	return id;
 }
 
-int StartModule(PspModule *m, u32 argSize, u32 argPtr, u32 statusPtr, bool waitForReturn) {
-	if (m->status != MODULE_STATUS_LOADED) return (int)SCE_KERNEL_ERROR_ALREADY_STARTED;
+// SceKernelSMOption: size, mpidstack, stacksize, priority, attribute.
+constexpr u32 kSMOptionSize = 20;
+constexpr u32 kSMOptionAttrMask = 0x00F06000;
+
+int ValidateSMOption(u32 opt) {
+	if (!opt || !mem::IsValidRange(opt, kSMOptionSize)) return 0;
+	if ((CompiledSdkVersion() & 0xFFFF0000) > 0x0207FFFF && GRead32(opt) != kSMOptionSize)
+		return (int)SCE_KERNEL_ERROR_ILLEGAL_SIZE;
+	if ((GRead32(opt + 16) & ~kSMOptionAttrMask) != 0) return (int)SCE_KERNEL_ERROR_ERROR;
+	return 0;
+}
+
+namespace {
+
+struct ModuleThreadParams {
+	s32 priority;
+	s32 stackSize;
+	u32 attr;
+	BlockAllocator *stackAlloc;  // nullptr: where the attr puts it
+};
+
+// A module_start/module_stop thread's parameters: a nonzero option field wins, then the module's
+// thread parameter export, then the defaults (stack 0x40000 for a user module, 0x1000 for a
+// kernel one). The option's attribute bits add to the module's; its stack partition must be one
+// the module could use itself. Follows PPSSPP's ResolveModuleThreadParams.
+int ResolveModuleThreadParams(PspModule *m, u32 prio, u32 stack, u32 attr, u32 opt, ModuleThreadParams &p) {
+	p.priority = prio ? (s32)prio : 0x20;
+	p.stackSize = stack ? (s32)stack : (m->kernelMode ? 0x1000 : 0x40000);
+	p.attr = attr;
+	p.stackAlloc = nullptr;
+	if (opt && mem::IsValidRange(opt, kSMOptionSize)) {
+		u32 mpid = GRead32(opt + 4), ostack = GRead32(opt + 8), oprio = GRead32(opt + 12), oattr = GRead32(opt + 16);
+		if (oprio) p.priority = (s32)oprio;
+		if (ostack) p.stackSize = (s32)ostack;
+		p.attr |= oattr & kSMOptionAttrMask;
+		switch (mpid) {
+		case 0: break;
+		case 1:
+		case 3:
+		case 4:
+			if (!m->kernelMode) return (int)SCE_KERNEL_ERROR_PARTITION_MISMATCH;
+			p.stackAlloc = &g_kernelMem;
+			break;
+		case 2:
+		case 5:
+		case 6:
+			if (m->kernelMode) return (int)SCE_KERNEL_ERROR_PARTITION_MISMATCH;
+			p.stackAlloc = mpid == 5 ? &g_volatileMem : &g_userMem;
+			break;
+		default: return (int)SCE_KERNEL_ERROR_PARTITION_MISMATCH;
+		}
+	}
+	// The top four bits (user mode and its level) are cleared; threadman sets them.
+	p.attr &= 0x0FFFFFFF;
+	return 0;
+}
+
+// Runs a module function in a new thread, which is deleted when it returns. With a waiting
+// caller, blocks until then and returns its exit status in *exitStatus.
+int RunModuleThread(PspModule *m, u32 entry, const ModuleThreadParams &p, u32 argSize, u32 argPtr, bool wait,
+                    s32 *exitStatus) {
+	SceUID tid = CreateThread(m->name.c_str(), entry, p.priority, p.stackSize, p.attr, m->gp, m->uid, m->kernelMode,
+	                          nullptr, p.stackAlloc);
+	if (tid < 0) return tid;
+	PspThread *t = Get<PspThread>(tid);
+	t->deleteOnReturn = true;
+	PspThread *caller = sched::Current();
+	if (wait && caller) t->endWaiters.push_back(caller->uid);
+	StartThread(t, argSize, argPtr);
+	if (wait && caller) {
+		s32 r = sched::Wait(WAITTYPE_THREADEND, tid, 0, false);
+		if (exitStatus) *exitStatus = r;
+	}
+	return 0;
+}
+
+}  // namespace
+
+int StartModule(PspModule *m, u32 argSize, u32 argPtr, u32 statusPtr, bool waitForReturn, u32 smOptionPtr) {
+	if (m->status != MODULE_STATUS_LOADED) return (int)SCE_KERNEL_ERROR_ERROR;
 	if (!m->moduleStart || m->moduleStart == 0xFFFFFFFF) {
 		m->status = MODULE_STATUS_STARTED;
 		return 0;
 	}
-	s32 prio = m->hasStartThreadParam && m->startThreadPrio ? (s32)m->startThreadPrio : 0x20;
-	s32 stack = m->hasStartThreadParam && m->startThreadStack ? (s32)m->startThreadStack : 0x40000;
-	u32 attr = m->hasStartThreadParam ? m->startThreadAttr : 0;
-	if (m->kernelMode) attr |= 0x00001000;
-	const char *threadName = waitForReturn ? "SceModmgrStart" : "user_main";
-	SceUID tid = CreateThread(threadName, m->moduleStart, prio, stack, attr, m->gp, m->uid);
-	if (tid < 0) return tid;
-	PspThread *t = Get<PspThread>(tid);
+	ModuleThreadParams p;
+	int r = ResolveModuleThreadParams(m, m->startThreadPrio, m->startThreadStack, m->startThreadAttr, smOptionPtr, p);
+	if (r < 0) return r;
 	m->status = MODULE_STATUS_STARTING;
-	PspThread *caller = sched::Current();
-	if (waitForReturn && caller) t->endWaiters.push_back(caller->uid);
-	StartThread(t, argSize, argPtr);
-	if (!waitForReturn || !caller) {
-		m->status = MODULE_STATUS_STARTED;
-		return 0;
+	s32 status = 0;
+	r = RunModuleThread(m, m->moduleStart, p, argSize, argPtr, waitForReturn, &status);
+	if (r < 0) {
+		m->status = MODULE_STATUS_LOADED;
+		return r;
 	}
-	s32 result = sched::Wait(WAITTYPE_THREADEND, tid, 0, false);
 	m->status = MODULE_STATUS_STARTED;
-	if (mem::IsValidRange(statusPtr, 4)) GWrite32(statusPtr, (u32)result);
-	return result;
+	if (waitForReturn && mem::IsValidRange(statusPtr, 4)) GWrite32(statusPtr, (u32)status);
+	return 0;
 }
 
-int StopModule(PspModule *m, u32 argSize, u32 argPtr, u32 statusPtr) {
+int StopModule(PspModule *m, u32 argSize, u32 argPtr, u32 statusPtr, u32 smOptionPtr) {
 	if (m->status != MODULE_STATUS_STARTED) return (int)SCE_KERNEL_ERROR_ALREADY_STOPPED;
-	if (m->moduleStop) {
-		SceUID tid = CreateThread("SceModmgrStop", m->moduleStop, 0x20, 0x40000, 0, m->gp, m->uid);
-		if (tid >= 0) {
-			PspThread *t = Get<PspThread>(tid);
-			PspThread *caller = sched::Current();
-			if (caller) t->endWaiters.push_back(caller->uid);
-			StartThread(t, argSize, argPtr);
-			if (caller) {
-				s32 r = sched::Wait(WAITTYPE_THREADEND, tid, 0, false);
-				if (mem::IsValidRange(statusPtr, 4)) GWrite32(statusPtr, (u32)r);
-			}
+	if (m->moduleStop && (m->moduleStop & 3) == 0 && mem::IsValidAddress(m->moduleStop)) {
+		ModuleThreadParams p;
+		int r = ResolveModuleThreadParams(m, m->stopThreadPrio, m->stopThreadStack, m->stopThreadAttr, smOptionPtr, p);
+		if (r < 0) return r;
+		m->status = MODULE_STATUS_STOPPING;
+		s32 status = 0;
+		r = RunModuleThread(m, m->moduleStop, p, argSize, argPtr, true, &status);
+		if (r < 0) {
+			m->status = MODULE_STATUS_STARTED;
+			return r;
 		}
+		if (mem::IsValidRange(statusPtr, 4)) GWrite32(statusPtr, (u32)status);
 	}
 	m->status = MODULE_STATUS_STOPPED;
 	return 0;
 }
 
 int UnloadModule(PspModule *m) {
-	if (m->status == MODULE_STATUS_STARTED || m->status == MODULE_STATUS_STARTING) return (int)SCE_KERNEL_ERROR_MODULE_CANNOT_REMOVE;
+	if (m->status == MODULE_STATUS_STARTING || m->status == MODULE_STATUS_STOPPING) return (int)SCE_KERNEL_ERROR_MODULE_CANNOT_REMOVE;
 	dispatch::UnregisterRange(m->memAddr, m->memSize);
 	if (BlockAllocator *a = AllocatorForAddress(m->memAddr)) a->Free(m->memAddr);
 	if (m->dll) FreeLibrary((HMODULE)m->dll);

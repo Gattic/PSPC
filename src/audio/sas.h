@@ -189,6 +189,9 @@ struct SasVoice {
 	bool loop = false;
 
 	int noiseFreq = 0;
+	// Noise generator state (the PSX SPU noise LFSR, which the 6-bit clock matches).
+	u16 noiseLevel = 0;
+	s32 noiseTimer = 0;
 
 	int volumeLeft = PSP_SAS_VOL_MAX;
 	int volumeRight = PSP_SAS_VOL_MAX;

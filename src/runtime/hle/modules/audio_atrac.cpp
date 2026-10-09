@@ -254,6 +254,8 @@ int ComputeAtracStateAndInitSecondBuffer(SceAtracIdInfo *info, u32 readSize, u32
 }
 
 int InitContextFromTrackInfo(SceAtracContext *ctx, const TrackInfo *wave, u32 bufferAddr, int readSize, int bufferSize) {
+	// A zero frame size (possible from an AA3 header) would divide by zero below.
+	if (wave->blockAlign == 0) return (int)SCE_ERROR_ATRAC_BAD_CODEC_PARAMS;
 	ctx->info.numChan = (u8)wave->numChans;
 	const int extraSamples = ctx->info.codec == 0x1001 ? 0x45 : 0x170;
 	ctx->info.firstValidSample = extraSamples + (int)wave->firstSampleOffset;

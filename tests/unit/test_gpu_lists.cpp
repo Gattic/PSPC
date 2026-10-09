@@ -356,7 +356,7 @@ TEST(gpu_list_interrupts_disabled) {
 
 namespace {
 int pendingCount = 0;
-void OnPending(void *) {
+void OnPending(void *, u64) {
 	pendingCount++;
 }
 }  // namespace
@@ -389,5 +389,57 @@ TEST(gpu_list_async_interrupts) {
 	InterruptDone();
 	CHECK(!TakeInterrupt(&intr));
 	CHECK_EQ(ListSync(id, 0), 0);
+	SetHooks(Hooks{});
+}
+
+namespace {
+u64 fakeTicks = 0;
+u64 lastPendingAt = 0;
+u64 GetFakeTicks(void *) {
+	return fakeTicks;
+}
+void OnPendingAt(void *, u64 at) {
+	lastPendingAt = at;
+}
+}  // namespace
+
+TEST(gpu_list_timing) {
+	Env env;
+	Hooks h;
+	h.getTicks = &GetFakeTicks;
+	h.onInterruptPending = &OnPendingAt;
+	fakeTicks = 1000;
+	SetHooks(h);
+	DL dl;
+	dl.Signal(SIGNAL_HANDLER_SUSPEND, 1).C(GE_CMD_ALPHATEST, 3).Finish(0);
+	const int id = EnqueueList(dl.start, 0, -1, 0, false);
+	// No callback: still an interrupt, raised once the GE got there (list start + commands + END).
+	CHECK(lastPendingAt > 1000);
+	CHECK_EQ(ListSync(id, 0), SYNC_WAIT);
+	Interrupt intr;
+	fakeTicks = lastPendingAt;
+	CHECK(TakeInterrupt(&intr));
+	InterruptDone();
+	// The FINISH interrupt, later; the list completes when it's delivered.
+	CHECK(lastPendingAt > fakeTicks);
+	CHECK_EQ(DrawSync(0), SYNC_WAIT);
+	fakeTicks = lastPendingAt;
+	CHECK(TakeInterrupt(&intr));
+	InterruptDone();
+	CHECK_EQ(ListSync(id, 0), 0);
+	CHECK_EQ(DrawSync(0), 0);
+
+	// The drawing is done when the GE reaches the FINISH, not when the interrupt was taken.
+	DL dl2;
+	dl2.C(GE_CMD_ALPHATEST, 4).Finish(0);
+	fakeTicks = 5000;
+	const int id2 = EnqueueList(dl2.start, 0, -1, 0, false);
+	while (TakeInterrupt(&intr))
+		InterruptDone();
+	CHECK(DrawCompleteTicks() > 5000);
+	CHECK_EQ(DrawSync(0), SYNC_WAIT);
+	fakeTicks = DrawCompleteTicks();
+	CHECK_EQ(DrawSync(0), 0);
+	CHECK_EQ(ListSync(id2, 0), 0);
 	SetHooks(Hooks{});
 }

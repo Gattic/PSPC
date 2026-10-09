@@ -11,6 +11,9 @@ namespace logging {
 LogLevel g_level = LogLevel::Info;
 static FILE *g_file = nullptr;
 static std::mutex g_mutex;
+void (*g_fatalHook)() = nullptr;
+
+void SetFatalHook(void (*hook)()) { g_fatalHook = hook; }
 
 void Init(LogLevel level, const char *filePath) {
 	g_level = level;
@@ -70,6 +73,7 @@ void Fatal(const char *fmt, ...) {
 	va_end(args);
 	fprintf(stderr, "[FATAL] %s\n", buf);
 	logging::Write(LogLevel::Error, "FATAL", "%s", buf);
+	if (logging::g_fatalHook) logging::g_fatalHook();
 	logging::Shutdown();
 	std::_Exit(3);
 }

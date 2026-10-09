@@ -109,6 +109,28 @@ static void ApplySwizzleT(const Ctx *c, float *v, int n, float invalid = 0.0f) {
 	ApplyPrefixST(v, c->vfpuCtrl[VFPU_CTRL_TPREFIX], n, invalid);
 }
 
+// The S prefix unit keeps the last value it produced for each lane (Ctx::pfxLatch). A lane whose
+// swizzle names an element past the vector has no input: the integer unpacks (vuc2i, vc2i, vus2i,
+// vs2i) then get the kept value, without abs or negate, where the float ops write zero
+// (cpu/vfpu/prefix_unpack, prefix_consume). Recorded rather than understood: what is known to
+// feed the latch is the S reads of vmov/vabs/vneg (prefixed or not) and of the unpacks, lane by
+// lane, an invalid lane keeping its old value. Whether other ops feed it isn't known; here they
+// don't. v holds the S values after ApplyPrefixST with the prefix `data`.
+static bool InvalidSwizzle(u32 data, int n, int i) {
+	return ((data >> (12 + i)) & 1) == 0 && (int)((data >> (i * 2)) & 3) >= n;
+}
+static void LatchPrefixS(Ctx *c, const float *v, int n, u32 data) {
+	for (int i = 0; i < n; i++) {
+		if (!InvalidSwizzle(data, n, i)) c->pfxLatch[i] = U(v[i]);
+	}
+}
+static void ReplayPrefixS(Ctx *c, float *v, int n, u32 data) {
+	for (int i = 0; i < n; i++) {
+		if (InvalidSwizzle(data, n, i)) v[i] = F(c->pfxLatch[i]);
+	}
+	LatchPrefixS(c, v, n, data);
+}
+
 // Saturation as PPSSPP's vfpu_clamp(v, min, max) = v >= max ? max : (v <= min ? min : v): NaN is
 // preserved and -0.0 becomes +0.0 for [0, 1]. Written on the bits, because compilers turn the
 // ternary into maxss/minss, which keep -0.0 (MSVC does, even with /fp:precise).
@@ -423,6 +445,7 @@ void ExecVV2Op(Ctx *c, u32 w) {
 		break;
 	default: ApplySwizzleS(c, s, n); break;
 	}
+	if (optype <= 2) LatchPrefixS(c, s, n, c->vfpuCtrl[VFPU_CTRL_SPREFIX]);
 	for (int i = 0; i < n; i++) {
 		switch (optype) {
 		case 0:
@@ -649,6 +672,8 @@ void ExecVx2i(Ctx *c, u32 w) {
 	int oz = n;
 	ReadVector(c, s.f, n, Vs(w));
 	ApplySwizzleS(c, s.f, n);
+	// An out-of-range swizzle replays the prefix unit's last value for that lane.
+	ReplayPrefixS(c, s.f, n, c->vfpuCtrl[VFPU_CTRL_SPREFIX]);
 	switch ((w >> 16) & 3) {
 	case 0: {
 		// vuc2i: 8-bit unsigned to 31-bit signed, replicating the byte (quad output only).

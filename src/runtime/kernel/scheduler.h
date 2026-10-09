@@ -31,6 +31,8 @@ bool StopRequested();
 
 // ---- Time ----
 u64 NowUs();
+// The CPU clock in cycles (222 MHz): exact in fast-time mode, NowUs()-based otherwise.
+u64 NowCycles();
 bool FastTime();
 // Charge CPU time to the running code (fast-time mode only; no-op otherwise).
 void ChargeCycles(s64 cycles);

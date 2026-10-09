@@ -110,6 +110,61 @@ def expand_inputs(args, paths):
     return out
 
 
+# Must match the CMakeLists.txt pspc-recomp writes (used with --cmake).
+CLANG_FLAGS = ['/O2', '/clang:-fno-strict-aliasing', '-Wno-unused-label', '-Wno-unused-variable']
+MSVC_FLAGS = ['/O2', '/bigobj', '/wd4102', '/wd4189', '/utf-8', '/permissive-', '/Zc:preprocessor']
+
+
+def build_direct(args, env, src, sha):
+    """Compiles and links the generated sources directly: no CMake configure per module."""
+    clang = args.compiler == 'clang'
+    # CreateProcess searches our own PATH, not env's: resolve the tools against the VS environment.
+    cc = shutil.which('clang-cl' if clang else 'cl', path=env['PATH'])
+    linker = shutil.which('link', path=env['PATH'])
+    if not cc or not linker:
+        raise RuntimeError('compiler or linker not found (clang-cl/cl, link)')
+    obj_dir = src / 'obj'
+    obj_dir.mkdir(exist_ok=True)
+    flags = ['/nologo', '/c', '/std:c++20', '/MT', '/EHsc', '/DNDEBUG', '/DNOMINMAX', '/DWIN32_LEAN_AND_MEAN',
+             '/D_CRT_SECURE_NO_WARNINGS', '/I' + str(ROOT / 'src'), '/I' + str(src)]
+    flags += CLANG_FLAGS if clang else MSVC_FLAGS
+
+    def compile_one(cpp):
+        obj = obj_dir / (cpp.stem + '.obj')
+        r = subprocess.run([cc] + flags + [str(cpp), '/Fo' + str(obj)], env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if r.returncode != 0:
+            raise RuntimeError('compile failed (%s):\n%s' % (cpp.name, r.stdout[-6000:]))
+        return obj
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as ex:
+        objs = list(ex.map(compile_one, sorted(src.glob('*.cpp'))))
+    dll = obj_dir / (sha + '.dll')
+    cmd = [linker, '/nologo', '/DLL', '/INCREMENTAL:NO', '/OUT:' + str(dll), '/IMPLIB:' + str(obj_dir / (sha + '.lib'))]
+    cmd += [str(o) for o in objs]
+    cmd += [str(pathlib.Path(args.lib_dir) / n) for n in LINK_LIBS] + ['kernel32.lib']
+    r = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if r.returncode != 0:
+        raise RuntimeError('link failed:\n' + r.stdout[-6000:])
+    return dll
+
+
+def build_with_cmake(args, env, src, sha):
+    bdir = src / 'build'
+    compiler = 'clang-cl' if args.compiler == 'clang' else 'cl'
+    cfg = ['cmake', '-S', str(src), '-B', str(bdir), '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
+           '-DCMAKE_CXX_COMPILER=' + compiler, '-DPSPC_SRC_DIR=' + str(ROOT / 'src').replace('\\', '/'),
+           '-DPSPC_LIB_DIR=' + str(args.lib_dir).replace('\\', '/')]
+    r = subprocess.run(cfg, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if r.returncode != 0:
+        raise RuntimeError('cmake configure failed:\n' + r.stdout[-4000:])
+    r = subprocess.run(['cmake', '--build', str(bdir), '--parallel', str(args.jobs)], env=env,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if r.returncode != 0:
+        raise RuntimeError('compile failed:\n' + r.stdout[-6000:])
+    return bdir / (sha + '.dll')
+
+
 def build_one(args, env, path):
     work = pathlib.Path(args.work)
     work.mkdir(parents=True, exist_ok=True)
@@ -144,19 +199,7 @@ def build_one(args, env, path):
     if r.returncode != 0:
         raise RuntimeError('pspc-recomp failed:\n' + r.stdout)
     summary = r.stdout.strip()
-    bdir = src / 'build'
-    compiler = 'clang-cl' if args.compiler == 'clang' else 'cl'
-    cfg = ['cmake', '-S', str(src), '-B', str(bdir), '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
-           '-DCMAKE_CXX_COMPILER=' + compiler, '-DPSPC_SRC_DIR=' + str(ROOT / 'src').replace('\\', '/'),
-           '-DPSPC_LIB_DIR=' + str(args.lib_dir).replace('\\', '/')]
-    r = subprocess.run(cfg, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    if r.returncode != 0:
-        raise RuntimeError('cmake configure failed:\n' + r.stdout[-4000:])
-    r = subprocess.run(['cmake', '--build', str(bdir), '--parallel', str(args.jobs)], env=env,
-                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    if r.returncode != 0:
-        raise RuntimeError('compile failed:\n' + r.stdout[-6000:])
-    dll = bdir / (sha + '.dll')
+    dll = build_with_cmake(args, env, src, sha) if args.cmake else build_direct(args, env, src, sha)
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(dll, dest)
     stamp.write_text(args.sem_version + '\n')
@@ -180,6 +223,7 @@ def main():
     ap.add_argument('--no-comments', action='store_true')
     ap.add_argument('--keep-src', action='store_true')
     ap.add_argument('--force', action='store_true')
+    ap.add_argument('--cmake', action='store_true', help='build through the generated CMakeLists.txt')
     args = ap.parse_args()
     env = vs_env()
     args.sem_version = sem_version()

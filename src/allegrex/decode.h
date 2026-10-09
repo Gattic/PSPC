@@ -43,6 +43,22 @@ inline bool IsBranchKind(Kind k) {
 	return k == Kind::BR || k == Kind::BRL || k == Kind::BRAL || k == Kind::BRALL;
 }
 inline bool IsLikelyKind(Kind k) { return k == Kind::BRL || k == Kind::BRALL; }
+
+// Condition hazards (cpu/fpu/fpu_branch_hazard, cpu/vfpu/vbranch_hazard). Compilers pad for
+// them, so only hand-written code sees them:
+//   * bc1f/bc1t (and the likely forms) right behind c.cond.s test the condition from before
+//     the compare;
+//   * bvf/bvt (and the likely forms) test the CC from before an mtvc to it within the three
+//     instructions before the branch, unless a vcmp is among them (the branch then waits for the
+//     VFPU and sees everything);
+//   * mfvc of the CC right behind vcmp reads the CC from before the vcmp.
+// The rule is static, from the words before the reader, so the interpreter and recompiled code
+// agree; the values from before live in Ctx::fpcondPrev / Ctx::ccPrev.
+inline bool MaySeeStaleCondition(Op op) {
+	return (op >= Op::BC1F && op <= Op::BC1TL) || (op >= Op::BVF && op <= Op::BVTL) || op == Op::MFVC;
+}
+// w is the reader, w1..w3 the words 4, 8 and 12 bytes before it.
+bool SeesStaleCondition(Op op, u32 w, u32 w1, u32 w2, u32 w3);
 inline bool HasDelaySlot(Kind k) {
 	return IsBranchKind(k) || k == Kind::J || k == Kind::JAL || k == Kind::JR || k == Kind::JALR;
 }

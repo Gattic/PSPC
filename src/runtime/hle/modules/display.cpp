@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+// Portions derived from PPSSPP (https://github.com/hrydgard/ppsspp), Copyright (c) 2012- PPSSPP Project, GPL-2.0-or-later.
 //
-// sceDisplay: framebuffer selection, VBlank timing (59.94 Hz, 286 lines of which 272 visible)
-// and presentation of the selected framebuffer to the host window at each VBlank.
+// sceDisplay: framebuffer selection, VBlank timing and presentation of the selected framebuffer to the
+// host window at each VBlank. Timing as PPSSPP measured it: a frame is 1001/60 ms, starting when the
+// vblank does; the vblank lasts 0.77 ms and the hcount counts 286 lines a frame from 1.
 #include <algorithm>
+#include <cmath>
 #include <vector>
 
 #include "common/log.h"
@@ -22,28 +25,40 @@ namespace display {
 
 namespace {
 
-constexpr double kFrameUs = 1000000.0 / 59.9400599;
+constexpr double kFrameUs = 1001000.0 / 60.0;
+// tests/display/vblanklen: 730-770us from sceDisplayWaitVblankStart returning until the vblank ends.
+constexpr double kVblankUs = 770.0;
+// sceDisplayIsVsync's window into the frame (guesses from tests).
+constexpr double kVsyncStartUs = 592.5;
+constexpr double kVsyncEndUs = 726.5;
 constexpr int kLinesPerFrame = 286;
-constexpr int kVisibleLines = 272;
+constexpr u64 kCyclesPerLine = sched::kCpuHz / 60 / kLinesPerFrame;
+constexpr u64 kCyclesPerUs = sched::kCpuHz / 1000000;
 
 struct FrameBuf {
-	u32 addr = 0;
+	u32 addr = 0x04000000;
 	int stride = 512;
 	int format = 3;
 };
 
 FrameBuf g_current, g_latched;
 bool g_latchPending = false;
+bool g_fbSet = false;  // the game has chosen a framebuffer
+bool g_hasSetMode = false;
 int g_mode = 0, g_width = 480, g_height = 272;
 u32 g_vcount = 0;
-u64 g_bootUs = 0;
+u32 g_hcountBase = 0;  // the accumulated hcount at the start of this frame
+bool g_inVblank = false;
+double g_bootUs = 0;
+double g_frameStartUs = 0;  // when the last vblank started
+u64 g_frames = 0;           // vblanks so far
 int g_brightness = 84;
+u32 g_holdMode = 0, g_resumeMode = 0;
 WaitQueue g_vblankWaiters;
 std::vector<u32> g_rgba;
 std::function<void()> g_vblankHook;
 
-u64 FrameStart(u64 frame) { return g_bootUs + (u64)(frame * kFrameUs); }
-u64 VblankStart(u64 frame) { return FrameStart(frame) + (u64)(kFrameUs * kVisibleLines / kLinesPerFrame); }
+u64 EnterUs(u64 frame) { return (u64)std::llround(g_bootUs + kFrameUs - kVblankUs + (double)frame * kFrameUs); }
 
 void Present() {
 	if (host::IsHeadless() || !g_current.addr) return;
@@ -51,16 +66,30 @@ void Present() {
 	host::PresentFrame(g_rgba.data(), 480, 272, 480);
 }
 
-void OnVblank() {
+void OnLeaveVblank() {
+	g_inVblank = false;
+}
+
+void OnEnterVblank() {
+	g_frameStartUs = (double)EnterUs(g_frames);
+	g_frames++;
+	g_inVblank = true;
 	g_vcount++;
+	g_hcountBase += kLinesPerFrame;
+	if (g_hcountBase > 0x7FFFFFFF) g_hcountBase -= 0x80000000;
+	sched::ScheduleEvent((u64)std::llround(g_frameStartUs + kVblankUs), OnLeaveVblank);
+
 	if (g_latchPending) {
 		g_current = g_latched;
 		g_latchPending = false;
 	}
 	Present();
 	if (g_vblankHook) g_vblankHook();
+
+	// The waiters for this vblank are released ~48us after it, plus ~9us for each one beyond the first
+	// (pspautotests threads/scheduling/vblankwake). Which vblank a wait is for is decided now.
 	g_vblankWaiters.Cleanup(WAITTYPE_VBLANK, 0);
-	std::vector<SceUID> waiters = g_vblankWaiters.threads;
+	std::vector<SceUID> waiters = g_vblankWaiters.threads, release;
 	g_vblankWaiters.threads.clear();
 	for (SceUID id : waiters) {
 		PspThread *t = Get<PspThread>(id);
@@ -70,10 +99,20 @@ void OnVblank() {
 			g_vblankWaiters.threads.push_back(id);
 			continue;
 		}
-		sched::Wake(t, 0);
+		release.push_back(id);
 	}
+	if (!release.empty()) {
+		const double at = g_frameStartUs + 48.0 + 9.0 * (double)(release.size() - 1);
+		sched::ScheduleEvent((u64)std::llround(at), [release]() {
+			for (SceUID id : release) {
+				PspThread *t = Get<PspThread>(id);
+				if (WaitQueue::IsWaitingOn(t, WAITTYPE_VBLANK, 0)) sched::Wake(t, 0);
+			}
+		});
+	}
+
 	sched::QueueInterrupt([]() { intr::TriggerAll(intr::PSP_VBLANK_INT); });
-	sched::ScheduleEvent(VblankStart(g_vcount), OnVblank);
+	sched::ScheduleEvent(EnterUs(g_frames), OnEnterVblank);
 }
 
 }  // namespace
@@ -81,26 +120,37 @@ void OnVblank() {
 void Init() {
 	g_current = g_latched = FrameBuf{};
 	g_latchPending = false;
+	g_fbSet = false;
+	g_hasSetMode = false;
+	g_mode = 0;
+	g_width = 480;
+	g_height = 272;
 	g_vcount = 0;
+	g_hcountBase = 0;
+	g_inVblank = false;
+	g_frames = 0;
 	g_vblankWaiters.threads.clear();
-	g_bootUs = sched::NowUs();
-	sched::ScheduleEvent(VblankStart(0), OnVblank);
+	g_bootUs = (double)sched::NowUs();
+	g_frameStartUs = g_bootUs;
+	sched::ScheduleEvent(EnterUs(0), OnEnterVblank);
 }
 
 void SetVblankHook(std::function<void()> fn) { g_vblankHook = std::move(fn); }
 
-u32 Vcount() { return g_vcount; }
-
-bool InVblank() {
-	u64 now = sched::NowUs();
-	double inFrame = std::fmod((double)(now - g_bootUs), kFrameUs);
-	return inFrame >= kFrameUs * kVisibleLines / kLinesPerFrame;
+void CurrentFramebuffer(u32 &addr, int &stride, int &format) {
+	addr = g_fbSet ? g_current.addr : 0;
+	stride = g_current.stride;
+	format = g_current.format;
 }
 
+u32 Vcount() { return g_vcount; }
+
+bool InVblank() { return g_inVblank; }
+
 u32 CurrentHcount() {
-	u64 now = sched::NowUs();
-	double inFrame = std::fmod((double)(now - g_bootUs), kFrameUs);
-	return (u32)(inFrame / kFrameUs * kLinesPerFrame);
+	const double into = std::max(0.0, (double)sched::NowUs() - g_frameStartUs);
+	// Can't seem to produce a 0 on real hardware, offsetting by 1 makes things look right (PPSSPP).
+	return 1 + (u32)((u64)(into * (double)kCyclesPerUs) / kCyclesPerLine);
 }
 
 void ConvertFramebuffer(u32 addr, int stride, int format, int width, int height, std::vector<u32> &out) {
@@ -156,6 +206,10 @@ void ConvertFramebuffer(u32 addr, int stride, int format, int width, int height,
 int WaitVblankStart(int count, bool cb) {
 	PspThread *t = sched::Current();
 	if (!t) return 0;
+	// These calls take ~115us: a vblank closer than that is missed, and the wait is for the next
+	// (on hardware a wait from >= 16500us into the frame waits for two).
+	const double untilNext = (double)EnterUs(g_frames) - (double)sched::NowUs();
+	if (untilNext <= 115.0) count++;
 	t->waitValue[0] = (u32)std::max(count, 1);
 	g_vblankWaiters.Add(t->uid);
 	return sched::Wait(WAITTYPE_VBLANK, 0, 0, cb);
@@ -167,11 +221,21 @@ namespace {
 
 using namespace display;
 
-int sceDisplaySetMode(int mode, int width, int height) {
-	if (mode != 0 || width != 480 || height != 272) return (int)SCE_KERNEL_ERROR_INVALID_SIZE;
+int CheckCanWait() {
+	if (!sched::DispatchEnabled()) return (int)SCE_KERNEL_ERROR_CAN_NOT_WAIT;
+	if (sched::InInterrupt()) return (int)SCE_KERNEL_ERROR_ILLEGAL_CONTEXT;
+	return 0;
+}
+
+u32 sceDisplaySetMode(int mode, int width, int height) {
+	if (mode != 0) return SCE_KERNEL_ERROR_INVALID_MODE;
+	if (width != 480 || height != 272) return SCE_KERNEL_ERROR_INVALID_SIZE;
+	g_hasSetMode = true;
 	g_mode = mode;
 	g_width = width;
 	g_height = height;
+	// It waits for a vblank start, where it can (pspautotests intr/waits).
+	if (!sched::InInterrupt() && sched::DispatchEnabled()) WaitVblankStart(1, false);
 	return 0;
 }
 
@@ -184,22 +248,37 @@ int sceDisplayGetMode(u32 modePtr, u32 wPtr, u32 hPtr) {
 
 u32 sceDisplaySetFrameBuf(u32 topaddr, int linesize, int pixelformat, int sync) {
 	if (sync != 0 && sync != 1) return SCE_KERNEL_ERROR_INVALID_MODE;
-	if (topaddr != 0 && (!mem::IsValidAddress(topaddr) || (topaddr & 0xF))) return SCE_KERNEL_ERROR_INVALID_POINTER;
+	const u32 a = topaddr & 0x3FFFFFFF;
+	const bool vram = a >= 0x04000000 && a < 0x04800000;
+	if (topaddr != 0 && !mem::IsRam(topaddr) && !vram) return SCE_KERNEL_ERROR_INVALID_POINTER;
+	if (topaddr & 0xF) return SCE_KERNEL_ERROR_INVALID_POINTER;
 	if ((linesize & 0x3F) != 0 || (linesize == 0 && topaddr != 0)) return SCE_KERNEL_ERROR_INVALID_SIZE;
 	if (pixelformat < 0 || pixelformat > 3) return SCE_KERNEL_ERROR_INVALID_FORMAT;
-	FrameBuf fb{topaddr, linesize, pixelformat};
+	// An immediate change can't change the format or stride: those go through the latch first.
+	if (sync == 0 && (pixelformat != g_latched.format || linesize != g_latched.stride))
+		return SCE_KERNEL_ERROR_INVALID_MODE;
+	sched::ChargeCycles(290);
+	FrameBuf fb;
+	fb.addr = topaddr;
+	fb.stride = linesize;
+	fb.format = pixelformat;
+	g_fbSet = true;
 	if (sync == 0) {
 		g_current = fb;
+		g_latched = fb;
 		g_latchPending = false;
 	} else {
 		g_latched = fb;
 		g_latchPending = true;
+		// The format and stride apply to the current framebuffer at once.
+		g_current.format = fb.format;
+		g_current.stride = fb.stride;
 	}
 	return 0;
 }
 
 u32 sceDisplayGetFrameBuf(u32 topPtr, u32 linePtr, u32 fmtPtr, int sync) {
-	const FrameBuf &fb = (sync == 1 && g_latchPending) ? g_latched : g_current;
+	const FrameBuf &fb = sync == 1 ? g_latched : g_current;
 	if (mem::IsValidRange(topPtr, 4)) GWrite32(topPtr, fb.addr);
 	if (mem::IsValidRange(linePtr, 4)) GWrite32(linePtr, (u32)fb.stride);
 	if (mem::IsValidRange(fmtPtr, 4)) GWrite32(fmtPtr, (u32)fb.format);
@@ -210,36 +289,65 @@ int sceDisplayWaitVblankStart() { return WaitVblankStart(1, false); }
 int sceDisplayWaitVblankStartCB() { return WaitVblankStart(1, true); }
 int sceDisplayWaitVblankStartMulti(int n) {
 	if (n <= 0) return (int)SCE_KERNEL_ERROR_INVALID_VALUE;
+	if (int err = CheckCanWait()) return err;
 	return WaitVblankStart(n, false);
 }
 int sceDisplayWaitVblankStartMultiCB(int n) {
 	if (n <= 0) return (int)SCE_KERNEL_ERROR_INVALID_VALUE;
+	if (int err = CheckCanWait()) return err;
 	return WaitVblankStart(n, true);
 }
-int sceDisplayWaitVblank() {
-	if (InVblank()) return 1;
-	return WaitVblankStart(1, false);
+// In a vblank already: no wait, and 1.
+int WaitVblank(bool cb) {
+	if (!InVblank()) {
+		WaitVblankStart(1, cb);
+		return 0;
+	}
+	sched::ChargeCycles(1110);
+	sched::Reschedule();
+	return 1;
 }
-int sceDisplayWaitVblankCB() {
-	if (InVblank()) return 1;
-	return WaitVblankStart(1, true);
-}
+int sceDisplayWaitVblank() { return WaitVblank(false); }
+int sceDisplayWaitVblankCB() { return WaitVblank(true); }
 
 float sceDisplayGetFramePerSec() { return 59.9400599f; }
-u32 sceDisplayGetVcount() { return Vcount(); }
-u32 sceDisplayGetCurrentHcount() { return CurrentHcount(); }
-u32 sceDisplayGetAccumulatedHcount() { return Vcount() * kLinesPerFrame + CurrentHcount(); }
+u32 sceDisplayGetVcount() {
+	sched::ChargeCycles(150);
+	sched::Reschedule();
+	return Vcount();
+}
+u32 sceDisplayGetCurrentHcount() {
+	sched::ChargeCycles(275);
+	return CurrentHcount();
+}
+// Always a positive int: wraps from 0x7FFFFFFF to 0.
+u32 AccumulatedHcount() { return (g_hcountBase + CurrentHcount()) & 0x7FFFFFFF; }
+u32 sceDisplayGetAccumulatedHcount() {
+	const u32 v = AccumulatedHcount();
+	sched::ChargeCycles(235);
+	return v;
+}
 int sceDisplayAdjustAccumulatedHcount(int value) {
 	if (value < 0) return (int)SCE_KERNEL_ERROR_INVALID_VALUE;
+	g_hcountBase += (u32)value - AccumulatedHcount();
 	return 0;
 }
 int sceDisplayIsVblank() { return InVblank() ? 1 : 0; }
-int sceDisplayIsVsync() { return InVblank() ? 1 : 0; }
-int sceDisplayIsForeground() { return g_current.addr ? 1 : 0; }
-int sceDisplaySetHoldMode(u32) { return 0; }
-int sceDisplaySetResumeMode(u32) { return 0; }
+int sceDisplayIsVsync() {
+	const double into = (double)sched::NowUs() - g_frameStartUs;
+	return into >= kVsyncStartUs && into <= kVsyncEndUs ? 1 : 0;
+}
+int sceDisplayIsForeground() { return g_hasSetMode && g_current.addr ? 1 : 0; }
+int sceDisplaySetHoldMode(u32 mode) {
+	g_holdMode = mode;
+	return 0;
+}
+int sceDisplaySetResumeMode(u32 mode) {
+	g_resumeMode = mode;
+	return 0;
+}
 int sceDisplayGetResumeMode(u32 ptr) {
-	if (mem::IsValidRange(ptr, 4)) GWrite32(ptr, 0);
+	if (mem::IsValidRange(ptr, 4)) GWrite32(ptr, g_resumeMode);
 	return 0;
 }
 int sceDisplayGetBrightness(u32 levelPtr, u32 unkPtr) {

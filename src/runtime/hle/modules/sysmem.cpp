@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // SysMemUserForUser: partition memory, firmware/SDK version queries, sceKernelPrintf.
 #include <cstdarg>
+#include <string>
 
 #include "common/log.h"
 #include "runtime/hle/hle_wrap.h"
 #include "runtime/hle/modules/modules.h"
 #include "runtime/kernel/errors.h"
+#include "runtime/kernel/kernel_hle.h"
 #include "runtime/kernel/sysmem.h"
 
 using namespace kernel;
@@ -20,38 +22,53 @@ u32 sceKernelTotalFreeMemSize() { return g_userMem.TotalFree(); }
 u32 sceKernelTotalMemSize() { return g_userMem.Size(); }
 u32 sceKernelDevkitVersion() { return g_firmwareVersion; }
 
-int sceKernelAllocPartitionMemory(int partition, const char *name, int type, u32 size, u32 addr) {
-	if (!name) return (int)SCE_KERNEL_ERROR_ERROR;
+// Validation order and error codes follow PPSSPP's sceKernelMemory.cpp / sceKernelHeap.cpp,
+// recorded by pspautotests sysmem/* on hardware (Portions derived from PPSSPP,
+// https://github.com/hrydgard/ppsspp, Copyright (c) 2012- PPSSPP Project, GPL-2.0-or-later).
+int AllocPartitionMemory(int partition, const char *name, int type, u32 size, u32 addr, bool kernelEntry) {
 	if (type < 0 || type > 4) return (int)SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCKTYPE;
-	BlockAllocator *a = AllocatorForPartition(partition);
-	if (!a || partition == 1 || partition == 3 || partition == 4)
-		return (int)SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT;
+	// Alignment is only allowed for powers of 2.
+	if ((type == 3 || type == 4) && ((addr & (addr - 1)) != 0 || addr == 0))
+		return (int)SCE_KERNEL_ERROR_ILLEGAL_ALIGNMENT_SIZE;
+	// The user entry point reports an out-of-range partition as ILLEGAL_ARGUMENT, the kernel one
+	// as ILLEGAL_PARTITION (sysmem/partitions).
+	if (partition < 1 || partition > 6)
+		return (int)(kernelEntry ? SCE_KERNEL_ERROR_ILLEGAL_PARTITION : SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT);
+	BlockAllocator *a = AllocatorForPartitionId(partition, kernelEntry || CallerIsKernelMode());
+	if (!a) return (int)SCE_KERNEL_ERROR_ILLEGAL_PARTITION;
+	if (!name) return (int)SCE_KERNEL_ERROR_ERROR;
 	if (size == 0) return (int)SCE_KERNEL_ERROR_MEMBLOCK_ALLOC_FAILED;
+	std::string tag = std::string(name).substr(0, 31);
 	u32 block = 0;
 	switch (type) {
-	case 0: block = a->Alloc(size, false, name); break;              // PSP_SMEM_Low
-	case 1: block = a->Alloc(size, true, name); break;               // PSP_SMEM_High
-	case 2: block = a->AllocAt(addr, size, name); break;             // PSP_SMEM_Addr
-	case 3:                                                         // PSP_SMEM_LowAligned
-	case 4: {                                                       // PSP_SMEM_HighAligned
-		if ((addr & (addr - 1)) != 0 || addr == 0) return (int)SCE_KERNEL_ERROR_ILLEGAL_ALIGNMENT_SIZE;
-		block = a->Alloc(size, type == 4, name, addr);
+	case 0: block = a->Alloc(size, false, tag.c_str()); break;  // PSP_SMEM_Low
+	case 1: block = a->Alloc(size, true, tag.c_str()); break;   // PSP_SMEM_High
+	case 2: block = a->AllocAt(addr & ~0xFFu, size, tag.c_str()); break;  // PSP_SMEM_Addr
+	case 3:                                                      // PSP_SMEM_LowAligned
+	case 4:                                                      // PSP_SMEM_HighAligned
+		block = a->Alloc(size, type == 4, tag.c_str(), addr);
 		break;
-	}
 	}
 	if (!block) return (int)SCE_KERNEL_ERROR_MEMBLOCK_ALLOC_FAILED;
 	auto *b = new MemBlock();
-	b->name = name;
+	b->name = tag;
 	b->addr = block;
-	b->size = a->BlockSize(block & ~0xFFu) ? a->BlockSize(block & ~0xFFu) : size;
+	b->size = a->BlockSize(block) ? a->BlockSize(block) : AlignUp(size, 0x100);
 	b->partition = partition;
 	return Register(b);
+}
+
+int sceKernelAllocPartitionMemory(int partition, const char *name, int type, u32 size, u32 addr) {
+	return AllocPartitionMemory(partition, name, type, size, addr, false);
+}
+int Kernel_sceKernelAllocPartitionMemory(int partition, const char *name, int type, u32 size, u32 addr) {
+	return AllocPartitionMemory(partition, name, type, size, addr, true);
 }
 
 int sceKernelFreePartitionMemory(SceUID id) {
 	MemBlock *b = Get<MemBlock>(id);
 	if (!b) return (int)SCE_KERNEL_ERROR_UNKNOWN_UID;
-	if (BlockAllocator *a = AllocatorForAddress(b->addr)) a->Free(AlignDown(b->addr, 0x100));
+	if (BlockAllocator *a = AllocatorForAddress(b->addr)) a->Free(b->addr);
 	Destroy(id);
 	return 0;
 }
@@ -64,18 +81,121 @@ u32 sceKernelGetBlockHeadAddr(SceUID id) {
 
 // SysMemUserForUser's AllocMemoryBlock family (firmware 6.x API, also used by later SDKs).
 int sceKernelAllocMemoryBlock(const char *name, u32 type, u32 size, u32 paramsAddr) {
-	(void)paramsAddr;
+	if (paramsAddr && (paramsAddr & 3) == 0 && mem::IsValidRange(paramsAddr, 4) && GRead32(paramsAddr) != 4)
+		return (int)SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT;
+	if (type != 0 && type != 1) return (int)SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCKTYPE;
+	if (size == 0) return (int)SCE_KERNEL_ERROR_MEMBLOCK_ALLOC_FAILED;
 	if (!name) return (int)SCE_KERNEL_ERROR_ERROR;
-	if (type > 1) return (int)SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCKTYPE;
-	return sceKernelAllocPartitionMemory(2, name, (int)type, size, 0);
+	std::string tag = std::string(name).substr(0, 31);
+	u32 block = g_userMem.Alloc(size, type == 1, tag.c_str());
+	if (!block) return (int)SCE_KERNEL_ERROR_MEMBLOCK_ALLOC_FAILED;
+	auto *b = new MemBlock();
+	b->name = tag;
+	b->addr = block;
+	b->size = g_userMem.BlockSize(block);
+	b->partition = 2;
+	return Register(b);
 }
 int sceKernelFreeMemoryBlock(SceUID id) { return sceKernelFreePartitionMemory(id); }
 int sceKernelGetMemoryBlockAddr(SceUID id, u32 outPtr) {
 	MemBlock *b = Get<MemBlock>(id);
-	if (!b) return (int)SCE_KERNEL_ERROR_UNKNOWN_UID;
+	if (!b) return 0;
 	if (mem::IsValidRange(outPtr, 4)) GWrite32(outPtr, b->addr);
 	return 0;
 }
+
+// ---- SysMemForKernel heaps ----
+
+struct KernelHeap : KObject {
+	static constexpr KType kType = KType::Other;
+	KType Type() const override { return kType; }
+	int partition = 0;
+	u32 size = 0, address = 0;
+	int flags = 0;
+	BlockAllocator alloc;
+};
+
+KernelHeap *GetHeap(SceUID id) {
+	KObject *o = GetAny(id);
+	return o && o->Type() == KType::Other ? dynamic_cast<KernelHeap *>(o) : nullptr;
+}
+
+int sceKernelCreateHeap(int partition, int size, int flags, const char *name) {
+	// Only partitions 1-6 exist; anything else is ILLEGAL_PARTITION (sysmem/kernel/heap).
+	if (partition < 1 || partition > 6) return (int)SCE_KERNEL_ERROR_ILLEGAL_PARTITION;
+	BlockAllocator *a = AllocatorForPartitionId(partition, true);
+	if (!a) return (int)SCE_KERNEL_ERROR_ILLEGAL_PARTITION;
+	if (size <= 0) return (int)SCE_KERNEL_ERROR_HEAPBLOCK_ALLOC_FAILED;
+	if (!name) return (int)SCE_KERNEL_ERROR_ERROR;
+	u32 allocSize = ((u32)size + 3) & ~3u;
+	// flags is ignored: every value creates a heap.
+	u32 addr = a->Alloc(allocSize, true, ("KernelHeap/" + std::string(name)).c_str());
+	if (!addr) return (int)SCE_KERNEL_ERROR_NO_MEMORY;
+	auto *h = new KernelHeap();
+	h->name = name;
+	h->partition = partition;
+	h->flags = flags;
+	h->size = a->BlockSize(addr);
+	h->address = addr;
+	// The first 128 bytes hold the heap's own bookkeeping.
+	h->alloc.Init(addr + 128, h->size > 128 ? h->size - 128 : 0, 16);
+	return Register(h);
+}
+
+u32 sceKernelAllocHeapMemory(SceUID id, int size) {
+	KernelHeap *h = GetHeap(id);
+	// Returns a pointer, so every failure is a null pointer.
+	if (!h) return 0;
+	// There are 8 bytes at the end of every block, reserved.
+	return h->alloc.Alloc((u32)size + 8, true, "heapblock");
+}
+
+u32 sceKernelAllocHeapMemoryWithOption(SceUID id, u32 size, u32 paramsPtr) {
+	KernelHeap *h = GetHeap(id);
+	if (!h) return 0;
+	u32 grain = 4;
+	if (paramsPtr != 0) {
+		if ((paramsPtr & 3) || !mem::IsValidRange(paramsPtr, 8)) return 0;
+		// The size field isn't validated; only the alignment matters, a power of 2 from 4 to
+		// 0x80 (0 means no preference).
+		grain = GRead32(paramsPtr + 4);
+		if (grain == 0) grain = 4;
+		else if (grain < 4 || grain > 0x80 || (grain & (grain - 1)) != 0) return 0;
+	}
+	u32 memSize = size + 8;
+	if (grain > 16) memSize = AlignUp(memSize, grain);
+	return h->alloc.Alloc(memSize, true, "heapblock", grain);
+}
+
+int sceKernelFreeHeapMemory(SceUID id, u32 block) {
+	KernelHeap *h = GetHeap(id);
+	if (!h) return (int)SCE_KERNEL_ERROR_UNKNOWN_UID;
+	if (block == 0) return 0;
+	if (!h->alloc.Free(block)) return (int)0x80000103;  // SCE_KERNEL_ERROR_INVALID_POINTER
+	return 0;
+}
+
+int sceKernelDeleteHeap(SceUID id) {
+	KernelHeap *h = GetHeap(id);
+	if (!h) return (int)SCE_KERNEL_ERROR_UNKNOWN_UID;
+	if (BlockAllocator *a = AllocatorForAddress(h->address)) a->Free(h->address);
+	Destroy(id);
+	return 0;
+}
+
+u32 sceKernelPartitionTotalFreeMemSize(int partition) {
+	BlockAllocator *a = AllocatorForPartitionId(partition, true);
+	if (!a) return SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT;
+	return a->TotalFree();
+}
+
+u32 sceKernelPartitionMaxFreeMemSize(int partition) {
+	BlockAllocator *a = AllocatorForPartitionId(partition, true);
+	if (!a) return SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT;
+	return a->MaxFree();
+}
+
+int sceKernelGetModel() { return 1; }  // PSP-2000
 
 // sceKernelPrintf(fmt, ...) with a minimal printf over guest varargs (a1..t3).
 void sceKernelPrintf(Ctx *c) {
@@ -174,4 +294,29 @@ void Register_SysMemUserForUser() {
 		HLEFN(0xD8DE5C1E, SysMemUserForUser_D8DE5C1E),
 	};
 	hle::RegisterModule("SysMemUserForUser", funcs);
+
+	static const hle::HleFunction kfuncs[] = {
+		HLEFN(0x636C953B, sceKernelAllocHeapMemory),
+		HLEFN(0xC9805775, sceKernelDeleteHeap),
+		HLEFN(0x1C1FBFE7, sceKernelCreateHeap),
+		HLEFN(0x237DBD4F, Kernel_sceKernelAllocPartitionMemory),
+		HLEFN(0xB6D61D02, sceKernelFreePartitionMemory),
+		HLEFN(0x9D9A5BA1, sceKernelGetBlockHeadAddr),
+		HLEFN(0x9697CD32, sceKernelPartitionTotalFreeMemSize),
+		HLEFN(0xE6581468, sceKernelPartitionMaxFreeMemSize),
+		HLEFN(0x3FC9AE6A, sceKernelDevkitVersion),
+		HLEFN(0x7B749390, sceKernelFreeHeapMemory),
+		HLEFN(0xEB7A74DB, sceKernelAllocHeapMemoryWithOption),
+		HLEFN(0x6373995D, sceKernelGetModel),
+		HLEFN(0x07C586A1, sceKernelGetModel),
+		HLEFN(0xDA07DC6E, sceKernelGetModel),
+		HLEFN(0x4823B9D9, sceKernelGetModel),
+		HLEFN(0x864EBFD7, sceKernelGetModel),
+		HLEFN(0x458A70B5, sceKernelGetModel),
+		HLEFN(0xA3B0B6BC, sceKernelGetModel),
+		HLEFN(0xA291F107, sceKernelMaxFreeMemSize),
+		HLEFN(0xF919F628, sceKernelTotalFreeMemSize),
+		HLERAW(0x13A5ABEF, sceKernelPrintf),
+	};
+	hle::RegisterModule("SysMemForKernel", kfuncs);
 }

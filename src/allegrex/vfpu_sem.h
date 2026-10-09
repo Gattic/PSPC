@@ -41,12 +41,14 @@ PSPC_FORCEINLINE void FastBinary(Ctx *c, u32 w, Hw hw, Host host) {
 	for (int i = 0; i < n; i++) c->vi[VecElem(Vd(w), n, i)] = d[i];
 }
 
-// Element-wise unary op on the bits of vs with default prefixes.
+// vmov/vabs/vneg with default prefixes: an element-wise op on the bits of vs. The S values also
+// go into the prefix unit's latch (Ctx::pfxLatch, see vfpu_exec.cpp).
 template <typename Fn>
 PSPC_FORCEINLINE void FastUnaryBits(Ctx *c, u32 w, Fn fn) {
 	const int n = VecSize(w);
 	u32 d[4];
 	for (int i = 0; i < n; i++) d[i] = fn(c->vi[VecElem(Vs(w), n, i)]);
+	for (int i = 0; i < n; i++) c->pfxLatch[i] = d[i];
 	for (int i = 0; i < n; i++) c->vi[VecElem(Vd(w), n, i)] = d[i];
 }
 
@@ -64,8 +66,14 @@ SEM(MFVC) {
 	const u32 reg = (w & 0xFF) - 128;
 	if (reg < 16) sem::SetR(c, insn::Rt(w), c->vfpuCtrl[reg]);
 }
+// mfvc of the CC right behind vcmp, which reads the CC from before it (ag::SeesStaleCondition).
+SEM(MFVC_PREV) { sem::SetR(c, insn::Rt(w), c->ccPrev); }
 SEM(MTV) { c->vi[vfpu::VOffset(w & 0x7F)] = c->r[insn::Rt(w)]; }
-SEM(MTVC) { vfpu::WriteCtrl(c, (w & 0xFF) - 128, c->r[insn::Rt(w)]); }
+SEM(MTVC) {
+	const u32 reg = (w & 0xFF) - 128;
+	if (reg == VFPU_CTRL_CC) c->ccPrev = c->vfpuCtrl[VFPU_CTRL_CC];
+	vfpu::WriteCtrl(c, reg, c->r[insn::Rt(w)]);
+}
 
 // Condition bit imm3 (bits 18-20) of the CC register: x, y, z, w, any, all.
 #define VFPU_CC_BIT_ ((c->vfpuCtrl[VFPU_CTRL_CC] >> ((w >> 18) & 7)) & 1)
@@ -74,6 +82,13 @@ COND(BVT) { return VFPU_CC_BIT_ != 0; }
 COND(BVFL) { return VFPU_CC_BIT_ == 0; }
 COND(BVTL) { return VFPU_CC_BIT_ != 0; }
 #undef VFPU_CC_BIT_
+// The same branches while an mtvc to the CC is still in flight (ag::SeesStaleCondition).
+#define VFPU_CC_PREV_BIT_ ((c->ccPrev >> ((w >> 18) & 7)) & 1)
+COND(BVF_PREV) { return VFPU_CC_PREV_BIT_ == 0; }
+COND(BVT_PREV) { return VFPU_CC_PREV_BIT_ != 0; }
+COND(BVFL_PREV) { return VFPU_CC_PREV_BIT_ == 0; }
+COND(BVTL_PREV) { return VFPU_CC_PREV_BIT_ != 0; }
+#undef VFPU_CC_PREV_BIT_
 
 // ---- Loads / stores ----
 SEM(LV_S) { c->vi[vfpu::VOffset(vfpu::LsRegS(w))] = GRead32(vfpu::LsAddr(c, w)); }
@@ -185,7 +200,10 @@ SEM(VCRS) { vfpu::ExecVcrs(c, w); }
 SEM(VDET) { vfpu::ExecVdet(c, w); }
 
 // ---- VFPU3 ----
-SEM(VCMP) { vfpu::ExecVcmp(c, w); }
+SEM(VCMP) {
+	c->ccPrev = c->vfpuCtrl[VFPU_CTRL_CC];
+	vfpu::ExecVcmp(c, w);
+}
 SEM(VMIN) { vfpu::ExecVminmax(c, w); }
 SEM(VMAX) { vfpu::ExecVminmax(c, w); }
 SEM(VSCMP) { vfpu::ExecVscmp(c, w); }

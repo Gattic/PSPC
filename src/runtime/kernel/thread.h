@@ -130,6 +130,9 @@ struct PspThread : KObject {
 	s64 busyCycles = 0;
 	bool busy = false;
 
+	// A module_start/module_stop thread: deleted (with its stack) when its entry returns.
+	bool deleteOnReturn = false;
+
 	// Host execution.
 	void *fiber = nullptr;
 	bool fiberStarted = false;

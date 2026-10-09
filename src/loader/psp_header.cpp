@@ -6,7 +6,17 @@ namespace loader {
 static u32 Rd32(const u8 *p) { u32 v; memcpy(&v, p, 4); return v; }
 static u16 Rd16(const u8 *p) { u16 v; memcpy(&v, p, 2); return v; }
 
+size_t SceHeaderSize(const u8 *data, size_t size) {
+	if (size < 8 || memcmp(data, "~SCE", 4) != 0) return 0;
+	u32 n = Rd32(data + 4);
+	return n >= 8 && n + 4 <= size && memcmp(data + n, "~PSP", 4) == 0 ? n : 0;
+}
+
 ContainerKind Classify(const u8 *data, size_t size) {
+	if (size_t n = SceHeaderSize(data, size)) {
+		data += n;
+		size -= n;
+	}
 	if (size >= 4 && data[0] == 0x7F && data[1] == 'E' && data[2] == 'L' && data[3] == 'F')
 		return ContainerKind::PlainElf;
 	if (size >= PSP_HEADER_SIZE && data[0] == '~' && data[1] == 'P' && data[2] == 'S' && data[3] == 'P') {
@@ -18,6 +28,10 @@ ContainerKind Classify(const u8 *data, size_t size) {
 }
 
 bool ParsePspHeader(const u8 *d, size_t size, PspHeader &h) {
+	if (size_t n = SceHeaderSize(d, size)) {
+		d += n;
+		size -= n;
+	}
 	if (size < PSP_HEADER_SIZE || memcmp(d, "~PSP", 4) != 0) return false;
 	h.modAttr = Rd16(d + 0x04);
 	h.compAttr = Rd16(d + 0x06);

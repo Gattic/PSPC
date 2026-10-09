@@ -231,6 +231,7 @@ public:
 	bool IsOK() const override { return true; }
 	void FlushBuffers() override {
 		if (mf_.IsOpen()) mf_.Flush();
+		fifo_.clear();
 	}
 
 	bool Decode(const u8 *inbuf, int inbytes, int *inbytesConsumed, int outputChannels, s16 *outbuf,
@@ -238,6 +239,7 @@ public:
 		if (outSamples) *outSamples = 0;
 		if (inbytesConsumed) *inbytesConsumed = 0;
 		if (!inbuf || inbytes <= 0) return false;
+		// Raw access units must be exactly one AU: the caller works out the length.
 		int consumed = inbytes;
 		bool adts = inbytes >= 7 && inbuf[0] == 0xFF && (inbuf[1] & 0xF6) == 0xF0;
 		int start = 0;
@@ -283,19 +285,27 @@ public:
 			pcm_.clear();
 			if (mf_.IsOpen()) mf_.Decode(inbuf, inbytes, pcm_);
 		}
-		const int mfCh = std::max(1, mf_.IsOpen() ? mf_.Channels() : 2);
-		int frames = (int)(pcm_.size() / mfCh);
-		if (!mf_.IsOpen()) frames = 1024;  // no decoder: silence of the right length
-		frames = std::min(frames, 2048);
-		if (outbuf) {
-			if (mf_.IsOpen()) {
-				ConvertChannels(pcm_.data(), mfCh, outbuf, outputChannels, frames);
-			} else {
-				memset(outbuf, 0, frames * 2 * outputChannels);
-			}
+		// Media Foundation hands each frame out only once the next one has gone in. Keep one
+		// frame out per frame in (a constant one-frame delay, the first frame silent), since
+		// callers take a frame without samples for the end of the stream.
+		if (mf_.IsOpen()) {
+			const int mfCh = std::max(1, mf_.Channels());
+			const size_t frames = pcm_.size() / mfCh;
+			if (frames) frameSize_ = (int)std::min<size_t>(frames, 2048);
+			const size_t old = fifo_.size();
+			fifo_.resize(old + frames * 2);
+			ConvertChannels(pcm_.data(), mfCh, fifo_.data() + old, 2, (int)frames);
+			if (fifo_.size() > 2048 * 2 * 4) fifo_.erase(fifo_.begin(), fifo_.begin() + (fifo_.size() - 2048 * 2 * 4));
 		}
+		const int n = frameSize_;
+		const int have = (int)std::min<size_t>(fifo_.size() / 2, (size_t)n);
+		if (outbuf) {
+			ConvertChannels(fifo_.data(), 2, outbuf, outputChannels, have);
+			memset(outbuf + have * outputChannels, 0, (n - have) * 2 * outputChannels);
+		}
+		fifo_.erase(fifo_.begin(), fifo_.begin() + have * 2);
 		if (inbytesConsumed) *inbytesConsumed = consumed;
-		if (outSamples) *outSamples = frames;
+		if (outSamples) *outSamples = n;
 		return true;
 	}
 
@@ -306,7 +316,8 @@ private:
 	bool mfFailed_ = false;
 	Mode mode_ = Mode::None;
 	int rate_, channels_;
-	std::vector<s16> pcm_;
+	int frameSize_ = 1024;
+	std::vector<s16> pcm_, fifo_;
 };
 
 }  // namespace

@@ -38,7 +38,7 @@ using namespace kernel;
 
 namespace {
 
-constexpr s32 kBudget = 20000;
+constexpr s32 kBudget = 200000;  // cycles (guest instructions) between yield checks at most
 constexpr int kNumPrio = 128;
 constexpr u64 kCyclesPerUs = kCpuHz / 1000000;
 // How long after its deadline a wait's timeout goes off, and how far into the call the deadline
@@ -121,21 +121,17 @@ u64 RealUs() {
 	       ((ticks % (u64)g_qpcFreq.QuadPart) * 1000000ull) / (u64)g_qpcFreq.QuadPart;
 }
 
-// Fold the guest instructions executed since the last sync into the virtual clock. Interpreted
-// code is counted exactly; native (AOT) code only through its back-edges, at two cycles each.
+// Fold the guest cycles run since the last sync into the virtual clock. Interpreted and native
+// code both charge one cycle per instruction to the running context's budget, so the clock (and
+// every test that measures time) is the same in both modes.
 void SyncClock() {
 	if (!g_fastTime || !OnEmuThread()) return;
-	u64 ic = interp::InstructionCount();
-	u64 di = ic - g_lastIcount;
-	g_lastIcount = ic;
-	u64 db = 0;
 	Ctx *c = cpu::CurrentCtx();
 	if (c && c == g_budgetCtx) {
 		s32 b = c->budget;
-		if (b < g_budgetMark) db = (u64)((s64)g_budgetMark - b);
+		if (b < g_budgetMark) g_vcycles += (u64)((s64)g_budgetMark - b);
 		g_budgetMark = b;
 	}
-	g_vcycles += std::max(di, db * 2);
 	g_vcyclesPublished.store(g_vcycles, std::memory_order_relaxed);
 }
 
@@ -147,19 +143,15 @@ u64 NextEventTime() {
 	return g_events.empty() ? UINT64_MAX : g_events.top().time;
 }
 
-// Back-edges the running code may take before the next yield check. In fast-time mode the check
-// has to come around when the next event is due, so it is a fraction of the cycles until then.
+// Cycles the running code may use before the next yield check (made at back-edges and
+// syscalls). In fast-time mode that is exactly the time until the next event.
 s32 ComputeBudget() {
 	if (!g_fastTime) return kBudget;
 	u64 next = NextEventTime();
 	if (next == UINT64_MAX) return kBudget;
-	u64 now = g_vcycles / kCyclesPerUs;
-	if (next <= now) return 1;
-	u64 cycles = (next - now) * kCyclesPerUs;
-	u64 b = cycles / 32;
-	if (b < 1) b = 1;
-	if (b > (u64)kBudget) b = kBudget;
-	return (s32)b;
+	u64 due = next * kCyclesPerUs;
+	if (due <= g_vcycles) return 0;
+	return (s32)std::min<u64>(due - g_vcycles, (u64)kBudget);
 }
 
 void SetBudget(Ctx *c) {
@@ -246,6 +238,9 @@ void RunThread(PspThread *t) {
 	g_current = t;
 	t->status = (t->status & ~(THREADSTATUS_READY | THREADSTATUS_WAIT)) | THREADSTATUS_RUNNING;
 	cpu::SetCurrentCtx(&t->ctx);
+	// Another thread or an interrupt may have touched memory: a pending ll/sc fails
+	// (cpu/lsu/llsc).
+	t->ctx.llbit = 0;
 	SetBudget(&t->ctx);
 	g_sliceStartUs = NowUs();
 	SwitchToFiber(t->fiber);
@@ -360,6 +355,11 @@ void WINAPI ThreadFiberProc(void *param) {
 		if (target == t->threadReturnStub) break;
 		interp::Run(c, target, t->threadReturnStub, 0);
 	}
+	if (t->deleteOnReturn) {
+		kernel::DeleteThreadCallbacks(t);
+		kernel::FreeThreadStack(t);
+		ExitCurrentThread((s32)c->r[2], true);
+	}
 	ExitCurrentThread((s32)c->r[2], false);
 }
 
@@ -394,13 +394,12 @@ void SaveWait(PspThread *t, SavedWait &s) {
 	memcpy(s.value, t->waitValue, sizeof(s.value));
 	s.callbacks = t->waitCallbacks;
 	s.paused = t->waitPaused;
-	s.hooks = std::move(t->waitHooks);
+	s.hooks = t->waitHooks;
 }
 
 void RestoreWait(PspThread *t, SavedWait &s) {
 	t->waitType = s.type;
 	t->waitId = s.id;
-	t->waitSeq = s.seq;
 	t->waitDone = s.done;
 	t->waitResult = s.result;
 	t->waitTimeoutPtr = s.timeoutPtr;
@@ -419,12 +418,15 @@ void WriteTimeLeft(PspThread *t) {
 	GWrite32(t->waitTimeoutPtr, WaitTimeLeft(t));
 }
 
+// The thread is woken first and the hook runs after, so threads the hook releases (FIFO
+// semaphores and VPLs) queue up behind it.
 void TimeoutNow(PspThread *t) {
-	if (t->waitHooks.timeout) t->waitHooks.timeout();
 	if (t->waitDone) return;
+	std::function<void()> hook = t->waitHooks.timeout;
 	if (t->waitTimeoutPtr && mem::IsValidRange(t->waitTimeoutPtr, 4)) GWrite32(t->waitTimeoutPtr, 0);
 	t->waitTimeoutPtr = 0;
 	Wake(t, t->waitTimeoutResult);
+	if (hook) hook();
 }
 
 void ArmTimeout(PspThread *t) {
@@ -442,6 +444,7 @@ void ArmTimeout(PspThread *t) {
 
 void PauseWait(PspThread *t) {
 	if (t->waitPaused) return;
+	LOGT("SCHED", "pause wait of %s (type %d id %08x)", t->name.c_str(), t->waitType, t->waitId);
 	t->waitPaused = true;
 	if (t->timeoutEventId) {
 		CancelEvent(t->timeoutEventId);
@@ -453,6 +456,7 @@ void PauseWait(PspThread *t) {
 // Callbacks are done (or were canceled before the thread got to run): carry on with the wait,
 // unless it can be satisfied now or its deadline has passed meanwhile.
 void ResumeWait(PspThread *t) {
+	LOGT("SCHED", "resume wait of %s (type %d id %08x, done %d)", t->name.c_str(), t->waitType, t->waitId, t->waitDone);
 	t->waitPaused = false;
 	if (t->waitDone) return;
 	// The timeout kept running during the callback; put it back first so an unlock reports
@@ -468,10 +472,9 @@ void ResumeWait(PspThread *t) {
 
 s32 DoWait(PspThread *t, WaitType type, SceUID id, u64 deadline, u32 latency, u32 timeoutPtr, bool cb,
            s32 timeoutResult, const WaitHooks *hooks) {
-	// A wait inside a callback of an outer wait: keep the outer one for when this returns.
-	SavedWait outer;
+	// A wait inside a callback of an outer wait replaces it; the outer one is put back when the
+	// callbacks return (see below).
 	bool nested = t->waitType != WAITTYPE_NONE;
-	if (nested) SaveWait(t, outer);
 
 	t->waitType = type;
 	t->waitId = id;
@@ -488,15 +491,23 @@ s32 DoWait(PspThread *t, WaitType type, SceUID id, u64 deadline, u32 latency, u3
 	if (!t->waitHooks.timeout && t->timeoutHook) t->waitHooks.timeout = std::move(t->timeoutHook);
 	t->timeoutHook = nullptr;
 	t->hasWaited = true;
+	t->releaseCount++;
 	t->timeoutEventId = 0;
 	++t->waitSeq;
+	LOGT("SCHED", "%s waits (type %d id %08x%s%s)", t->name.c_str(), type, id, cb ? " CB" : "", nested ? " nested" : "");
 	ArmTimeout(t);
 
 	for (;;) {
 		if (t->waitDone) break;
 		if (cb && kernel::CanRunCallbacks(t) && kernel::HasPendingCallbacks(t)) {
 			PauseWait(t);
+			// The callbacks may wait themselves (overwriting the wait state, including the values
+			// the caller stored for this wait): keep this one for when they return.
+			SavedWait outer;
+			SaveWait(t, outer);
+			u32 seq = t->waitSeq;
 			kernel::RunPendingCallbacks(t);
+			if (t->waitSeq != seq) RestoreWait(t, outer);
 			continue;
 		}
 		if (t->waitPaused) {
@@ -512,13 +523,13 @@ s32 DoWait(PspThread *t, WaitType type, SceUID id, u64 deadline, u32 latency, u3
 		t->timeoutEventId = 0;
 	}
 	s32 result = t->waitResult;
+	LOGT("SCHED", "%s wait (type %d id %08x) ends with %08x", t->name.c_str(), t->waitType, t->waitId, result);
 	t->waitType = WAITTYPE_NONE;
 	t->waitId = 0;
 	t->waitTimeoutPtr = 0;
 	t->waitDeadline = 0;
 	t->waitPaused = false;
 	t->waitHooks = WaitHooks{};
-	if (nested) RestoreWait(t, outer);
 	return result;
 }
 
@@ -555,11 +566,28 @@ u64 NowUs() {
 	return RealUs() + g_timeOffset;
 }
 
+u64 NowCycles() {
+	if (g_fastTime) {
+		if (!OnEmuThread()) return g_vcyclesPublished.load(std::memory_order_relaxed);
+		SyncClock();
+		return g_vcycles;
+	}
+	return NowUs() * kCyclesPerUs;
+}
+
 void ChargeCycles(s64 cycles) {
 	if (!g_fastTime || cycles <= 0 || !OnEmuThread()) return;
 	SyncClock();
 	g_vcycles += (u64)cycles;
 	g_vcyclesPublished.store(g_vcycles, std::memory_order_relaxed);
+	// Charged time comes out of the running code's budget too (budget and mark move together, so
+	// SyncClock doesn't count it twice): an event that became due is noticed at the next
+	// back-edge, and a loop of cheap HLE calls sees timers on time.
+	if (g_budgetCtx && g_budgetCtx == cpu::CurrentCtx()) {
+		s64 b = std::max<s64>((s64)g_budgetCtx->budget - cycles, -(s64)kBudget);
+		g_budgetCtx->budget = (s32)b;
+		g_budgetMark = (s32)b;
+	}
 }
 
 void BusyDelayCycles(s64 cycles) {
@@ -578,6 +606,16 @@ void BusyDelayCycles(s64 cycles) {
 u64 ScheduleEvent(u64 atUs, std::function<void()> fn) {
 	u64 id = g_nextEventId++;
 	g_events.push(Event{atUs, id, std::move(fn)});
+	// An event sooner than the running code's budget reaches must cut the budget short.
+	if (g_fastTime && g_budgetCtx && g_budgetCtx == cpu::CurrentCtx() && OnEmuThread()) {
+		SyncClock();
+		s64 until = (s64)(atUs * kCyclesPerUs) - (s64)g_vcycles;
+		if (until < g_budgetCtx->budget) {
+			s32 b = (s32)std::max<s64>(until, 0);
+			g_budgetCtx->budget = b;
+			g_budgetMark = b;
+		}
+	}
 	return id;
 }
 
@@ -732,11 +770,15 @@ void HandOffTo(PspThread *t) {
 s32 Wait(WaitType type, SceUID id, u32 timeoutPtr, bool processCallbacks, const WaitHooks *hooks) {
 	PspThread *t = g_current;
 	if (!t || g_inInterrupt) {
-		if (t) t->timeoutHook = nullptr;
+		if (t) {
+			t->timeoutHook = nullptr;
+			++t->waitSeq;  // the caller may have clobbered the wait values
+		}
 		return (s32)SCE_KERNEL_ERROR_ILLEGAL_CONTEXT;
 	}
 	if (!DispatchEnabled()) {
 		t->timeoutHook = nullptr;
+		++t->waitSeq;
 		return (s32)SCE_KERNEL_ERROR_CAN_NOT_WAIT;
 	}
 	u64 deadline = 0;
@@ -752,6 +794,7 @@ s32 Wait(WaitType type, SceUID id, u32 timeoutPtr, bool processCallbacks, const 
 
 s32 WaitUntil(WaitType type, SceUID id, u64 deadlineUs, bool processCallbacks, const WaitHooks *hooks) {
 	PspThread *t = g_current;
+	if (t) ++t->waitSeq;
 	if (!t || g_inInterrupt) return (s32)SCE_KERNEL_ERROR_ILLEGAL_CONTEXT;
 	if (!DispatchEnabled()) return (s32)SCE_KERNEL_ERROR_CAN_NOT_WAIT;
 	return DoWait(t, type, id, deadlineUs ? deadlineUs : 1, 0, 0, processCallbacks, 0, hooks);
@@ -794,6 +837,7 @@ u32 WaitTimeLeft(PspThread *t) {
 
 void Wake(PspThread *t, s32 result) {
 	if (t->waitDone || t->waitType == WAITTYPE_NONE) return;
+	LOGT("SCHED", "wake %s (type %d id %08x) with %08x", t->name.c_str(), t->waitType, t->waitId, result);
 	WriteTimeLeft(t);
 	t->waitDone = true;
 	t->waitResult = result;
@@ -840,7 +884,9 @@ void YieldToSamePriority() {
 void YieldCheck(Ctx *c) {
 	PspThread *t = g_current;
 	if (!t || g_inInterrupt || &t->ctx != c) {
+		SyncClock();
 		c->budget = kBudget;
+		if (c == g_budgetCtx) g_budgetMark = kBudget;
 		return;
 	}
 	SyncClock();
@@ -966,9 +1012,18 @@ u32 RunInterruptHandler(u32 func, u32 gp, std::initializer_list<u32> args, u32 s
 	g_intrCtx.r[29] = g_intrStackTop - stackReserve;
 	g_intrCtx.r[28] = gp;
 	g_intrCtx.fcr31 = 0x00000E00;
+	// The handler's cycles go on the clock too: give it its own budget for the duration.
+	SyncClock();
+	Ctx *prevBudgetCtx = g_budgetCtx;
+	g_intrCtx.budget = kBudget;
+	g_budgetCtx = &g_intrCtx;
+	g_budgetMark = kBudget;
 	cpu::SetCurrentCtx(&g_intrCtx);
 	u32 result = cpu::CallGuest(&g_intrCtx, func, args);
+	SyncClock();
 	cpu::SetCurrentCtx(prevCtx);
+	g_budgetCtx = prevBudgetCtx;
+	if (prevBudgetCtx) g_budgetMark = prevBudgetCtx->budget;
 	g_inInterrupt = prevIntr;
 	return result;
 }

@@ -878,6 +878,27 @@ int sceKernelRegisterStderrPipe(u32) { return 0; }
 
 }  // namespace
 
+namespace io {
+
+bool ReadRestOfFd(int fd, std::vector<u8> &out, std::string *path) {
+	FileNode *f = fd >= 0 && fd < kMaxFds ? GetFd(fd) : nullptr;
+	if (!f || f->isDir || f->isTty || !f->Fs()) return false;
+	vfs::FileSystem *fs = f->Fs();
+	s64 pos = fs->Seek(f->handle, 0, 1);
+	s64 end = fs->Seek(f->handle, 0, 2);
+	fs->Seek(f->handle, pos, 0);
+	if (pos < 0 || end < pos) return false;
+	out.resize((size_t)(end - pos));
+	s64 n = out.empty() ? 0 : fs->Read(f->handle, out.data(), out.size());
+	fs->Seek(f->handle, pos, 0);
+	if (n < 0) return false;
+	out.resize((size_t)n);
+	if (path) *path = f->path;
+	return true;
+}
+
+}  // namespace io
+
 void Register_IoFileMgrForUser() {
 	for (auto &f : g_fds) f.reset();
 	g_defaultAsyncPrio = -1;

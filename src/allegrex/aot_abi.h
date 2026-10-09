@@ -2,12 +2,17 @@
 //
 // Interface between the runtime and ahead-of-time recompiled module DLLs.
 //
-// A module DLL contains one C++ function per guest function (void f(Ctx*)), compiled against
-// sem.h. It exports pspc_aot_module(), which the runtime calls once after LoadLibrary. The DLL
+// A module DLL contains two C++ entry points per guest function, compiled against sem.h: the
+// body B_xxx(Ctx*, ra0, sp0), which runs the guest code as part of a frame that returns to ra0
+// (sp0 is the stack pointer that frame started with), and the call entry F_xxx(Ctx*) =
+// B_xxx(c, $ra, $sp). Calls use the call entry; jumps into a function (tail calls, or a jump to a
+// label that also starts a function) use the body with the jumper's ra0/sp0, so the code knows
+// where its frame really returns to. It exports pspc_aot_module(), which the runtime calls once after LoadLibrary. The DLL
 // keeps its own g_membase / g_cop0 / g_intrEnabled globals and fills them from the API.
 //
 // Control-flow conventions used by generated code (see docs/RECOMPILER.md):
-//   * jal inside the module      -> direct C call, then an unwind check.
+//   * jal inside the module      -> direct C call of the body, then an unwind check.
+//   * j to a function entry      -> body with the current ra0/sp0, then return.
 //   * jal/jalr to anything else  -> api->callIndirect(c, target).
 //   * jr $ra                     -> return if $ra equals the value it had on entry,
 //                                   otherwise api->nonlocalReturn(c, target) and return.
@@ -19,7 +24,7 @@
 
 #include "allegrex/ctx.h"
 
-#define PSPC_AOT_ABI_VERSION 1
+#define PSPC_AOT_ABI_VERSION 2
 
 struct PspcRuntimeApi {
 	u32 abiVersion;
@@ -42,10 +47,12 @@ struct PspcRuntimeApi {
 };
 
 typedef void (*AotFn)(Ctx *);
+typedef void (*AotBodyFn)(Ctx *, u32 ra0, u32 sp0);
 
 struct AotFunctionEntry {
-	u32 offset;  // Guest address minus recompileBase.
-	AotFn fn;
+	u32 offset;      // Guest address minus recompileBase.
+	AotFn fn;        // call entry
+	AotBodyFn body;  // jump entry
 };
 
 struct AotModuleDesc {

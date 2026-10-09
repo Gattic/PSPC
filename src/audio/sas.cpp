@@ -369,6 +369,23 @@ void SasVoice::ReadSamples(s16 *output, int numSamples) {
 		break;
 	}
 	case VOICETYPE_ATRAC3: atrac3.GetNextSamples(output, numSamples); break;
+	case VOICETYPE_NOISE: {
+		// nocash's PSX SPU noise generator: bits 0-1 of the clock are the step (4..7), bits 2-5
+		// the shift. The PSP's exact sequence is unverified, but it is the same kind of clock.
+		const int step = 4 + (noiseFreq & 3);
+		const int shift = (noiseFreq >> 2) & 0xF;
+		for (int i = 0; i < numSamples; i++) {
+			noiseTimer -= step;
+			const int parity = ((noiseLevel >> 15) ^ (noiseLevel >> 12) ^ (noiseLevel >> 11) ^ (noiseLevel >> 10) ^ 1) & 1;
+			if (noiseTimer < 0) {
+				noiseLevel = (u16)((noiseLevel << 1) | parity);
+				noiseTimer += 0x20000 >> shift;
+				if (noiseTimer < 0) noiseTimer += 0x20000 >> shift;
+			}
+			output[i] = (s16)noiseLevel;
+		}
+		break;
+	}
 	default: memset(output, 0, numSamples * sizeof(s16)); break;
 	}
 }

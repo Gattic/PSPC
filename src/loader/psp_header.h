@@ -35,6 +35,9 @@ struct PspHeader {
 
 constexpr u32 PSP_HEADER_SIZE = 0x150;
 
+// Size of a "~SCE" wrapper in front of a ~PSP container (some firmware modules shipped on discs
+// carry one), or 0. Classify and ParsePspHeader look through it.
+size_t SceHeaderSize(const u8 *data, size_t size);
 ContainerKind Classify(const u8 *data, size_t size);
 bool ParsePspHeader(const u8 *data, size_t size, PspHeader &out);
 

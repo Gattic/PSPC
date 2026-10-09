@@ -32,6 +32,7 @@ u32 BlockAllocator::Take(size_t idx, u32 addr, u32 size, const char *tag) {
 }
 
 u32 BlockAllocator::Alloc(u32 size, bool fromTop, const char *tag, u32 align) {
+	if (size > size_) return 0;
 	if (size == 0) size = grain_;
 	size = AlignUp(size, grain_);
 	if (align < grain_) align = grain_;
@@ -55,6 +56,7 @@ u32 BlockAllocator::Alloc(u32 size, bool fromTop, const char *tag, u32 align) {
 }
 
 u32 BlockAllocator::AllocAt(u32 addr, u32 size, const char *tag) {
+	if (size > size_) return 0;
 	u32 a = AlignDown(addr, grain_);
 	size = AlignUp(size + (addr - a), grain_);
 	for (size_t i = 0; i < blocks_.size(); i++) {

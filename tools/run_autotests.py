@@ -13,6 +13,7 @@ import concurrent.futures
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import time
@@ -46,6 +47,11 @@ def run_one(args, rel, prx, exp):
         cmd.append('--interp')
     # Tests address their data as host0:/tests/..., i.e. host0: is the pspautotests root.
     cmd += ['--host0', str(pathlib.Path(args.tests).parent)]
+    # A fresh memory stick per test: savedata tests share folder names and would collide.
+    ms = ROOT / 'build' / 'autotest-ms' / rel.replace('/', '_')
+    shutil.rmtree(ms, ignore_errors=True)
+    ms.mkdir(parents=True)
+    cmd += ['--memstick', str(ms)]
     cmd.append(str(prx))
     start = time.time()
     try:
@@ -55,6 +61,7 @@ def run_one(args, rel, prx, exp):
         code = proc.returncode
     except subprocess.TimeoutExpired:
         out, err, code = '', 'host timeout', -1
+    shutil.rmtree(ms, ignore_errors=True)
     elapsed = time.time() - start
     want = normalize(exp.read_text(encoding='utf-8', errors='replace'))
     got = normalize(out)
@@ -85,6 +92,8 @@ def main():
     ap.add_argument('--verbose', '-v', action='store_true')
     ap.add_argument('filters', nargs='*')
     args = ap.parse_args()
+    # Test output can hold characters the console code page lacks.
+    sys.stdout.reconfigure(errors='backslashreplace')
 
     tests = find_tests(pathlib.Path(args.tests), args.filters)
     if not tests:

@@ -46,7 +46,12 @@ struct alignas(64) Ctx {
 	void *thread;  // Owning kernel thread object.
 	u32 interruptsEnabled;
 	u32 inInterrupt;
-	u32 pad[14];
+
+	// Pipeline state the semantics keep (in what used to be padding, so no offset moved).
+	u32 fpcondPrev;   // fpcond before the last c.cond.s (ag::SeesStaleCondition)
+	u32 ccPrev;       // VFPU CC before the last mtvc to it or vcmp (ag::SeesStaleCondition)
+	u32 pfxLatch[4];  // last S value per lane out of the VFPU prefix unit (vfpu_exec.cpp)
+	u32 pad[8];
 };
 
 static_assert(sizeof(Ctx) % 64 == 0, "Ctx must stay cache-line sized");

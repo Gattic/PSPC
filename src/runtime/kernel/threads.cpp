@@ -34,7 +34,7 @@ void NotifyThreadEnd(PspThread *t) {
 }
 
 SceUID CreateThread(const char *name, u32 entry, s32 prio, s32 stackSize, u32 attr, u32 gp, SceUID moduleId,
-                    bool allowKernel, s64 *fillCycles) {
+                    bool allowKernel, s64 *fillCycles, BlockAllocator *stackAlloc) {
 	if (fillCycles) *fillCycles = 0;
 	if (!name) return (s32)SCE_KERNEL_ERROR_ERROR;
 	for (int i = 0; i < 4 && name[i]; i++) {
@@ -68,7 +68,7 @@ SceUID CreateThread(const char *name, u32 entry, s32 prio, s32 stackSize, u32 at
 	t->moduleId = moduleId;
 
 	u32 size = AlignUp((u32)stackSize, 0x100);
-	BlockAllocator &alloc = (attr & PSP_THREAD_ATTR_KERNEL) ? g_kernelMem : g_userMem;
+	BlockAllocator &alloc = stackAlloc ? *stackAlloc : (attr & PSP_THREAD_ATTR_KERNEL) ? g_kernelMem : g_userMem;
 	u32 stack = alloc.Alloc(size, (attr & PSP_THREAD_ATTR_LOW_STACK) == 0, ("stack/" + t->name).c_str());
 	if (!stack) {
 		delete t;
@@ -77,7 +77,7 @@ SceUID CreateThread(const char *name, u32 entry, s32 prio, s32 stackSize, u32 at
 	t->stackAddr = stack;
 	t->stackSize = size;
 	// Filling the stack with 0xFF takes about a cycle per byte.
-	if (fillCycles && (attr & PSP_THREAD_ATTR_NO_FILLSTACK) == 0) *fillCycles = (s64)size - (s64)size / 64;
+	if (fillCycles && (attr & PSP_THREAD_ATTR_NO_FILLSTACK) == 0) *fillCycles = (s64)size - (s64)size / 25;
 	return Register(t);
 }
 
@@ -161,7 +161,8 @@ int StartThread(PspThread *t, u32 argSize, u32 argPtr) {
 		// The firmware hands the CPU straight to the new thread, even when a better thread is
 		// ready but hasn't been dispatched (pspautotests threads/threads/termsuspended).
 		if (*g_intrEnabled) {
-			sched::ChargeCycles(2000);
+			// About 35us from the call to the new thread's entry (threads/scheduling/handoff).
+			sched::ChargeCycles(3100);
 			sched::HandOffTo(t);
 		}
 	} else if (cur) {

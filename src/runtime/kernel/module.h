@@ -34,6 +34,7 @@ struct PspModule : KObject {
 	u32 moduleStart = 0, moduleStop = 0;
 	u32 startThreadPrio = 0, startThreadStack = 0, startThreadAttr = 0;
 	bool hasStartThreadParam = false;
+	u32 stopThreadPrio = 0, stopThreadStack = 0, stopThreadAttr = 0;
 	u32 status = MODULE_STATUS_LOADED;
 	bool kernelMode = false;
 	bool aot = false;
@@ -49,10 +50,14 @@ struct LoadOptions {
 // Loads an executable image (ELF/PRX, possibly ~PSP packed). `path` is the PSP path it came
 // from. Returns the module UID or a negative PSP error.
 SceUID LoadModuleFromMemory(const std::vector<u8> &data, const std::string &path, const LoadOptions &opts);
-// Starts a module: runs module_start in a new thread. If called from a guest thread, blocks
-// until module_start returns. Returns module_start's status (or an error).
-int StartModule(PspModule *m, u32 argSize, u32 argPtr, u32 statusPtr, bool waitForReturn);
-int StopModule(PspModule *m, u32 argSize, u32 argPtr, u32 statusPtr);
+// Starts a module: runs module_start in a new thread (deleted when it returns). With
+// waitForReturn (and a calling guest thread), blocks until module_start returns and stores its
+// exit status at statusPtr. smOptionPtr is a guest SceKernelSMOption (0 = none). Returns 0 or an
+// error.
+int StartModule(PspModule *m, u32 argSize, u32 argPtr, u32 statusPtr, bool waitForReturn, u32 smOptionPtr = 0);
+int StopModule(PspModule *m, u32 argSize, u32 argPtr, u32 statusPtr, u32 smOptionPtr = 0);
+// Checks a guest SceKernelSMOption (size for newer SDKs, attribute bits).
+int ValidateSMOption(u32 smOptionPtr);
 int UnloadModule(PspModule *m);
 PspModule *ModuleByAddress(u32 addr);
 PspModule *ModuleByName(const std::string &name);

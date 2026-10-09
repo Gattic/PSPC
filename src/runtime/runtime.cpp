@@ -13,6 +13,7 @@
 #include "common/fileutil.h"
 #include "common/log.h"
 #include "runtime/boot.h"
+#include "runtime/core/backtrace.h"
 #include "runtime/core/cpu.h"
 #include "runtime/core/dispatch.h"
 #include "runtime/core/interp.h"
@@ -30,6 +31,7 @@
 
 namespace ctrl {
 void OnVblank();
+void AddScriptedPress(u32 vblank, u32 buttons, u32 frames);
 }
 namespace umd {
 void NotifyDiscChanged();
@@ -148,7 +150,43 @@ bool PrepareBoot(const Options &o, BootTarget &bt) {
 	return true;
 }
 
+// --dump-frames: the displayed framebuffer as a 24-bit BMP every N VBlanks (works headless).
+void DumpFrame(const std::string &dir) {
+	u32 addr;
+	int stride, format;
+	display::CurrentFramebuffer(addr, stride, format);
+	if (!addr) return;
+	std::vector<u32> px;
+	display::ConvertFramebuffer(addr, stride, format, 480, 272, px);
+	const int w = 480, h = 272, rowBytes = w * 3;
+	std::vector<u8> bmp(54 + (size_t)rowBytes * h);
+	auto put32 = [&](size_t at, u32 v) { memcpy(&bmp[at], &v, 4); };
+	bmp[0] = 'B';
+	bmp[1] = 'M';
+	put32(2, (u32)bmp.size());
+	put32(10, 54);
+	put32(14, 40);
+	put32(18, (u32)w);
+	put32(22, (u32)h);
+	bmp[26] = 1;
+	bmp[28] = 24;
+	put32(34, (u32)(rowBytes * h));
+	for (int y = 0; y < h; y++) {
+		u8 *row = &bmp[54 + (size_t)(h - 1 - y) * rowBytes];  // bottom-up
+		for (int x = 0; x < w; x++) {
+			u32 p = px[(size_t)y * w + x];
+			row[x * 3 + 0] = (u8)(p >> 16);
+			row[x * 3 + 1] = (u8)(p >> 8);
+			row[x * 3 + 2] = (u8)p;
+		}
+	}
+	char name[32];
+	snprintf(name, sizeof(name), "frame_%06u.bmp", display::Vcount());
+	WriteWholeFile(fs::u8path(dir) / name, bmp.data(), bmp.size());
+}
+
 int RunOnce(const Options &o, BootTarget bt) {
+	backtrace::InstallFatalHook();
 	if (!mem::Init((u32)o.ramMB << 20)) Fatal("Cannot reserve guest memory");
 	kernel::InitMemoryPartitions(mem::g_ramSize, o.largeUserMemory);
 	kernel::g_firmwareVersion = o.firmwareVersion;
@@ -178,7 +216,19 @@ int RunOnce(const Options &o, BootTarget bt) {
 	io::SetCwd(bt.cwd);
 
 	display::Init();
-	display::SetVblankHook([]() { ctrl::OnVblank(); });
+	for (const Options::Press &p : o.presses) ctrl::AddScriptedPress(p.vblank, p.buttons, p.frames);
+	if (!o.dumpFramesDir.empty()) {
+		std::error_code ec;
+		fs::create_directories(fs::u8path(o.dumpFramesDir), ec);
+		std::string dir = o.dumpFramesDir;
+		u32 every = (u32)std::max(1, o.dumpEvery);
+		display::SetVblankHook([dir, every]() {
+			ctrl::OnVblank();
+			if (display::Vcount() % every == 0) DumpFrame(dir);
+		});
+	} else {
+		display::SetVblankHook([]() { ctrl::OnVblank(); });
+	}
 
 	// The M33 layer: config.se, kernel NID resolver, plugins (docs/m33-behaviors.md).
 	m33::BootInfo bi;
@@ -227,6 +277,15 @@ int Run(const Options &o) {
 			if (!finished) {
 				LOGW("RUNTIME", "Timeout after %d s", o.timeoutSec);
 				sched::PostFromHost([]() { sched::RequestStop(124); });
+				// The emulation thread may be stuck somewhere that never looks at host posts.
+				for (int i = 0; i < 50 && !finished; i++) Sleep(100);
+				if (!finished) {
+					fprintf(stderr, "[FATAL] Emulation did not stop within 5 s of the timeout; terminating\n");
+					fflush(stdout);
+					fflush(stderr);
+					logging::Shutdown();
+					TerminateProcess(GetCurrentProcess(), 124);
+				}
 			}
 		});
 	}

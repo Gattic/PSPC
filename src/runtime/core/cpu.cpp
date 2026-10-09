@@ -89,7 +89,14 @@ u32 CallGuest(Ctx *c, u32 func, std::initializer_list<u32> args) {
 	return result;
 }
 
-void YieldCheck(Ctx *c) { sched::YieldCheck(c); }
+void YieldCheck(Ctx *c) {
+	// Taking an interrupt is an exception, and an exception breaks an ll/sc pair (cpu/lsu/llsc).
+	// The scheduler counts each interrupt that preempts the thread.
+	kernel::PspThread *t = sched::Current();
+	const u32 interrupts = t ? t->intrPreemptCount : 0;
+	sched::YieldCheck(c);
+	if (t && t->intrPreemptCount != interrupts) c->llbit = 0;
+}
 
 void Break(Ctx *c, u32 insn, u32 pc) {
 	LOGW("CPU", "break 0x%05x at %08x (ra=%08x)", (insn >> 6) & 0xFFFFF, pc, c->r[31]);

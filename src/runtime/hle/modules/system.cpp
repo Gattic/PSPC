@@ -616,7 +616,13 @@ int sceImposeSetBacklightOffTime(int v) {
 int sceDmacMemcpy(u32 dst, u32 src, u32 size) {
 	if (size == 0) return (int)SCE_KERNEL_ERROR_INVALID_SIZE;
 	if (!mem::IsValidRange(dst, size) || !mem::IsValidRange(src, size)) return (int)SCE_KERNEL_ERROR_INVALID_POINTER;
+	if (dst + size >= 0x80000000u || src + size >= 0x80000000u || size >= 0x80000000u)
+		return (int)SCE_KERNEL_ERROR_PRIV_REQUIRED;
 	mem::Memcpy(dst, src, size);
+	// The caller waits for the transfer: about 236 bytes/us for copies of 272 bytes and up
+	// (measured on hardware, as in PPSSPP's sceDmac); other threads run meanwhile.
+	if (size >= 272 && sched::Current() && sched::DispatchEnabled() && !sched::InInterrupt())
+		sched::WaitUntil(WAITTYPE_HLEDELAY, sched::CurrentId(), sched::NowUs() + size / 236, false);
 	return 0;
 }
 int sceHprmPeekCurrentKey(u32 ptr) {

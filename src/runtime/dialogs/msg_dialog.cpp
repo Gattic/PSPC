@@ -15,8 +15,9 @@ namespace utility {
 
 namespace {
 
-// Rough: on a PSP this takes ~0.55-0.65 s (utility/msgdialog/dialog, workshare).
-constexpr int MSG_INIT_DELAY_US = 560000;
+// On a PSP this takes 534-550 ms in utility/msgdialog/dialog (but ~650 ms in workshare, whose dialog
+// threads all share one priority).
+constexpr int MSG_INIT_DELAY_US = 540000;
 constexpr int MSG_SHUTDOWN_DELAY_US = 26000;
 
 constexpr u32 SIZE_V1 = 572, SIZE_V2 = 580, SIZE_V3 = 708;
@@ -155,10 +156,13 @@ int MsgDialog::Update(int animSpeed) {
 	if (GetStatus() != STATUS_RUNNING) return (int)SCE_ERROR_UTILITY_INVALID_STATUS;
 
 	// On a PSP an Abort only takes effect from the 8th Update, whatever animSpeed is
-	// (utility/dialog/abort).
+	// (utility/dialog/abort), and a bad request finishes at the 9th (utility/msgdialog/dialog).
 	framesRun_++;
-	if ((flag_ & DS_ERROR) || ((flag_ & DS_ABORT) && framesRun_ >= 8)) {
+	if (((flag_ & DS_ERROR) && framesRun_ >= 9) || ((flag_ & DS_ABORT) && framesRun_ >= 8)) {
 		ChangeStatus(STATUS_FINISHED, 0);
+	} else if (flag_ & DS_ERROR) {
+		// Nothing to show; the error result is written when it finishes.
+		return 0;
 	} else {
 		UpdateButtons();
 		UpdateCommon();

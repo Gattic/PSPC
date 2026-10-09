@@ -58,7 +58,7 @@ struct DisplayList {
 	StackEntry stack[32];
 	int stackptr;
 	bool interrupted;
-	bool waitPending;  // threads in sceGeListSync(id, 0) wait
+	u64 waitUntilTicks;  // sceGeListSync(id, 0) waits until then (NEVER until it completes)
 	bool interruptsEnabled;
 	bool pendingInterrupt;
 	bool started;
@@ -74,6 +74,7 @@ struct PendingInterrupt {
 	u32 pc;
 	u32 cmd;
 	u16 token;
+	u64 atTicks;  // when the GE raises it
 	bool stops;  // the GE waits for it (all but HANDLER_CONTINUE signals)
 };
 
@@ -84,7 +85,13 @@ int nextListID = 0;
 bool interruptRunning = false;
 bool isbreak = false;
 GPURunState gpuState = GPUSTATE_DONE;
-bool drawPending = false;
+// Timing (PPSSPP's model): the GE runs a list at once, but what it does happens when it would on
+// hardware, on the CPU clock (hooks.getTicks). Without a clock everything happens at time 0.
+constexpr u64 NEVER = ~0ull;
+u64 startingTicks = 0;
+s64 cyclesExecuted = 0;
+u64 busyTicks = 0;               // the GE is busy with earlier work until then
+u64 drawCompleteTicks = 0;       // sceGeDrawSync(0) waits until then
 u32 sdkVersion = 0x06060010;
 Hooks hooks;
 std::deque<PendingInterrupt> pendingIntrs;
@@ -228,14 +235,33 @@ void RestoreContextFrom(u32 addr) {
 	}
 }
 
+u64 NowTicks() {
+	return hooks.getTicks ? hooks.getTicks(hooks.user) : 0;
+}
+
+// Where the GE is in time.
+u64 GeTicks() {
+	return hooks.getTicks ? startingTicks + (u64)cyclesExecuted : 0;
+}
+
 void NotifyDrawSyncDone() {
-	drawPending = false;
 	if (hooks.onDrawSyncDone)
 		hooks.onDrawSyncDone(hooks.user);
 }
 
-void NotifyListDone(DisplayList &dl) {
-	dl.waitPending = false;
+// All drawing done (as far as is queued) at `at`.
+void SetDrawComplete(u64 at) {
+	busyTicks = std::max(busyTicks, at);
+	if (drawCompleteTicks == at)
+		return;
+	drawCompleteTicks = at;
+	NotifyDrawSyncDone();
+}
+
+void NotifyListDone(DisplayList &dl, u64 at) {
+	dl.waitUntilTicks = at;
+	if (at)
+		busyTicks = std::max(busyTicks, at);
 	if (hooks.onListDone)
 		hooks.onListDone(hooks.user, (int)(LIST_ID_MAGIC ^ (u32)dl.id));
 }
@@ -246,16 +272,17 @@ void CompleteFailedList(DisplayList &list) {
 		list.started = false;
 	}
 	list.state = DL_STATE_COMPLETED;
-	NotifyListDone(list);
+	NotifyListDone(list, GeTicks());
 }
 
 void TriggerInterrupt(DisplayList &list, bool stops = true) {
 	const u32 pc = list.pc;
-	pendingIntrs.push_back({ list.id, pc, ReadListWord(pc - 4) >> 24, list.subIntrToken, stops });
+	const u64 at = GeTicks();
+	pendingIntrs.push_back({ list.id, pc, ReadListWord(pc - 4) >> 24, list.subIntrToken, at, stops });
 	if (stops)
 		list.pendingInterrupt = true;
 	if (hooks.onInterruptPending)
-		hooks.onInterruptPending(hooks.user);
+		hooks.onInterruptPending(hooks.user, at);
 }
 
 bool AnyPendingInterrupt(int listid) {
@@ -291,9 +318,12 @@ void InterruptEnd(int listid) {
 				RemoveFromQueue(listid);
 		}
 		// If that was the last list, sceGeDrawSync waiters are woken before the ones of this list.
-		if (dlQueue.empty() && dl.state == DL_STATE_COMPLETED)
+		if (dlQueue.empty() && dl.state == DL_STATE_COMPLETED) {
+			if (drawCompleteTicks == NEVER)
+				drawCompleteTicks = NowTicks();
 			NotifyDrawSyncDone();
-		NotifyListDone(dl);
+		}
+		NotifyListDone(dl, 0);
 	}
 }
 
@@ -346,6 +376,47 @@ bool DrawPointers(u32 vertType, int count, int maxVertexCount, const u8 **verts,
 
 void FlushImm();
 
+// PPSSPP's guess of the transform cost.
+int PerVertexCycles() {
+	int cost = 20;
+	if (gstate.isLightingEnabled()) {
+		cost += 10;
+		for (int i = 0; i < 4; i++)
+			if (gstate.isLightChanEnabled(i))
+				cost += 7;
+	}
+	if (gstate.getUVGenMode() != GE_TEXMAP_TEXTURE_COORDS)
+		cost += 20;
+	const int morphCount = ((gstate.vertType & GE_VTYPE_MORPHCOUNT_MASK) >> 18) + 1;
+	if (morphCount > 1)
+		cost += 5 * morphCount;
+	return cost;
+}
+
+// How long a clear takes to fill, measured on a PSP (pspautotests gpu/timing/blittiming, through
+// PPSSPP, which doesn't charge it): ns per pixel at 222 MHz, by framebuffer format.
+int ClearFillCycles(GEPrimitiveType prim, const u8 *verts, const u8 *inds, int count, u32 vertType) {
+	if (prim != GE_PRIM_RECTANGLES || !gstate.isModeThrough() || !gstate.isModeClear() ||
+		(vertType & GE_VTYPE_POS_MASK) != GE_VTYPE_POS_16BIT)
+		return 0;
+	const bool is32Bit = gstate.FrameBufFormat() == GE_FORMAT_8888;
+	const double ns = is32Bit ? (gstate.isClearModeDepthMask() ? 7.82 : 5.28) : 3.77;
+	const int left = gstate.getScissorX1(), top = gstate.getScissorY1();
+	const int right = gstate.getScissorX2() + 1, bottom = gstate.getScissorY2() + 1;
+	const int idxType = (int)((vertType & GE_VTYPE_IDX_MASK) >> 11);
+	double pixels = 0.0;
+	for (int i = 0; i + 1 < count; i += 2) {
+		s16 p0[2], p1[2];
+		memcpy(p0, verts + drawFmt.size * ReadIndex(inds, idxType, i) + drawFmt.posoff, 4);
+		memcpy(p1, verts + drawFmt.size * ReadIndex(inds, idxType, i + 1) + drawFmt.posoff, 4);
+		const int x0 = std::max(left, (int)std::min(p0[0], p1[0])), x1 = std::min(right, (int)std::max(p0[0], p1[0]));
+		const int y0 = std::max(top, (int)std::min(p0[1], p1[1])), y1 = std::min(bottom, (int)std::max(p0[1], p1[1]));
+		if (x1 > x0 && y1 > y0)
+			pixels += (double)(x1 - x0) * (y1 - y0);
+	}
+	return (int)(pixels * ns * (double)(222000000 / 1000000) / 1000.0);
+}
+
 void Execute_Prim(u32 op) {
 	const int count = op & 0xFFFF;
 	if (count == 0)
@@ -356,6 +427,9 @@ void Execute_Prim(u32 op) {
 	const u8 *verts, *inds;
 	if (!DrawPointers(vertType, count, count, &verts, &inds))
 		return;
+	cyclesExecuted += PerVertexCycles() * count;
+	if (hooks.getTicks)
+		cyclesExecuted += ClearFillCycles(prim, verts, inds, count, vertType);
 	SubmitPrimitive(verts, inds, prim, count, vertType);
 	// The vertex (or index) address advances; VADDR/IADDR stay.
 	AdvanceVerts(vertType, count, count * drawFmt.size);
@@ -381,6 +455,8 @@ void Execute_BoundingBox(u32 op) {
 		currentList->bboxResult = false;
 		return;
 	}
+	// Measured on a PSP for several counts.
+	cyclesExecuted += count * 22;
 	const u32 vertType = gstate.vertType;
 	if (drawFmt.vtype != vertType)
 		drawFmt.Set(vertType);
@@ -498,6 +574,7 @@ void Execute_BlockTransfer() {
 	dstBase = WrapVram(dstBase);
 
 	const u32 bytesPerRow = (u32)width * bpp;
+	cyclesExecuted += ((s64)height * width * bpp * 16) / 10;
 	const u32 src = srcBase + (u32)(srcY * srcStride + srcX) * bpp;
 	const u32 dst = dstBase + (u32)(dstY * dstStride + dstX) * bpp;
 	const u32 srcSize = (u32)(height - 1) * srcStride * bpp + bytesPerRow;
@@ -631,6 +708,7 @@ void Execute_ImmVertex(u32 op) {
 
 void Execute_End(u32 op) {
 	DisplayList *list = currentList;
+	cyclesExecuted += 60;
 	const u32 prev = ReadListWord(list->pc - 4);
 	switch (prev >> 24) {
 	case GE_CMD_SIGNAL: {
@@ -763,7 +841,7 @@ void Execute_End(u32 op) {
 					list->started = false;
 				}
 				list->state = DL_STATE_COMPLETED;
-				NotifyListDone(*list);
+				NotifyListDone(*list, GeTicks());
 			}
 			break;
 		}
@@ -933,6 +1011,11 @@ void ExecuteOp(u32 op, u32 diff) {
 
 // Runs lists until one stalls, pauses or raises an interrupt (GPUCommon::ProcessDLQueue).
 void ProcessDLQueue() {
+	startingTicks = NowTicks();
+	cyclesExecuted = 0;
+	// Still busy with earlier work (a list before its stall): this starts when the GE gets free.
+	if (startingTicks < busyTicks)
+		cyclesExecuted = (s64)(busyTicks - startingTicks);
 	while (!dlQueue.empty()) {
 		const int listIndex = dlQueue.front();
 		DisplayList &list = dls[listIndex];
@@ -957,6 +1040,7 @@ void ProcessDLQueue() {
 		if (list.state != DL_STATE_RUNNING && !list.resumeHw)
 			list.hwStall = list.stall;
 		list.resumeHw = false;
+		cyclesExecuted += 60;
 		list.state = DL_STATE_RUNNING;
 		list.interrupted = false;
 		gpuState = list.pc == list.hwStall ? GPUSTATE_STALL : GPUSTATE_RUNNING;
@@ -975,6 +1059,8 @@ void ProcessDLQueue() {
 			const u32 diff = op ^ gstate.cmdmem[cmd];
 			gstate.cmdmem[cmd] = op;
 			g_stats.commands++;
+			// Two CPU cycles (the GE runs at half the clock) per command.
+			cyclesExecuted += 2;
 			ExecuteOp(op, diff);
 			list.pc += 4;
 		}
@@ -985,8 +1071,12 @@ void ProcessDLQueue() {
 			if (list.pendingInterrupt) {
 				// The list stays at the head until its finish callback has run (InterruptEnd), which wakes
 				// the sceGeDrawSync waiters. One that comes in between doesn't wait.
-				if (dlQueue.size() == 1)
-					drawPending = false;
+				// That was all the drawing though: a sceGeDrawSync from now on doesn't wait. The waiting ones
+				// are woken by the interrupt (InterruptEnd), after the finish callback.
+				if (dlQueue.size() == 1) {
+					drawCompleteTicks = GeTicks();
+					busyTicks = std::max(busyTicks, drawCompleteTicks);
+				}
 				return;
 			}
 			break;
@@ -996,14 +1086,15 @@ void ProcessDLQueue() {
 		case GPUSTATE_STALL:
 		case GPUSTATE_INTERRUPT:
 		default:
+			// Resumed later; the GE is busy with what it did so far.
+			busyTicks = std::max(busyTicks, GeTicks());
 			return;
 		}
 		if (list.state != DL_STATE_QUEUED)
 			RemoveFromQueue(listIndex);
 	}
 	currentList = nullptr;
-	if (drawPending)
-		NotifyDrawSyncDone();
+	SetDrawComplete(GeTicks());
 }
 
 // GeIntrHandler::run: starts the oldest pending interrupt. Returns true if there's a callback to run.
@@ -1092,7 +1183,7 @@ void DeliverInterruptSync() {
 bool BusyDrawing() {
 	// Stopped for a finish callback, and a signal callback unless it's a CONTINUE one.
 	if (interruptRunning) {
-		const bool continueSignal = currentList && currentList->signal == SIGNAL_HANDLER_CONTINUE;
+		const bool continueSignal = !pendingIntrs.empty() && pendingIntrs.front().cmd == GE_CMD_SIGNAL && !pendingIntrs.front().stops;
 		if (!continueSignal)
 			return false;
 	}
@@ -1116,7 +1207,8 @@ void ResetLists() {
 	currentList = nullptr;
 	interruptRunning = false;
 	isbreak = false;
-	drawPending = false;
+	drawCompleteTicks = 0;
+	busyTicks = 0;
 	gpuState = GPUSTATE_DONE;
 	asyncTaken = false;
 }
@@ -1290,7 +1382,7 @@ int EnqueueList(u32 listpc, u32 stall, int callbackId, u32 optParamAddr, bool he
 			id = possibleID;
 			break;
 		}
-		if (possible.state == DL_STATE_COMPLETED && !possible.waitPending)
+		if (possible.state == DL_STATE_COMPLETED && possible.waitUntilTicks <= NowTicks())
 			id = possibleID;
 	}
 	if (id < 0)
@@ -1308,7 +1400,7 @@ int EnqueueList(u32 listpc, u32 stall, int callbackId, u32 optParamAddr, bool he
 	dl.stackptr = 0;
 	dl.signal = SIGNAL_NONE;
 	dl.interrupted = false;
-	dl.waitPending = true;
+	dl.waitUntilTicks = NEVER;
 	dl.interruptsEnabled = true;
 	dl.started = false;
 	dl.offsetAddr = 0;
@@ -1316,7 +1408,8 @@ int EnqueueList(u32 listpc, u32 stall, int callbackId, u32 optParamAddr, bool he
 	dl.stackAddr = stackAddr;
 	dl.hung = false;
 	dl.context = 0;
-	if (argsValid && argsSize >= 8) {
+	// The context is used whatever the size says.
+	if (argsValid && ValidBytesAt(optParamAddr) >= 8) {
 		const u32 ctx = GRead32(optParamAddr + 4);
 		if (ctx && IsValidAddress(ctx))
 			dl.context = ctx;
@@ -1336,12 +1429,12 @@ int EnqueueList(u32 listpc, u32 stall, int callbackId, u32 optParamAddr, bool he
 	} else if (currentList) {
 		dl.state = DL_STATE_QUEUED;
 		dlQueue.push_back(id);
-		drawPending = true;
+		drawCompleteTicks = NEVER;
 	} else {
 		dl.state = DL_STATE_RUNNING;
 		currentList = &dl;
 		dlQueue.push_front(id);
-		drawPending = true;
+		drawCompleteTicks = NEVER;
 		runList = true;
 	}
 	if (runList)
@@ -1362,7 +1455,7 @@ int DequeueList(int listId) {
 		PopDLQueue();
 	else
 		RemoveFromQueue(listid);
-	NotifyListDone(dl);
+	NotifyListDone(dl, 0);
 	return 0;
 }
 
@@ -1398,14 +1491,14 @@ int ListSync(int listId, int mode) {
 		default: return (int)ERR_INVALID_ID;
 		}
 	}
-	return dl.waitPending ? SYNC_WAIT : 0;
+	return dl.waitUntilTicks > NowTicks() ? SYNC_WAIT : 0;
 }
 
 int DrawSync(int mode) {
 	if (mode < 0 || mode > 1)
 		return (int)ERR_INVALID_MODE;
 	if (mode == 0) {
-		if (drawPending)
+		if (drawCompleteTicks > NowTicks())
 			return SYNC_WAIT;
 		DrawSyncWoken();
 		return 0;
@@ -1423,6 +1516,17 @@ int DrawSync(int mode) {
 	if (top->state != DL_STATE_QUEUED && top->pc == top->stall)
 		return 3;
 	return 2;
+}
+
+u64 ListWaitTicks(int listId) {
+	const int listid = (int)(LIST_ID_MAGIC ^ (u32)listId);
+	if (listid < 0 || listid >= MAX_LISTS)
+		return 0;
+	return dls[listid].waitUntilTicks;
+}
+
+u64 DrawCompleteTicks() {
+	return drawCompleteTicks;
 }
 
 void DrawSyncWoken() {
@@ -1493,7 +1597,7 @@ int Continue() {
 				return (int)ERR_BUSY;
 			currentList->state = DL_STATE_RUNNING;
 			currentList->signal = SIGNAL_NONE;
-			drawPending = true;
+			drawCompleteTicks = NEVER;
 		} else {
 			currentList->state = DL_STATE_QUEUED;
 			currentList->signal = SIGNAL_NONE;

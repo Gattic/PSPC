@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: GPL-2.0-or-later
 #include "runtime/core/dispatch.h"
 
 #include <atomic>
@@ -19,6 +19,7 @@ constexpr u32 SLOTS = (1u << PAGE_SHIFT) / 4;
 
 struct Page {
 	HostFn slot[SLOTS];
+	BodyFn body[SLOTS];
 };
 
 std::unique_ptr<Page> g_pages[NUM_PAGES];
@@ -29,6 +30,16 @@ void Miss(u32 target) {
 	if (g_missHook) g_missHook(target);
 }
 
+Page &PageFor(u32 p) {
+	auto &page = g_pages[p >> PAGE_SHIFT];
+	if (!page) {
+		page = std::make_unique<Page>();
+		memset(page->slot, 0, sizeof(page->slot));
+		memset(page->body, 0, sizeof(page->body));
+	}
+	return *page;
+}
+
 }  // namespace
 
 void Init() {
@@ -36,18 +47,17 @@ void Init() {
 	g_count = 0;
 }
 
-void Register(u32 addr, HostFn fn) {
+void RegisterNative(u32 addr, HostFn fn, BodyFn body) {
 	u32 p = (addr & GUEST_ADDR_MASK);
-	auto &page = g_pages[p >> PAGE_SHIFT];
-	if (!page) {
-		page = std::make_unique<Page>();
-		memset(page->slot, 0, sizeof(page->slot));
-	}
-	HostFn &slot = page->slot[(p & 0xFFFF) >> 2];
+	Page &page = PageFor(p);
+	HostFn &slot = page.slot[(p & 0xFFFF) >> 2];
 	if (!slot && fn) g_count++;
 	if (slot && !fn) g_count--;
 	slot = fn;
+	page.body[(p & 0xFFFF) >> 2] = fn ? body : nullptr;
 }
+
+void Register(u32 addr, HostFn fn) { RegisterNative(addr, fn, nullptr); }
 
 void UnregisterRange(u32 addr, u32 size) {
 	for (u32 a = addr & ~3u; a < addr + size; a += 4) {
@@ -63,6 +73,7 @@ void UnregisterRange(u32 addr, u32 size) {
 			slot = nullptr;
 			g_count--;
 		}
+		page->body[(p & 0xFFFF) >> 2] = nullptr;
 	}
 }
 
@@ -71,6 +82,13 @@ HostFn Lookup(u32 addr) {
 	const auto &page = g_pages[p >> PAGE_SHIFT];
 	if (!page) return nullptr;
 	return page->slot[(p & 0xFFFF) >> 2];
+}
+
+BodyFn LookupBody(u32 addr) {
+	u32 p = addr & GUEST_ADDR_MASK;
+	const auto &page = g_pages[p >> PAGE_SHIFT];
+	if (!page) return nullptr;
+	return page->body[(p & 0xFFFF) >> 2];
 }
 
 u32 RegisteredCount() { return g_count.load(); }
@@ -86,8 +104,15 @@ void Call(Ctx *c, u32 target) {
 }
 
 void Jump(Ctx *c, u32 target, u32 ra0, u32 sp0) {
+	// Recompiled code continues the jumper's frame: it returns to ra0 like the jumper would.
+	if (BodyFn body = LookupBody(target)) {
+		c->pc = target;
+		body(c, ra0, sp0);
+		return;
+	}
 	if (HostFn fn = Lookup(target)) {
-		// The callee returns to whatever $ra holds now; continue there if it isn't our exit.
+		// A thunk with call semantics returns to whatever $ra holds now; continue there if it
+		// isn't our exit.
 		u32 ret = c->r[31];
 		c->pc = target;
 		fn(c);

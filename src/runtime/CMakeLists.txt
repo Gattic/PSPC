@@ -13,6 +13,7 @@ file(GLOB PSPC_KERNEL_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/kern
 add_library(pspc_runtime STATIC
 	boot.cpp
 	runtime.cpp
+	core/backtrace.cpp
 	core/cpu.cpp
 	core/dispatch.cpp
 	core/interp.cpp

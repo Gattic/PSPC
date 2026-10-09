@@ -27,14 +27,20 @@ struct Hooks {
 	// GE FINISH interrupt: the finish callback. The list reads COMPLETED, the GE is idle and its state is
 	// still what the list left; the context is restored and the next list starts after the hook returns.
 	void (*onFinish)(void *user, int listId, int callbackId, u32 finishArg) = nullptr;
-	// A list completed or was dequeued: wake threads in sceGeListSync(listId, 0).
+	// A list completed or was dequeued: wake threads in sceGeListSync(listId, 0) once ListWaitTicks(listId)
+	// has come.
 	void (*onListDone)(void *user, int listId) = nullptr;
-	// The queue drained: wake threads in sceGeDrawSync(0) (then call DrawSyncWoken() if any were woken).
+	// The queue drained: wake threads in sceGeDrawSync(0) once DrawCompleteTicks() has come (then call
+	// DrawSyncWoken() if any were woken).
 	void (*onDrawSyncDone)(void *user) = nullptr;
-	// Optional, enables asynchronous interrupt delivery: called when a GE interrupt is raised. The GE stays
-	// stopped; the HLE calls TakeInterrupt() when it can take it, runs the callback it names, then calls
-	// InterruptDone(). onSignal/onFinish are not used in this mode.
-	void (*onInterruptPending)(void *user) = nullptr;
+	// Optional, enables asynchronous interrupt delivery: called when a GE interrupt is raised, which
+	// happens at atTicks. The GE stays stopped; the HLE calls TakeInterrupt() when it can take it (from
+	// then), runs the callback it names, then calls InterruptDone(). onSignal/onFinish are unused then.
+	void (*onInterruptPending)(void *user, u64 atTicks) = nullptr;
+	// Optional, the CPU clock in cycles (222 MHz). The GE then takes time: lists run at once, but their
+	// interrupts and completion happen when they would on hardware (PPSSPP's cycle estimates), and
+	// sceGeListSync/sceGeDrawSync wait for that. Without it, everything happens at time 0.
+	u64 (*getTicks)(void *user) = nullptr;
 };
 void SetHooks(const Hooks &h);
 
@@ -52,6 +58,9 @@ int DrawSync(int mode);
 constexpr int SYNC_WAIT = 1;
 // After onDrawSyncDone woke at least one thread: completed lists become free (like the firmware's wake).
 void DrawSyncWoken();
+// When the waits of sceGeListSync(listId, 0) / sceGeDrawSync(0) end (~0: not yet known).
+u64 ListWaitTicks(int listId);
+u64 DrawCompleteTicks();
 int Break(int mode, u32 paramAddr);
 int Continue();
 u32 GetCmd(int cmd);

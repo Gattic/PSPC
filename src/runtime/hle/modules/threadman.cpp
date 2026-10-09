@@ -1,19 +1,24 @@
-﻿// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: GPL-2.0-or-later
 //
-// ThreadManForUser: threads, callbacks, delays, semaphores, event flags, mutexes, alarms and
-// system time. Behaviour (argument validation order, error codes, wake order) follows PPSSPP's
-// HLE, which encodes pspautotests results recorded on hardware.
+// ThreadManForUser: threads, callbacks, delays, dispatch control, system time, id lists and
+// thread event handlers. Synchronisation objects, alarms/VTimers, message boxes/pipes and memory
+// pools live in kernel_*.cpp and register into the same library.
+//
+// Behaviour (argument validation order, error codes, wake order, call costs) follows PPSSPP's
+// sceKernelThread.cpp / sceKernelTime.cpp, which encode pspautotests results recorded on hardware.
 // Portions derived from PPSSPP (https://github.com/hrydgard/ppsspp), Copyright (c) 2012- PPSSPP
 // Project, GPL-2.0-or-later.
 #include <algorithm>
+#include <map>
 
 #include "common/log.h"
-#include "runtime/core/cpu.h"
 #include "runtime/core/cpu.h"
 #include "runtime/hle/hle_wrap.h"
 #include "runtime/hle/modules/modules.h"
 #include "runtime/kernel/callbacks.h"
 #include "runtime/kernel/errors.h"
+#include "runtime/kernel/kernel_hle.h"
+#include "runtime/kernel/module.h"
 #include "runtime/kernel/scheduler.h"
 #include "runtime/kernel/sysmem.h"
 #include "runtime/kernel/threads.h"
@@ -23,7 +28,16 @@ using namespace kernel;
 
 namespace kernel {
 u32 g_threadReturnSyscall = 0;
+
+bool CallerIsKernelMode() {
+	PspThread *cur = sched::Current();
+	if (cur && (cur->attr & PSP_THREAD_ATTR_KERNEL)) return true;
+	if (cur) {
+		if (PspModule *m = Get<PspModule>(cur->moduleId)) return m->kernelMode;
+	}
+	return false;
 }
+}  // namespace kernel
 
 namespace {
 
@@ -36,20 +50,117 @@ PspThread *ThreadOrCurrent(SceUID id) {
 	return Get<PspThread>(id);
 }
 
-bool TimesOutAtOnce(u32 timeoutPtr) {
-	if (!timeoutPtr || !mem::IsValidRange(timeoutPtr, 4)) return false;
-	return GRead32(timeoutPtr) == 0;
+bool IsStopped(PspThread *t) { return (t->status & (THREADSTATUS_DORMANT | THREADSTATUS_DEAD)) != 0; }
+
+// ---------------------------------------------------------------- thread event handlers
+
+enum ThreadEventType : u32 {
+	THREADEVENT_CREATE = 1,
+	THREADEVENT_START = 2,
+	THREADEVENT_EXIT = 4,
+	THREADEVENT_DELETE = 8,
+	THREADEVENT_SUPPORTED = 15,
+};
+constexpr SceUID SCE_TE_THREADID_ALL_USER = (SceUID)0xFFFFFFF0;
+
+struct ThreadEventHandler : KObject {
+	static constexpr KType kType = KType::ThreadEventHandler;
+	KType Type() const override { return kType; }
+	SceUID threadId = 0;
+	u32 mask = 0, handler = 0, common = 0;
+};
+
+std::map<SceUID, std::vector<SceUID>> g_threadEventHandlers;
+
+// Runs the matching handlers as calls on the current thread. Returns true if any ran.
+bool TriggerThreadEvent(PspThread *subject, ThreadEventType type) {
+	if (g_threadEventHandlers.empty()) return false;
+	PspThread *cur = CurThread();
+	if (!cur || sched::InInterrupt()) return false;
+	bool ran = false;
+	auto runList = [&](SceUID key) {
+		auto it = g_threadEventHandlers.find(key);
+		if (it == g_threadEventHandlers.end()) return;
+		std::vector<SceUID> ids = it->second;
+		for (SceUID id : ids) {
+			ThreadEventHandler *h = Get<ThreadEventHandler>(id);
+			if (!h || (h->mask & type) == 0) continue;
+			cpu::CallGuest(&cur->ctx, h->handler, {(u32)type, (u32)subject->uid, h->common});
+			ran = true;
+		}
+	};
+	runList(subject->uid);
+	runList(SCE_TE_THREADID_ALL_USER);
+	return ran;
+}
+
+SceUID sceKernelRegisterThreadEventHandler(const char *name, SceUID threadId, u32 mask, u32 handler, u32 common) {
+	if (!name) return (SceUID)SCE_KERNEL_ERROR_ERROR;
+	if (threadId == 0 && mask != THREADEVENT_EXIT) return (SceUID)SCE_KERNEL_ERROR_ILLEGAL_ATTR;
+	if (threadId != SCE_TE_THREADID_ALL_USER && !Get<PspThread>(threadId)) return (SceUID)SCE_KERNEL_ERROR_UNKNOWN_THID;
+	if ((mask & ~THREADEVENT_SUPPORTED) != 0) return (SceUID)SCE_KERNEL_ERROR_ILLEGAL_MASK;
+	auto *h = new ThreadEventHandler();
+	h->name = TruncName(name);
+	h->threadId = threadId;
+	h->mask = mask;
+	h->handler = handler;
+	h->common = common;
+	SceUID id = Register(h);
+	g_threadEventHandlers[threadId].push_back(id);
+	return id;
+}
+
+int sceKernelReleaseThreadEventHandler(SceUID id) {
+	ThreadEventHandler *h = Get<ThreadEventHandler>(id);
+	if (!h) return (int)SCE_KERNEL_ERROR_UNKNOWN_TEID;
+	auto &list = g_threadEventHandlers[h->threadId];
+	list.erase(std::remove(list.begin(), list.end(), id), list.end());
+	if (list.empty()) g_threadEventHandlers.erase(h->threadId);
+	Destroy(id);
+	return 0;
+}
+
+int sceKernelReferThreadEventHandlerStatus(SceUID id, u32 infoPtr) {
+	ThreadEventHandler *h = Get<ThreadEventHandler>(id);
+	if (!h) return (int)SCE_KERNEL_ERROR_UNKNOWN_TEID;
+	struct {
+		u32 size;
+		char name[32];
+		SceUID threadId;
+		u32 mask, handler, common;
+	} info{};
+	info.size = sizeof(info);
+	CopyName(info.name, h->name);
+	info.threadId = h->threadId;
+	info.mask = h->mask;
+	info.handler = h->handler;
+	info.common = h->common;
+	if (mem::IsValidRange(infoPtr, sizeof(info)) && GRead32(infoPtr) != 0) mem::WriteBytes(infoPtr, &info, sizeof(info));
+	return 0;
 }
 
 // ---------------------------------------------------------------- threads
 
 int sceKernelCreateThread(const char *name, u32 entry, u32 prio, s32 stackSize, u32 attr, u32 optionAddr) {
+	(void)optionAddr;
 	PspThread *cur = CurThread();
 	u32 gp = cur ? cur->ctx.r[28] : 0;
 	SceUID mod = cur ? cur->moduleId : 0;
-	if ((attr & ~0xF0F0FFFFu) != 0) attr &= 0xF0F0FFFFu;
-	SceUID id = CreateThread(name, entry, (s32)prio, stackSize, attr, gp, mod);
-	if (id < 0) LOGD("THREAD", "sceKernelCreateThread(%s) failed %08x", name ? name : "(null)", id);
+	s64 fill = 0;
+	SceUID id = CreateThread(name, entry, (s32)prio, stackSize, attr, gp, mod, CallerIsKernelMode(), &fill);
+	if (id < 0) return id;
+	// Creating a thread resumes dispatch.
+	sched::SetDispatchEnabled(true);
+	// About 165us, plus filling the stack at a little under a cycle per byte (a busy wait that
+	// better threads can preempt): threads/scheduling/costs and preemptsyscall.
+	sched::ChargeCycles(37000);
+	sched::Reschedule();
+	PspThread *t = Get<PspThread>(id);
+	if (t && TriggerThreadEvent(t, THREADEVENT_CREATE)) {
+		sched::ChargeCycles(fill);
+	} else {
+		sched::BusyDelayCycles(fill);
+	}
 	return id;
 }
 
@@ -58,68 +169,94 @@ int sceKernelStartThread(SceUID id, s32 argSize, u32 argPtr) {
 	if (argSize < 0 || (argPtr & 0x80000000)) return (int)SCE_KERNEL_ERROR_ILLEGAL_ADDR;
 	PspThread *t = Get<PspThread>(id);
 	if (!t) return (int)SCE_KERNEL_ERROR_UNKNOWN_THID;
-	if (!t->IsDormant()) return (int)SCE_KERNEL_ERROR_NOT_DORMANT;
-	return StartThread(t, (u32)argSize, argPtr);
+	if (t->status != THREADSTATUS_DORMANT) return (int)SCE_KERNEL_ERROR_NOT_DORMANT;
+	sched::ChargeCycles(3400);
+	int r = StartThread(t, (u32)argSize, argPtr);
+	if (r == 0) TriggerThreadEvent(t, THREADEVENT_START);
+	return r;
+}
+
+[[noreturn]] void ExitThreadCommon(s32 status, bool deleteAfter) {
+	PspThread *t = CurThread();
+	TriggerThreadEvent(t, THREADEVENT_EXIT);
+	if (deleteAfter) {
+		DeleteThreadCallbacks(t);
+		FreeThreadStack(t);
+	}
+	sched::ExitCurrentThread(status, deleteAfter);
 }
 
 void _sceKernelExitThread(s32 status) {
-	sched::ExitCurrentThread(status, false);
+	if (!CurThread()) return;
+	ExitThreadCommon(status, false);
 }
 
 int sceKernelExitThread(s32 status) {
 	PspThread *t = CurThread();
 	if (!t) return (int)SCE_KERNEL_ERROR_ILLEGAL_CONTEXT;
+	if (!sched::DispatchEnabled() && CompiledSdkVersion() >= 0x03080000) return (int)SCE_KERNEL_ERROR_CAN_NOT_WAIT;
 	if (status < 0) status = (s32)SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT;
-	sched::ExitCurrentThread(status, false);
+	ExitThreadCommon(status, false);
 }
 
 int sceKernelExitDeleteThread(s32 status) {
 	PspThread *t = CurThread();
 	if (!t) return (int)SCE_KERNEL_ERROR_ILLEGAL_CONTEXT;
+	if (!sched::DispatchEnabled() && CompiledSdkVersion() >= 0x03080000) return (int)SCE_KERNEL_ERROR_CAN_NOT_WAIT;
+	ExitThreadCommon(status, true);
+}
+
+// Stops (if needed) and frees a thread that isn't the current one.
+void DestroyThread(PspThread *t) {
+	if (!IsStopped(t)) sched::TerminateThread(t, (s32)SCE_KERNEL_ERROR_THREAD_TERMINATED);
+	t->status = THREADSTATUS_DEAD;
 	DeleteThreadCallbacks(t);
 	FreeThreadStack(t);
-	sched::ExitCurrentThread(status, true);
+	TriggerThreadEvent(t, THREADEVENT_DELETE);
+	sched::DeleteThread(t);
 }
 
 int sceKernelDeleteThread(SceUID id) {
 	if (id == 0 || id == sched::CurrentId()) return (int)SCE_KERNEL_ERROR_NOT_DORMANT;
 	PspThread *t = Get<PspThread>(id);
 	if (!t) return (int)SCE_KERNEL_ERROR_UNKNOWN_THID;
-	if (!t->IsDormant()) return (int)SCE_KERNEL_ERROR_NOT_DORMANT;
-	for (SceUID w : t->endWaiters) {
-		if (PspThread *wt = Get<PspThread>(w); wt && wt->waitType == WAITTYPE_THREADEND && wt->waitId == id)
-			sched::Wake(wt, (s32)SCE_KERNEL_ERROR_WAIT_DELETE);
-	}
-	DeleteThreadCallbacks(t);
-	FreeThreadStack(t);
-	sched::DeleteThread(t);
+	if (!IsStopped(t)) return (int)SCE_KERNEL_ERROR_NOT_DORMANT;
+	// 50-100us whatever the stack size (threads/scheduling/costs).
+	sched::ChargeCycles(15000);
+	DestroyThread(t);
 	return 0;
 }
 
 int sceKernelTerminateThread(SceUID id) {
+	if (sched::InInterrupt() && CompiledSdkVersion() >= 0x03080000) return (int)SCE_KERNEL_ERROR_ILLEGAL_CONTEXT;
+	if (!sched::DispatchEnabled() && CompiledSdkVersion() >= 0x03080000) return (int)SCE_KERNEL_ERROR_CAN_NOT_WAIT;
 	if (id == 0 || id == sched::CurrentId()) return (int)SCE_KERNEL_ERROR_ILLEGAL_THID;
 	PspThread *t = Get<PspThread>(id);
 	if (!t) return (int)SCE_KERNEL_ERROR_UNKNOWN_THID;
-	if (t->IsDormant()) return (int)SCE_KERNEL_ERROR_DORMANT;
+	if (IsStopped(t)) return (int)SCE_KERNEL_ERROR_DORMANT;
+	// Threads this wakes are made ready, but nothing is dispatched until the next dispatch point
+	// (threads/threads/termsuspended).
 	sched::TerminateThread(t, (s32)SCE_KERNEL_ERROR_THREAD_TERMINATED);
-	sched::Reschedule();
+	TriggerThreadEvent(t, THREADEVENT_EXIT);
 	return 0;
 }
 
 int sceKernelTerminateDeleteThread(SceUID id) {
 	if (id == 0 || id == sched::CurrentId()) return (int)SCE_KERNEL_ERROR_ILLEGAL_THID;
+	if (!sched::DispatchEnabled() && CompiledSdkVersion() >= 0x03080000) return (int)SCE_KERNEL_ERROR_CAN_NOT_WAIT;
 	PspThread *t = Get<PspThread>(id);
 	if (!t) return (int)SCE_KERNEL_ERROR_UNKNOWN_THID;
-	if (!t->IsDormant()) sched::TerminateThread(t, (s32)SCE_KERNEL_ERROR_THREAD_TERMINATED);
-	DeleteThreadCallbacks(t);
-	FreeThreadStack(t);
-	sched::DeleteThread(t);
-	sched::Reschedule();
+	bool wasStopped = IsStopped(t);
+	if (!wasStopped) {
+		sched::TerminateThread(t, (s32)SCE_KERNEL_ERROR_THREAD_TERMINATED);
+		TriggerThreadEvent(t, THREADEVENT_EXIT);
+	}
+	DestroyThread(t);
 	return 0;
 }
 
 int sceKernelGetThreadId() {
-	if (sched::InInterrupt()) return (int)SCE_KERNEL_ERROR_ILLEGAL_CONTEXT;
+	sched::ChargeCycles(180);
 	return sched::CurrentId();
 }
 
@@ -129,14 +266,22 @@ int sceKernelGetThreadCurrentPriority() {
 }
 
 int sceKernelChangeThreadPriority(SceUID id, s32 prio) {
-	PspThread *t = ThreadOrCurrent(id);
+	if (id == 0) id = sched::CurrentId();
+	// 0 means the current (running) thread's priority, not the target's.
+	if (prio == 0 && CurThread()) prio = CurThread()->currentPriority;
+	PspThread *t = Get<PspThread>(id);
 	if (!t) return (int)SCE_KERNEL_ERROR_UNKNOWN_THID;
-	if (t->IsDormant()) return (int)SCE_KERNEL_ERROR_DORMANT;
-	if (prio == 0) prio = CurThread() ? CurThread()->currentPriority : prio;
+	if (IsStopped(t)) return (int)SCE_KERNEL_ERROR_DORMANT;
 	if (prio < 0x08 || prio > 0x77) return (int)SCE_KERNEL_ERROR_ILLEGAL_PRIORITY;
-	sched::ChangePriority(t, prio);
-	sched::Reschedule();
-	if (t == CurThread()) sched::YieldToSamePriority();
+	sched::ChargeCycles(450);
+	if (t == CurThread()) {
+		// The running thread goes to the back of its (new) priority's queue.
+		t->currentPriority = prio;
+		sched::YieldToSamePriority();
+	} else {
+		sched::ChangePriority(t, prio);
+		sched::Reschedule();
+	}
 	return 0;
 }
 
@@ -144,39 +289,47 @@ int sceKernelRotateThreadReadyQueue(s32 prio) {
 	PspThread *cur = CurThread();
 	if (!cur) return 0;
 	if (prio == 0) prio = cur->currentPriority;
-	if (prio < 0x08 || prio > 0x77) return (int)SCE_KERNEL_ERROR_ILLEGAL_PRIORITY;
-	if (prio == cur->currentPriority) {
-		sched::YieldToSamePriority();
-	} else {
+	if (prio <= 0x07 || prio > 0x77) return (int)SCE_KERNEL_ERROR_ILLEGAL_PRIORITY;
+	sched::ChargeCycles(250);
+	if (!sched::ReadyQueueEmpty(prio)) {
+		if (cur->currentPriority == prio) {
+			// Yield to everyone else of the same priority.
+			sched::YieldToSamePriority();
+			return 0;
+		}
 		sched::RotateReadyQueue(prio);
 	}
+	sched::Reschedule();
 	return 0;
 }
 
 int sceKernelGetThreadExitStatus(SceUID id) {
-	PspThread *t = ThreadOrCurrent(id);
+	sched::ChargeCycles(330);
+	PspThread *t = Get<PspThread>(id);
 	if (!t) return (int)SCE_KERNEL_ERROR_UNKNOWN_THID;
-	if (!t->IsDormant()) return (int)SCE_KERNEL_ERROR_NOT_DORMANT;
-	return t->exitStatus;
+	if (t->status == THREADSTATUS_DORMANT) return t->exitStatus;
+	return (int)SCE_KERNEL_ERROR_NOT_DORMANT;
 }
 
 int sceKernelGetThreadStackFreeSize(SceUID id) {
 	PspThread *t = ThreadOrCurrent(id);
 	if (!t) return (int)SCE_KERNEL_ERROR_UNKNOWN_THID;
-	// Count untouched 0xFF bytes from the bottom (after the UID word).
-	u32 n = 0;
-	for (u32 a = t->stackAddr + 4; a < t->stackAddr + t->stackSize; a++, n++) {
-		if (GRead8(a) != 0xFF) break;
+	// Count the untouched 0xFF bytes from 0x10 above the bottom (the UID is written there).
+	int n = 0;
+	if (t->stackSize > 0x10 && mem::IsValidRange(t->stackAddr + 0x10, t->stackSize - 0x10)) {
+		for (u32 off = 0x10; off < t->stackSize; ++off) {
+			if (GRead8(t->stackAddr + off) != 0xFF) break;
+			n++;
+		}
 	}
-	return (int)(n & ~3u);
+	return n & ~3;
 }
 
 int sceKernelCheckThreadStack() {
 	PspThread *t = CurThread();
-	if (!t) return 0;
-	u32 sp = t->ctx.r[29];
-	if (sp < t->stackAddr || sp > t->stackAddr + t->stackSize) return (int)SCE_KERNEL_ERROR_ILLEGAL_STACK_SIZE;
-	return (int)(sp - t->stackAddr);
+	if (!t) return -1;
+	s64 diff = (s64)t->ctx.r[29] - (s64)t->stackAddr;
+	return (int)(diff < 0 ? -diff : diff);
 }
 
 struct SceKernelThreadInfo {
@@ -201,56 +354,91 @@ struct SceKernelThreadInfo {
 };
 static_assert(sizeof(SceKernelThreadInfo) == 0x68, "thread info size");
 
-int sceKernelReferThreadStatus(SceUID id, u32 infoPtr) {
-	PspThread *t = ThreadOrCurrent(id);
-	if (!t) return (int)SCE_KERNEL_ERROR_UNKNOWN_THID;
-	if (!mem::IsValidRange(infoPtr, 4)) return (int)SCE_KERNEL_ERROR_ILLEGAL_ADDR;
-	u32 wanted = GRead32(infoPtr);
-	if (wanted == 0) return 0;
+SceKernelThreadInfo MakeThreadInfo(PspThread *t, u32 size) {
 	SceKernelThreadInfo info{};
-	info.size = sizeof(info);
-	strncpy(info.name, t->name.c_str(), 31);
+	info.size = size;
+	CopyName(info.name, t->name);
 	info.attr = t->attr;
 	info.status = t->status;
-	if (t == CurThread()) info.status = THREADSTATUS_RUNNING | (t->status & THREADSTATUS_SUSPEND);
-	if (t->inReadyQueue && !(t->status & THREADSTATUS_WAIT)) info.status = THREADSTATUS_READY;
+	bool current = t == CurThread();
+	if (current) {
+		sched::UpdateRunTime();
+		info.status = THREADSTATUS_RUNNING | (t->status & THREADSTATUS_SUSPEND);
+	}
 	info.entry = t->entry;
 	info.stack = t->stackAddr;
 	info.stackSize = (s32)t->stackSize;
 	info.gpReg = t->gpReg;
 	info.initPriority = t->initPriority;
 	info.currentPriority = t->currentPriority;
-	info.waitType = t->waitDone ? 0 : t->waitType;
-	info.waitId = t->waitDone ? 0 : t->waitId;
+	// A thread keeps reporting its last wait until it gets the CPU again.
+	bool showWait = !current && ((t->status & THREADSTATUS_WAIT) || t->waitDone);
+	info.waitType = showWait ? t->waitType : 0;
+	info.waitId = showWait ? t->waitId : 0;
 	info.wakeupCount = t->wakeupCount;
 	info.exitStatus = t->exitStatus;
+	info.runClocksLo = (u32)t->runUs;
+	info.runClocksHi = (u32)(t->runUs >> 32);
 	info.intrPreemptCount = (s32)t->intrPreemptCount;
 	info.threadPreemptCount = (s32)t->threadPreemptCount;
 	info.releaseCount = (s32)t->releaseCount;
-	u32 n = std::min<u32>(wanted, sizeof(info));
-	if (!mem::IsValidRange(infoPtr, n)) return (int)SCE_KERNEL_ERROR_ILLEGAL_ADDR;
-	memcpy(GPtr(infoPtr), &info, n);
+	return info;
+}
+
+int sceKernelReferThreadStatus(SceUID id, u32 infoPtr) {
+	constexpr u32 kSize = 104, kSizeAfter260 = 108;
+	PspThread *t = ThreadOrCurrent(id);
+	if (!t) {
+		sched::ChargeCycles(700);
+		sched::Reschedule();
+		return (int)SCE_KERNEL_ERROR_UNKNOWN_THID;
+	}
+	if (!mem::IsValidRange(infoPtr, 4) || (infoPtr & 3)) return 0;
+	u32 wanted = GRead32(infoPtr);
+	if (CompiledSdkVersion() > 0x02060010) {
+		if (wanted > kSizeAfter260) {
+			sched::ChargeCycles(1200);
+			sched::Reschedule();
+			return (int)SCE_KERNEL_ERROR_ILLEGAL_SIZE;
+		}
+		SceKernelThreadInfo info = MakeThreadInfo(t, kSizeAfter260);
+		if (wanted != 0) {
+			u32 n = std::min<u32>(wanted, sizeof(info));
+			if (mem::IsValidRange(infoPtr, wanted)) {
+				mem::WriteBytes(infoPtr, &info, n);
+				if (wanted > sizeof(info)) mem::Memset(infoPtr + sizeof(info), 0, wanted - sizeof(info));
+			}
+		}
+	} else {
+		SceKernelThreadInfo info = MakeThreadInfo(t, kSize);
+		u32 n = std::min(kSize, wanted);
+		if (n && mem::IsValidRange(infoPtr, n)) mem::WriteBytes(infoPtr, &info, n);
+	}
+	sched::ChargeCycles(1400);
+	sched::Reschedule();
 	return 0;
 }
 
-u32 sceKernelReferThreadRunStatus(SceUID id, u32 statusPtr) {
+int sceKernelReferThreadRunStatus(SceUID id, u32 statusPtr) {
 	PspThread *t = ThreadOrCurrent(id);
-	if (!t) return SCE_KERNEL_ERROR_UNKNOWN_THID;
-	if (!mem::IsValidRange(statusPtr, 4)) return SCE_KERNEL_ERROR_ILLEGAL_ADDR;
+	if (!t) return (int)SCE_KERNEL_ERROR_UNKNOWN_THID;
 	// SceKernelThreadRunStatus: size, status, currentPriority, waitType, waitId, wakeupCount,
 	// runForClocks(8), intr/thread preempt counts, releaseCount.
-	u32 buf[13] = {};
+	u32 buf[11] = {};
+	if (!mem::IsValidRange(statusPtr, sizeof(buf))) return -1;
+	SceKernelThreadInfo info = MakeThreadInfo(t, 0);
 	buf[0] = sizeof(buf);
-	buf[1] = t == CurThread() ? THREADSTATUS_RUNNING : t->status;
-	buf[2] = (u32)t->currentPriority;
-	buf[3] = t->waitType;
-	buf[4] = (u32)t->waitId;
-	buf[5] = (u32)t->wakeupCount;
-	buf[8] = t->intrPreemptCount;
-	buf[9] = t->threadPreemptCount;
-	buf[10] = t->releaseCount;
-	u32 wanted = std::min<u32>(GRead32(statusPtr), sizeof(buf));
-	if (wanted) mem::WriteBytes(statusPtr, buf, wanted);
+	buf[1] = info.status;
+	buf[2] = (u32)info.currentPriority;
+	buf[3] = info.waitType;
+	buf[4] = (u32)info.waitId;
+	buf[5] = (u32)info.wakeupCount;
+	buf[6] = info.runClocksLo;
+	buf[7] = info.runClocksHi;
+	buf[8] = (u32)info.intrPreemptCount;
+	buf[9] = (u32)info.threadPreemptCount;
+	buf[10] = (u32)info.releaseCount;
+	mem::WriteBytes(statusPtr, buf, sizeof(buf));
 	return 0;
 }
 
@@ -258,7 +446,7 @@ int sceKernelSuspendThread(SceUID id) {
 	if (id == 0 || id == sched::CurrentId()) return (int)SCE_KERNEL_ERROR_ILLEGAL_THID;
 	PspThread *t = Get<PspThread>(id);
 	if (!t) return (int)SCE_KERNEL_ERROR_UNKNOWN_THID;
-	if (t->IsDormant()) return (int)SCE_KERNEL_ERROR_DORMANT;
+	if (IsStopped(t)) return (int)SCE_KERNEL_ERROR_DORMANT;
 	if (t->IsSuspended()) return (int)SCE_KERNEL_ERROR_SUSPEND;
 	sched::Suspend(t);
 	return 0;
@@ -274,28 +462,59 @@ int sceKernelResumeThread(SceUID id) {
 	return 0;
 }
 
-static int WaitThreadEnd(SceUID id, u32 timeoutPtr, bool cb) {
+int WaitThreadEnd(SceUID id, u32 timeoutPtr, bool cb) {
 	if (id == 0 || id == sched::CurrentId()) return (int)SCE_KERNEL_ERROR_ILLEGAL_THID;
+	if (!sched::DispatchEnabled()) return (int)SCE_KERNEL_ERROR_CAN_NOT_WAIT;
+	if (sched::InInterrupt()) return (int)SCE_KERNEL_ERROR_ILLEGAL_CONTEXT;
 	PspThread *t = Get<PspThread>(id);
 	if (!t) return (int)SCE_KERNEL_ERROR_UNKNOWN_THID;
-	if (cb) RunPendingCallbacks(CurThread());
-	if (t->IsDormant()) return t->exitStatus;
-	if (TimesOutAtOnce(timeoutPtr)) return (int)SCE_KERNEL_ERROR_WAIT_TIMEOUT;
-	if (std::find(t->endWaiters.begin(), t->endWaiters.end(), sched::CurrentId()) == t->endWaiters.end())
-		t->endWaiters.push_back(sched::CurrentId());
-	return sched::Wait(WAITTYPE_THREADEND, id, timeoutPtr, cb);
+	PspThread *cur = CurThread();
+	if (t->status == THREADSTATUS_DORMANT) {
+		if (cb) RunPendingCallbacks(cur);
+		return t->exitStatus;
+	}
+	if (sched::WaitTimesOutAtOnce(timeoutPtr)) return (int)SCE_KERNEL_ERROR_WAIT_TIMEOUT;
+	SceUID me = cur->uid;
+	auto addWaiter = [id, me]() {
+		if (PspThread *target = Get<PspThread>(id)) {
+			if (std::find(target->endWaiters.begin(), target->endWaiters.end(), me) == target->endWaiters.end())
+				target->endWaiters.push_back(me);
+		}
+	};
+	addWaiter();
+	WaitHooks hooks;
+	hooks.pause = [id, me]() {
+		if (PspThread *target = Get<PspThread>(id))
+			target->endWaiters.erase(std::remove(target->endWaiters.begin(), target->endWaiters.end(), me),
+			                         target->endWaiters.end());
+	};
+	hooks.resume = [id, me, addWaiter]() {
+		PspThread *w = Get<PspThread>(me);
+		PspThread *target = Get<PspThread>(id);
+		if (!target) {
+			sched::Wake(w, (s32)SCE_KERNEL_ERROR_WAIT_DELETE);
+			return true;
+		}
+		if (target->status == THREADSTATUS_DORMANT) {
+			sched::Wake(w, target->exitStatus);
+			return true;
+		}
+		addWaiter();
+		return false;
+	};
+	return sched::Wait(WAITTYPE_THREADEND, id, timeoutPtr, cb, &hooks);
 }
 
 int sceKernelWaitThreadEnd(SceUID id, u32 timeoutPtr) { return WaitThreadEnd(id, timeoutPtr, false); }
 int sceKernelWaitThreadEndCB(SceUID id, u32 timeoutPtr) { return WaitThreadEnd(id, timeoutPtr, true); }
 
 int sceKernelReleaseWaitThread(SceUID id) {
-	if (id == sched::CurrentId()) return (int)SCE_KERNEL_ERROR_ILLEGAL_THID;
+	if (id == 0 || id == sched::CurrentId()) return (int)SCE_KERNEL_ERROR_ILLEGAL_THID;
 	PspThread *t = Get<PspThread>(id);
 	if (!t) return (int)SCE_KERNEL_ERROR_UNKNOWN_THID;
-	if (!t->IsWaiting() || t->waitDone) return (int)SCE_KERNEL_ERROR_NOT_WAIT;
-	if (t->waitType == WAITTYPE_HLEDELAY) return (int)SCE_KERNEL_ERROR_NOT_WAIT;
-	t->releaseCount++;
+	if (!t->IsWaiting() || t->waitDone || t->waitType == WAITTYPE_NONE) return (int)SCE_KERNEL_ERROR_NOT_WAIT;
+	if (t->waitType == WAITTYPE_HLEDELAY || t->waitType == WAITTYPE_MODULE) return (int)SCE_KERNEL_ERROR_NOT_WAIT;
+	t->waitTimeoutPtr = 0;  // a released wait leaves the timeout alone
 	sched::Wake(t, (s32)SCE_KERNEL_ERROR_RELEASE_WAIT);
 	sched::Reschedule();
 	return 0;
@@ -303,29 +522,41 @@ int sceKernelReleaseWaitThread(SceUID id) {
 
 // ---------------------------------------------------------------- sleep / delay
 
-static int SleepThread(bool cb) {
+int SleepThread(bool cb) {
 	PspThread *t = CurThread();
-	if (!t) return (int)SCE_KERNEL_ERROR_ILLEGAL_CONTEXT;
-	if (cb) RunPendingCallbacks(t);
-	if (t->wakeupCount > 0) {
+	if (!t) return -1;
+	bool pending = cb && HasPendingCallbacks(t) && CanRunCallbacks(t);
+	if (t->wakeupCount > 0 && !pending) {
 		t->wakeupCount--;
 		return 0;
 	}
-	return sched::Wait(WAITTYPE_SLEEP, 0, 0, cb);
+	SceUID me = t->uid;
+	WaitHooks hooks;
+	hooks.resume = [me]() {
+		PspThread *w = Get<PspThread>(me);
+		if (w && w->wakeupCount > 0) {
+			w->wakeupCount--;
+			sched::Wake(w, 0);
+			return true;
+		}
+		return false;
+	};
+	return sched::Wait(WAITTYPE_SLEEP, 0, 0, cb, &hooks);
 }
 
 int sceKernelSleepThread() { return SleepThread(false); }
 int sceKernelSleepThreadCB() { return SleepThread(true); }
 
 int sceKernelWakeupThread(SceUID id) {
-	PspThread *t = ThreadOrCurrent(id);
+	if (id == sched::CurrentId()) return (int)SCE_KERNEL_ERROR_ILLEGAL_THID;
+	PspThread *t = Get<PspThread>(id);
 	if (!t) return (int)SCE_KERNEL_ERROR_UNKNOWN_THID;
-	if (t->IsWaiting() && t->waitType == WAITTYPE_SLEEP && !t->waitDone) {
-		sched::Wake(t, 0);
-		sched::Reschedule();
-	} else {
+	if (!t->IsWaitingFor(WAITTYPE_SLEEP, 0)) {
 		t->wakeupCount++;
+		return 0;
 	}
+	sched::Wake(t, 0);
+	sched::Reschedule();
 	return 0;
 }
 
@@ -337,30 +568,42 @@ int sceKernelCancelWakeupThread(SceUID id) {
 	return count;
 }
 
+// Measured from inside the delaying thread, a delay of n us takes n + 25us, and at least 230us
+// (threads/scheduling/delaylen, handoff). Part of that is the call's own time before it waits.
+constexpr s64 kDelayCallCycles = 400;     // up to the "returns at once" decision
+constexpr s64 kDelayWaitCycles = 1700;    // setting up the wait
 u64 DelayUs(u64 us) {
-	if (us < 200) return 210;
+	if (us < 200) us = 205;
+	// Wraps around (seen on firmware), and potentially wakes up soon.
 	if (us > 0x8000000000000000ULL) us -= 0x8000000000000000ULL;
+	// Converting millennia to hundreds of years: basically forever, but no overflow.
 	if (us > 0x0010000000000000ULL) us >>= 12;
-	return us;
+	// It never wakes up right away.
+	return us + 15;
 }
 
-static int Delay(u64 us, bool cb) {
+int Delay(u64 us, bool cb, bool atOnceCheck) {
 	PspThread *t = CurThread();
 	if (!t) return (int)SCE_KERNEL_ERROR_ILLEGAL_CONTEXT;
+	sched::ChargeCycles(kDelayCallCycles);
+	if (atOnceCheck) {
+		if (sched::DelayReturnsAtOnce((u32)std::min<u64>(us, 0xFFFFFFFF)) && !(cb && HasPendingCallbacks(t))) return 0;
+	}
+	sched::ChargeCycles(kDelayWaitCycles);
 	u64 deadline = sched::NowUs() + DelayUs(us);
 	return sched::WaitUntil(WAITTYPE_DELAY, t->uid, deadline, cb);
 }
 
-int sceKernelDelayThread(u32 us) { return Delay(us, false); }
-int sceKernelDelayThreadCB(u32 us) { return Delay(us, true); }
+int sceKernelDelayThread(u32 us) { return Delay(us, false, true); }
+int sceKernelDelayThreadCB(u32 us) { return Delay(us, true, true); }
 
 int sceKernelDelaySysClockThread(u32 clockPtr) {
 	if (!mem::IsValidRange(clockPtr, 8)) return (int)SCE_KERNEL_ERROR_ILLEGAL_ADDRESS;
-	return Delay(GRead<u64>(clockPtr), false);
+	return Delay(GRead<u64>(clockPtr), false, false);
 }
 int sceKernelDelaySysClockThreadCB(u32 clockPtr) {
 	if (!mem::IsValidRange(clockPtr, 8)) return (int)SCE_KERNEL_ERROR_ILLEGAL_ADDRESS;
-	return Delay(GRead<u64>(clockPtr), true);
+	return Delay(GRead<u64>(clockPtr), true, false);
 }
 
 // ---------------------------------------------------------------- dispatch
@@ -369,15 +612,58 @@ u32 sceKernelSuspendDispatchThread() {
 	if (!*g_intrEnabled) return SCE_KERNEL_ERROR_CPUDI;
 	u32 old = sched::DispatchFlag() ? 1 : 0;
 	sched::SetDispatchEnabled(false);
+	sched::ChargeCycles(940);
 	return old;
 }
 
 u32 sceKernelResumeDispatchThread(u32 enabled) {
 	if (!*g_intrEnabled) return SCE_KERNEL_ERROR_CPUDI;
-	bool was = sched::DispatchFlag();
 	sched::SetDispatchEnabled(enabled != 0);
-	if (!was && enabled) sched::Reschedule();
+	sched::ChargeCycles(940);
+	sched::Reschedule();
 	return 0;
+}
+
+int sceKernelChangeCurrentThreadAttr(u32 clearAttr, u32 setAttr) {
+	if ((clearAttr & ~PSP_THREAD_ATTR_VFPU) != 0 || (setAttr & ~PSP_THREAD_ATTR_VFPU) != 0)
+		return (int)SCE_KERNEL_ERROR_ILLEGAL_ATTR;
+	PspThread *t = CurThread();
+	if (!t) return -1;
+	t->attr = (t->attr & ~clearAttr) | setAttr;
+	return 0;
+}
+
+// sceKernelExtendThreadStack(size, entry, arg): run entry(arg) on a fresh stack, which the
+// thread reports as its stack meanwhile.
+u32 sceKernelExtendThreadStack(u32 size, u32 entry, u32 arg) {
+	if (size < 512) return SCE_KERNEL_ERROR_ILLEGAL_STACK_SIZE;
+	PspThread *t = CurThread();
+	if (!t) return (u32)-1;
+	u32 stack = g_userMem.Alloc(size, true, ("extended/" + t->name).c_str());
+	if (!stack) return SCE_KERNEL_ERROR_NO_MEMORY;
+	u32 blockSize = g_userMem.BlockSize(stack);
+	if (!blockSize) blockSize = AlignUp(size, 0x100);
+	t->pushedStacks.push_back({t->stackAddr, t->stackSize});
+	t->stackAddr = stack;
+	t->stackSize = blockSize;
+	mem::Memset(stack, 0xFF, blockSize);
+	GWrite32(stack, (u32)t->uid);
+	u32 end = stack + blockSize;
+	// The firmware saves ra, sp and pc at the top of the new stack.
+	GWrite32(end - 4, t->ctx.r[31]);
+	GWrite32(end - 8, t->ctx.r[29]);
+	GWrite32(end - 12, hle::CurrentCallerPc() + 8);
+	u32 oldSp = t->ctx.r[29];
+	t->ctx.r[29] = end - 0x10;
+	u32 result = cpu::CallGuest(&t->ctx, entry, {arg});
+	t->ctx.r[29] = oldSp;
+	if (!t->pushedStacks.empty()) {
+		g_userMem.Free(t->stackAddr);
+		t->stackAddr = t->pushedStacks.back().first;
+		t->stackSize = t->pushedStacks.back().second;
+		t->pushedStacks.pop_back();
+	}
+	return result;
 }
 
 // ---------------------------------------------------------------- callbacks
@@ -397,7 +683,16 @@ int sceKernelDeleteCallback(SceUID id) {
 	return 0;
 }
 
-int sceKernelNotifyCallback(SceUID id, s32 arg) { return NotifyCallback(id, arg); }
+int sceKernelNotifyCallback(SceUID id, s32 arg) {
+	Callback *cb = Get<Callback>(id);
+	if (!cb) return (int)SCE_KERNEL_ERROR_UNKNOWN_CBID;
+	SceUID owner = cb->threadId;
+	NotifyCallback(id, arg);
+	// A better priority thread in a CB wait runs the callback right away.
+	PspThread *t = Get<PspThread>(owner);
+	if (t && t != CurThread() && t->IsWaiting() && t->waitCallbacks) sched::Reschedule();
+	return 0;
+}
 
 int sceKernelCancelCallback(SceUID id) {
 	Callback *cb = Get<Callback>(id);
@@ -416,8 +711,6 @@ int sceKernelGetCallbackCount(SceUID id) {
 int sceKernelReferCallbackStatus(SceUID id, u32 infoPtr) {
 	Callback *cb = Get<Callback>(id);
 	if (!cb) return (int)SCE_KERNEL_ERROR_UNKNOWN_CBID;
-	if (!mem::IsValidRange(infoPtr, 4)) return 0;
-	// SceKernelCallbackInfo: size, name[32], threadId, callback, common, notifyCount, notifyArg.
 	struct {
 		u32 size;
 		char name[32];
@@ -427,56 +720,85 @@ int sceKernelReferCallbackStatus(SceUID id, u32 infoPtr) {
 		s32 notifyCount;
 		s32 notifyArg;
 	} info{};
+	if (!mem::IsValidRange(infoPtr, sizeof(info)) || GRead32(infoPtr) == 0) return 0;
 	info.size = sizeof(info);
-	strncpy(info.name, cb->name.c_str(), 31);
+	CopyName(info.name, cb->name);
 	info.threadId = cb->threadId;
 	info.callback = cb->entry;
 	info.common = cb->commonArg;
 	info.notifyCount = cb->notifyCount;
 	info.notifyArg = cb->notifyArg;
-	u32 wanted = std::min<u32>(GRead32(infoPtr), sizeof(info));
-	if (wanted) mem::WriteBytes(infoPtr, &info, wanted);
+	mem::WriteBytes(infoPtr, &info, sizeof(info));
 	return 0;
 }
 
 void sceKernelCheckCallback(Ctx *c) {
 	PspThread *t = CurThread();
+	sched::ChargeCycles(230);
+	// Unlike CB waits, this refuses to run callbacks from inside one.
+	if (t && t->callbackDepth > 0) {
+		c->r[2] = SCE_KERNEL_ERROR_ILLEGAL_CONTEXT;
+		return;
+	}
 	c->r[2] = (t && RunPendingCallbacks(t)) ? 1 : 0;
 }
 
 // ---------------------------------------------------------------- time
 
-struct SceKernelSysClock {
-	u32 low, hi;
-};
-
-u64 sceKernelGetSystemTimeWide() { return sched::NowUs(); }
-u32 sceKernelGetSystemTimeLow() { return (u32)sched::NowUs(); }
 int sceKernelGetSystemTime(u32 clockPtr) {
-	if (!mem::IsValidRange(clockPtr, 8)) return (int)SCE_KERNEL_ERROR_ILLEGAL_ADDR;
-	GWrite<u64>(clockPtr, sched::NowUs());
+	u64 t = sched::NowUs();
+	if (mem::IsValidRange(clockPtr, 8) && (clockPtr & 3) == 0) GWrite<u64>(clockPtr, t);
+	sched::ChargeCycles(265);
 	return 0;
+}
+// TEMP-TIMETRACE
+static bool TimeTrace() { static int on = -1; if (on < 0) on = getenv("PSPC_TIMETRACE") != nullptr; return on; }
+u32 sceKernelGetSystemTimeLow() {
+	u64 t = sched::NowUs();
+	if (TimeTrace()) fprintf(stderr, "[tt] %s %llu\n", CurThread() ? CurThread()->name.c_str() : "?", (unsigned long long)t);
+	sched::ChargeCycles(165);
+	return (u32)t;
+}
+u64 sceKernelGetSystemTimeWide() {
+	u64 t = sched::NowUs();
+	sched::ChargeCycles(250);
+	return t;
 }
 
 int sceKernelUSec2SysClock(u32 us, u32 clockPtr) {
-	if (mem::IsValidRange(clockPtr, 8)) GWrite<u64>(clockPtr, us);
+	if (mem::IsValidRange(clockPtr, 8) && (clockPtr & 3) == 0) GWrite<u64>(clockPtr, us);
+	sched::ChargeCycles(165);
 	return 0;
 }
-u64 sceKernelUSec2SysClockWide(u32 us) { return us; }
-int sceKernelSysClock2USec(u32 clockPtr, u32 lowPtr, u32 highPtr) {
-	u64 t = mem::IsValidRange(clockPtr, 8) ? GRead<u64>(clockPtr) : 0;
-	if (mem::IsValidRange(lowPtr, 4)) GWrite32(lowPtr, (u32)(t / 1000000));
-	if (mem::IsValidRange(highPtr, 4)) GWrite32(highPtr, (u32)(t % 1000000));
+u64 sceKernelUSec2SysClockWide(u32 us) {
+	sched::ChargeCycles(150);
+	return us;
+}
+int sceKernelSysClock2USec(u32 clockPtr, u32 highPtr, u32 lowPtr) {
+	if (!mem::IsValidRange(clockPtr, 8)) return -1;
+	u64 t = GRead<u64>(clockPtr);
+	if (mem::IsValidRange(highPtr, 4) && (highPtr & 3) == 0) GWrite32(highPtr, (u32)(t / 1000000));
+	if (mem::IsValidRange(lowPtr, 4) && (lowPtr & 3) == 0) GWrite32(lowPtr, (u32)(t % 1000000));
+	sched::ChargeCycles(415);
 	return 0;
 }
-int sceKernelSysClock2USecWide(u32 lo, u32 hi, u32 secPtr, u32 usecPtr) {
+int sceKernelSysClock2USecWide(u32 lo, u32 hi, u32 lowPtr, u32 highPtr) {
 	u64 t = ((u64)hi << 32) | lo;
-	if (mem::IsValidRange(secPtr, 4)) GWrite32(secPtr, (u32)(t / 1000000));
-	if (mem::IsValidRange(usecPtr, 4)) GWrite32(usecPtr, (u32)(t % 1000000));
+	if (mem::IsValidRange(lowPtr, 4) && (lowPtr & 3) == 0) {
+		GWrite32(lowPtr, (u32)(t / 1000000));
+		if (mem::IsValidRange(highPtr, 4) && (highPtr & 3) == 0) GWrite32(highPtr, (u32)(t % 1000000));
+	} else if (mem::IsValidRange(highPtr, 4) && (highPtr & 3) == 0) {
+		GWrite32(highPtr, (u32)t);
+	}
+	sched::ChargeCycles(385);
 	return 0;
 }
 
-u32 sceKernelLibcClock() { return (u32)sched::NowUs(); }
+u32 sceKernelLibcClock() {
+	u32 t = (u32)sched::NowUs();
+	sched::ChargeCycles(330);
+	return t;
+}
 u32 sceKernelLibcGettimeofday(u32 tvPtr, u32 tzPtr) {
 	if (mem::IsValidRange(tvPtr, 8)) {
 		u64 now = sched::NowUs() + 1262304000ull * 1000000ull;  // arbitrary epoch base (2010)
@@ -484,623 +806,109 @@ u32 sceKernelLibcGettimeofday(u32 tvPtr, u32 tzPtr) {
 		GWrite32(tvPtr + 4, (u32)(now % 1000000));
 	}
 	(void)tzPtr;
+	sched::ChargeCycles(1885);
 	return 0;
 }
 
 int sceKernelDcacheWritebackAll() { return 0; }
 int sceKernelDcacheWritebackInvalidateAll() { return 0; }
 
-// ---------------------------------------------------------------- semaphores
-
-struct Semaphore : KObject {
-	static constexpr KType kType = KType::Semaphore;
-	KType Type() const override { return kType; }
-	u32 attr = 0;
-	s32 initCount = 0, count = 0, maxCount = 0;
-	WaitQueue waiters;
-};
-
-constexpr u32 PSP_SEMA_ATTR_PRIORITY = 0x100;
-
-// Wake waiters that can now take their count. Returns true if any woke.
-bool SemaWakeWaiters(Semaphore *s) {
-	s->waiters.Cleanup(WAITTYPE_SEMA, s->uid);
-	if (s->attr & PSP_SEMA_ATTR_PRIORITY) s->waiters.SortByPriority();
-	bool woke = false;
-	for (size_t i = 0; i < s->waiters.threads.size();) {
-		PspThread *t = Get<PspThread>(s->waiters.threads[i]);
-		s32 want = (s32)t->waitValue[0];
-		if (want > s->count) {
-			if (!(s->attr & PSP_SEMA_ATTR_PRIORITY)) break;  // FIFO: strict order
-			i++;
-			continue;
-		}
-		s->count -= want;
-		s->waiters.threads.erase(s->waiters.threads.begin() + i);
-		sched::Wake(t, 0);
-		woke = true;
-	}
-	return woke;
-}
-
-int sceKernelCreateSema(const char *name, u32 attr, s32 initVal, s32 maxVal, u32 optPtr) {
-	if (!name) return (int)SCE_KERNEL_ERROR_ERROR;
-	if (attr >= 0x200) return (int)SCE_KERNEL_ERROR_ILLEGAL_ATTR;
-	auto *s = new Semaphore();
-	s->name = name;
-	s->attr = attr;
-	s->initCount = s->count = initVal;
-	s->maxCount = maxVal;
-	(void)optPtr;
-	return Register(s);
-}
-
-int sceKernelDeleteSema(SceUID id) {
-	Semaphore *s = Get<Semaphore>(id);
-	if (!s) return (int)SCE_KERNEL_ERROR_UNKNOWN_SEMID;
-	bool woke = s->waiters.WakeAll(WAITTYPE_SEMA, id, (s32)SCE_KERNEL_ERROR_WAIT_DELETE);
-	Destroy(id);
-	if (woke) sched::Reschedule();
-	return 0;
-}
-
-int sceKernelSignalSema(SceUID id, s32 signal) {
-	Semaphore *s = Get<Semaphore>(id);
-	if (!s) return (int)SCE_KERNEL_ERROR_UNKNOWN_SEMID;
-	int waiting = s->waiters.Count(WAITTYPE_SEMA, id);
-	if ((s64)s->count + signal - waiting > s->maxCount) return (int)SCE_KERNEL_ERROR_SEMA_OVF;
-	s->count += signal;
-	if (SemaWakeWaiters(s)) sched::Reschedule();
-	return 0;
-}
-
-static int WaitSema(SceUID id, s32 want, u32 timeoutPtr, bool cb) {
-	if (want <= 0) return (int)SCE_KERNEL_ERROR_ILLEGAL_COUNT;
-	Semaphore *s = Get<Semaphore>(id);
-	if (!s) return (int)SCE_KERNEL_ERROR_UNKNOWN_SEMID;
-	if (want > s->maxCount) return (int)SCE_KERNEL_ERROR_ILLEGAL_COUNT;
-	PspThread *t = CurThread();
-	bool hasCallbacks = cb && t && HasPendingCallbacks(t);
-	if (s->count >= want && s->waiters.Count(WAITTYPE_SEMA, id) == 0 && !hasCallbacks) {
-		s->count -= want;
-		return 0;
-	}
-	if (!hasCallbacks && TimesOutAtOnce(timeoutPtr)) return (int)SCE_KERNEL_ERROR_WAIT_TIMEOUT;
-	if (!sched::DispatchEnabled()) return (int)SCE_KERNEL_ERROR_CAN_NOT_WAIT;
-	t->waitValue[0] = (u32)want;
-	s->waiters.Add(t->uid);
-	SceUID semId = id;
-	t->timeoutHook = [semId]() {
-		// FIFO semaphores: a timed-out head may unblock the next waiter.
-		if (Semaphore *sm = Get<Semaphore>(semId)) {
-			PspThread *cur = sched::Current();
-			(void)cur;
-			sched::ScheduleEvent(0, [semId]() {
-				if (Semaphore *s2 = Get<Semaphore>(semId)) SemaWakeWaiters(s2);
-			});
-			(void)sm;
-		}
-	};
-	return sched::Wait(WAITTYPE_SEMA, id, timeoutPtr, cb);
-}
-
-int sceKernelWaitSema(SceUID id, s32 want, u32 timeoutPtr) { return WaitSema(id, want, timeoutPtr, false); }
-int sceKernelWaitSemaCB(SceUID id, s32 want, u32 timeoutPtr) { return WaitSema(id, want, timeoutPtr, true); }
-
-int sceKernelPollSema(SceUID id, s32 want) {
-	if (want <= 0) return (int)SCE_KERNEL_ERROR_ILLEGAL_COUNT;
-	Semaphore *s = Get<Semaphore>(id);
-	if (!s) return (int)SCE_KERNEL_ERROR_UNKNOWN_SEMID;
-	if (s->count >= want && s->waiters.Count(WAITTYPE_SEMA, id) == 0) {
-		s->count -= want;
-		return 0;
-	}
-	return (int)SCE_KERNEL_ERROR_SEMA_ZERO;
-}
-
-int sceKernelCancelSema(SceUID id, s32 newCount, u32 numWaitPtr) {
-	Semaphore *s = Get<Semaphore>(id);
-	if (!s) return (int)SCE_KERNEL_ERROR_UNKNOWN_SEMID;
-	if (newCount > s->maxCount) return (int)SCE_KERNEL_ERROR_ILLEGAL_COUNT;
-	int n = s->waiters.Count(WAITTYPE_SEMA, id);
-	if (mem::IsValidRange(numWaitPtr, 4)) GWrite32(numWaitPtr, (u32)n);
-	s->count = newCount < 0 ? s->initCount : newCount;
-	if (s->waiters.WakeAll(WAITTYPE_SEMA, id, (s32)SCE_KERNEL_ERROR_WAIT_CANCEL)) sched::Reschedule();
-	return 0;
-}
-
-int sceKernelReferSemaStatus(SceUID id, u32 infoPtr) {
-	Semaphore *s = Get<Semaphore>(id);
-	if (!s) return (int)SCE_KERNEL_ERROR_UNKNOWN_SEMID;
-	if (!mem::IsValidRange(infoPtr, 4)) return -1;
-	struct {
-		u32 size;
-		char name[32];
-		u32 attr;
-		s32 initCount, currentCount, maxCount, numWaitThreads;
-	} info{};
-	info.size = sizeof(info);
-	strncpy(info.name, s->name.c_str(), 31);
-	info.attr = s->attr;
-	info.initCount = s->initCount;
-	info.currentCount = s->count;
-	info.maxCount = s->maxCount;
-	info.numWaitThreads = s->waiters.Count(WAITTYPE_SEMA, id);
-	u32 wanted = std::min<u32>(GRead32(infoPtr), sizeof(info));
-	if (wanted) mem::WriteBytes(infoPtr, &info, wanted);
-	return 0;
-}
-
-// ---------------------------------------------------------------- event flags
-
-struct EventFlag : KObject {
-	static constexpr KType kType = KType::EventFlag;
-	KType Type() const override { return kType; }
-	u32 attr = 0, initPattern = 0, pattern = 0;
-	WaitQueue waiters;
-};
-
-constexpr u32 PSP_EVENT_WAITMULTIPLE = 0x200;
-constexpr u32 PSP_EVENT_WAITOR = 0x01;
-constexpr u32 PSP_EVENT_WAITCLEARALL = 0x10;
-constexpr u32 PSP_EVENT_WAITCLEAR = 0x20;
-constexpr u32 PSP_EVENT_WAITKNOWN = PSP_EVENT_WAITCLEAR | PSP_EVENT_WAITCLEARALL | PSP_EVENT_WAITOR;
-
-bool EvfMatches(u32 pattern, u32 bits, u32 mode) {
-	return (mode & PSP_EVENT_WAITOR) ? (bits & pattern) != 0 : (bits & pattern) == bits;
-}
-
-bool EvfApply(u32 &pattern, u32 bits, u32 mode, u32 outAddr) {
-	if (!EvfMatches(pattern, bits, mode)) return false;
-	if (outAddr && mem::IsValidRange(outAddr, 4)) GWrite32(outAddr, pattern);
-	if (mode & PSP_EVENT_WAITCLEAR) pattern &= ~bits;
-	if (mode & PSP_EVENT_WAITCLEARALL) pattern = 0;
-	return true;
-}
-
-int sceKernelCreateEventFlag(const char *name, u32 attr, u32 initPattern, u32 optPtr) {
-	if (!name) return (int)SCE_KERNEL_ERROR_ERROR;
-	if ((attr & 0x100) != 0 || attr >= 0x300) return (int)SCE_KERNEL_ERROR_ILLEGAL_ATTR;
-	auto *e = new EventFlag();
-	e->name = name;
-	e->attr = attr;
-	e->initPattern = e->pattern = initPattern;
-	(void)optPtr;
-	return Register(e);
-}
-
-u32 sceKernelDeleteEventFlag(SceUID id) {
-	EventFlag *e = Get<EventFlag>(id);
-	if (!e) return SCE_KERNEL_ERROR_UNKNOWN_EVFID;
-	e->waiters.Cleanup(WAITTYPE_EVENTFLAG, id);
-	for (SceUID u : e->waiters.threads) {
-		PspThread *t = Get<PspThread>(u);
-		if (t->waitValue[2] && mem::IsValidRange(t->waitValue[2], 4)) GWrite32(t->waitValue[2], e->pattern);
-	}
-	bool woke = e->waiters.WakeAll(WAITTYPE_EVENTFLAG, id, (s32)SCE_KERNEL_ERROR_WAIT_DELETE);
-	Destroy(id);
-	if (woke) sched::Reschedule();
-	return 0;
-}
-
-u32 sceKernelSetEventFlag(SceUID id, u32 bits) {
-	EventFlag *e = Get<EventFlag>(id);
-	if (!e) return SCE_KERNEL_ERROR_UNKNOWN_EVFID;
-	e->pattern |= bits;
-	e->waiters.Cleanup(WAITTYPE_EVENTFLAG, id);
-	bool woke = false;
-	for (size_t i = 0; i < e->waiters.threads.size();) {
-		PspThread *t = Get<PspThread>(e->waiters.threads[i]);
-		if (EvfApply(e->pattern, t->waitValue[0], t->waitValue[1], t->waitValue[2])) {
-			e->waiters.threads.erase(e->waiters.threads.begin() + i);
-			sched::Wake(t, 0);
-			woke = true;
-		} else {
-			i++;
-		}
-	}
-	if (woke) sched::Reschedule();
-	return 0;
-}
-
-u32 sceKernelClearEventFlag(SceUID id, u32 bits) {
-	EventFlag *e = Get<EventFlag>(id);
-	if (!e) return SCE_KERNEL_ERROR_UNKNOWN_EVFID;
-	e->pattern &= bits;
-	return 0;
-}
-
-static int WaitEventFlag(SceUID id, u32 bits, u32 mode, u32 outBitsPtr, u32 timeoutPtr, bool cb) {
-	if ((mode & ~PSP_EVENT_WAITKNOWN) != 0) return (int)SCE_KERNEL_ERROR_ILLEGAL_MODE;
-	if (bits == 0) return (int)SCE_KERNEL_ERROR_EVF_ILPAT;
-	if (!sched::DispatchEnabled()) return (int)SCE_KERNEL_ERROR_CAN_NOT_WAIT;
-	EventFlag *e = Get<EventFlag>(id);
-	if (!e) return (int)SCE_KERNEL_ERROR_UNKNOWN_EVFID;
-	PspThread *t = CurThread();
-	bool hasCallbacks = cb && HasPendingCallbacks(t);
-	if (!hasCallbacks && EvfApply(e->pattern, bits, mode, outBitsPtr)) return 0;
-	if (hasCallbacks && EvfMatches(e->pattern, bits, mode)) {
-		RunPendingCallbacks(t);
-		if (EvfApply(e->pattern, bits, mode, outBitsPtr)) return 0;
-	}
-	if (e->waiters.Count(WAITTYPE_EVENTFLAG, id) > 0 && (e->attr & PSP_EVENT_WAITMULTIPLE) == 0)
-		return (int)SCE_KERNEL_ERROR_EVF_MULTI;
-	if (TimesOutAtOnce(timeoutPtr)) {
-		if (outBitsPtr && mem::IsValidRange(outBitsPtr, 4)) GWrite32(outBitsPtr, e->pattern);
-		return (int)SCE_KERNEL_ERROR_WAIT_TIMEOUT;
-	}
-	t->waitValue[0] = bits;
-	t->waitValue[1] = mode;
-	t->waitValue[2] = outBitsPtr;
-	e->waiters.Add(t->uid);
-	t->timeoutHook = [id, outBitsPtr]() {
-		if (EventFlag *ev = Get<EventFlag>(id); ev && outBitsPtr && mem::IsValidRange(outBitsPtr, 4))
-			GWrite32(outBitsPtr, ev->pattern);
-	};
-	return sched::Wait(WAITTYPE_EVENTFLAG, id, timeoutPtr, cb);
-}
-
-int sceKernelWaitEventFlag(SceUID id, u32 bits, u32 mode, u32 outBitsPtr, u32 timeoutPtr) {
-	return WaitEventFlag(id, bits, mode, outBitsPtr, timeoutPtr, false);
-}
-int sceKernelWaitEventFlagCB(SceUID id, u32 bits, u32 mode, u32 outBitsPtr, u32 timeoutPtr) {
-	return WaitEventFlag(id, bits, mode, outBitsPtr, timeoutPtr, true);
-}
-
-int sceKernelPollEventFlag(SceUID id, u32 bits, u32 mode, u32 outBitsPtr) {
-	if ((mode & ~PSP_EVENT_WAITKNOWN) != 0) return (int)SCE_KERNEL_ERROR_ILLEGAL_MODE;
-	if ((mode & PSP_EVENT_WAITCLEARALL) && (mode & PSP_EVENT_WAITCLEAR)) return (int)SCE_KERNEL_ERROR_ILLEGAL_MODE;
-	if (bits == 0) return (int)SCE_KERNEL_ERROR_EVF_ILPAT;
-	EventFlag *e = Get<EventFlag>(id);
-	if (!e) return (int)SCE_KERNEL_ERROR_UNKNOWN_EVFID;
-	if (EvfApply(e->pattern, bits, mode, outBitsPtr)) return 0;
-	if (outBitsPtr && mem::IsValidRange(outBitsPtr, 4)) GWrite32(outBitsPtr, e->pattern);
-	if (e->waiters.Count(WAITTYPE_EVENTFLAG, id) > 0 && (e->attr & PSP_EVENT_WAITMULTIPLE) == 0)
-		return (int)SCE_KERNEL_ERROR_EVF_MULTI;
-	return (int)SCE_KERNEL_ERROR_EVF_COND;
-}
-
-u32 sceKernelCancelEventFlag(SceUID id, u32 pattern, u32 numWaitPtr) {
-	EventFlag *e = Get<EventFlag>(id);
-	if (!e) return SCE_KERNEL_ERROR_UNKNOWN_EVFID;
-	int n = e->waiters.Count(WAITTYPE_EVENTFLAG, id);
-	if (mem::IsValidRange(numWaitPtr, 4)) GWrite32(numWaitPtr, (u32)n);
-	e->pattern = pattern;
-	for (SceUID u : e->waiters.threads) {
-		PspThread *t = Get<PspThread>(u);
-		if (t->waitValue[2] && mem::IsValidRange(t->waitValue[2], 4)) GWrite32(t->waitValue[2], pattern);
-	}
-	if (e->waiters.WakeAll(WAITTYPE_EVENTFLAG, id, (s32)SCE_KERNEL_ERROR_WAIT_CANCEL)) sched::Reschedule();
-	return 0;
-}
-
-u32 sceKernelReferEventFlagStatus(SceUID id, u32 infoPtr) {
-	EventFlag *e = Get<EventFlag>(id);
-	if (!e) return SCE_KERNEL_ERROR_UNKNOWN_EVFID;
-	if (!mem::IsValidRange(infoPtr, 4)) return 0;
-	struct {
-		u32 size;
-		char name[32];
-		u32 attr, initPattern, currentPattern;
-		s32 numWaitThreads;
-	} info{};
-	info.size = sizeof(info);
-	strncpy(info.name, e->name.c_str(), 31);
-	info.attr = e->attr;
-	info.initPattern = e->initPattern;
-	info.currentPattern = e->pattern;
-	info.numWaitThreads = e->waiters.Count(WAITTYPE_EVENTFLAG, id);
-	u32 wanted = std::min<u32>(GRead32(infoPtr), sizeof(info));
-	if (wanted) mem::WriteBytes(infoPtr, &info, wanted);
-	return 0;
-}
-
-// ---------------------------------------------------------------- mutexes
-
-struct Mutex : KObject {
-	static constexpr KType kType = KType::Mutex;
-	KType Type() const override { return kType; }
-	u32 attr = 0;
-	s32 initCount = 0, lockLevel = 0;
-	SceUID owner = 0;
-	WaitQueue waiters;
-};
-
-constexpr u32 PSP_MUTEX_ATTR_PRIORITY = 0x100;
-constexpr u32 PSP_MUTEX_ATTR_ALLOW_RECURSIVE = 0x200;
-
-bool MutexWakeNext(Mutex *m) {
-	m->waiters.Cleanup(WAITTYPE_MUTEX, m->uid);
-	if (m->waiters.threads.empty()) return false;
-	if (m->attr & PSP_MUTEX_ATTR_PRIORITY) m->waiters.SortByPriority();
-	SceUID next = m->waiters.threads.front();
-	m->waiters.threads.erase(m->waiters.threads.begin());
-	PspThread *t = Get<PspThread>(next);
-	m->owner = next;
-	m->lockLevel = (s32)t->waitValue[0];
-	sched::Wake(t, 0);
-	return true;
-}
-
-int sceKernelCreateMutex(const char *name, u32 attr, s32 initCount, u32 optPtr) {
-	if (!name) return (int)SCE_KERNEL_ERROR_ERROR;
-	if (attr & ~0xBFF) return (int)SCE_KERNEL_ERROR_ILLEGAL_ATTR;
-	if (initCount < 0) return (int)SCE_KERNEL_ERROR_ILLEGAL_COUNT;
-	if ((attr & PSP_MUTEX_ATTR_ALLOW_RECURSIVE) == 0 && initCount > 1) return (int)SCE_KERNEL_ERROR_ILLEGAL_COUNT;
-	auto *m = new Mutex();
-	m->name = name;
-	m->attr = attr;
-	m->initCount = initCount;
-	m->lockLevel = initCount;
-	SceUID id = Register(m);
-	if (initCount > 0) m->owner = sched::CurrentId();
-	(void)optPtr;
-	return id;
-}
-
-int sceKernelDeleteMutex(SceUID id) {
-	Mutex *m = Get<Mutex>(id);
-	if (!m) return (int)SCE_KERNEL_ERROR_UNKNOWN_MUTEXID;
-	bool woke = m->waiters.WakeAll(WAITTYPE_MUTEX, id, (s32)SCE_KERNEL_ERROR_WAIT_DELETE);
-	Destroy(id);
-	if (woke) sched::Reschedule();
-	return 0;
-}
-
-static int TryLockMutexFor(Mutex *m, s32 count, int *error) {
-	SceUID cur = sched::CurrentId();
-	if (count <= 0) {
-		*error = (int)SCE_KERNEL_ERROR_ILLEGAL_COUNT;
-		return 0;
-	}
-	if (count > 1 && !(m->attr & PSP_MUTEX_ATTR_ALLOW_RECURSIVE)) {
-		*error = (int)SCE_KERNEL_ERROR_ILLEGAL_COUNT;
-		return 0;
-	}
-	if ((s64)m->lockLevel + count < 0) {
-		*error = (int)SCE_KERNEL_ERROR_MUTEX_LOCK_OVERFLOW;
-		return 0;
-	}
-	if (m->lockLevel == 0) {
-		m->lockLevel = count;
-		m->owner = cur;
-		return 1;
-	}
-	if (m->owner == cur) {
-		if (m->attr & PSP_MUTEX_ATTR_ALLOW_RECURSIVE) {
-			m->lockLevel += count;
-			return 1;
-		}
-		*error = (int)SCE_KERNEL_ERROR_MUTEX_RECURSIVE_NOT_ALLOWED;
-		return 0;
-	}
-	return 0;
-}
-
-static int LockMutex(SceUID id, s32 count, u32 timeoutPtr, bool cb) {
-	Mutex *m = Get<Mutex>(id);
-	if (!m) return (int)SCE_KERNEL_ERROR_UNKNOWN_MUTEXID;
-	int error = 0;
-	if (TryLockMutexFor(m, count, &error)) return 0;
-	if (error) return error;
-	if (TimesOutAtOnce(timeoutPtr)) return (int)SCE_KERNEL_ERROR_WAIT_TIMEOUT;
-	if (!sched::DispatchEnabled()) return (int)SCE_KERNEL_ERROR_CAN_NOT_WAIT;
-	PspThread *t = CurThread();
-	t->waitValue[0] = (u32)count;
-	m->waiters.Add(t->uid);
-	return sched::Wait(WAITTYPE_MUTEX, id, timeoutPtr, cb);
-}
-
-int sceKernelLockMutex(SceUID id, s32 count, u32 timeoutPtr) { return LockMutex(id, count, timeoutPtr, false); }
-int sceKernelLockMutexCB(SceUID id, s32 count, u32 timeoutPtr) { return LockMutex(id, count, timeoutPtr, true); }
-
-int sceKernelTryLockMutex(SceUID id, s32 count) {
-	Mutex *m = Get<Mutex>(id);
-	if (!m) return (int)SCE_KERNEL_ERROR_UNKNOWN_MUTEXID;
-	int error = 0;
-	if (TryLockMutexFor(m, count, &error)) return 0;
-	return error ? error : (int)SCE_KERNEL_ERROR_MUTEX_LOCKED;
-}
-
-int sceKernelUnlockMutex(SceUID id, s32 count) {
-	Mutex *m = Get<Mutex>(id);
-	if (!m) return (int)SCE_KERNEL_ERROR_UNKNOWN_MUTEXID;
-	if (count <= 0) return (int)SCE_KERNEL_ERROR_ILLEGAL_COUNT;
-	if ((m->attr & PSP_MUTEX_ATTR_ALLOW_RECURSIVE) == 0 && count > 1) return (int)SCE_KERNEL_ERROR_ILLEGAL_COUNT;
-	if (m->lockLevel == 0 || m->owner != sched::CurrentId()) return (int)SCE_KERNEL_ERROR_MUTEX_UNLOCKED;
-	if (m->lockLevel < count) return (int)SCE_KERNEL_ERROR_MUTEX_UNLOCK_UNDERFLOW;
-	m->lockLevel -= count;
-	if (m->lockLevel == 0) {
-		m->owner = 0;
-		if (MutexWakeNext(m)) sched::Reschedule();
-	}
-	return 0;
-}
-
-int sceKernelCancelMutex(SceUID id, s32 count, u32 numWaitPtr) {
-	Mutex *m = Get<Mutex>(id);
-	if (!m) return (int)SCE_KERNEL_ERROR_UNKNOWN_MUTEXID;
-	bool recursive = (m->attr & PSP_MUTEX_ATTR_ALLOW_RECURSIVE) != 0;
-	if (count < 0 && count != -1) return (int)SCE_KERNEL_ERROR_ILLEGAL_COUNT;
-	if (count > 1 && !recursive) return (int)SCE_KERNEL_ERROR_ILLEGAL_COUNT;
-	int n = m->waiters.Count(WAITTYPE_MUTEX, id);
-	if (mem::IsValidRange(numWaitPtr, 4)) GWrite32(numWaitPtr, (u32)n);
-	bool woke = m->waiters.WakeAll(WAITTYPE_MUTEX, id, (s32)SCE_KERNEL_ERROR_WAIT_CANCEL);
-	if (count <= 0) {
-		m->lockLevel = 0;
-		m->owner = 0;
-	} else {
-		m->lockLevel = count;
-		m->owner = sched::CurrentId();
-	}
-	if (woke) sched::Reschedule();
-	return 0;
-}
-
-int sceKernelReferMutexStatus(SceUID id, u32 infoPtr) {
-	Mutex *m = Get<Mutex>(id);
-	if (!m) return (int)SCE_KERNEL_ERROR_UNKNOWN_MUTEXID;
-	if (!mem::IsValidRange(infoPtr, 4)) return 0;
-	struct {
-		u32 size;
-		char name[32];
-		u32 attr;
-		s32 initCount, lockLevel;
-		SceUID lockThread;
-		s32 numWaitThreads;
-	} info{};
-	info.size = sizeof(info);
-	strncpy(info.name, m->name.c_str(), 31);
-	info.attr = m->attr;
-	info.initCount = m->initCount;
-	info.lockLevel = m->lockLevel;
-	info.lockThread = m->lockLevel ? m->owner : -1;
-	info.numWaitThreads = m->waiters.Count(WAITTYPE_MUTEX, id);
-	u32 wanted = std::min<u32>(GRead32(infoPtr), sizeof(info));
-	if (wanted) mem::WriteBytes(infoPtr, &info, wanted);
-	return 0;
-}
-
-// ---------------------------------------------------------------- alarms
-
-struct Alarm : KObject {
-	static constexpr KType kType = KType::Alarm;
-	KType Type() const override { return kType; }
-	u32 handler = 0, common = 0, gp = 0;
-	u64 schedule = 0;  // absolute time
-	u64 eventId = 0;
-};
-
-void ScheduleAlarm(SceUID id, u64 at) {
-	Alarm *a = Get<Alarm>(id);
-	if (!a) return;
-	a->schedule = at;
-	a->eventId = sched::ScheduleEvent(at, [id]() {
-		Alarm *al = Get<Alarm>(id);
-		if (!al) return;
-		al->eventId = 0;
-		u32 handler = al->handler, common = al->common, gp = al->gp;
-		sched::QueueInterrupt([id, handler, common, gp]() {
-			u32 next = sched::RunInterruptHandler(handler, gp, {common});
-			if (!Get<Alarm>(id)) return;
-			if (next == 0) {
-				Destroy(id);
-			} else {
-				ScheduleAlarm(id, sched::NowUs() + next);
-			}
-		});
-	});
-}
-
-SceUID SetAlarm(u64 us, u32 handler, u32 common) {
-	if (!mem::IsValidAddress(handler)) return (s32)SCE_KERNEL_ERROR_ILLEGAL_ADDR;
-	auto *a = new Alarm();
-	a->name = "alarm";
-	a->handler = handler;
-	a->common = common;
-	PspThread *t = CurThread();
-	a->gp = t ? t->ctx.r[28] : 0;
-	SceUID id = Register(a);
-	ScheduleAlarm(id, sched::NowUs() + us);
-	return id;
-}
-
-int sceKernelSetAlarm(u32 us, u32 handler, u32 common) { return SetAlarm(us, handler, common); }
-int sceKernelSetSysClockAlarm(u32 clockPtr, u32 handler, u32 common) {
-	u64 us = mem::IsValidRange(clockPtr, 8) ? GRead<u64>(clockPtr) : 0;
-	return SetAlarm(us, handler, common);
-}
-int sceKernelCancelAlarm(SceUID id) {
-	Alarm *a = Get<Alarm>(id);
-	if (!a) return (int)SCE_KERNEL_ERROR_UNKNOWN_ALMID;
-	sched::CancelEvent(a->eventId);
-	Destroy(id);
-	return 0;
-}
-int sceKernelReferAlarmStatus(SceUID id, u32 infoPtr) {
-	Alarm *a = Get<Alarm>(id);
-	if (!a) return (int)SCE_KERNEL_ERROR_UNKNOWN_ALMID;
-	if (!mem::IsValidRange(infoPtr, 4)) return (int)SCE_KERNEL_ERROR_ILLEGAL_ADDR;
-	u32 size = GRead32(infoPtr);
-	if (size >= 12) GWrite<u64>(infoPtr + 4, a->schedule);
-	if (size >= 16) GWrite32(infoPtr + 12, a->handler);
-	if (size >= 20) GWrite32(infoPtr + 16, a->common);
-	return 0;
-}
-
 // ---------------------------------------------------------------- id lists / system status
+
+enum : u32 {
+	TMID_Thread = 1,
+	TMID_Semaphore = 2,
+	TMID_EventFlag = 3,
+	TMID_Mbox = 4,
+	TMID_Vpl = 5,
+	TMID_Fpl = 6,
+	TMID_Mpipe = 7,
+	TMID_Callback = 8,
+	TMID_ThreadEventHandler = 9,
+	TMID_Alarm = 10,
+	TMID_VTimer = 11,
+	TMID_Mutex = 12,
+	TMID_LwMutex = 13,
+	TMID_Tlspl = 14,
+	TMID_SleepThread = 64,
+	TMID_DelayThread = 65,
+	TMID_SuspendThread = 66,
+	TMID_DormantThread = 67,
+};
+
+u32 IdTypeOf(KObject *o) {
+	switch (o->Type()) {
+	case KType::Thread: return TMID_Thread;
+	case KType::Semaphore: return TMID_Semaphore;
+	case KType::EventFlag: return TMID_EventFlag;
+	case KType::Mbx: return TMID_Mbox;
+	case KType::Vpl: return TMID_Vpl;
+	case KType::Fpl: return TMID_Fpl;
+	case KType::MsgPipe: return TMID_Mpipe;
+	case KType::Callback: return TMID_Callback;
+	case KType::ThreadEventHandler: return TMID_ThreadEventHandler;
+	case KType::Alarm: return TMID_Alarm;
+	case KType::VTimer: return TMID_VTimer;
+	case KType::Mutex: return TMID_Mutex;
+	case KType::LwMutex: return TMID_LwMutex;
+	case KType::Tls: return TMID_Tlspl;
+	default: return 0;
+	}
+}
 
 u32 sceKernelGetThreadmanIdType(SceUID id) {
 	KObject *o = GetAny(id);
 	if (!o) return SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT;
-	switch (o->Type()) {
-	case KType::Thread: return 1;
-	case KType::Semaphore: return 2;
-	case KType::EventFlag: return 3;
-	case KType::Mbx: return 4;
-	case KType::Vpl: return 5;
-	case KType::Fpl: return 6;
-	case KType::MsgPipe: return 7;
-	case KType::Callback: return 8;
-	case KType::ThreadEventHandler: return 9;
-	case KType::Alarm: return 10;
-	case KType::VTimer: return 11;
-	case KType::Mutex: return 12;
-	case KType::LwMutex: return 13;
-	case KType::Tls: return 14;
-	default: return SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT;
-	}
+	u32 type = IdTypeOf(o);
+	return type ? type : SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT;
 }
 
 u32 sceKernelGetThreadmanIdList(u32 type, u32 listPtr, u32 listSize, u32 countPtr) {
-	if (type < 1 || type > 14) return SCE_KERNEL_ERROR_ILLEGAL_TYPE;
+	if (listSize >= 0x8000000) return SCE_KERNEL_ERROR_ILLEGAL_ADDR;
+	if (!mem::IsValidAddress(listPtr) && listSize > 0) return SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT;
 	std::vector<SceUID> ids;
-	ForEachObject([&](KObject *o) {
-		if (sceKernelGetThreadmanIdType(o->uid) == type) ids.push_back(o->uid);
-	});
+	if (type > 0 && type <= TMID_Tlspl) {
+		ForEachObject([&](KObject *o) {
+			if (IdTypeOf(o) == type) ids.push_back(o->uid);
+		});
+	} else if (type >= TMID_SleepThread && type <= TMID_DormantThread) {
+		ForEach<PspThread>([&](PspThread *t) {
+			bool match = false;
+			switch (type) {
+			case TMID_SleepThread: match = t->IsWaitingFor(WAITTYPE_SLEEP, 0); break;
+			case TMID_DelayThread: match = t->IsWaitingFor(WAITTYPE_DELAY, t->uid); break;
+			case TMID_SuspendThread: match = t->IsSuspended(); break;
+			case TMID_DormantThread: match = IsStopped(t); break;
+			}
+			if (match) ids.push_back(t->uid);
+		});
+	} else {
+		return SCE_KERNEL_ERROR_ILLEGAL_TYPE;
+	}
 	u32 n = 0;
 	for (SceUID id : ids) {
 		if (n < listSize && mem::IsValidRange(listPtr + n * 4, 4)) GWrite32(listPtr + n * 4, (u32)id);
 		n++;
 	}
-	if (mem::IsValidRange(countPtr, 4)) GWrite32(countPtr, (u32)ids.size());
-	return 0;
+	if (mem::IsValidAddress(countPtr)) GWrite32(countPtr, (u32)ids.size());
+	return (u32)ids.size() > listSize ? listSize : (u32)ids.size();
 }
 
 int sceKernelReferSystemStatus(u32 statusPtr) {
-	if (mem::IsValidRange(statusPtr, 4)) {
-		u32 size = std::min<u32>(GRead32(statusPtr), 64);
-		for (u32 i = 4; i < size; i += 4) GWrite32(statusPtr + i, 0);
-	}
+	u32 buf[7] = {};
+	buf[0] = sizeof(buf);
+	if (mem::IsValidRange(statusPtr, sizeof(buf))) mem::WriteBytes(statusPtr, buf, sizeof(buf));
 	return 0;
 }
 
-int sceKernelReferGlobalProfiler() { return 0; }
-u32 sceKernelReferThreadProfiler() { return 0; }
-
-int sceKernelChangeCurrentThreadAttr(u32 clearAttr, u32 setAttr) {
-	PspThread *t = CurThread();
-	if ((clearAttr & ~PSP_THREAD_ATTR_VFPU) != 0 || (setAttr & ~PSP_THREAD_ATTR_VFPU) != 0)
-		return (int)SCE_KERNEL_ERROR_ILLEGAL_ATTR;
-	if (t) t->attr = (t->attr & ~clearAttr) | setAttr;
+// They just return NULL, in about 140 cycles.
+u32 sceKernelReferGlobalProfiler() {
+	sched::ChargeCycles(140);
 	return 0;
 }
-
-// sceKernelExtendThreadStack(size, entry, arg): run entry(arg) on a fresh stack.
-u32 sceKernelExtendThreadStack(u32 size, u32 entry, u32 arg) {
-	if (size < 512) return SCE_KERNEL_ERROR_ILLEGAL_STACK_SIZE;
-	PspThread *t = CurThread();
-	if (!t) return SCE_KERNEL_ERROR_ILLEGAL_CONTEXT;
-	u32 stack = g_userMem.Alloc(size, true, "extended stack");
-	if (!stack) return SCE_KERNEL_ERROR_NO_MEMORY;
-	mem::Memset(stack, 0xFF, size);
-	GWrite32(stack, (u32)t->uid);
-	u32 oldSp = t->ctx.r[29];
-	t->ctx.r[29] = stack + size;
-	u32 result = cpu::CallGuest(&t->ctx, entry, {arg});
-	t->ctx.r[29] = oldSp;
-	g_userMem.Free(stack);
-	return result;
+u32 sceKernelReferThreadProfiler() {
+	sched::ChargeCycles(140);
+	return 0;
 }
 
 }  // namespace
@@ -1112,60 +920,34 @@ void Register_ThreadManForUser() {
 	};
 	hle::RegisterModule("FakeSysCalls", fake);
 
+	constexpr u32 NI = KF_NOT_IN_INTERRUPT;
+	constexpr u32 NID = KF_NOT_IN_INTERRUPT | KF_NOT_DISPATCH_SUSPENDED;
 	static const hle::HleFunction funcs[] = {
-		HLEFN(0x55C20A00, sceKernelCreateEventFlag),
-		HLEFN(0x812346E4, sceKernelClearEventFlag),
-		HLEFN(0xEF9E4C70, sceKernelDeleteEventFlag),
-		HLEFN(0x1FB15A32, sceKernelSetEventFlag),
-		HLEFN(0x402FCF22, sceKernelWaitEventFlag),
-		HLEFN(0x328C546A, sceKernelWaitEventFlagCB),
-		HLEFN(0x30FD48F0, sceKernelPollEventFlag),
-		HLEFN(0xCD203292, sceKernelCancelEventFlag),
-		HLEFN(0xA66B0120, sceKernelReferEventFlagStatus),
-
-		HLEFN(0x8FFDF9A2, sceKernelCancelSema),
-		HLEFN(0xD6DA4BA1, sceKernelCreateSema),
-		HLEFN(0x28B6489C, sceKernelDeleteSema),
-		HLEFN(0x58B1F937, sceKernelPollSema),
-		HLEFN(0xBC6FEBC5, sceKernelReferSemaStatus),
-		HLEFN(0x3F53E640, sceKernelSignalSema),
-		HLEFN(0x4E3A1105, sceKernelWaitSema),
-		HLEFN(0x6D212BAC, sceKernelWaitSemaCB),
-
-		HLEFN(0xF8170FBE, sceKernelDeleteMutex),
-		HLEFN(0xB011B11F, sceKernelLockMutex),
-		HLEFN(0x5BF4DD27, sceKernelLockMutexCB),
-		HLEFN(0x6B30100F, sceKernelUnlockMutex),
-		HLEFN(0xB7D098C6, sceKernelCreateMutex),
-		HLEFN(0x0DDCD2C9, sceKernelTryLockMutex),
-		HLEFN(0xA9C2CB9A, sceKernelReferMutexStatus),
-		HLEFN(0x87D9223C, sceKernelCancelMutex),
-
 		HLEFN(0xFCCFAD26, sceKernelCancelWakeupThread),
 		HLEFN(0xEA748E31, sceKernelChangeCurrentThreadAttr),
 		HLEFN(0x71BC9871, sceKernelChangeThreadPriority),
-		HLEFN(0x446D8DE6, sceKernelCreateThread),
+		KFN(0x446D8DE6, sceKernelCreateThread, NI),
 		HLEFN(0x9FA03CD3, sceKernelDeleteThread),
-		HLEFN(0xBD123D9E, sceKernelDelaySysClockThread),
-		HLEFN(0x1181E963, sceKernelDelaySysClockThreadCB),
-		HLEFN(0xCEADEB47, sceKernelDelayThread),
-		HLEFN(0x68DA9E36, sceKernelDelayThreadCB),
+		KFN(0xBD123D9E, sceKernelDelaySysClockThread, NID),
+		KFN(0x1181E963, sceKernelDelaySysClockThreadCB, NID),
+		KFN(0xCEADEB47, sceKernelDelayThread, NID),
+		KFN(0x68DA9E36, sceKernelDelayThreadCB, NID),
 		HLEFN(0xAA73C935, sceKernelExitThread),
 		HLEFN(0x809CE29B, sceKernelExitDeleteThread),
 		HLEFN(0x94AA61EE, sceKernelGetThreadCurrentPriority),
-		HLEFN(0x293B45B8, sceKernelGetThreadId),
+		KFN(0x293B45B8, sceKernelGetThreadId, NI),
 		HLEFN(0x3B183E26, sceKernelGetThreadExitStatus),
 		HLEFN(0x52089CA1, sceKernelGetThreadStackFreeSize),
 		HLEFN(0xFFC36A14, sceKernelReferThreadRunStatus),
 		HLEFN(0x17C1684E, sceKernelReferThreadStatus),
 		HLEFN(0x2C34E053, sceKernelReleaseWaitThread),
 		HLEFN(0x75156E8F, sceKernelResumeThread),
-		HLEFN(0x3AD58B8C, sceKernelSuspendDispatchThread),
-		HLEFN(0x27E22EC2, sceKernelResumeDispatchThread),
+		KFN(0x3AD58B8C, sceKernelSuspendDispatchThread, NI),
+		KFN(0x27E22EC2, sceKernelResumeDispatchThread, NI),
 		HLEFN(0x912354A7, sceKernelRotateThreadReadyQueue),
-		HLEFN(0x9ACE131E, sceKernelSleepThread),
-		HLEFN(0x82826F70, sceKernelSleepThreadCB),
-		HLEFN(0xF475845D, sceKernelStartThread),
+		KFN(0x9ACE131E, sceKernelSleepThread, NID),
+		KFN(0x82826F70, sceKernelSleepThreadCB, NID),
+		KFN(0xF475845D, sceKernelStartThread, NI),
 		HLEFN(0x9944F31F, sceKernelSuspendThread),
 		HLEFN(0x616403BA, sceKernelTerminateThread),
 		HLEFN(0x383F7BCC, sceKernelTerminateDeleteThread),
@@ -1182,11 +964,6 @@ void Register_ThreadManForUser() {
 		HLEFN(0x627E6F3A, sceKernelReferSystemStatus),
 		HLEFN(0x64D4540E, sceKernelReferThreadProfiler),
 
-		HLEFN(0x6652B8CA, sceKernelSetAlarm),
-		HLEFN(0xB2C25152, sceKernelSetSysClockAlarm),
-		HLEFN(0x7E65B999, sceKernelCancelAlarm),
-		HLEFN(0xDAA3F564, sceKernelReferAlarmStatus),
-
 		HLEFN(0xBA6B92E2, sceKernelSysClock2USec),
 		HLEFN(0x110DEC9A, sceKernelUSec2SysClock),
 		HLEFN(0xC8CD158C, sceKernelUSec2SysClockWide),
@@ -1194,6 +971,10 @@ void Register_ThreadManForUser() {
 
 		HLEFN(0x278C0DF5, sceKernelWaitThreadEnd),
 		HLEFN(0xD59EAD2F, sceKernelWakeupThread),
+
+		HLEFN(0x0C106E53, sceKernelRegisterThreadEventHandler),
+		HLEFN(0x72F3C145, sceKernelReleaseThreadEventHandler),
+		HLEFN(0x369EEB6B, sceKernelReferThreadEventHandlerStatus),
 
 		HLERAW(0x349D6D6C, sceKernelCheckCallback),
 		HLEFN(0xE81CAF8F, sceKernelCreateCallback),
@@ -1211,4 +992,10 @@ void Register_ThreadManForUser() {
 	};
 	hle::RegisterModule("ThreadManForUser", funcs);
 	hle::RegisterModule("ThreadManForKernel", funcs);
+
+	kernel::RegisterThreadManSync();
+	kernel::RegisterThreadManTimers();
+	kernel::RegisterThreadManMbx();
+	kernel::RegisterThreadManMsgPipe();
+	kernel::RegisterThreadManPools();
 }

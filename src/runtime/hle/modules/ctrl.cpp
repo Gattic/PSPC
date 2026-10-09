@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // sceCtrl: buttons/analog sampled at every VBlank from the host input.
 #include <deque>
+#include <vector>
 
 #include "runtime/hle/display.h"
 #include "runtime/hle/hle_wrap.h"
@@ -33,11 +34,24 @@ std::deque<Sample> g_samples;
 u32 g_latchMake = 0, g_latchBreak = 0, g_latchPress = 0, g_latchRelease = 0, g_prevButtons = 0;
 u32 g_lastVcountSampled = 0xFFFFFFFF;
 
+// Buttons held by --press (headless runs, scripted tests): [vblank, vblank + frames).
+struct ScriptedPress {
+	u32 vblank, frames, buttons;
+};
+std::vector<ScriptedPress> g_script;
+
+u32 ScriptedButtons() {
+	u32 v = display::Vcount(), b = 0;
+	for (const ScriptedPress &p : g_script)
+		if (v >= p.vblank && v - p.vblank < p.frames) b |= p.buttons;
+	return b;
+}
+
 void TakeSample() {
 	host::CtrlState s = host::GetCtrl();
 	Sample smp;
 	smp.time = (u32)sched::NowUs();
-	smp.buttons = s.buttons;
+	smp.buttons = s.buttons | ScriptedButtons();
 	smp.lx = g_samplingMode ? s.lx : 128;
 	smp.ly = g_samplingMode ? s.ly : 128;
 	u32 changed = smp.buttons ^ g_prevButtons;
@@ -139,6 +153,7 @@ int sceCtrlGetIdleCancelThreshold(u32 resetPtr, u32 backPtr) {
 
 namespace ctrl {
 void OnVblank() { TakeSample(); }
+void AddScriptedPress(u32 vblank, u32 buttons, u32 frames) { g_script.push_back({vblank, frames, buttons}); }
 }  // namespace ctrl
 
 void Register_sceCtrl() {

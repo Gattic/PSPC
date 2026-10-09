@@ -13,6 +13,8 @@
 // Register_sceAudio() also registers every other audio library (see audio_hle.h).
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <deque>
 #include <vector>
 
 #include "audio/guest_memory.h"
@@ -27,8 +29,6 @@
 #include "runtime/kernel/scheduler.h"
 #include "runtime/kernel/thread.h"
 #include "runtime/kernel/waitqueue.h"
-
-
 
 using namespace kernel;
 
@@ -86,15 +86,23 @@ struct SrcWaiter {
 	u32 result;
 };
 
-// Channel 8: Output2, SRC and Vaudio. Two DMA descriptors, no mixer.
+// Channel 8: Output2, SRC and Vaudio. Two DMA descriptors, no mixer: the DMA feeds the codec,
+// which resamples. What the API sees (armed descriptors retiring) runs on its own exact clock,
+// independent of the 64-sample mix blocks, since a buffer finishes wherever its last sample
+// falls (audio/output2/frequency). The mixer just reads the same buffers for the host output.
 struct AudioSRCChannel {
 	bool reserved = false;
 	u32 sampleCount = 0;
 	u32 leftVolume = 0;
 	u32 rightVolume = 0;
 	u32 format = 0;
-	PendingBuffer buffers[2];
+	// Armed descriptors (0..2), what sceAudioOutput2GetRestSample counts.
 	int bufferCount = 0;
+	// When the last armed buffer has played out.
+	u64 lastEndUs = 0;
+	std::deque<u64> retireEvents;
+	// What the mixer still reads from. Can hold a buffer that already retired (by up to a block).
+	std::deque<PendingBuffer> playing;
 	u32 playedSamples = 0;
 	u32 frac = 0;
 	// One completion can sit unclaimed, so the first output after an idle stretch doesn't block.
@@ -108,13 +116,21 @@ struct AudioSRCChannel {
 		format = 0;
 		sampleCount = 0;
 		bufferCount = 0;
+		lastEndUs = 0;
+		for (u64 id : retireEvents) sched::CancelEvent(id);
+		retireEvents.clear();
+		playing.clear();
 		playedSamples = 0;
 		frac = 0;
 		completion = false;
 		waitingThreads.clear();
-		for (PendingBuffer &b : buffers) b = PendingBuffer{};
 	}
 };
+
+// A descriptor retires when its DMA transfer finishes, slightly ahead of the audio being heard
+// (PPSSPP's docs/sceAudio.md puts it at about 100us; audio/output2/rest, measured after two
+// checkpoint prints, fits 50us best here).
+constexpr u64 kSrcRetireEarlyUs = 50;
 
 AudioChannel g_chans[PSP_AUDIO_CHANNEL_MAX];
 AudioSRCChannel g_src;
@@ -136,7 +152,8 @@ s64 g_meBusyUntilUs = 0;
 
 s32 g_mixBuffer[kHwBlock * 2];
 std::vector<s16> g_hostBuffer;
-u64 g_mixedBlocks = 0;
+double g_mixCostUs = 0;  // debug stats: time spent in AudioUpdate since the last report
+u64 g_mixCostBlocks = 0;
 
 // ---- Timing ----
 
@@ -259,6 +276,8 @@ bool ChannelFinished(AudioChannel &chan) {
 	return true;
 }
 
+void OnSRCRetire();
+
 int SRCCallUs(const AudioSRCChannel &chan) { return chan.Full() ? 45 : 112; }
 
 // The non-waiting half of an SRC output. Sets *mustWait when the caller has to park.
@@ -273,17 +292,24 @@ u32 SRCEnqueue(AudioSRCChannel &chan, u32 samplePtr, int vol, bool *mustWait) {
 			chan.rightVolume = (u32)vol;
 		}
 		const bool wasIdle = chan.bufferCount == 0;
-		if (wasIdle) {
-			// Starting the DMA signals a completion by itself.
-			chan.completion = true;
+		// Starting the DMA signals a completion by itself.
+		if (wasIdle) chan.completion = true;
+		const bool audioIdle = chan.playing.empty();
+		if (audioIdle) {
 			chan.playedSamples = 0;
 			chan.frac = 0;
 		}
-		chan.buffers[chan.bufferCount].address = samplePtr;
-		chan.buffers[chan.bufferCount].samples = chan.sampleCount;
+		chan.playing.push_back(PendingBuffer{samplePtr, chan.sampleCount});
 		chan.bufferCount++;
 		result = chan.sampleCount;
-		if (wasIdle) StartSRCDMA();
+		// The buffer plays from the end of the previous one (or now), at the channel's rate.
+		const u64 now = sched::NowUs();
+		const int rate = g_srcFrequency != 0 ? g_srcFrequency : g_mixFrequency;
+		const u64 start = std::max(now, chan.lastEndUs);
+		chan.lastEndUs = start + ((u64)chan.sampleCount * 1000000 + rate / 2) / (u64)rate;
+		const u64 retire = chan.lastEndUs > now + kSrcRetireEarlyUs ? chan.lastEndUs - kSrcRetireEarlyUs : now;
+		chan.retireEvents.push_back(sched::ScheduleEvent(retire, OnSRCRetire));
+		if (audioIdle) StartSRCDMA();
 	} else if (chan.bufferCount == 0) {
 		return 0;
 	}
@@ -325,6 +351,13 @@ bool SRCCompleted(AudioSRCChannel &chan) {
 	}
 	chan.completion = true;
 	return false;
+}
+
+// The oldest armed SRC descriptor retired.
+void OnSRCRetire() {
+	if (!g_src.retireEvents.empty()) g_src.retireEvents.pop_front();
+	if (g_src.bufferCount > 0) g_src.bufferCount--;
+	SRCCompleted(g_src);
 }
 
 void WakeSRCThreads(AudioSRCChannel &chan, int result) {
@@ -372,17 +405,16 @@ bool MixChannel(AudioChannel &chan) {
 }
 
 bool MixSRC(AudioSRCChannel &chan) {
-	if (chan.bufferCount == 0) return false;
+	if (chan.playing.empty()) return false;
 	const int inRate = g_srcFrequency != 0 ? g_srcFrequency : g_mixFrequency;
 	const u32 ratio = (u32)(((u64)(u32)inRate << 16) / (u32)g_mixFrequency);
 	const bool resampling = ratio != 0x10000;
 	const bool mono = chan.format == PSP_AUDIO_FORMAT_MONO;
 	const u32 stride = mono ? 2 : 4;
 	const int lv = (int)chan.leftVolume, rv = (int)chan.rightVolume;
-	bool woke = false;
 	for (int out = 0; out < kHwBlock; out++) {
-		if (chan.bufferCount == 0) break;
-		const PendingBuffer &buf = chan.buffers[0];
+		if (chan.playing.empty()) break;
+		const PendingBuffer &buf = chan.playing.front();
 		const u32 addr = buf.address + chan.playedSamples * stride;
 		if (const s16 *src = (const s16 *)mem::GetPointer(addr, stride)) {
 			const int l0 = src[0];
@@ -391,7 +423,7 @@ bool MixSRC(AudioSRCChannel &chan) {
 			if (resampling) {
 				// The codec reads the two descriptors as one stream.
 				u32 nextAddr = addr + stride;
-				if (chan.playedSamples + 1 >= buf.samples) nextAddr = chan.bufferCount > 1 ? chan.buffers[1].address : 0;
+				if (chan.playedSamples + 1 >= buf.samples) nextAddr = chan.playing.size() > 1 ? chan.playing[1].address : 0;
 				if (nextAddr != 0) {
 					if (const s16 *next = (const s16 *)mem::GetPointer(nextAddr, stride)) {
 						l1 = next[0];
@@ -406,49 +438,71 @@ bool MixSRC(AudioSRCChannel &chan) {
 		chan.frac += ratio;
 		u32 step = chan.frac >> 16;
 		chan.frac &= 0xFFFF;
-		while (step > 0 && chan.bufferCount > 0) {
-			const u32 take = std::min(step, chan.buffers[0].samples - chan.playedSamples);
+		while (step > 0 && !chan.playing.empty()) {
+			const u32 take = std::min(step, chan.playing.front().samples - chan.playedSamples);
 			chan.playedSamples += take;
 			step -= take;
-			if (chan.playedSamples >= chan.buffers[0].samples) {
-				chan.buffers[0] = chan.buffers[1];
-				chan.buffers[1] = PendingBuffer{};
-				chan.bufferCount--;
+			if (chan.playedSamples >= chan.playing.front().samples) {
+				chan.playing.pop_front();
 				chan.playedSamples = 0;
-				woke |= SRCCompleted(chan);
 			}
 		}
 	}
-	return woke;
+	// Retiring descriptors (and waking waiters) runs on its own timer, see OnSRCRetire.
+	return false;
 }
 
 void SubmitToHost() {
 	if (host::IsHeadless()) return;
-	const size_t frames = g_hostBuffer.size() / 2;
+	size_t frames = g_hostBuffer.size() / 2;
 	if (frames < 512) return;
 	// A dry device queue means we underran (or are just starting): put a little slack in front
 	// so scheduling jitter doesn't turn into clicks.
-	if (host::AudioQueuedFrames() == 0) {
+	const int queued = host::AudioQueuedFrames();
+	if (queued == 0) {
 		std::vector<s16> silence(1024 * 2, 0);
 		host::AudioSubmit(silence.data(), 1024);
+	} else if (!sched::FastTime() && queued > 3072) {
+		// The device clock runs a little slower than ours: drop one frame in 64 until the queue is
+		// back near its usual depth, instead of letting AudioSubmit stall the emulation. (With
+		// --fast-time the queue limit is what paces the emulation, so leave it alone.)
+		size_t out = 0;
+		const size_t n = g_hostBuffer.size() / 2;
+		for (size_t i = 0; i < n; i++) {
+			if (i % 64 == 63) continue;
+			g_hostBuffer[out * 2] = g_hostBuffer[i * 2];
+			g_hostBuffer[out * 2 + 1] = g_hostBuffer[i * 2 + 1];
+			out++;
+		}
+		g_hostBuffer.resize(out * 2);
+		frames = out;
+	}
+	// Rate and level check for debugging: what reached the device, against the wall clock.
+	static u64 statFrames = 0;
+	static int statPeak = 0;
+	static auto statStart = std::chrono::steady_clock::now();
+	statFrames += frames;
+	if (logging::g_level <= LogLevel::Debug) {
+		for (size_t i = 0; i < frames * 2; i++) statPeak = std::max(statPeak, std::abs((int)g_hostBuffer[i]));
 	}
 	host::AudioSubmit(g_hostBuffer.data(), (int)frames);
 	g_hostBuffer.clear();
-
-	// Rate check for debugging: what actually reached the device, against the wall clock.
-	static u64 statFrames = 0;
-	static auto statStart = std::chrono::steady_clock::now();
-	statFrames += frames;
 	const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - statStart).count();
 	if (secs >= 5.0) {
-		LOGD("AUDIO", "host output: %llu frames in %.2fs = %.0f Hz, %d frames queued", (unsigned long long)statFrames, secs,
-		     statFrames / secs, host::AudioQueuedFrames());
+		LOGD("AUDIO", "host output: %llu frames in %.2fs = %.0f Hz, %d frames queued, peak %d", (unsigned long long)statFrames, secs,
+		     statFrames / secs, host::AudioQueuedFrames(), statPeak);
+		if (g_mixCostBlocks) LOGD("AUDIO", "mixer: %.2f us per 64-sample block (%.1f us per 60Hz frame)", g_mixCostUs / g_mixCostBlocks, g_mixCostUs / g_mixCostBlocks * 44100.0 / 64 / 60);
+		g_mixCostUs = 0;
+		g_mixCostBlocks = 0;
 		statFrames = 0;
+		statPeak = 0;
 		statStart = std::chrono::steady_clock::now();
 	}
 }
 
 void AudioUpdate() {
+	const bool timing = logging::g_level <= LogLevel::Debug;
+	const auto mixStart = timing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 	memset(g_mixBuffer, 0, sizeof(g_mixBuffer));
 	g_audioMixing = true;
 	g_mixerDMABusy = AnyChannelPlaying();
@@ -458,14 +512,17 @@ void AudioUpdate() {
 	woke |= MixSRC(g_src);
 	g_audioMixing = false;
 	if (woke) RescheduleAfterWake();
-	g_mixedBlocks++;
 
 	if (!host::IsHeadless()) {
 		const size_t old = g_hostBuffer.size();
 		g_hostBuffer.resize(old + kHwBlock * 2);
 		for (int i = 0; i < kHwBlock * 2; i++) g_hostBuffer[old + i] = audio::ClampS16(g_mixBuffer[i]);
-		SubmitToHost();
 	}
+	if (timing) {
+		g_mixCostUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - mixStart).count();
+		g_mixCostBlocks++;
+	}
+	if (!host::IsHeadless()) SubmitToHost();
 }
 
 u8 *GuestPtrAccessor(u32 addr, u32 size) { return mem::GetPointer(addr, size); }
@@ -524,7 +581,14 @@ u32 sceAudioOutputPanned(u32 chan, int leftvol, int rightvol, u32 samplePtr) {
 	return r;
 }
 
+// Games poll these in tight loops; make the call a dispatch point so mixer blocks that fell due
+// meanwhile are accounted before answering.
+void PollPoint() {
+	if (g_inited) sched::Reschedule();
+}
+
 int sceAudioGetChannelRestLen(u32 chan) {
+	PollPoint();
 	if (chan >= PSP_AUDIO_CHANNEL_MAX) return (int)SCE_ERROR_AUDIO_INVALID_CHANNEL;
 	const AudioChannel &c = g_chans[chan];
 	int rest = (int)c.remainingSamples;
@@ -533,6 +597,7 @@ int sceAudioGetChannelRestLen(u32 chan) {
 }
 
 int sceAudioGetChannelRestLength(u32 chan) {
+	PollPoint();
 	if (chan >= PSP_AUDIO_CHANNEL_MAX) return (int)SCE_ERROR_AUDIO_INVALID_CHANNEL;
 	const AudioChannel &c = g_chans[chan];
 	int rest = c.sampleAddress != 0 ? (int)c.remainingSamples : 0;
@@ -647,6 +712,7 @@ u32 sceAudioOutput2ChangeLength(u32 sampleCount) {
 }
 
 u32 sceAudioOutput2GetRestSample() {
+	PollPoint();
 	if (!g_src.reserved) return SCE_ERROR_AUDIO_CHANNEL_NOT_RESERVED;
 	return (u32)g_src.bufferCount * g_src.sampleCount;
 }
