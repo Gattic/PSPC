@@ -1,0 +1,26 @@
+# Copyrighted or user-supplied inputs: never commit.
+/Games/
+/private/
+/reference/
+
+# Build output
+/build*/
+/out/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+
+# Runtime data written by pspc
+/ms0/
+/cache/
+*.log
+
+# Editors / tools
+.vs/
+.vscode/
+__pycache__/
+*.pyc
