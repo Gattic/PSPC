@@ -303,6 +303,11 @@ bool RunBusy() {
 	if (!busy) return false;
 	PspThread *ready = PeekBestReady();
 	if (ready && ready->currentPriority < busy->currentPriority) return false;
+	// Getting back to the busy thread after another one ran costs a switch, as for any thread.
+	if (g_lastRun != busy) {
+		if (g_lastRun != nullptr) ChargeCycles(kSwitchCycles);
+		g_lastRun = busy;
+	}
 	SyncClock();
 	u64 now = g_vcycles / kCyclesPerUs;
 	u64 next = NextEventTime();
@@ -374,6 +379,7 @@ struct SavedWait {
 	u32 timeoutPtr;
 	u64 deadline;
 	u32 latency;
+	u32 wakeCycles;
 	s32 timeoutResult;
 	u32 value[4];
 	bool callbacks;
@@ -390,6 +396,7 @@ void SaveWait(PspThread *t, SavedWait &s) {
 	s.timeoutPtr = t->waitTimeoutPtr;
 	s.deadline = t->waitDeadline;
 	s.latency = t->waitLatencyUs;
+	s.wakeCycles = t->waitWakeCycles;
 	s.timeoutResult = t->waitTimeoutResult;
 	memcpy(s.value, t->waitValue, sizeof(s.value));
 	s.callbacks = t->waitCallbacks;
@@ -405,6 +412,7 @@ void RestoreWait(PspThread *t, SavedWait &s) {
 	t->waitTimeoutPtr = s.timeoutPtr;
 	t->waitDeadline = s.deadline;
 	t->waitLatencyUs = s.latency;
+	t->waitWakeCycles = s.wakeCycles;
 	t->waitTimeoutResult = s.timeoutResult;
 	memcpy(t->waitValue, s.value, sizeof(s.value));
 	t->waitCallbacks = s.callbacks;
@@ -438,6 +446,8 @@ void ArmTimeout(PspThread *t) {
 		if (!w || w->waitSeq != seq || w->waitDone || w->waitType == WAITTYPE_NONE) return;
 		w->timeoutEventId = 0;
 		if (w->waitPaused) return;  // re-checked when the callbacks return
+		// The interrupt's own time goes to whoever has the CPU (threads/scheduling/preemptsyscall).
+		if (w->waitWakeCycles) ChargeCycles(w->waitWakeCycles);
 		TimeoutNow(w);
 	});
 }
@@ -471,7 +481,7 @@ void ResumeWait(PspThread *t) {
 }
 
 s32 DoWait(PspThread *t, WaitType type, SceUID id, u64 deadline, u32 latency, u32 timeoutPtr, bool cb,
-           s32 timeoutResult, const WaitHooks *hooks) {
+           s32 timeoutResult, const WaitHooks *hooks, u32 wakeCycles = 0) {
 	// A wait inside a callback of an outer wait replaces it; the outer one is put back when the
 	// callbacks return (see below).
 	bool nested = t->waitType != WAITTYPE_NONE;
@@ -484,6 +494,7 @@ s32 DoWait(PspThread *t, WaitType type, SceUID id, u64 deadline, u32 latency, u3
 	t->waitTimeoutPtr = timeoutPtr;
 	t->waitDeadline = deadline;
 	t->waitLatencyUs = latency;
+	t->waitWakeCycles = wakeCycles;
 	t->waitTimeoutResult = timeoutResult;
 	t->waitPaused = false;
 	t->cbQueued = false;
@@ -650,6 +661,17 @@ int Run() {
 			RunThread(t);
 			continue;
 		}
+		// Every thread has ended (dormant or dead): nothing can ever run again, so the program
+		// is over (a kernel module that unloaded itself, a homebrew that returned from main).
+		bool alive = false;
+		kernel::ForEach<PspThread>([&](PspThread *t) {
+			if (!(t->status & (THREADSTATUS_DORMANT | THREADSTATUS_DEAD))) alive = true;
+		});
+		if (!alive) {
+			LOGI("SCHED", "No thread left alive; stopping");
+			g_exitCode = 0;
+			break;
+		}
 		IdleUntil(NextEventTime());
 	}
 	ConvertFiberToThread();
@@ -792,12 +814,22 @@ s32 Wait(WaitType type, SceUID id, u32 timeoutPtr, bool processCallbacks, const 
 	              (s32)SCE_KERNEL_ERROR_WAIT_TIMEOUT, hooks);
 }
 
-s32 WaitUntil(WaitType type, SceUID id, u64 deadlineUs, bool processCallbacks, const WaitHooks *hooks) {
+s32 WaitUntil(WaitType type, SceUID id, u64 deadlineUs, bool processCallbacks, const WaitHooks *hooks,
+              u32 wakeCycles) {
 	PspThread *t = g_current;
 	if (t) ++t->waitSeq;
 	if (!t || g_inInterrupt) return (s32)SCE_KERNEL_ERROR_ILLEGAL_CONTEXT;
 	if (!DispatchEnabled()) return (s32)SCE_KERNEL_ERROR_CAN_NOT_WAIT;
-	return DoWait(t, type, id, deadlineUs ? deadlineUs : 1, 0, 0, processCallbacks, 0, hooks);
+	if (!deadlineUs) deadlineUs = 1;
+	if (g_fastTime && wakeCycles) {
+		// The interrupt runs that long before the deadline, so the thread is ready on time.
+		u64 wakeUs = wakeCycles / kCyclesPerUs;
+		u64 now = NowUs();
+		deadlineUs = deadlineUs > now + wakeUs ? deadlineUs - wakeUs : std::min(deadlineUs, now + 1);
+	} else {
+		wakeCycles = 0;
+	}
+	return DoWait(t, type, id, deadlineUs, 0, 0, processCallbacks, 0, hooks, (u32)wakeCycles);
 }
 
 // On hardware these outcomes depend on the phase of the clock. Go with the likelier one, except
@@ -822,9 +854,13 @@ bool WaitTimesOutAtOnce(u32 timeoutPtr, int basePercent, int stepPercent) {
 
 bool DelayReturnsAtOnce(u32 usec) {
 	// The deadline is taken, and the clock read again when the alarm is set, about 0.6us later
-	// (1.65us on a thread's first wait, when the code is out of the cache).
-	const PspThread *t = g_current;
-	int gapPercent = t && !t->hasWaited ? 165 : 60;
+	// (about 1.85us on a thread's first wait or delay, when the code is out of the cache: a new
+	// thread's first sceKernelDelayThread(1) usually returns at once - "sometimes" in
+	// threads/scheduling/delayzero, all three in threads/scheduling/scheduling - and its second
+	// doesn't).
+	PspThread *t = g_current;
+	int gapPercent = t && !t->hasWaited ? 185 : 60;
+	if (t) t->hasWaited = true;
 	return Chance(gapPercent - (int)std::min<u32>(usec, 2) * 100);
 }
 

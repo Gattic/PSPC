@@ -93,6 +93,25 @@ BodyFn LookupBody(u32 addr) {
 
 u32 RegisteredCount() { return g_count.load(); }
 
+u32 GuestFunctionAt(const void *hostAddr, size_t *offset) {
+	uintptr_t a = (uintptr_t)hostAddr, best = 0;
+	u32 guest = 0;
+	for (u32 pg = 0; pg < NUM_PAGES; pg++) {
+		if (!g_pages[pg]) continue;
+		for (u32 s = 0; s < SLOTS; s++) {
+			const uintptr_t fns[2] = {(uintptr_t)g_pages[pg]->slot[s], (uintptr_t)g_pages[pg]->body[s]};
+			for (uintptr_t f : fns) {
+				if (f && f <= a && f > best) {
+					best = f;
+					guest = (pg << PAGE_SHIFT) | (s << 2);
+				}
+			}
+		}
+	}
+	if (offset) *offset = (size_t)(a - best);
+	return guest;
+}
+
 void Call(Ctx *c, u32 target) {
 	if (HostFn fn = Lookup(target)) {
 		c->pc = target;

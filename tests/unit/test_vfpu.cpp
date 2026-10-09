@@ -1093,20 +1093,10 @@ TEST(vfpu_hw_prefix_consume) {
 		line += Fmt(" pfx=%08x,%08x,%08x", sp, tp, dp);
 		got.push_back(line);
 	}
-	// Lines where PPSSPP's interpreter (which we follow) differs from the hardware; PPSSPP lists
-	// this test in tests_next. vuc2ifs.s: the S prefix's lane-0 swizzle (y) is out of range for a
-	// single, PPSSPP negates the zero it reads, and the 0x80 top byte becomes 0x40404040, which
-	// D 0:1 saturates to 1.0. The hardware doesn't negate, so every lane is 0.
-	std::vector<std::string> want = ReadLines(path);
-	const std::map<std::string, std::string> ppssppDivergence = {
-		{"vuc2ifs.s", "vuc2ifs.s      op=00000000,00000000,00000000,3f800000"},
-	};
-	for (std::string &w : want) {
-		for (const auto &[name, ours] : ppssppDivergence) {
-			if (w.rfind(name + " ", 0) == 0) w = ours + w.substr(ours.size());
-		}
-	}
-	CompareLines("prefix_consume", got, want);
+	// vuc2ifs.s: the S prefix's lane-0 swizzle (y) is out of range for a single, so the lane
+	// replays the prefix unit's latch (zero in a new context; on hardware the test's setup vmovs
+	// leave zero there too) without the negate. PPSSPP negates a zero, which comes out as 1.0.
+	CompareLines("prefix_consume", got, ReadLines(path));
 }
 
 // Replays cpu/vfpu/vrnd: the generator's sequence and state for several seeds, the float forms,

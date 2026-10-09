@@ -169,7 +169,17 @@ u32 sceKernelMemset(u32 addr, int c, u32 n) {
 	return addr;
 }
 u32 sceKernelMemcpy(u32 dst, u32 src, u32 n) {
-	mem::Memcpy(dst, src, n);
+	if (n == 0 || !mem::IsValidRange(dst, n) || !mem::IsValidRange(src, n)) return dst;
+	if (dst + n < src || src + n < dst) {
+		mem::Memcpy(dst, src, n);
+		return dst;
+	}
+	// Overlapping: copied forward 8 bytes at a time like the hardware, so a copy to a little
+	// further on repeats the start (pspautotests misc/libc; PPSSPP's sceKernelMemcpy).
+	u8 *d = GPtr(dst);
+	const u8 *s = GPtr(src);
+	for (u32 i = n / 8; i > 0; --i, d += 8, s += 8) memmove(d, s, 8);
+	for (u32 i = n % 8; i > 0; --i) *d++ = *s++;
 	return dst;
 }
 

@@ -67,9 +67,11 @@ void HandOffTo(PspThread *t);
 // Returns the wake result. Fails with CAN_NOT_WAIT when dispatch or interrupts are disabled.
 s32 Wait(kernel::WaitType type, SceUID id, u32 timeoutPtr, bool processCallbacks,
          const kernel::WaitHooks *hooks = nullptr);
-// Block until an absolute time (delays). Returns 0, or a wake result.
+// Block until an absolute time (delays). Returns 0, or a wake result. wakeCycles (fast-time
+// only) is the time the timer interrupt that ends the wait spends before the thread is ready:
+// it's taken from whatever thread is running then.
 s32 WaitUntil(kernel::WaitType type, SceUID id, u64 deadlineUs, bool processCallbacks,
-              const kernel::WaitHooks *hooks = nullptr);
+              const kernel::WaitHooks *hooks = nullptr, u32 wakeCycles = 0);
 // On hardware a very short timeout often expires before the wait even starts: the call then
 // fails with WAIT_TIMEOUT at once, without writing the timeout back. Call this before queueing.
 bool WaitTimesOutAtOnce(u32 timeoutPtr, int basePercent = 85, int stepPercent = 35);

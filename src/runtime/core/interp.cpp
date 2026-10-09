@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "runtime/core/interp.h"
-#include <xmmintrin.h>
-#include <cstdio>
-#include <cstdlib>
 
 #include "allegrex/decode.h"
 #include "allegrex/guestmem.h"
@@ -97,13 +94,34 @@ void Run(Ctx *c, u32 pc, u32 ra0, u32 sp0) {
 		return true;
 	};
 
-	static u32 dbgPc = [] { const char *e = getenv("PSPC_DBG_PC"); return e ? (u32)strtoul(e, nullptr, 16) : 0u; }();
+	// A jump to native code. A recompiled body continues this frame (it returns to ra0 for us).
+	// A thunk (HLE import stub) has call semantics: run it, then carry on at $ra in this loop -
+	// not in a nested interpreter, which would grow the host stack every time a loop tail-calls an
+	// import. Returns false when target has no native code; *done means this frame is finished.
+	auto nativeJump = [&](u32 target, bool *done, u32 *next) -> bool {
+		if (dispatch::LookupBody(target)) {
+			dispatch::Jump(c, target, ra0, sp0);
+			*done = true;
+			return true;
+		}
+		HostFn fn = dispatch::Lookup(target);
+		if (!fn) return false;
+		u32 ret = c->r[31];
+		c->pc = target;
+		fn(c);
+		if (c->unwinding || (ret == ra0 && c->r[29] >= sp0)) {
+			if (!c->unwinding) c->pc = ret;
+			*done = true;
+			return true;
+		}
+		*done = false;
+		*next = ret;
+		return true;
+	};
+
 	for (;;) {
 		c->pc = pc;
 		u32 w = GRead32(pc);
-		if (pc == dbgPc) {
-			fprintf(stderr, "DBG pc=%08x w=%08x v0=%08x v1=%08x a0=%08x a1=%08x a2=%08x ra=%08x sp=%08x fp=%08x f0=%08x f1=%08x fcr31=%08x mxcsr=%08x mv0=%08x\n", pc, w, c->r[2], c->r[3], c->r[4], c->r[5], c->r[6], c->r[31], c->r[29], c->r[30], c->fi[0], c->fi[1], c->fcr31, _mm_getcsr(), mem::IsValidAddress(c->r[2]) ? GRead32(c->r[2]) : 0xdeadbeef);
-		}
 		Op op = ag::Decode(w);
 		Kind k = ag::OpKind(op);
 		g_icount++;
@@ -149,9 +167,12 @@ void Run(Ctx *c, u32 pc, u32 ra0, u32 sp0) {
 		case Kind::J: {
 			u32 target = insn::JumpTarget(pc, w);
 			ExecDelaySlot(c, pc + 4);
-			if (dispatch::Lookup(target)) {
-				dispatch::Jump(c, target, ra0, sp0);
-				return;
+			bool done = false;
+			u32 next = 0;
+			if (nativeJump(target, &done, &next)) {
+				if (done) return;
+				pc = next;
+				continue;
 			}
 			if (target <= pc && c->budget < 0) {
 				c->pc = target;
@@ -185,9 +206,14 @@ void Run(Ctx *c, u32 pc, u32 ra0, u32 sp0) {
 				c->pc = target;
 				return;
 			}
-			if (rs != 31 && dispatch::Lookup(target)) {
-				dispatch::Jump(c, target, ra0, sp0);
-				return;
+			if (rs != 31) {
+				bool done = false;
+				u32 next = 0;
+				if (nativeJump(target, &done, &next)) {
+					if (done) return;
+					pc = next;
+					continue;
+				}
 			}
 			if (!mem::IsValidAddress(target)) BadPc(c, target, pc);
 			pc = target;

@@ -188,6 +188,19 @@ int Run(const Config &cfg, const std::function<int()> &emulation, const std::fun
 		if (present) {
 			SDL_RenderClear(ren);
 			SDL_RenderCopy(ren, tex, nullptr, nullptr);
+			// Diagnostics: PSPC_HOST_SNAPSHOT=<file.bmp> saves what the renderer drew for the 600th
+			// presented frame (screen captures fail while the desktop is locked).
+			static int presents = 0;
+			static const char *snap = getenv("PSPC_HOST_SNAPSHOT");
+			if (snap && ++presents == 600) {
+				int w = 0, h = 0;
+				SDL_GetRendererOutputSize(ren, &w, &h);
+				if (SDL_Surface *s = SDL_CreateRGBSurfaceWithFormat(0, w, h, 32, SDL_PIXELFORMAT_ARGB8888)) {
+					if (SDL_RenderReadPixels(ren, nullptr, SDL_PIXELFORMAT_ARGB8888, s->pixels, s->pitch) == 0)
+						SDL_SaveBMP(s, snap);
+					SDL_FreeSurface(s);
+				}
+			}
 			SDL_RenderPresent(ren);
 		} else {
 			SDL_Delay(1);

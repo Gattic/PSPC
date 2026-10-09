@@ -319,4 +319,12 @@ void Register_SysMemUserForUser() {
 		HLERAW(0x13A5ABEF, sceKernelPrintf),
 	};
 	hle::RegisterModule("SysMemForKernel", kfuncs);
+
+	// Kernel debug output goes where sceKernelPrintf's does (tests print with Kprintf).
+	static const hle::HleFunction kdebug[] = {
+		HLERAW(0x84F370BC, sceKernelPrintf),  // Kprintf
+		HLESTUB(0x7CEB2C09, "sceKernelRegisterKprintfHandler"),
+		HLESTUB(0xE7A3874D, "sceKernelRegisterAssertHandler"),
+	};
+	hle::RegisterModule("KDebugForKernel", kdebug);
 }

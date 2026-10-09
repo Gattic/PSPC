@@ -230,6 +230,22 @@ int RunOnce(const Options &o, BootTarget bt) {
 		display::SetVblankHook([]() { ctrl::OnVblank(); });
 	}
 
+	// A sceKernelLoadExec relaunch boots the requested guest path, with every device mounted as
+	// for the original program.
+	std::vector<u8> bootArgs;
+	if (!o.bootPath.empty()) {
+		std::vector<u8> image;
+		if (!io::ReadFile(o.bootPath, image) || image.empty()) {
+			LOGE("BOOT", "LoadExec target %s not found", o.bootPath.c_str());
+			return 2;
+		}
+		bt.image = std::move(image);
+		bt.pspPath = o.bootPath;
+		bt.cwd = o.bootPath.substr(0, o.bootPath.rfind('/') + 1);
+		io::SetCwd(bt.cwd);
+		if (!o.bootArgsFile.empty()) ReadWholeFile(fs::u8path(o.bootArgsFile), bootArgs);
+	}
+
 	// The M33 layer: config.se, kernel NID resolver, plugins (docs/m33-behaviors.md).
 	m33::BootInfo bi;
 	bi.fromDisc = bt.pspPath.rfind("disc0:", 0) == 0;
@@ -239,7 +255,7 @@ int RunOnce(const Options &o, BootTarget bt) {
 	if (!o.dataDir.empty()) m33::RegisterNidResolver((fs::u8path(o.dataDir) / "m33_nid_resolver.csv").string());
 	if (o.plugins) m33::LoadPlugins();
 
-	SceUID mod = boot::BootModule(bt.image, bt.pspPath);
+	SceUID mod = boot::BootModule(bt.image, bt.pspPath, bootArgs);
 	if (mod < 0) {
 		LOGE("BOOT", "Failed to load %s: %08x", bt.pspPath.c_str(), mod);
 		return 2;
@@ -253,6 +269,7 @@ int RunOnce(const Options &o, BootTarget bt) {
 }
 
 std::string g_relaunchTarget;
+std::string g_loadExecPath, g_loadExecArgsFile;
 
 }  // namespace
 
@@ -260,6 +277,14 @@ bool TakeRelaunch(std::string &hostFile) {
 	if (g_relaunchTarget.empty()) return false;
 	hostFile = g_relaunchTarget;
 	g_relaunchTarget.clear();
+	return true;
+}
+
+bool TakeLoadExecRelaunch(std::string &pspPath, std::string &argsFile) {
+	if (g_loadExecPath.empty()) return false;
+	pspPath = g_loadExecPath;
+	argsFile = g_loadExecArgsFile;
+	g_loadExecPath.clear();
 	return true;
 }
 
@@ -300,9 +325,15 @@ int Run(const Options &o) {
 			std::string next;
 			std::vector<u8> args;
 			if (code == boot::kExitLoadExec && boot::TakeLoadExecRequest(next, args)) {
-				// A full reset (fresh memory, kernel objects) is required for LoadExec; it needs a
-				// process-level restart today. Report and stop.
-				LOGW("RUNTIME", "sceKernelLoadExec(%s) requested; chaining executables is not supported yet", next.c_str());
+				// LoadExec needs a full reset (fresh memory and kernel objects): the frontend starts a
+				// new process that boots `next`. The argument block travels in a temp file.
+				wchar_t tmp[MAX_PATH];
+				GetTempPathW(MAX_PATH, tmp);
+				fs::path argsFile = fs::path(tmp) / ("pspc_loadexec_" + std::to_string(GetCurrentProcessId()) + ".bin");
+				if (!args.empty()) WriteWholeFile(argsFile, args.data(), args.size());
+				LOGI("RUNTIME", "sceKernelLoadExec(%s): restarting", next.c_str());
+				g_loadExecPath = next;
+				g_loadExecArgsFile = args.empty() ? "" : PathToUtf8(argsFile);
 				code = 0;
 			}
 			return code;

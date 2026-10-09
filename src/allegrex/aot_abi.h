@@ -24,7 +24,7 @@
 
 #include "allegrex/ctx.h"
 
-#define PSPC_AOT_ABI_VERSION 2
+#define PSPC_AOT_ABI_VERSION 3
 
 struct PspcRuntimeApi {
 	u32 abiVersion;
@@ -65,6 +65,10 @@ struct AotModuleDesc {
 	u32 numFunctions;
 	const AotFunctionEntry *functions;
 	u32 *delta;         // Written by the runtime: actual load base - recompileBase.
+	// One flag per entry of `functions`, set by the runtime when the guest rewrote that function's
+	// code: its body then hands over to the interpreter (direct calls inside the module bypass
+	// the runtime's dispatch table, so they need this check).
+	u8 *patched;
 };
 
 typedef const AotModuleDesc *(*PspcAotModuleFn)(const PspcRuntimeApi *api);

@@ -114,6 +114,8 @@ int main(int argc, char **argv) {
 		else if (a == "--no-plugins") o.plugins = false;
 		else if (a == "--host0") o.host0Dir = next();
 		else if (a == "--umd") o.umdImage = next();
+		else if (a == "--boot-path") o.bootPath = next();
+		else if (a == "--boot-args") o.bootArgsFile = next();
 		else if (a == "--fw") o.firmwareVersion = ParseFw(next());
 		else if (a == "--scale") o.windowScale = atoi(next().c_str());
 		else if (a == "--test-display") o.hasDisplayForTests = true;
@@ -162,24 +164,44 @@ int main(int argc, char **argv) {
 	}
 	logging::Init(level, logFile.empty() ? nullptr : logFile.c_str());
 	int rc = runtime::Run(o);
-	std::string next;
-	if (runtime::TakeRelaunch(next)) {
-		// M33 LoadExec: start a fresh runtime for the new executable with the same options.
+	std::string next, bootPath, bootArgs;
+	bool m33 = runtime::TakeRelaunch(next);
+	bool loadExec = !m33 && runtime::TakeLoadExecRelaunch(bootPath, bootArgs);
+	if (m33 || loadExec) {
+		// LoadExec: a fresh runtime (new process) for the new executable, with the same options.
+		// M33 swaps the host file; plain sceKernelLoadExec boots a guest path with the original
+		// mounts.
 		std::wstring cmd = L"\"" + (exeDir / "pspc.exe").wstring() + L"\"";
 		for (int i = 1; i < argc; i++) {
-			std::wstring arg = fs::u8path(argv[i]).wstring();
-			if (argv[i] == o.file) arg = fs::u8path(next).wstring();
+			std::string a = argv[i];
+			if ((a == "--boot-path" || a == "--boot-args") && i + 1 < argc) {
+				i++;
+				continue;
+			}
+			std::wstring arg = fs::u8path(a).wstring();
+			if (m33 && a == o.file) arg = fs::u8path(next).wstring();
 			cmd += L" \"" + arg + L"\"";
 		}
+		if (loadExec) {
+			cmd += L" --boot-path \"" + fs::u8path(bootPath).wstring() + L"\"";
+			if (!bootArgs.empty()) cmd += L" --boot-args \"" + fs::u8path(bootArgs).wstring() + L"\"";
+		}
+		fflush(stdout);
+		fflush(stderr);
 		STARTUPINFOW si{};
 		si.cb = sizeof(si);
+		si.dwFlags = STARTF_USESTDHANDLES;
+		si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+		si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+		si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
 		PROCESS_INFORMATION pi{};
-		if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+		if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) {
 			CloseHandle(pi.hThread);
 			WaitForSingleObject(pi.hProcess, INFINITE);
 			DWORD code = 0;
 			GetExitCodeProcess(pi.hProcess, &code);
 			CloseHandle(pi.hProcess);
+			if (!bootArgs.empty()) DeleteFileW(fs::u8path(bootArgs).wstring().c_str());
 			return (int)code;
 		}
 	}

@@ -30,12 +30,27 @@ _seen_lock = threading.Lock()
 _seen = set()
 
 
+def source_sem_version():
+    """Hash of src/allegrex computed exactly as src/CMakeLists.txt does."""
+    files = sorted(p.resolve().as_posix() for p in (ROOT / 'src' / 'allegrex').iterdir() if p.is_file())
+    joined = ''.join(hashlib.sha1(pathlib.Path(f).read_bytes()).hexdigest() for f in files)
+    return hashlib.sha1(joined.encode()).hexdigest()[:8]
+
+
 def sem_version():
-    """The semantics version the runtime will demand (see src/CMakeLists.txt)."""
+    """The semantics version the runtime will demand. The DLLs are compiled against the current
+    sources and link the build tree's libraries, so both must agree."""
+    built = None
     for line in SEM_HEADER.read_text().splitlines():
         if line.startswith('#define PSPC_SEM_VERSION'):
-            return line.split()[2].rstrip('u').lower()
-    raise RuntimeError('no PSPC_SEM_VERSION in %s' % SEM_HEADER)
+            built = line.split()[2].rstrip('u').lower()[2:]
+    if not built:
+        raise RuntimeError('no PSPC_SEM_VERSION in %s' % SEM_HEADER)
+    current = source_sem_version()
+    if built != current:
+        raise RuntimeError('src/allegrex changed since %s was built (%s != %s): rebuild the main tree first'
+                           % (SEM_HEADER.parent.parent, built, current))
+    return '0x' + built
 
 
 def snapshot_libs(work, version):
@@ -126,7 +141,7 @@ def build_direct(args, env, src, sha):
     obj_dir = src / 'obj'
     obj_dir.mkdir(exist_ok=True)
     flags = ['/nologo', '/c', '/std:c++20', '/MT', '/EHsc', '/DNDEBUG', '/DNOMINMAX', '/DWIN32_LEAN_AND_MEAN',
-             '/D_CRT_SECURE_NO_WARNINGS', '/I' + str(ROOT / 'src'), '/I' + str(src)]
+             '/D_CRT_SECURE_NO_WARNINGS', '/I' + str(ROOT / 'src'), '/I' + str(SEM_HEADER.parent), '/I' + str(src)]
     flags += CLANG_FLAGS if clang else MSVC_FLAGS
 
     def compile_one(cpp):
@@ -154,7 +169,8 @@ def build_with_cmake(args, env, src, sha):
     compiler = 'clang-cl' if args.compiler == 'clang' else 'cl'
     cfg = ['cmake', '-S', str(src), '-B', str(bdir), '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
            '-DCMAKE_CXX_COMPILER=' + compiler, '-DPSPC_SRC_DIR=' + str(ROOT / 'src').replace('\\', '/'),
-           '-DPSPC_LIB_DIR=' + str(args.lib_dir).replace('\\', '/')]
+           '-DPSPC_LIB_DIR=' + str(args.lib_dir).replace('\\', '/'),
+           '-DPSPC_GEN_DIR=' + str(SEM_HEADER.parent).replace('\\', '/')]
     r = subprocess.run(cfg, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if r.returncode != 0:
         raise RuntimeError('cmake configure failed:\n' + r.stdout[-4000:])
@@ -210,12 +226,16 @@ def build_one(args, env, path):
 
 
 def main():
+    global BIN, LIB, SEM_HEADER
     # @file reads one argument per line (long module lists).
     ap = argparse.ArgumentParser(fromfile_prefix_chars='@')
     ap.add_argument('inputs', nargs='+')
-    ap.add_argument('--cache', default=str(BIN / 'cache' / 'aot'))
+    ap.add_argument('--build-dir', default=None,
+                    help='build tree for pspc-recomp, the link libraries and the semantics version '
+                         '(default: build/RelWithDebInfo)')
+    ap.add_argument('--cache', default=None, help='AOT cache (default: <build dir>/bin/cache/aot)')
     ap.add_argument('--work', default=str(ROOT / 'build' / 'aot-work'))
-    ap.add_argument('--decrypt', default=str(BIN / 'pspc-decrypt.exe'))
+    ap.add_argument('--decrypt', default=None)
     ap.add_argument('--compiler', choices=['clang', 'msvc'], default='clang')
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 4)
     ap.add_argument('--modules-in-parallel', type=int, default=1)
@@ -225,6 +245,11 @@ def main():
     ap.add_argument('--force', action='store_true')
     ap.add_argument('--cmake', action='store_true', help='build through the generated CMakeLists.txt')
     args = ap.parse_args()
+    if args.build_dir:
+        tree = pathlib.Path(args.build_dir).resolve()
+        BIN, LIB, SEM_HEADER = tree / 'bin', tree / 'lib', tree / 'generated' / 'pspc_sem_version.h'
+    args.cache = args.cache or str(BIN / 'cache' / 'aot')
+    args.decrypt = args.decrypt or str(BIN / 'pspc-decrypt.exe')
     env = vs_env()
     args.sem_version = sem_version()
     args.lib_dir = snapshot_libs(pathlib.Path(args.work), args.sem_version)

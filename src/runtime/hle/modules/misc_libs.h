@@ -11,3 +11,5 @@ void Register_CccLibrary();
 void Register_RegAndSystemLibraries();
 // font.cpp: sceLibFont (PGF fonts).
 void Register_FontLibraries();
+// media_*.cpp: sceMpeg, sceMpegbase, scePsmf, scePsmfPlayer, sceVideocodec, sceJpeg, sceMp4.
+void Register_MediaLibraries();

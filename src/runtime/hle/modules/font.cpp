@@ -99,7 +99,7 @@ enum Language : u16 { LANG_JAPANESE = 1, LANG_LATIN = 2, LANG_KOREAN = 3 };
 
 // The firmware fonts, in firmware index order. Sizes are 1/64 point, resolutions 1/64 dpi.
 // fileSize and stingySize are what sceFontOpen allocates in mode 1 (plus kFontFileExtra) and
-// otherwise (pspautotests font/open); they are used when the file itself isn't installed.
+// otherwise (pspautotests font/open); they are used unless the installed file is the firmware's.
 struct RegistryEntry {
 	s32 hSize, vSize, hRes, vRes;
 	u32 extraAttributes;
@@ -394,13 +394,16 @@ void TableSizes(const PgfLayout &l, u32 (&sizes)[TA_COUNT]) {
 	memcpy(sizes, s, sizeof(s));
 }
 
-bool AllocTables(const FontNewLibParams &p, const PgfLayout &l, std::vector<u32> &freeOrder,
+// How the firmware splits jpn0's tables (pspautotests font/fonttest); they add up to its stingySize.
+constexpr u32 kJpn0FirmwareTables[TA_COUNT] = {2040, 2040, 2040, 848, 1020, 0, 0, 114632, 23224};
+
+bool AllocTables(const FontNewLibParams &p, const u32 (&sizes)[TA_COUNT], std::vector<u32> &freeOrder,
                  u32 (*blocksOut)[TA_COUNT] = nullptr) {
-	u32 sizes[TA_COUNT], blocks[TA_COUNT] = {};
-	TableSizes(l, sizes);
+	u32 blocks[TA_COUNT] = {};
 	for (int i = 0; i < TA_COUNT; i++) {
 		blocks[i] = GameAlloc(p, sizes[i]);
 		if (sizes[i] && (!blocks[i] || !mem::IsValidRange(blocks[i], sizes[i]))) {
+			LOGD("FONT", "font table allocation %d of %u bytes failed (%08x)", i, sizes[i], blocks[i]);
 			blocks[i] = 0;
 			for (int j = i - 1; j >= 0; j--) GameFree(p, blocks[j]);
 			return false;
@@ -411,6 +414,13 @@ bool AllocTables(const FontNewLibParams &p, const PgfLayout &l, std::vector<u32>
 		freeOrder.push_back(blocks[i]);
 	if (blocksOut) memcpy(*blocksOut, blocks, sizeof(blocks));
 	return true;
+}
+
+bool AllocTables(const FontNewLibParams &p, const PgfLayout &l, std::vector<u32> &freeOrder,
+                 u32 (*blocksOut)[TA_COUNT] = nullptr) {
+	u32 sizes[TA_COUNT];
+	TableSizes(l, sizes);
+	return AllocTables(p, sizes, freeOrder, blocksOut);
 }
 
 // User files are identified by the name the game passes.
@@ -705,15 +715,25 @@ u32 sceFontOpen(u32 libHandle, u32 index, u32 mode, u32 errorPtr) {
 	FontNewLibParams p = LiveParams(*lib);
 	std::vector<u32> allocations;
 	bool allocated;
-	if (!full && !f.data->IsBlank()) {
+	// The game's font heap is sized for what the firmware takes for its own file. A stand-in for it
+	// (PPSSPP's open fonts are larger: their jpn0 needs 204320 bytes of tables against 145844) must
+	// take the same, or the open fails where it works on hardware (Monster Hunter Freedom Unite
+	// draws no menu text). The firmware's own file is recognised by its tables adding up to the
+	// registry's stingy size.
+	const bool firmwareFile = !f.data->IsBlank() && f.data->Layout().TableBytes() == e.stingySize;
+	if (!full && firmwareFile) {
 		allocated = AllocTables(p, f.data->Layout(), allocations);
+	} else if (!full && index == 0) {
+		allocated = AllocTables(p, kJpn0FirmwareTables, allocations);
 	} else {
-		// A blank font has no tables to split the stingy size into.
-		u32 block = GameAlloc(p, full ? kFontFileExtra + (f.fileSize ? f.fileSize : e.fileSize) : e.stingySize);
+		// Where the firmware's split of the stingy size isn't known: one block of that size.
+		u32 block = GameAlloc(p, full ? kFontFileExtra + (firmwareFile ? f.fileSize : e.fileSize) : e.stingySize);
 		allocated = block != 0;
 		if (block) allocations = {block};
 	}
 	if (!allocated) {
+		LOGW("FONT", "sceFontOpen(%08x, %u, %u): the game's allocator refused the font's memory", libHandle, index,
+		     mode);
 		SetError(errorPtr, SCE_FONT_ERROR_OUT_OF_MEMORY);
 		return 0;
 	}

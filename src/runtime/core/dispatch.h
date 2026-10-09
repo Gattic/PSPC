@@ -21,6 +21,9 @@ void UnregisterRange(u32 addr, u32 size);
 HostFn Lookup(u32 addr);
 BodyFn LookupBody(u32 addr);
 u32 RegisteredCount();
+// Diagnostics: the guest function whose host code starts closest below `hostAddr` (0 if none).
+// Scans the whole table; for crash reports only.
+u32 GuestFunctionAt(const void *hostAddr, size_t *offset);
 
 // Call semantics: $ra already holds the return address. Runs native code if registered,
 // otherwise interprets until the callee returns. Sets c->pc = target before a native call.

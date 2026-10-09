@@ -285,8 +285,14 @@ u32 sceDisplayGetFrameBuf(u32 topPtr, u32 linePtr, u32 fmtPtr, int sync) {
 	return 0;
 }
 
-int sceDisplayWaitVblankStart() { return WaitVblankStart(1, false); }
-int sceDisplayWaitVblankStartCB() { return WaitVblankStart(1, true); }
+int sceDisplayWaitVblankStart() {
+	if (int err = CheckCanWait()) return err;
+	return WaitVblankStart(1, false);
+}
+int sceDisplayWaitVblankStartCB() {
+	if (int err = CheckCanWait()) return err;
+	return WaitVblankStart(1, true);
+}
 int sceDisplayWaitVblankStartMulti(int n) {
 	if (n <= 0) return (int)SCE_KERNEL_ERROR_INVALID_VALUE;
 	if (int err = CheckCanWait()) return err;
@@ -297,9 +303,11 @@ int sceDisplayWaitVblankStartMultiCB(int n) {
 	if (int err = CheckCanWait()) return err;
 	return WaitVblankStart(n, true);
 }
-// In a vblank already: no wait, and 1.
+// In a vblank already: no wait, and 1 (even in an interrupt handler; pspautotests intr/waits).
 int WaitVblank(bool cb) {
+	if (!sched::DispatchEnabled()) return (int)SCE_KERNEL_ERROR_CAN_NOT_WAIT;
 	if (!InVblank()) {
+		if (sched::InInterrupt()) return (int)SCE_KERNEL_ERROR_ILLEGAL_CONTEXT;
 		WaitVblankStart(1, cb);
 		return 0;
 	}

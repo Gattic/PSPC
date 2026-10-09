@@ -48,9 +48,10 @@ def run_one(args, rel, prx, exp):
     # Tests address their data as host0:/tests/..., i.e. host0: is the pspautotests root.
     cmd += ['--host0', str(pathlib.Path(args.tests).parent)]
     # A fresh memory stick per test: savedata tests share folder names and would collide.
-    ms = ROOT / 'build' / 'autotest-ms' / rel.replace('/', '_')
+    # Per run (pid) as well, so concurrent runs of the suite don't share folders.
+    ms = ROOT / 'build' / 'autotest-ms' / str(os.getpid()) / rel.replace('/', '_')
     shutil.rmtree(ms, ignore_errors=True)
-    ms.mkdir(parents=True)
+    ms.mkdir(parents=True, exist_ok=True)
     cmd += ['--memstick', str(ms)]
     cmd.append(str(prx))
     start = time.time()
@@ -124,6 +125,7 @@ def main():
         print('  %-10s %3d / %3d' % (d, *by_dir[d]))
     if args.json:
         pathlib.Path(args.json).write_text(json.dumps(results, indent=1), encoding='utf-8')
+    shutil.rmtree(ROOT / 'build' / 'autotest-ms' / str(os.getpid()), ignore_errors=True)
     return 0 if passed == len(results) else 1
 
 

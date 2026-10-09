@@ -175,6 +175,15 @@ void RebindImportersOf(PspModule *exporter) {
 
 bool TryLoadAot(PspModule *m, const loader::ElfFile &elf, u32 *requiredBase) {
 	if (!g_aotEnabled || g_aotDir.empty()) return false;
+	// A DLL is one process-wide instance with one relocation delta: a second copy of a module
+	// that is already running natively (a game loading the same PRX twice) is interpreted.
+	for (SceUID id : g_modules) {
+		PspModule *other = Get<PspModule>(id);
+		if (other && other->aot && other->sha1 == m->sha1) {
+			LOGI("AOT", "%s is already loaded natively; this copy runs in the interpreter", m->name.c_str());
+			return false;
+		}
+	}
 	std::string hex = HexString(m->sha1.data(), m->sha1.size());
 	fs::path dllPath = fs::path(g_aotDir) / (hex + ".dll");
 	if (!fs::exists(dllPath)) return false;
@@ -204,9 +213,17 @@ void RegisterAotFunctions(PspModule *m) {
 	const AotModuleDesc *desc = entry(cpu::AotApi());
 	u32 delta = m->image.relocatable ? (m->image.lowAddr - desc->recompileBase) : 0;
 	*desc->delta = delta;
-	for (u32 i = 0; i < desc->numFunctions; i++)
-		dispatch::RegisterNative(desc->recompileBase + delta + desc->functions[i].offset, desc->functions[i].fn,
-		                         desc->functions[i].body);
+	m->aotEntries.clear();
+	for (u32 i = 0; i < desc->numFunctions; i++) {
+		u32 addr = desc->recompileBase + delta + desc->functions[i].offset;
+		dispatch::RegisterNative(addr, desc->functions[i].fn, desc->functions[i].body);
+		m->aotEntries.push_back(addr);
+	}
+	std::sort(m->aotEntries.begin(), m->aotEntries.end());
+	m->aotPatched = desc->patched;
+	// What the native code was compiled from (relocated, imports bound): later writes to the code
+	// show up as differences against this.
+	if (const u8 *p = mem::GetPointer(m->memAddr, m->memSize)) m->pristine.assign(p, p + m->memSize);
 	LOGI("AOT", "%s: %u native functions (delta %08x)", m->name.c_str(), desc->numFunctions, delta);
 }
 
@@ -470,6 +487,44 @@ int UnloadModule(PspModule *m) {
 	g_modules.erase(std::remove(g_modules.begin(), g_modules.end(), m->uid), g_modules.end());
 	Destroy(m->uid);
 	return 0;
+}
+
+int InvalidateNativeCode(u32 addr, u32 size) {
+	int dropped = 0;
+	for (SceUID id : g_modules) {
+		PspModule *m = Get<PspModule>(id);
+		if (!m || !m->aot || m->pristine.empty()) continue;
+		u32 lo = std::max(addr & ~3u, m->memAddr), hi = std::min(addr + size, m->memAddr + m->memSize);
+		if (lo >= hi) continue;
+		const u8 *cur = mem::GetPointer(m->memAddr, m->memSize);
+		if (!cur) continue;
+		auto inCode = [&](u32 a) {
+			for (const auto &r : m->image.codeRanges)
+				if (a >= r.first && a < r.second) return true;
+			return false;
+		};
+		for (u32 a = lo; a + 4 <= hi; a += 4) {
+			if (!inCode(a)) continue;  // data changes all the time; only code matters
+			u32 off = a - m->memAddr;
+			if (memcmp(cur + off, &m->pristine[off], 4) == 0) continue;
+			// The function holding the word is the nearest entry at or below it (bodies that
+			// reach past the next entry are rare; their callers still see the change there).
+			auto it = std::upper_bound(m->aotEntries.begin(), m->aotEntries.end(), a);
+			if (it != m->aotEntries.begin()) {
+				u32 entry = *std::prev(it);
+				size_t idx = (size_t)(std::prev(it) - m->aotEntries.begin());
+				if (m->aotPatched && !m->aotPatched[idx]) {
+					m->aotPatched[idx] = 1;  // direct calls from other native code check this
+					dispatch::Register(entry, nullptr);
+					dropped++;
+					LOGI("AOT", "%s: code at %08x changed; %08x now runs in the interpreter", m->name.c_str(), a,
+					     entry);
+				}
+			}
+			memcpy(&m->pristine[off], cur + off, 4);
+		}
+	}
+	return dropped;
 }
 
 PspModule *ModuleByAddress(u32 addr) {

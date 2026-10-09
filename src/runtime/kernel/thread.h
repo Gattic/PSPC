@@ -106,6 +106,7 @@ struct PspThread : KObject {
 	u32 waitTimeoutPtr = 0;    // guest u32* that receives the time left
 	u64 waitDeadline = 0;      // absolute us when the timeout fires, 0 = none
 	u32 waitLatencyUs = 0;     // how far past the deadline the timeout fires (not part of time left)
+	u32 waitWakeCycles = 0;    // CPU time the timer interrupt that ends the wait takes from whoever runs
 	s32 waitTimeoutResult = 0; // what a timeout wakes the wait with
 	u64 timeoutEventId = 0;
 	u32 waitValue[4] = {};     // per-wait-type data (e.g. event flag pattern)

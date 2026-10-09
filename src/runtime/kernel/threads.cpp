@@ -162,7 +162,7 @@ int StartThread(PspThread *t, u32 argSize, u32 argPtr) {
 		// ready but hasn't been dispatched (pspautotests threads/threads/termsuspended).
 		if (*g_intrEnabled) {
 			// About 35us from the call to the new thread's entry (threads/scheduling/handoff).
-			sched::ChargeCycles(3100);
+			sched::ChargeCycles(2700);
 			sched::HandOffTo(t);
 		}
 	} else if (cur) {

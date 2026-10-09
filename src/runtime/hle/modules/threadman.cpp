@@ -170,7 +170,8 @@ int sceKernelStartThread(SceUID id, s32 argSize, u32 argPtr) {
 	PspThread *t = Get<PspThread>(id);
 	if (!t) return (int)SCE_KERNEL_ERROR_UNKNOWN_THID;
 	if (t->status != THREADSTATUS_DORMANT) return (int)SCE_KERNEL_ERROR_NOT_DORMANT;
-	sched::ChargeCycles(3400);
+	// 10-25us when the new thread doesn't get the CPU (threads/scheduling/costs).
+	sched::ChargeCycles(3800);
 	int r = StartThread(t, (u32)argSize, argPtr);
 	if (r == 0) TriggerThreadEvent(t, THREADEVENT_START);
 	return r;
@@ -227,13 +228,20 @@ int sceKernelDeleteThread(SceUID id) {
 	return 0;
 }
 
+// Finding the thread, and then terminating it. checkpoint() terminates and restarts a thread, at
+// least 25us in all even when the thread had already ended (threads/scheduling/costs).
+constexpr s64 kTerminateLookupCycles = 700;
+constexpr s64 kTerminateCycles = 2100;
+
 int sceKernelTerminateThread(SceUID id) {
 	if (sched::InInterrupt() && CompiledSdkVersion() >= 0x03080000) return (int)SCE_KERNEL_ERROR_ILLEGAL_CONTEXT;
 	if (!sched::DispatchEnabled() && CompiledSdkVersion() >= 0x03080000) return (int)SCE_KERNEL_ERROR_CAN_NOT_WAIT;
 	if (id == 0 || id == sched::CurrentId()) return (int)SCE_KERNEL_ERROR_ILLEGAL_THID;
 	PspThread *t = Get<PspThread>(id);
 	if (!t) return (int)SCE_KERNEL_ERROR_UNKNOWN_THID;
+	sched::ChargeCycles(kTerminateLookupCycles);
 	if (IsStopped(t)) return (int)SCE_KERNEL_ERROR_DORMANT;
+	sched::ChargeCycles(kTerminateCycles);
 	// Threads this wakes are made ready, but nothing is dispatched until the next dispatch point
 	// (threads/threads/termsuspended).
 	sched::TerminateThread(t, (s32)SCE_KERNEL_ERROR_THREAD_TERMINATED);
@@ -247,7 +255,9 @@ int sceKernelTerminateDeleteThread(SceUID id) {
 	PspThread *t = Get<PspThread>(id);
 	if (!t) return (int)SCE_KERNEL_ERROR_UNKNOWN_THID;
 	bool wasStopped = IsStopped(t);
+	sched::ChargeCycles(kTerminateLookupCycles);
 	if (!wasStopped) {
+		sched::ChargeCycles(kTerminateCycles);
 		sched::TerminateThread(t, (s32)SCE_KERNEL_ERROR_THREAD_TERMINATED);
 		TriggerThreadEvent(t, THREADEVENT_EXIT);
 	}
@@ -571,7 +581,13 @@ int sceKernelCancelWakeupThread(SceUID id) {
 // Measured from inside the delaying thread, a delay of n us takes n + 25us, and at least 230us
 // (threads/scheduling/delaylen, handoff). Part of that is the call's own time before it waits.
 constexpr s64 kDelayCallCycles = 400;     // up to the "returns at once" decision
-constexpr s64 kDelayWaitCycles = 1700;    // setting up the wait
+// Setting up the wait: a thread that a better one's delay hands the CPU to starts waiting late
+// enough that a 1000us delay ends the wait less than 1012us in (threads/semaphores/wait).
+constexpr s64 kDelayWaitCycles = 2750;
+// The timer interrupt that ends a delay takes about 23us of whatever thread has the CPU then: a
+// better thread delaying 200us at a time costs a busy thread about 45us per wake, switches
+// included (threads/scheduling/preemptsyscall).
+constexpr u32 kDelayWakeCycles = 23 * 222;
 u64 DelayUs(u64 us) {
 	if (us < 200) us = 205;
 	// Wraps around (seen on firmware), and potentially wakes up soon.
@@ -579,7 +595,7 @@ u64 DelayUs(u64 us) {
 	// Converting millennia to hundreds of years: basically forever, but no overflow.
 	if (us > 0x0010000000000000ULL) us >>= 12;
 	// It never wakes up right away.
-	return us + 15;
+	return us + 10;
 }
 
 int Delay(u64 us, bool cb, bool atOnceCheck) {
@@ -591,7 +607,7 @@ int Delay(u64 us, bool cb, bool atOnceCheck) {
 	}
 	sched::ChargeCycles(kDelayWaitCycles);
 	u64 deadline = sched::NowUs() + DelayUs(us);
-	return sched::WaitUntil(WAITTYPE_DELAY, t->uid, deadline, cb);
+	return sched::WaitUntil(WAITTYPE_DELAY, t->uid, deadline, cb, nullptr, kDelayWakeCycles);
 }
 
 int sceKernelDelayThread(u32 us) { return Delay(us, false, true); }
@@ -751,11 +767,8 @@ int sceKernelGetSystemTime(u32 clockPtr) {
 	sched::ChargeCycles(265);
 	return 0;
 }
-// TEMP-TIMETRACE
-static bool TimeTrace() { static int on = -1; if (on < 0) on = getenv("PSPC_TIMETRACE") != nullptr; return on; }
 u32 sceKernelGetSystemTimeLow() {
 	u64 t = sched::NowUs();
-	if (TimeTrace()) fprintf(stderr, "[tt] %s %llu\n", CurThread() ? CurThread()->name.c_str() : "?", (unsigned long long)t);
 	sched::ChargeCycles(165);
 	return (u32)t;
 }
@@ -793,25 +806,6 @@ int sceKernelSysClock2USecWide(u32 lo, u32 hi, u32 lowPtr, u32 highPtr) {
 	sched::ChargeCycles(385);
 	return 0;
 }
-
-u32 sceKernelLibcClock() {
-	u32 t = (u32)sched::NowUs();
-	sched::ChargeCycles(330);
-	return t;
-}
-u32 sceKernelLibcGettimeofday(u32 tvPtr, u32 tzPtr) {
-	if (mem::IsValidRange(tvPtr, 8)) {
-		u64 now = sched::NowUs() + 1262304000ull * 1000000ull;  // arbitrary epoch base (2010)
-		GWrite32(tvPtr, (u32)(now / 1000000));
-		GWrite32(tvPtr + 4, (u32)(now % 1000000));
-	}
-	(void)tzPtr;
-	sched::ChargeCycles(1885);
-	return 0;
-}
-
-int sceKernelDcacheWritebackAll() { return 0; }
-int sceKernelDcacheWritebackInvalidateAll() { return 0; }
 
 // ---------------------------------------------------------------- id lists / system status
 
@@ -985,10 +979,6 @@ void Register_ThreadManForUser() {
 		HLEFN(0x730ED8BC, sceKernelReferCallbackStatus),
 
 		HLEFN(0x532A522E, _sceKernelExitThread),
-		HLEFN(0x71EC4271, sceKernelLibcGettimeofday),
-		HLEFN(0x79D1C3FA, sceKernelDcacheWritebackAll),
-		HLEFN(0x91E4F6A7, sceKernelLibcClock),
-		HLEFN(0xB435DEC5, sceKernelDcacheWritebackInvalidateAll),
 	};
 	hle::RegisterModule("ThreadManForUser", funcs);
 	hle::RegisterModule("ThreadManForKernel", funcs);

@@ -67,6 +67,33 @@ SceUID LoadFromBytes(const std::vector<u8> &data, const std::string &path, u32 o
 	return LoadModuleFromMemory(data, path, opts);
 }
 
+// How long a load takes on hardware (fast-time mode only), from a memory stick: about 12ms for a
+// 5KB module and 36ms for a 210KB one, 15ms for the 5KB one with a better thread delaying 200us at
+// a time alongside. Reading the file is waiting (worse threads get the CPU: 10-50% of it for the
+// small module, 50-90% for the large one); parsing and relocating is busy, preemptible by better
+// threads (threads/scheduling/callcosts, syscallkinds).
+bool CanSpendTime() {
+	return sched::FastTime() && sched::Current() && !sched::InInterrupt() && sched::DispatchEnabled();
+}
+
+void LoadReadTime(size_t fileSize) {
+	if (!CanSpendTime()) return;
+	u64 us = 900 + (u64)fileSize * 102 / 1000;
+	sched::WaitUntil(WAITTYPE_HLEDELAY, sched::CurrentId(), sched::NowUs() + us, false);
+}
+
+void LoadWorkTime(size_t fileSize) {
+	if (!CanSpendTime()) return;
+	u64 us = 10700 + (u64)fileSize / 80;
+	sched::BusyDelayCycles((s64)(us * (sched::kCpuHz / 1000000)));
+}
+
+// Unloading is busy too, about 400us with a better thread delaying alongside (syscallkinds).
+void UnloadWorkTime() {
+	if (!CanSpendTime()) return;
+	sched::BusyDelayCycles((s64)(330 * (sched::kCpuHz / 1000000)));
+}
+
 int sceKernelLoadModule(const char *path, u32 flags, u32 optPtr) {
 	(void)flags;
 	if (!path) return (int)SCE_KERNEL_ERROR_ILLEGAL_ADDR;
@@ -75,7 +102,10 @@ int sceKernelLoadModule(const char *path, u32 flags, u32 optPtr) {
 		LOGW("LOADER", "sceKernelLoadModule(%s): file not found", path);
 		return (int)SCE_KERNEL_ERROR_ERRNO_FILE_NOT_FOUND;
 	}
-	return LoadFromBytes(data, path, optPtr);
+	LoadReadTime(data.size());
+	SceUID id = LoadFromBytes(data, path, optPtr);
+	if (id >= 0) LoadWorkTime(data.size());
+	return id;
 }
 
 int sceKernelLoadModuleNpDrm(const char *path, u32 flags, u32 optPtr) { return sceKernelLoadModule(path, flags, optPtr); }
@@ -91,14 +121,19 @@ int sceKernelLoadModuleByID(int fd, u32 flags, u32 optPtr) {
 	std::vector<u8> data;
 	std::string path;
 	if (!io::ReadRestOfFd(fd, data, &path)) return (int)SCE_KERNEL_ERROR_BADF;
-	return LoadFromBytes(data, path + " (by fd)", optPtr);
+	LoadReadTime(data.size());
+	SceUID id = LoadFromBytes(data, path + " (by fd)", optPtr);
+	if (id >= 0) LoadWorkTime(data.size());
+	return id;
 }
 
 int sceKernelLoadModuleBufferUsbWlan(u32 size, u32 buf, u32 flags, u32 optPtr) {
 	(void)flags;
 	if (!mem::IsValidRange(buf, size)) return (int)SCE_KERNEL_ERROR_ILLEGAL_ADDR;
 	std::vector<u8> data(GPtr(buf), GPtr(buf) + size);
-	return LoadFromBytes(data, "(buffer)", optPtr);
+	SceUID id = LoadFromBytes(data, "(buffer)", optPtr);
+	if (id >= 0) LoadWorkTime(data.size());
+	return id;
 }
 
 int sceKernelStartModule(SceUID id, u32 argSize, u32 argPtr, u32 statusPtr, u32 optPtr) {
@@ -137,6 +172,7 @@ int sceKernelUnloadModule(SceUID id) {
 		return id;
 	}
 	int r = UnloadModule(m);
+	if (r >= 0) UnloadWorkTime();
 	return r < 0 ? r : id;
 }
 
@@ -146,12 +182,15 @@ PspModule *CallerModule() {
 	return nullptr;
 }
 
-int sceKernelSelfStopUnloadModule(int exitCode, u32 argSize, u32 argPtr) {
+// noinline: MSVC 19.44 at /O2 miscompiled the inlined HLE wrapper of this never-returning
+// function (it dropped the body and evaluated a stack argument that doesn't exist).
+__declspec(noinline) int sceKernelSelfStopUnloadModule(int exitCode, u32 argSize, u32 argPtr) {
 	(void)argSize;
 	(void)argPtr;
 	PspModule *m = CallerModule();
 	if (m) m->status = MODULE_STATUS_STOPPED;
 	sched::ExitCurrentThread(exitCode, true);
+	return 0;  // not reached
 }
 
 int sceKernelStopUnloadSelfModuleWithStatus(int exitCode, u32 argSize, u32 argPtr, u32 statusPtr, u32 optPtr) {

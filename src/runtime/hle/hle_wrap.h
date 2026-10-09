@@ -8,8 +8,10 @@
 //   const HleFunction table[] = { HLEFN(0x12345678, sceFoo), ... };
 #pragma once
 
+#include <array>
 #include <tuple>
 #include <type_traits>
+#include <utility>
 
 #include "allegrex/guestmem.h"
 #include "common/log.h"
@@ -40,55 +42,62 @@ struct PspPtr {
 namespace hle {
 namespace detail {
 
-struct ArgState {
-	Ctx *c;
-	int gpr = 4;
-	int fpr = 12;
-	// Argument word i (4 = $a0); past $t3 they continue on the caller's stack at $sp.
-	u32 Word(int i) const {
-		if (i <= 11) return c->r[i];
-		u32 a = c->r[29] + 4 * (u32)(i - 12);
-		return mem::IsValidRange(a, 4) ? GRead32(a) : 0;
-	}
-};
+// Stack argument `index` (0 = the first word at $sp). Out of line: keeps the wrappers small.
+u32 StackArgWord(const Ctx *c, int index);
+
+// Every argument's register (or stack word) is fixed at compile time, and each read is a pure
+// function of that constant. (An earlier version threaded a mutable cursor through a tuple
+// initializer; MSVC 19.44 /O2 miscompiled one instance of it.)
+template <typename T>
+struct IsPspPtr : std::false_type {};
+template <typename T>
+struct IsPspPtr<PspPtr<T>> : std::true_type {};
 
 template <typename T>
-struct ArgReader {
-	static T Read(ArgState &s) {
-		static_assert(sizeof(T) <= 8, "unsupported HLE argument type");
-		if constexpr (std::is_floating_point_v<T>) {
-			return (T)s.c->f[s.fpr++];
-		} else if constexpr (sizeof(T) == 8) {
-			if (s.gpr & 1) s.gpr++;
-			u64 lo = s.Word(s.gpr);
-			u64 hi = s.Word(s.gpr + 1);
-			s.gpr += 2;
-			return (T)(lo | (hi << 32));
-		} else {
-			u32 v = s.Word(s.gpr);
-			s.gpr++;
-			return (T)v;
+constexpr bool kFloatArg = std::is_floating_point_v<T>;
+template <typename T>
+constexpr bool kWideArg = !kFloatArg<T> && !std::is_pointer_v<T> && !IsPspPtr<T>::value && sizeof(T) == 8;
+
+// Slot of each argument: 4..11 = $a0-$t3 (then stack words from 12), 12.. = $f12-.
+template <typename... A>
+constexpr std::array<int, sizeof...(A) + 1> ArgSlots() {
+	std::array<int, sizeof...(A) + 1> out{};
+	int gpr = 4, fpr = 12, i = 0;
+	auto place = [&](bool isFloat, bool isWide) {
+		if (isFloat) return fpr++;
+		if (isWide) {
+			gpr += gpr & 1;  // 64-bit values take an aligned register pair
+			gpr += 2;
+			return gpr - 2;
 		}
-	}
-};
+		return gpr++;
+	};
+	((out[i++] = place(kFloatArg<A>, kWideArg<A>)), ...);
+	return out;
+}
 
-template <typename T>
-struct ArgReader<PspPtr<T>> {
-	static PspPtr<T> Read(ArgState &s) {
-		u32 v = s.Word(s.gpr);
-		s.gpr++;
-		return PspPtr<T>(v);
-	}
-};
+template <int Slot>
+inline u32 WordAt(Ctx *c) {
+	if constexpr (Slot <= 11) return c->r[Slot];
+	else return StackArgWord(c, Slot - 12);
+}
 
-template <>
-struct ArgReader<const char *> {
-	static const char *Read(ArgState &s) {
-		u32 v = s.Word(s.gpr);
-		s.gpr++;
+template <typename T, int Slot>
+inline T ReadArg(Ctx *c) {
+	if constexpr (kFloatArg<T>) {
+		return (T)c->f[Slot];
+	} else if constexpr (IsPspPtr<T>::value) {
+		return T(WordAt<Slot>(c));
+	} else if constexpr (std::is_same_v<T, const char *>) {
+		u32 v = WordAt<Slot>(c);
 		return v ? mem::GetCString(v) : nullptr;
+	} else if constexpr (kWideArg<T>) {
+		return (T)((u64)WordAt<Slot>(c) | ((u64)WordAt<Slot + 1>(c) << 32));
+	} else {
+		static_assert(sizeof(T) <= 4 && !std::is_pointer_v<T>, "unsupported HLE argument type");
+		return (T)WordAt<Slot>(c);
 	}
-};
+}
 
 template <typename R>
 inline void WriteRet(Ctx *c, R v) {
@@ -102,16 +111,20 @@ inline void WriteRet(Ctx *c, R v) {
 	}
 }
 
-template <auto F, typename R, typename... A>
-inline void WrapImpl(Ctx *c, R (*)(A...)) {
-	ArgState st{c};
-	std::tuple<std::decay_t<A>...> args{ArgReader<std::decay_t<A>>::Read(st)...};
+template <auto F, typename R, typename Args, size_t... I>
+inline void WrapIndexed(Ctx *c, std::index_sequence<I...>) {
+	constexpr auto slots = ArgSlots<std::tuple_element_t<I, Args>...>();
 	if constexpr (std::is_void_v<R>) {
-		std::apply(F, args);
+		F(ReadArg<std::tuple_element_t<I, Args>, slots[I]>(c)...);
 	} else {
-		R r = std::apply(F, args);
+		R r = F(ReadArg<std::tuple_element_t<I, Args>, slots[I]>(c)...);
 		WriteRet<R>(c, r);
 	}
+}
+
+template <auto F, typename R, typename... A>
+inline void WrapImpl(Ctx *c, R (*)(A...)) {
+	WrapIndexed<F, R, std::tuple<std::decay_t<A>...>>(c, std::index_sequence_for<A...>{});
 }
 
 }  // namespace detail

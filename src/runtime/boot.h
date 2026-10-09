@@ -12,8 +12,9 @@ namespace boot {
 
 constexpr int kExitLoadExec = 0x4C4F4144;  // scheduler exit code meaning "restart with a new executable"
 
-// Loads `image` as the main module and starts it. `pspPath` becomes argv[0].
-SceUID BootModule(const std::vector<u8> &image, const std::string &pspPath);
+// Loads `image` as the main module and starts it. `pspPath` becomes argv[0], unless `args` (the
+// argument block a sceKernelLoadExec caller passed) is given.
+SceUID BootModule(const std::vector<u8> &image, const std::string &pspPath, const std::vector<u8> &args = {});
 
 void RequestLoadExec(const std::string &pspPath, const std::vector<u8> &args);
 bool TakeLoadExecRequest(std::string &pspPath, std::vector<u8> &args);

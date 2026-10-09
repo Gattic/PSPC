@@ -40,6 +40,9 @@ struct PspModule : KObject {
 	bool aot = false;
 	void *dll = nullptr;
 	u32 aotRecompileBase = 0;
+	std::vector<u32> aotEntries;  // guest addresses of the native functions, sorted (= table order)
+	u8 *aotPatched = nullptr;     // the DLL's per-function "code was rewritten" flags
+	std::vector<u8> pristine;     // the module image as loaded, to spot later code patches
 };
 
 struct LoadOptions {
@@ -60,6 +63,10 @@ int StopModule(PspModule *m, u32 argSize, u32 argPtr, u32 statusPtr, u32 smOptio
 int ValidateSMOption(u32 smOptionPtr);
 int UnloadModule(PspModule *m);
 PspModule *ModuleByAddress(u32 addr);
+// After the guest changed code in [addr, addr+size) (it flushes the icache to say so): native
+// functions containing a changed word are dropped so that code runs in the interpreter, which
+// sees the patch (CFW plugins hook game functions this way). Returns how many were dropped.
+int InvalidateNativeCode(u32 addr, u32 size);
 PspModule *ModuleByName(const std::string &name);
 const std::vector<SceUID> &LoadedModules();
 

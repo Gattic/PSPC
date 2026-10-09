@@ -15,15 +15,16 @@ std::string g_loadExecPath;
 std::vector<u8> g_loadExecArgs;
 }  // namespace
 
-SceUID BootModule(const std::vector<u8> &image, const std::string &pspPath) {
+SceUID BootModule(const std::vector<u8> &image, const std::string &pspPath, const std::vector<u8> &args) {
 	kernel::LoadOptions opts;
 	SceUID id = kernel::LoadModuleFromMemory(image, pspPath, opts);
 	if (id < 0) return id;
 	kernel::PspModule *m = kernel::Get<kernel::PspModule>(id);
-	// argv block: the executable path, NUL terminated.
-	u32 argSize = (u32)pspPath.size() + 1;
+	// argv block: the LoadExec caller's, or the executable path, NUL terminated.
+	u32 argSize = args.empty() ? (u32)pspPath.size() + 1 : (u32)args.size();
 	u32 argp = kernel::AllocKernelMemory(AlignUp(argSize, 16), "boot args");
-	mem::WriteBytes(argp, pspPath.c_str(), argSize);
+	if (args.empty()) mem::WriteBytes(argp, pspPath.c_str(), argSize);
+	else mem::WriteBytes(argp, args.data(), argSize);
 	int r = kernel::StartModule(m, argSize, argp, 0, false);
 	if (r < 0) return r;
 	return id;

@@ -9,4 +9,5 @@ void Register_Misc() {
 	Register_CccLibrary();
 	Register_RegAndSystemLibraries();
 	Register_FontLibraries();
+	Register_MediaLibraries();
 }

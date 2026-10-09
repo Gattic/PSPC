@@ -23,6 +23,8 @@ struct Options {
 	std::string flash1Dir;
 	std::string host0Dir;      // host0: root (default: the boot file's folder)
 	std::string umdImage;      // disc image to insert when booting a non-disc executable
+	std::string bootPath;      // LoadExec relaunch: guest path to boot instead of the file's own
+	std::string bootArgsFile;  // LoadExec relaunch: argument block for the booted module
 	bool plugins = true;      // load ms0:/seplugins/game.txt (M33)
 	std::string dataDir;       // contains nids.csv
 	std::string decryptTool;
@@ -43,5 +45,8 @@ struct Options {
 int Run(const Options &opts);
 // After Run(): an M33 LoadExec asked to continue with this host file.
 bool TakeRelaunch(std::string &hostFile);
+// After Run(): the program called sceKernelLoadExec; restart booting this guest path with the
+// argument block stored in argsFile ("" for none). See Options::bootPath.
+bool TakeLoadExecRelaunch(std::string &pspPath, std::string &argsFile);
 
 }  // namespace runtime

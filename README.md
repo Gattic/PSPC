@@ -6,20 +6,25 @@ interpreter as a fallback. The PSP OS, as of firmware 4.01 with the M33 custom f
 **reimplemented natively**, using the decompiled firmware as its specification.
 
 Read [PLAN.md](PLAN.md) for the goals and phases, and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-for how it works.
+and [docs/RECOMPILER.md](docs/RECOMPILER.md) for how it works.
 
 ## Status
 
+Retail games boot and play: Daxter reaches gameplay, Syphon Filter: Combat Ops and Logan's Shadow
+reach their profile screens, Monster Hunter Freedom Unite its game menu - natively (AOT) and in the
+interpreter. pspautotests: about 460 of 559 pass; the interpreter and AOT give the same results.
+
 | Area | State |
 |---|---|
-| Allegrex CPU: decoder, interpreter, FPU, VFPU | Working. Validated against pspautotests `cpu/` |
-| AOT recompiler (`pspc-recomp`) + DLL pipeline | Working. `cpu/cpu_alu` runs 100% native with output identical to hardware |
-| Kernel: threads (fibers), sync objects, memory, modules, interrupts | Working. Being completed against `threads/` and `sysmem/` |
-| Display, controller, power, RTC, UMD, I/O, ISO/CSO | Working / being completed |
-| GE graphics (software renderer) | In progress |
-| Audio (sceAudio, SAS, ATRAC3/3+, MP3) | In progress |
-| sceUtility (save data, dialogs), network (offline) | In progress |
+| Allegrex CPU: decoder, interpreter, FPU, VFPU (bit-exact hardware model) | Working. `cpu/` 40/42 (the other two can't pass, see docs) |
+| AOT recompiler (`pspc-recomp`) + DLL pipeline | Working. 99%+ code coverage on retail games, whole discs build in about a minute |
+| Kernel: threads (fibers), sync objects, memory, modules, interrupts, timing | Working. `threads/` 148/158 |
+| GE graphics (multithreaded software renderer), display timing | Working. `gpu/` ~80/111 |
+| Audio (sceAudio, SAS, ATRAC3/3+, MP3, AAC, audiocodec) | Working. `audio/` 72/74 |
+| I/O, UMD, memory stick, ISO/CSO/ZSO/DAX | Working |
+| sceUtility (save data, dialogs, OSK), fonts (PGF), network (offline) | Working |
 | M33 layer (SystemCtrl, KUBridge, VshCtrl, config.se, plugins, NID resolver) | Working |
+| Video (sceMpeg/PSMF), JPEG | In progress |
 | Firmware tooling (M33 extraction, inventory, NID database, Ghidra pipeline, pspc-decrypt) | Working |
 | Real 4.01 XMB | Needs the official 4.01 update file (see below) |
 
@@ -33,28 +38,49 @@ build.cmd                       :: configure + build into build\RelWithDebInfo
 build\RelWithDebInfo\bin\pspc_unittests.exe
 ```
 
-## Running
+## Playing
+
+Put your game dumps (ISO/CSO, or EBOOT.PBP folders) in `Games\` and start the library window:
 
 ```bat
-build\RelWithDebInfo\bin\pspc.exe Games\MyHomebrew\EBOOT.PBP
+build\RelWithDebInfo\bin\pspc-launcher.exe
+```
+
+Double-click (or Enter) plays a game; right-click > *Build native code* compiles it ahead of time
+(about a minute per disc; otherwise it runs in the interpreter, which is slower but complete).
+From the command line:
+
+```bat
+python -I tools\pspc_build.py Games\MyGame.iso     :: once per game: native code for every module
 build\RelWithDebInfo\bin\pspc.exe Games\MyGame.iso
 ```
 
 Keyboard: arrows = D-pad, Z = Cross, X = Circle, A = Square, S = Triangle, Q/W = L/R,
 Enter = Start, Space = Select, Esc = Home, I/J/K/L = analog stick. Game controllers work through SDL.
 
-Before first launch, build the game's native code (otherwise it runs in the interpreter):
+Useful options (`pspc --help` lists them all):
 
-```bat
-python -I tools\pspc_build.py Games\MyHomebrew\EBOOT.PBP
-```
+| Option | |
+|---|---|
+| `--interp` | ignore native code, interpret everything |
+| `--headless --fast-time` | no window or audio, skip idle time (tests, batch runs) |
+| `--dump-frames <dir> --dump-every <n>` | save the displayed frame as BMP every n VBlanks |
+| `--press <vblank>:<BUTTONS>[:<frames>]` | scripted input, e.g. `--press 600:START --press 900:CROSS+UP:4` |
+| `--memstick <dir>`, `--flash0 <dir>`, `--host0 <dir>` | device roots |
+| `--umd <image>` | insert a disc while running a .prx/.elf/.pbp |
+| `--fw 6.60` | firmware version reported to games |
+| `--timeout <s>`, `--log <level>`, `--log-file <path>` | |
 
-Options: `pspc --help`. Save data goes to `<pspc dir>\ms0\PSP\SAVEDATA`, and M33 settings to
-`<pspc dir>\flash1\config.se`. Plugins listed in `ms0\seplugins\game.txt` are loaded the way M33
-loads them.
+Save data goes to `<pspc dir>\ms0\PSP\SAVEDATA`, and M33 settings to `<pspc dir>\flash1\config.se`.
+Plugins listed in `ms0\seplugins\game.txt` are loaded the way M33 loads them. A game that chains
+to another executable (`sceKernelLoadExec`) is restarted in a fresh runtime automatically.
 
 **Game files:** use dumps of discs and downloads you own. Encrypted executables are decrypted by
 `pspc-decrypt.exe`, which must sit next to `pspc.exe`. PSN titles need your own license files.
+
+**Fonts:** games that draw text with the system fonts need `flash0\font\*.pgf`. They come with the
+official firmware (below); until then any compatible PGF set placed in `<pspc dir>\flash0\font`
+works. Without fonts that text is invisible but the game keeps running.
 
 ## Firmware (optional)
 
@@ -71,9 +97,13 @@ See [docs/firmware-tooling.md](docs/firmware-tooling.md).
 ## Testing
 
 ```bat
-python -I tools\run_autotests.py            :: pspautotests, interpreter
-python -I tools\run_autotests.py --aot cpu/ :: using AOT-compiled modules
+python -I tools\run_autotests.py                    :: pspautotests, interpreter
+python -I tools\pspc_build.py @list.txt --modules-in-parallel 6 --jobs 3   :: test DLLs
+python -I tools\run_autotests.py --aot              :: the same with AOT-compiled modules
 ```
+
+Comparing the two runs is a differential test of the recompiler. On a fatal error or a host crash
+pspc prints a symbolized backtrace (frames in AOT DLLs are named by guest function).
 
 ## License
 

@@ -123,6 +123,13 @@ void PatchImportStubToGuest(u32 stubAddr, const std::string &library, u32 nid, u
 	(void)nid;
 }
 
+namespace detail {
+u32 StackArgWord(const Ctx *c, int index) {
+	u32 a = c->r[29] + 4u * (u32)index;
+	return mem::IsValidRange(a, 4) ? GRead32(a) : 0;
+}
+}  // namespace detail
+
 void Syscall(Ctx *c, u32 insn, u32 pc) {
 	u32 code = (insn >> 6) & 0xFFFFF;
 	if (code == cpu::SYSCALL_MAGIC_RETURN) {
@@ -153,6 +160,12 @@ void Syscall(Ctx *c, u32 insn, u32 pc) {
 		}
 		e.func->fn(c);
 		if (logging::g_level <= LogLevel::Trace) LOGT("HLE", "  %s -> %08x", e.name.c_str(), c->r[2]);
+		// The firmware leaves the caller-saved registers it used holding garbage; games that read
+		// them anyway behave as on hardware (misc/deadbeef, same set as PPSSPP).
+		c->r[1] = 0xDEADBEEF;
+		for (int r = 4; r <= 15; r++) c->r[r] = 0xDEADBEEF;
+		c->r[24] = c->r[25] = 0xDEADBEEF;
+		c->hi = c->lo = 0xDEADBEEF;
 	} else {
 		if (!e.warned) {
 			e.warned = true;
