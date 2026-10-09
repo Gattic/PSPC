@@ -101,7 +101,9 @@ bool ParseArgs(const std::vector<std::string> &argv, Args *args, std::string *er
 			return true;
 		};
 		std::string v;
-		if (a == "--json") {
+		if (a == "--help" || a == "-h") {
+			args->command = "help";
+		} else if (a == "--json") {
 			args->json = true;
 		} else if (a == "--keep-encrypted") {
 			args->keepEncrypted = true;
@@ -429,6 +431,10 @@ int CmdPsar(const Args &args) {
 	if (!ReadFileBytes(args.positional[0], &data, &error)) {
 		fprintf(stderr, "pspc-decrypt: %s\n", error.c_str());
 		return EXIT_FAILED;
+	}
+	int generation = 0;
+	if (!PsarParseModel(args.model, &generation)) {
+		return Usage("bad --model '" + args.model + "' (any, or 01g..12g)");
 	}
 	const u8 *psar = nullptr;
 	size_t psarSize = 0;

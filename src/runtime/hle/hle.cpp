@@ -1,6 +1,8 @@
 ﻿// SPDX-License-Identifier: GPL-2.0-or-later
 #include "runtime/hle/hle.h"
 
+#include <xmmintrin.h>
+
 #include <algorithm>
 #include <deque>
 #include <fstream>
@@ -132,6 +134,10 @@ void Syscall(Ctx *c, u32 insn, u32 pc) {
 	}
 	SyscallEntry &e = g_syscalls[code];
 	e.calls++;
+	// A syscall breaks an ll/sc pair (cpu/lsu/llsc), and native code runs in the default FP mode.
+	c->llbit = 0;
+	const unsigned guestCsr = _mm_getcsr();
+	_mm_setcsr(0x1F80);
 	const SyscallEntry *prev = g_current;
 	u32 prevPc = g_currentCallerPc;
 	g_current = &e;
@@ -153,6 +159,7 @@ void Syscall(Ctx *c, u32 insn, u32 pc) {
 	}
 	g_current = prev;
 	g_currentCallerPc = prevPc;
+	_mm_setcsr(guestCsr);
 }
 
 void LoadNidDatabase(const std::filesystem::path &csv) {

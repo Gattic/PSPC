@@ -808,6 +808,10 @@ struct Unpacker {
 
 }  // namespace
 
+bool PsarParseModel(const std::string &name, int *generation) {
+	return ParseModel(name, generation);
+}
+
 bool LocatePsar(const u8 *data, size_t size, const u8 **psar, size_t *psarSize, std::string *error) {
 	if (HasMagic(data, size, "\0PBP", 4)) {
 		PbpFile pbp;

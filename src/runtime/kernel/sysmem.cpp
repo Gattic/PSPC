@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+﻿// SPDX-License-Identifier: GPL-2.0-or-later
 #include "runtime/kernel/sysmem.h"
 
 #include "common/log.h"
@@ -121,6 +121,9 @@ void InitMemoryPartitions(u32 ramSize, bool largeUserMemory) {
 	u32 userEnd = 0x0A000000;
 	if (largeUserMemory && ramSize > 0x02000000) userEnd = 0x08000000 + ramSize;
 	g_userMem.Init(0x08800000, userEnd - 0x08800000, 0x100);
+	// The firmware keeps usersystemlib's work area at the bottom of user memory, so the first
+	// module loads at 0x08804000 (cpu/cpu_alu/cpu_branch prints addresses relative to that).
+	g_userMem.AllocAt(0x08800000, 0x4000, "usersystemlib");
 }
 
 BlockAllocator *AllocatorForPartition(int partition) {

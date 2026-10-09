@@ -73,7 +73,7 @@ if(PSPC_BUILD_TESTS)
 	add_executable(pspc_decrypt_tests ${PSPC_DECRYPT_TEST_SOURCES})
 	target_link_libraries(pspc_decrypt_tests PRIVATE pspc_decrypt_core)
 	if(MSVC)
-		set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_kl4e_artart78.c PROPERTIES COMPILE_OPTIONS "/wd4018;/wd4244")
+		set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/tests/ref_kl4e_artart78.c PROPERTIES COMPILE_OPTIONS "/wd4005;/wd4018;/wd4244")
 	endif()
 	add_dependencies(pspc_decrypt_tests pspc-decrypt)
 	add_test(NAME pspc_decrypt_tests

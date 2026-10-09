@@ -35,6 +35,9 @@ struct PsarSummary {
 	int derived = 0;
 };
 
+// "any", "01g".."12g" or a bare number. False if it's none of those.
+bool PsarParseModel(const std::string &name, int *generation);
+
 // Accepts an updater EBOOT.PBP (DATA.PSAR section) or a bare PSAR (DATA.PSAR, a disc's DATA.BIN).
 bool LocatePsar(const u8 *data, size_t size, const u8 **psar, size_t *psarSize, std::string *error);
 

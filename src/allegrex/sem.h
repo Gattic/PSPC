@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+﻿// SPDX-License-Identifier: GPL-2.0-or-later
 //
 // Instruction semantics for the integer, FPU and control-register instructions.
 //
@@ -13,6 +13,7 @@
 
 #include <bit>
 #include <cmath>
+#include <xmmintrin.h>
 
 #include "allegrex/ctx.h"
 #include "allegrex/guestmem.h"
@@ -48,6 +49,19 @@ PSPC_FORCEINLINE double RoundIeee754(double d) {
 }
 
 PSPC_FORCEINLINE u32 F2U(float f) { return std::bit_cast<u32>(f); }
+
+// The FPU's rounding mode (fcr31 bits 0-1) and flush-to-zero (bit 24) map onto MXCSR. Each guest
+// thread is a fiber created with FIBER_FLAG_FLOAT_SWITCH, so the setting follows the thread.
+PSPC_FORCEINLINE void ApplyFpuMode(u32 fcr31) {
+	static const unsigned rc[4] = {_MM_ROUND_NEAREST, _MM_ROUND_TOWARD_ZERO, _MM_ROUND_UP, _MM_ROUND_DOWN};
+	unsigned csr = _mm_getcsr() & ~(unsigned)(_MM_ROUND_MASK | _MM_FLUSH_ZERO_MASK | 0x40);
+	csr |= rc[fcr31 & 3];
+	if (fcr31 & (1u << 24)) csr |= _MM_FLUSH_ZERO_ON | 0x40;
+	_mm_setcsr(csr);
+}
+
+// FPU arithmetic produces the positive default NaN for every NaN result (cpu/fpu/fpu_nan).
+PSPC_FORCEINLINE float CanonNan(float r) { return r != r ? std::bit_cast<float>(0x7FC00000u) : r; }
 PSPC_FORCEINLINE float U2F(u32 u) { return std::bit_cast<float>(u); }
 
 PSPC_FORCEINLINE u32 ReverseBits32(u32 v) {
@@ -224,6 +238,7 @@ SEM(CTC1) {
 		u32 v = VRT;
 		c->fcr31 = v & 0x0181FFFF;
 		c->fpcond = (v >> 23) & 1;
+		sem::ApplyFpuMode(c->fcr31);
 	}
 }
 
@@ -232,17 +247,17 @@ SEM(CTC1) {
 #define FD_ c->f[insn::Fd(w)]
 #define FDI_ c->fi[insn::Fd(w)]
 
-SEM(ADD_S) { FD_ = FS_ + FT_; }
-SEM(SUB_S) { FD_ = FS_ - FT_; }
+SEM(ADD_S) { FD_ = sem::CanonNan(FS_ + FT_); }
+SEM(SUB_S) { FD_ = sem::CanonNan(FS_ - FT_); }
 SEM(MUL_S) {
 	float a = FS_, b = FT_;
 	if ((std::isinf(a) && b == 0.0f) || (std::isinf(b) && a == 0.0f)) {
 		FDI_ = 0x7FC00000u;
 	} else {
-		FD_ = a * b;
+		FD_ = sem::CanonNan(a * b);
 	}
 }
-SEM(DIV_S) { FD_ = FS_ / FT_; }
+SEM(DIV_S) { FD_ = sem::CanonNan(FS_ / FT_); }
 SEM(SQRT_S) {
 	float a = FS_;
 	if (a < 0.0f) {

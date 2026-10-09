@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "common/common.h"
@@ -99,7 +100,11 @@ public:
 		for (auto it = std::filesystem::recursive_directory_iterator(path_, ec); it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
 			std::filesystem::permissions(it->path(), std::filesystem::perms::owner_write, std::filesystem::perm_options::add, ec);
 		}
-		std::filesystem::remove_all(path_, ec);
+		// A scanner can still hold a just-closed file, leaving it delete-pending for a moment.
+		for (int i = 0; i < 40 && std::filesystem::exists(path_, ec); i++) {
+			std::filesystem::remove_all(path_, ec);
+			if (std::filesystem::exists(path_, ec)) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+		}
 	}
 	const std::filesystem::path &Path() const { return path_; }
 
