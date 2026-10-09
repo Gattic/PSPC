@@ -10,6 +10,7 @@
 #pragma once
 
 #include <bit>
+#include <cmath>
 
 #include "allegrex/ctx.h"
 
@@ -142,6 +143,48 @@ constexpr u32 Float16ToFloat32Bits(u16 h) {
 	return (sign << 31) | ((u32)(exponent + 112) << 23) | (fraction << 13);
 }
 
+// ---- Arithmetic as the VFPU does it ----
+// true: model the hardware datapath, as recorded by pspautotests (denormals as zero, VFPU NaN
+// results, the exact dot product, sequential vcrsp lanes, min/max ordering). false: PPSSPP's
+// interpreter defaults (host float math, plain float sums), for lockstep runs against PPSSPP.
+inline constexpr bool kHardwareFloat = true;
+
+// The adder and multiplier read denormal inputs as zero, flush denormal results to a signed zero
+// and produce 0x7F800001 for NaN: positive from the adder, with the sign of x ^ y from the
+// multiplier and divider (cpu/vfpu/prefix_sat, prefixes, specials; PPSSPP vfpu_mul/vfpu_div).
+// They work on float bits so the NaN pattern never passes through a float constant (MSVC quiets
+// those).
+PSPC_FORCEINLINE u32 FlushDenormal(u32 x) { return (x & 0x7F800000) ? x : (x & 0x80000000); }
+PSPC_FORCEINLINE u32 HwAddResult(u32 z) {
+	z = FlushDenormal(z);  // exact: a sum of normals below 2^-126 is representable
+	return (z & 0x7FFFFFFF) > 0x7F800000 ? 0x7F800001u : z;
+}
+PSPC_FORCEINLINE u32 HwAdd(u32 x, u32 y) {
+	return HwAddResult(std::bit_cast<u32>(std::bit_cast<float>(FlushDenormal(x)) + std::bit_cast<float>(FlushDenormal(y))));
+}
+PSPC_FORCEINLINE u32 HwSub(u32 x, u32 y) {
+	return HwAddResult(std::bit_cast<u32>(std::bit_cast<float>(FlushDenormal(x)) - std::bit_cast<float>(FlushDenormal(y))));
+}
+// Results below FLT_MIN - FLT_TRUE_MIN / 4 flush (the x86 FTZ threshold, PPSSPP issue 21070).
+PSPC_FORCEINLINE u32 HwMul(u32 x, u32 y) {
+	x = FlushDenormal(x);
+	y = FlushDenormal(y);
+	const float a = std::bit_cast<float>(x), b = std::bit_cast<float>(y);
+	u32 z = std::bit_cast<u32>(a * b);
+	if ((z & 0x7FFFFFFF) <= 0x00800000 && std::fabs((double)a * (double)b) < 1.1754943157898259e-38) z &= 0x80000000;
+	if ((z & 0x7FFFFFFF) > 0x7F800000) z = ((x ^ y) & 0x80000000) | 0x7F800001;
+	return z;
+}
+PSPC_FORCEINLINE u32 HwDiv(u32 x, u32 y) {
+	x = FlushDenormal(x);
+	y = FlushDenormal(y);
+	const float a = std::bit_cast<float>(x), b = std::bit_cast<float>(y);
+	u32 z = std::bit_cast<u32>(a / b);
+	if ((z & 0x7FFFFFFF) <= 0x00800000 && std::fabs((double)a / (double)b) < 1.1754943157898259e-38) z &= 0x80000000;
+	if ((z & 0x7FFFFFFF) > 0x7F800000) z = ((x ^ y) & 0x80000000) | 0x7F800001;
+	return z;
+}
+
 // ---- Control registers ----
 // Writable bits of a control register through mtvc/vmtvc. Returns false for read-only ones.
 constexpr bool CtrlWriteMask(u32 reg, u32 *mask) {
@@ -172,10 +215,12 @@ PSPC_FORCEINLINE void WriteCtrl(Ctx *c, u32 reg, u32 value) {
 	if (reg < 16 && CtrlWriteMask(reg, &mask)) c->vfpuCtrl[reg] = (value & mask) | CtrlSetBits(reg);
 }
 
-// Power-on VFPU state (PPSSPP MIPSState::Init). The runtime must apply this to every new
-// thread context: a zeroed S/T prefix means "swizzle everything from x".
+// VFPU state of a new thread (PPSSPP PSPThreadContext::reset): every register holds the VFPU NaN
+// (cpu/vfpu/vavg reads untouched lanes), prefixes neutral, the RNG at its default seed. The
+// runtime must apply this to every new thread context; a zeroed S/T prefix would mean "swizzle
+// everything from x".
 inline void InitCtx(Ctx *c) {
-	for (int i = 0; i < 128; i++) c->vi[i] = 0;
+	for (int i = 0; i < 128; i++) c->vi[i] = 0x7F800001;
 	for (int i = 0; i < 16; i++) c->vfpuCtrl[i] = 0;
 	c->vfpuCtrl[VFPU_CTRL_SPREFIX] = PFX_DEFAULT_ST;
 	c->vfpuCtrl[VFPU_CTRL_TPREFIX] = PFX_DEFAULT_ST;
@@ -193,6 +238,12 @@ inline void InitCtx(Ctx *c) {
 PSPC_FORCEINLINE bool HasDefaultPrefixes(const Ctx *c) {
 	return c->vfpuCtrl[VFPU_CTRL_SPREFIX] == PFX_DEFAULT_ST && c->vfpuCtrl[VFPU_CTRL_TPREFIX] == PFX_DEFAULT_ST &&
 	       c->vfpuCtrl[VFPU_CTRL_DPREFIX] == PFX_DEFAULT_D;
+}
+
+// The inline fast paths of the float ops: default prefixes, and the FPU's rounding mode (which
+// the runtime maps onto MXCSR) at round-to-nearest, since the VFPU always rounds to nearest.
+PSPC_FORCEINLINE bool FastFloatOk(const Ctx *c) {
+	return HasDefaultPrefixes(c) && (!kHardwareFloat || (c->fcr31 & 3) == 0);
 }
 
 PSPC_FORCEINLINE void EatPrefixes(Ctx *c) {

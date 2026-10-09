@@ -41,6 +41,10 @@ inline float BitsFloat(u32 u) {
 	return f;
 }
 
+inline bool IsFiniteF(float f) {
+	return (FloatBits(f) & 0x7F800000) != 0x7F800000;
+}
+
 inline float TruncateToFloat24(float f) {
 	return BitsFloat(FloatBits(f) & 0xFFFFFF00);
 }
@@ -66,7 +70,7 @@ inline float ScaleByPow2(float f, int n, u32 sign) {
 }
 
 // The GE's reciprocal. w must be a normal float24; returns a float24.
-inline float GERecip(float w) {
+PSPC_FORCEINLINE float GERecip(float w) {
 	const u32 bits = FloatBits(w);
 	const u32 i = (bits >> 8) & 0x7FFF;
 	const int e = (int)((bits >> 23) & 0xFF) - 127;
@@ -161,7 +165,7 @@ inline void GECombineMatrices(float out[16], const float a[16], const float b[16
 
 inline float GEViewport(float clipC, float clipW, float scale, float center) {
 	const float w = TruncateToFloat24(clipW);
-	if (!std::isfinite(w) || !std::isfinite(clipC) || fabsf(w) < FLT_MIN)
+	if (!IsFiniteF(w) || !IsFiniteF(clipC) || fabsf(w) < FLT_MIN)
 		return clipC * scale / clipW + center;
 	const float ndc = ProductToFloat24((double)TruncateToFloat24(clipC) * GERecip(w));
 	return GEAdd(ProductToFloat24((double)ndc * scale), center);

@@ -3,6 +3,7 @@
 add_library(pspc_fs STATIC
 	block_device.cpp
 	decompress.cpp
+	fat_names.cpp
 	host_fs.cpp
 	iso_fs.cpp
 	param_sfo.cpp

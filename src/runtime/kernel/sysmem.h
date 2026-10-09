@@ -48,6 +48,13 @@ u32 AllocKernelMemory(u32 size, const char *tag);
 
 // Firmware version reported to games (sceKernelDevkitVersion format, e.g. 0x06060010).
 extern u32 g_firmwareVersion;
+inline u32 FirmwareVersion() { return g_firmwareVersion; }
+// The SDK version the game declared through sceKernelSetCompiledSdkVersion*, 0 if none.
+u32 CompiledSdkVersion();
+
+// The allocator behind a partition id as sceKernelCreate{Vpl,Fpl,MsgPipe,Tlspl} see it: the
+// kernel partitions (1, 3, 4) and 8/10 only for kernel-mode callers. nullptr if not allowed.
+BlockAllocator *AllocatorForPartitionId(int id, bool kernelMode);
 
 struct MemBlock : KObject {
 	static constexpr KType kType = KType::MemBlock;

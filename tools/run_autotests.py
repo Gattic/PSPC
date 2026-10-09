@@ -44,6 +44,8 @@ def run_one(args, rel, prx, exp):
     cmd = [args.pspc, '--headless', '--fast-time', '--timeout', str(args.timeout), '--log', 'warn']
     if not args.aot:
         cmd.append('--interp')
+    # Tests address their data as host0:/tests/..., i.e. host0: is the pspautotests root.
+    cmd += ['--host0', str(pathlib.Path(args.tests).parent)]
     cmd.append(str(prx))
     start = time.time()
     try:

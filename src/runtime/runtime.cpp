@@ -3,8 +3,11 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <filesystem>
+#include <map>
+#include <set>
 #include <thread>
 
 #include "common/fileutil.h"
@@ -22,6 +25,7 @@
 #include "runtime/kernel/module.h"
 #include "runtime/kernel/scheduler.h"
 #include "runtime/kernel/sysmem.h"
+#include "runtime/m33/m33.h"
 #include "runtime/media/disc.h"
 
 namespace ctrl {
@@ -35,6 +39,46 @@ namespace runtime {
 
 namespace {
 
+// Interpreter fallbacks inside AOT-compiled modules, written to <aot dir>/<sha1>.hints so the
+// next pspc_build.py run compiles those entry points natively.
+std::map<std::string, std::set<u32>> g_aotMisses;
+std::string g_aotDirForHints;
+
+void RecordAotMiss(u32 target) {
+	kernel::PspModule *m = kernel::ModuleByAddress(target);
+	if (!m || !m->aot) return;
+	u32 delta = m->image.relocatable ? m->image.lowAddr - m->aotRecompileBase : 0;
+	g_aotMisses[HexString(m->sha1.data(), m->sha1.size())].insert(target - delta);
+}
+
+void WriteAotHints() {
+	for (auto &kv : g_aotMisses) {
+		fs::path p = fs::u8path(g_aotDirForHints) / (kv.first + ".hints");
+		std::set<u32> all = kv.second;
+		std::vector<u8> old;
+		if (ReadWholeFile(p, old)) {
+			std::string text(old.begin(), old.end());
+			size_t pos = 0;
+			while (pos < text.size()) {
+				size_t end = text.find('\n', pos);
+				if (end == std::string::npos) end = text.size();
+				std::string line = text.substr(pos, end - pos);
+				if (!line.empty() && line[0] != '#') all.insert((u32)strtoul(line.c_str(), nullptr, 16));
+				pos = end + 1;
+			}
+		}
+		std::string out = "# entry points the interpreter reached inside this AOT module\n";
+		char buf[16];
+		for (u32 a : all) {
+			snprintf(buf, sizeof(buf), "%08x\n", a);
+			out += buf;
+		}
+		WriteTextFile(p, out);
+		LOGI("AOT", "%zu interpreter entries recorded in %s", kv.second.size(), p.string().c_str());
+	}
+	g_aotMisses.clear();
+}
+
 struct BootTarget {
 	std::vector<u8> image;
 	std::string pspPath;
@@ -43,10 +87,24 @@ struct BootTarget {
 
 u32 Rd32(const u8 *p) { u32 v; memcpy(&v, p, 4); return v; }
 
+fs::path Host0Root(const Options &o) {
+	return o.host0Dir.empty() ? fs::u8path(o.file).parent_path() : fs::u8path(o.host0Dir);
+}
+
+// host0: path of a host file, relative to the host0 root when the file lies under it.
+std::string Host0PathOf(const Options &o, const fs::path &file) {
+	std::error_code ec;
+	fs::path rel = fs::relative(fs::absolute(file, ec), fs::absolute(Host0Root(o), ec), ec);
+	std::string r = ec || rel.empty() ? PathToUtf8(file.filename()) : PathToUtf8(rel);
+	std::replace(r.begin(), r.end(), '\\', '/');
+	if (r.rfind("..", 0) == 0) r = PathToUtf8(file.filename());
+	return "host0:/" + r;
+}
+
 bool PrepareBoot(const Options &o, BootTarget &bt) {
 	fs::path file = fs::u8path(o.file);
 	std::string ext = ToLower(file.extension().string());
-	io::Mount("host0", io::MakeHostDevice(file.parent_path().string(), false));
+	io::Mount("host0", io::MakeHostDevice(Host0Root(o).string(), false));
 	if (ext == ".iso" || ext == ".cso" || ext == ".zso" || ext == ".dax" || ext == ".jso") {
 		if (!media::MountDisc(file.string())) {
 			LOGE("BOOT", "Cannot open disc image %s", o.file.c_str());
@@ -81,8 +139,12 @@ bool PrepareBoot(const Options &o, BootTarget &bt) {
 		return true;
 	}
 	bt.image = std::move(data);
-	bt.pspPath = "host0:/" + PathToUtf8(file.filename());
-	bt.cwd = "host0:/";
+	bt.pspPath = Host0PathOf(o, file);
+	bt.cwd = bt.pspPath.substr(0, bt.pspPath.rfind('/') + 1);
+	if (!o.umdImage.empty() && !media::MountDisc(o.umdImage)) {
+		LOGE("BOOT", "Cannot open disc image %s", o.umdImage.c_str());
+		return false;
+	}
 	return true;
 }
 
@@ -100,21 +162,32 @@ int RunOnce(const Options &o, BootTarget bt) {
 	io::Init();
 	io::Mount("ms0", io::MakeHostDevice(o.memstickDir, false));
 	io::Mount("flash0", io::MakeHostDevice(o.flash0Dir, true));
+	io::Mount("flash1", io::MakeHostDevice(o.flash1Dir, false));
 	io::Mount("emulator", io::MakeEmulatorDevice(o.hasDisplayForTests));
 	io::Mount("kemulator", io::MakeEmulatorDevice(o.hasDisplayForTests));
 	kernel::SetAotCacheDir(o.aotDir);
 	kernel::SetAotEnabled(o.aot);
+	g_aotDirForHints = o.aotDir;
+	dispatch::SetMissHook(&RecordAotMiss);
 	kernel::SetDecryptTool(o.decryptTool);
 	kernel::SetDecryptCacheDir(o.decryptCacheDir);
 
 	// Re-mount host0/disc0 for this run (PrepareBoot mounted them before io::Init cleared them).
-	fs::path file = fs::u8path(o.file);
-	io::Mount("host0", io::MakeHostDevice(file.parent_path().string(), false));
+	io::Mount("host0", io::MakeHostDevice(Host0Root(o).string(), false));
 	media::RemountDiscIfAny();
 	io::SetCwd(bt.cwd);
 
 	display::Init();
 	display::SetVblankHook([]() { ctrl::OnVblank(); });
+
+	// The M33 layer: config.se, kernel NID resolver, plugins (docs/m33-behaviors.md).
+	m33::BootInfo bi;
+	bi.fromDisc = bt.pspPath.rfind("disc0:", 0) == 0;
+	bi.apitype = bi.fromDisc ? m33::APITYPE_GAME_UMD : m33::APITYPE_GAME_MS;
+	bi.initFileName = bt.pspPath;
+	m33::Init(o.flash1Dir, bi);
+	if (!o.dataDir.empty()) m33::RegisterNidResolver((fs::u8path(o.dataDir) / "m33_nid_resolver.csv").string());
+	if (o.plugins) m33::LoadPlugins();
 
 	SceUID mod = boot::BootModule(bt.image, bt.pspPath);
 	if (mod < 0) {
@@ -125,10 +198,20 @@ int RunOnce(const Options &o, BootTarget bt) {
 	LOGI("RUNTIME", "Exited with code %d after %llu interpreted instructions, %u bad memory accesses", rc,
 	     (unsigned long long)interp::InstructionCount(), mem::BadAccessCount());
 	if (logging::g_level <= LogLevel::Info) hle::DumpUnimplementedStats();
+	WriteAotHints();
 	return rc;
 }
 
+std::string g_relaunchTarget;
+
 }  // namespace
+
+bool TakeRelaunch(std::string &hostFile) {
+	if (g_relaunchTarget.empty()) return false;
+	hostFile = g_relaunchTarget;
+	g_relaunchTarget.clear();
+	return true;
+}
 
 int Run(const Options &o) {
 	host::Config hc;

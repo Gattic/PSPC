@@ -6,6 +6,7 @@ add_library(pspc_gpu STATIC
 	gemath.cpp
 	raster_state.cpp
 	rasterizer.cpp
+	sampler.cpp
 	spline.cpp
 	transform.cpp
 	vertex.cpp

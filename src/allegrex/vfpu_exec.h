@@ -21,8 +21,10 @@ u32 Rcp(u32 x);
 u32 Exp2(u32 x);
 u32 Rexp2(u32 x);
 u32 Log2(u32 x);
-// The hardware's four-term dot product (bit-exact model, see vfpu_math.cpp).
+// The hardware's four-term dot product (bit-exact model, see vfpu_math.cpp): denormals are zero,
+// NaN results are 0x7F800001. DotBits is the SSE2 version, DotBitsReference the scalar one.
 u32 DotBits(const u32 a[4], const u32 b[4]);
+u32 DotBitsReference(const u32 a[4], const u32 b[4]);
 void RndInit(u32 seed, u32 *rcx);
 u32 RndGenerate(u32 *rcx);
 u32 H2F(u16 h);

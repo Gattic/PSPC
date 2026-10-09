@@ -78,9 +78,6 @@ std::string NormalizePspPath(std::string_view cwd, std::string_view path) {
 	if (path.empty()) {
 		return NormalizePspPath(cwd);
 	}
-	if (path[0] == '/' || path[0] == '\\') {
-		return JoinComponents(cwdDevice, SplitPspPathComponents(path));
-	}
 	std::string joined(cwdRest);
 	joined += '/';
 	joined += path;

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+﻿// SPDX-License-Identifier: GPL-2.0-or-later
 //
 // C++ emission. Conventions (see allegrex/aot_abi.h):
 //   * every guest function F at address A becomes `void F_A(Ctx *c)`;
@@ -15,6 +15,7 @@
 #include "allegrex/decode.h"
 #include "allegrex/insn.h"
 #include "common/fileutil.h"
+#include "pspc_sem_version.h"
 
 namespace recomp {
 
@@ -328,7 +329,7 @@ bool Generate(const ModuleImage &img, const Analysis &an, const CodegenOptions &
 	for (u32 e : entries) glue += Fmt("\t{0x%08Xu, &F_%08X},\n", e - img.low, e);
 	glue += "};\n\n";
 	glue += "static AotModuleDesc g_desc = {\n";
-	glue += Fmt("\tPSPC_AOT_ABI_VERSION, 0, \"%s\",\n\t{", img.name.c_str());
+	glue += Fmt("\tPSPC_AOT_ABI_VERSION, 0x%08Xu, \"%s\",\n\t{", PSPC_SEM_VERSION, img.name.c_str());
 	for (size_t i = 0; i < 20; i++) glue += Fmt("0x%02X%s", img.sha1[i], i + 1 < 20 ? ", " : "");
 	glue += "},\n";
 	glue += Fmt("\t0x%08Xu, %u, (u32)(sizeof(kFunctions) / sizeof(kFunctions[0])), kFunctions, &g_delta,\n};\n\n",

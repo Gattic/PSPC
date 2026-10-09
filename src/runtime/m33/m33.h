@@ -1,0 +1,68 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//
+// Native reimplementation of the 4.01 M33 custom-firmware layer (systemctrl, vshctrl, KUBridge).
+// Specification: docs/m33-behaviors.md. M33 works by patching Sony modules in RAM; here the same
+// behaviours are provided by the native kernel instead, so no patching happens.
+#pragma once
+
+#include <string>
+#include <vector>
+
+#include "common/common.h"
+
+namespace m33 {
+
+// SEConfig (systemctrl_se.h): 0x58 bytes stored in flash1:/config.se.
+struct SEConfig {
+	s32 magic;  // 0x47434553 "SECG"
+	s32 hidecorrupt;
+	s32 skiplogo;
+	s32 umdactivatedplaincheck;
+	s32 gamekernel150;
+	s32 executebootbin;
+	s32 startupprog;
+	s32 umdmode;
+	s32 useisofsonumdinserted;
+	s32 vshcpuspeed;
+	s32 vshbusspeed;
+	s32 umdisocpuspeed;
+	s32 umdisobusspeed;
+	s32 fakeregion;
+	s32 freeumdregion;
+	s32 hardresetHB;
+	s32 usbdevice;
+	s32 novshmenu;
+	s32 usbcharge;
+	s32 notusedaxupd;
+	s32 reserved[2];
+};
+static_assert(sizeof(SEConfig) == 0x58, "SEConfig layout");
+
+enum Apitype : u32 {
+	APITYPE_VSH = 0x100,       // XMB
+	APITYPE_GAME_UMD = 0x120,  // disc / ISO game
+	APITYPE_GAME_MS = 0x141,   // memory stick game (homebrew, PSN)
+	APITYPE_POPS = 0x144,
+};
+
+struct BootInfo {
+	u32 apitype = APITYPE_GAME_MS;
+	std::string initFileName;  // what kuKernelInitFileName reports
+	bool fromDisc = false;
+};
+
+void Init(const std::string &flash1HostDir, const BootInfo &boot);
+const SEConfig &Config();
+void SetConfig(const SEConfig &c);
+
+// Loads and starts the plugins listed for the current boot type (seplugins/game.txt etc.).
+// Called before the main module starts.
+void LoadPlugins();
+
+// NID aliases from data/m33_nid_resolver.csv: old (1.50-era) kernel NIDs -> 4.01 NIDs.
+void RegisterNidResolver(const std::string &csvPath);
+
+// A sctrlKernelLoadExecVSH* call asked for a relaunch: the host executable to run next.
+bool TakeRelaunch(std::string &hostFile);
+
+}  // namespace m33

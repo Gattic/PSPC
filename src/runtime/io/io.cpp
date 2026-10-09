@@ -1,19 +1,21 @@
-﻿// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Memory stick devctls ported from PPSSPP (Core/HLE/sceIo.cpp), Copyright (c) 2012- PPSSPP Project,
+// GPL-2.0-or-later.
 #include "runtime/io/io.h"
 
-#include <windows.h>
-
 #include <algorithm>
-#include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <map>
-#include <mutex>
 
 #include "allegrex/guestmem.h"
 #include "common/fileutil.h"
 #include "common/log.h"
+#include "fs/vfs.h"
 #include "runtime/core/memory.h"
+#include "runtime/kernel/callbacks.h"
 #include "runtime/kernel/errors.h"
+#include "runtime/kernel/scheduler.h"
 
 namespace io {
 
@@ -21,277 +23,188 @@ namespace {
 
 std::map<std::string, std::shared_ptr<Device>> g_mounts;
 std::string g_cwd = "ms0:/";
+std::map<SceUID, std::string> g_threadCwd;
 
-std::string CanonDevice(std::string d) {
-	d = ToLower(d);
-	if (d == "fatms0" || d == "fatms" || d == "ms") return "ms0";
-	if (d == "umd1" || d == "umd" || d == "isofs0") return "umd0";
-	return d;
+// Memory stick state: always inserted, FAT assigned.
+constexpr u32 kMsInserted = 1;
+constexpr u32 kMsDeviceInserted = 4;  // 0x02025801 driver status
+std::vector<SceUID> g_msCallbacks, g_msFatCallbacks;
+u32 g_msFatState = 1;
+// A constant capacity keeps results reproducible (PPSSPP does the same).
+constexpr u64 kFakeFreeSpace = 1536ull << 20;
+
+bool IsCallback(u32 uid) { return kernel::Get<kernel::Callback>((SceUID)uid) != nullptr; }
+
+bool RemoveOne(std::vector<SceUID> &v, SceUID id) {
+	auto it = std::find(v.begin(), v.end(), id);
+	if (it == v.end()) return false;
+	v.erase(it);
+	return true;
 }
 
-// Collapse "." and ".." and duplicate slashes; never climbs above "/".
-std::string NormalizePath(const std::string &p) {
-	std::vector<std::string> parts;
-	std::string cur;
-	auto flush = [&]() {
-		if (cur.empty() || cur == ".") {
-		} else if (cur == "..") {
-			if (!parts.empty()) parts.pop_back();
-		} else {
-			parts.push_back(cur);
+int WriteMsCapacity(u32 inAddr, u32 inLen) {
+	// The argument is a pointer to the struct, not the struct (PPSSPP; pspautotests mstick).
+	if (!mem::IsValidRange(inAddr, 4) || inLen < 4) return (int)SCE_ERROR_MEMSTICK_DEVCTL_BAD_PARAMS;
+	u32 ptr = GRead32(inAddr);
+	if (mem::IsValidRange(ptr, 20)) {
+		const u32 sectorSize = 0x200, sectorCount = 0x8000 / sectorSize;
+		const u32 clusters = (u32)((kFakeFreeSpace * 95 / 100) / (sectorSize * sectorCount));
+		GWrite32(ptr, clusters);       // max clusters
+		GWrite32(ptr + 4, clusters);   // free clusters
+		GWrite32(ptr + 8, clusters);   // max sectors
+		GWrite32(ptr + 12, sectorSize);
+		GWrite32(ptr + 16, sectorCount);
+	}
+	return 0;
+}
+
+int MemoryStickDevctl(const std::string &name, u32 cmd, u32 inAddr, u32 inLen, u32 outAddr, u32 outLen, u32 *delayUs) {
+	if (name == "fatms0") {
+		switch (cmd) {
+		case 0x0240D81E:  // invalidate the driver's file table cache
+			return 0;
+		case 0x02415821:  // register an insert/eject callback, notified at once while inserted
+			if (!mem::IsValidRange(inAddr, 4) || inLen < 4) return (int)SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT;
+			if (g_msFatCallbacks.size() >= 32 || !IsCallback(GRead32(inAddr))) return (int)SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT;
+			g_msFatCallbacks.push_back((SceUID)GRead32(inAddr));
+			kernel::NotifyCallback((SceUID)GRead32(inAddr), (s32)g_msFatState);
+			return 0;
+		case 0x02415822:  // unregister
+			if (!mem::IsValidRange(inAddr, 4) || inLen < 4) return (int)SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT;
+			return RemoveOne(g_msFatCallbacks, (SceUID)GRead32(inAddr)) ? 0 : (int)SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT;
+		case 0x02415823:  // set FAT state
+			if (!mem::IsValidRange(inAddr, 4) || inLen != 4) return -1;
+			g_msFatState = GRead32(inAddr);
+			return 0;
+		case 0x02425823:  // FAT enabled? (ignores outLen)
+			if ((s32)(outAddr + outLen) < (s32)outAddr) return (int)SCE_KERNEL_ERROR_ILLEGAL_ADDR;
+			if (!mem::IsValidRange(outAddr, 4)) return (int)SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT;
+			GWrite32(outAddr, g_msFatState);
+			*delayUs = 106;
+			return 0;
+		case 0x02425824:  // write protected?
+			if (!mem::IsValidRange(outAddr, 4) || outLen != 4) return -1;
+			GWrite32(outAddr, 0);
+			return 0;
+		case 0x02425818:
+			return WriteMsCapacity(inAddr, inLen);
 		}
-		cur.clear();
-	};
-	for (char ch : p) {
-		if (ch == '/' || ch == '\\') flush();
-		else cur.push_back(ch);
+		return (int)SCE_KERNEL_ERROR_UNSUP;
 	}
-	flush();
-	std::string out = "/";
-	for (size_t i = 0; i < parts.size(); i++) {
-		if (i) out += "/";
-		out += parts[i];
+	switch (cmd) {
+	case 0x02025801:  // driver status
+		if (!mem::IsValidRange(outAddr, 4) || outLen < 4) return (int)SCE_ERROR_MEMSTICK_DEVCTL_BAD_PARAMS;
+		GWrite32(outAddr, kMsDeviceInserted);
+		return 0;
+	case 0x02015804:  // register an insert/eject callback (mscmhc0:)
+		if (!mem::IsValidRange(inAddr, 4) || outAddr != 0 || inLen < 4) return (int)SCE_ERROR_MEMSTICK_DEVCTL_BAD_PARAMS;
+		if (g_msCallbacks.size() >= 32 || !IsCallback(GRead32(inAddr))) return (int)SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT;
+		g_msCallbacks.push_back((SceUID)GRead32(inAddr));
+		kernel::NotifyCallback((SceUID)GRead32(inAddr), (s32)kMsInserted);
+		return 0;
+	case 0x02015805:
+		if (!mem::IsValidRange(inAddr, 4) || inLen < 4) return (int)SCE_ERROR_MEMSTICK_DEVCTL_BAD_PARAMS;
+		return RemoveOne(g_msCallbacks, (SceUID)GRead32(inAddr)) ? 0 : (int)SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT;
+	case 0x02025806:  // inserted? 1 = yes, 2 = no
+		if (!mem::IsValidRange(outAddr, 4) || outLen < 4) return (int)SCE_ERROR_MEMSTICK_DEVCTL_BAD_PARAMS;
+		GWrite32(outAddr, kMsInserted);
+		return 0;
+	case 0x02425818:
+		return WriteMsCapacity(inAddr, inLen);
+	case 0x02425824:
+		if (!mem::IsValidRange(outAddr, 4) || outLen != 4) return -1;
+		GWrite32(outAddr, 0);
+		return 0;
+	case 0x02425856:  // used by the VSH, meaning unknown
+		return 0;
 	}
-	return out;
-}
-
-PspDateTime ToPspTime(std::chrono::system_clock::time_point tp) {
-	time_t t = std::chrono::system_clock::to_time_t(tp);
-	tm lt{};
-	localtime_s(&lt, &t);
-	PspDateTime d{};
-	d.year = (u16)(lt.tm_year + 1900);
-	d.month = (u16)(lt.tm_mon + 1);
-	d.day = (u16)lt.tm_mday;
-	d.hour = (u16)lt.tm_hour;
-	d.minute = (u16)lt.tm_min;
-	d.second = (u16)lt.tm_sec;
-	return d;
-}
-
-std::chrono::system_clock::time_point FileTimeToSys(fs::file_time_type ft) {
-	return std::chrono::clock_cast<std::chrono::system_clock>(ft);
+	return (int)SCE_KERNEL_ERROR_UNSUP;
 }
 
 class HostDevice : public Device {
 public:
-	HostDevice(const std::string &root, bool readOnly) : root_(fs::path(root)), readOnly_(readOnly) {
-		std::error_code ec;
-		fs::create_directories(root_, ec);
-	}
+	HostDevice(std::string root, bool readOnly) : root_(std::move(root)), readOnly_(readOnly) {}
 
-	fs::path Host(const std::string &path) const {
-		std::string n = NormalizePath(path);
-		fs::path p = root_;
-		if (n.size() > 1) p /= fs::u8path(n.substr(1));
-		return p;
+	DevClass Class() const override { return cls_; }
+	vfs::FileSystem *Fs() override {
+		if (!fs_) Configure("host0");
+		return fs_.get();
 	}
-
-	int Open(const std::string &path, int flags, int mode) override {
-		(void)mode;
-		fs::path p = Host(path);
-		std::error_code ec;
-		bool exists = fs::exists(p, ec);
-		if (exists && fs::is_directory(p, ec)) return (int)SCE_KERNEL_ERROR_ERRNO_IS_DIRECTORY;
-		bool write = (flags & PSP_O_WRONLY) != 0;
-		if (write && readOnly_) return (int)SCE_KERNEL_ERROR_ERRNO_READ_ONLY;
-		if ((flags & PSP_O_CREAT) && (flags & PSP_O_EXCL) && exists) return (int)SCE_KERNEL_ERROR_ERRNO_FILE_ALREADY_EXISTS;
-		if (!exists && !(flags & PSP_O_CREAT)) return (int)SCE_KERNEL_ERROR_ERRNO_FILE_NOT_FOUND;
-		const wchar_t *fmode;
-		if (!write) fmode = L"rb";
-		else if (!exists || (flags & PSP_O_TRUNC)) fmode = (flags & PSP_O_RDONLY) ? L"w+b" : L"wb";
-		else fmode = (flags & PSP_O_RDONLY) ? L"r+b" : L"r+b";
-		if (!exists && write && p.has_parent_path() && !fs::exists(p.parent_path(), ec))
-			return (int)SCE_KERNEL_ERROR_ERRNO_FILE_NOT_FOUND;
-		FILE *f = _wfopen(p.wstring().c_str(), fmode);
-		if (!f) return (int)SCE_KERNEL_ERROR_ERRNO_FILE_NOT_FOUND;
-		int h = next_++;
-		files_[h] = {f, (flags & PSP_O_APPEND) != 0};
-		return h;
+	void OnMount(const std::string &name) override { Configure(name); }
+	int Devctl(const std::string &devName, u32 cmd, u32 inAddr, u32 inLen, u32 outAddr, u32 outLen, u32 *delayUs) override {
+		if (cls_ == DevClass::MemoryStick) return MemoryStickDevctl(devName, cmd, inAddr, inLen, outAddr, outLen, delayUs);
+		return Device::Devctl(devName, cmd, inAddr, inLen, outAddr, outLen, delayUs);
 	}
-	int Close(int h) override {
-		auto it = files_.find(h);
-		if (it == files_.end()) return (int)SCE_KERNEL_ERROR_BADF;
-		fclose(it->second.f);
-		files_.erase(it);
-		return 0;
-	}
-	s64 Read(int h, void *buf, s64 size) override {
-		auto it = files_.find(h);
-		if (it == files_.end()) return (s64)(s32)SCE_KERNEL_ERROR_BADF;
-		return (s64)fread(buf, 1, (size_t)size, it->second.f);
-	}
-	s64 Write(int h, const void *buf, s64 size) override {
-		auto it = files_.find(h);
-		if (it == files_.end()) return (s64)(s32)SCE_KERNEL_ERROR_BADF;
-		if (it->second.append) _fseeki64(it->second.f, 0, SEEK_END);
-		s64 n = (s64)fwrite(buf, 1, (size_t)size, it->second.f);
-		fflush(it->second.f);
-		return n;
-	}
-	s64 Seek(int h, s64 offset, int whence) override {
-		auto it = files_.find(h);
-		if (it == files_.end()) return (s64)(s32)SCE_KERNEL_ERROR_BADF;
-		int w = whence == 1 ? SEEK_CUR : whence == 2 ? SEEK_END : SEEK_SET;
-		if (_fseeki64(it->second.f, offset, w) != 0) return (s64)(s32)SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT;
-		return _ftelli64(it->second.f);
-	}
-	int GetStat(const std::string &path, PspIoStat &st) override {
-		fs::path p = Host(path);
-		std::error_code ec;
-		if (!fs::exists(p, ec)) return (int)SCE_KERNEL_ERROR_ERRNO_FILE_NOT_FOUND;
-		memset(&st, 0, sizeof(st));
-		bool dir = fs::is_directory(p, ec);
-		st.mode = (dir ? FIO_S_IFDIR : FIO_S_IFREG) | 0777;
-		st.attr = (dir ? FIO_SO_IFDIR : FIO_SO_IFREG) | 0x7;
-		st.size = dir ? 0 : (s64)fs::file_size(p, ec);
-		auto t = ToPspTime(FileTimeToSys(fs::last_write_time(p, ec)));
-		st.ctime = st.atime = st.mtime = t;
-		return 0;
-	}
-	int Remove(const std::string &path) override {
-		if (readOnly_) return (int)SCE_KERNEL_ERROR_ERRNO_READ_ONLY;
-		std::error_code ec;
-		fs::path p = Host(path);
-		if (!fs::exists(p, ec)) return (int)SCE_KERNEL_ERROR_ERRNO_FILE_NOT_FOUND;
-		if (fs::is_directory(p, ec)) return (int)SCE_KERNEL_ERROR_ERRNO_IS_DIRECTORY;
-		return fs::remove(p, ec) ? 0 : (int)SCE_KERNEL_ERROR_ERRNO_NO_PERM;
-	}
-	int Mkdir(const std::string &path, int mode) override {
-		(void)mode;
-		if (readOnly_) return (int)SCE_KERNEL_ERROR_ERRNO_READ_ONLY;
-		std::error_code ec;
-		fs::path p = Host(path);
-		if (fs::exists(p, ec)) return (int)SCE_KERNEL_ERROR_ERRNO_FILE_ALREADY_EXISTS;
-		return fs::create_directory(p, ec) ? 0 : (int)SCE_KERNEL_ERROR_ERRNO_FILE_NOT_FOUND;
-	}
-	int Rmdir(const std::string &path) override {
-		if (readOnly_) return (int)SCE_KERNEL_ERROR_ERRNO_READ_ONLY;
-		std::error_code ec;
-		fs::path p = Host(path);
-		if (!fs::is_directory(p, ec)) return (int)SCE_KERNEL_ERROR_ERRNO_FILE_NOT_FOUND;
-		return fs::remove(p, ec) ? 0 : (int)SCE_KERNEL_ERROR_ERRNO_DIRECTORY_IS_NOT_EMPTY;
-	}
-	int Rename(const std::string &from, const std::string &to) override {
-		if (readOnly_) return (int)SCE_KERNEL_ERROR_ERRNO_READ_ONLY;
-		std::error_code ec;
-		fs::path a = Host(from), b = Host(to);
-		if (!fs::exists(a, ec)) return (int)SCE_KERNEL_ERROR_ERRNO_FILE_NOT_FOUND;
-		if (fs::exists(b, ec)) return (int)SCE_KERNEL_ERROR_ERRNO_FILE_ALREADY_EXISTS;
-		fs::rename(a, b, ec);
-		return ec ? (int)SCE_KERNEL_ERROR_ERRNO_NO_PERM : 0;
-	}
-	int DOpen(const std::string &path) override {
-		fs::path p = Host(path);
-		std::error_code ec;
-		if (!fs::is_directory(p, ec)) return (int)SCE_KERNEL_ERROR_ERRNO_FILE_NOT_FOUND;
-		std::vector<PspIoDirent> ents;
-		auto add = [&](const std::string &name, const fs::path &hp) {
-			PspIoDirent e{};
-			std::error_code ec2;
-			bool dir = fs::is_directory(hp, ec2);
-			e.stat.mode = (dir ? FIO_S_IFDIR : FIO_S_IFREG) | 0777;
-			e.stat.attr = (dir ? FIO_SO_IFDIR : FIO_SO_IFREG) | 0x7;
-			e.stat.size = dir ? 0 : (s64)fs::file_size(hp, ec2);
-			auto t = ToPspTime(FileTimeToSys(fs::last_write_time(hp, ec2)));
-			e.stat.ctime = e.stat.atime = e.stat.mtime = t;
-			strncpy(e.name, name.c_str(), 255);
-			ents.push_back(e);
-		};
-		add(".", p);
-		add("..", p);
-		for (auto &de : fs::directory_iterator(p, ec)) add(PathToUtf8(de.path().filename()), de.path());
-		int h = next_++;
-		dirs_[h] = {std::move(ents), 0};
-		return h;
-	}
-	int DRead(int h, PspIoDirent &ent) override {
-		auto it = dirs_.find(h);
-		if (it == dirs_.end()) return (int)SCE_KERNEL_ERROR_BADF;
-		if (it->second.pos >= it->second.ents.size()) return 0;
-		ent = it->second.ents[it->second.pos++];
-		return 1;
-	}
-	int DClose(int h) override {
-		if (!dirs_.erase(h)) return (int)SCE_KERNEL_ERROR_BADF;
-		return 0;
-	}
-	int Devctl(const std::string &devName, u32 cmd, u32 inAddr, u32 inLen, u32 outAddr, u32 outLen) override {
-		(void)devName;
-		(void)inAddr;
-		(void)inLen;
-		switch (cmd) {
-		case 0x02425818: {  // memory stick: get free space info
-			if (!mem::IsValidRange(inAddr, 4)) return (int)SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT;
-			u32 ptr = GRead32(inAddr);
-			if (mem::IsValidRange(ptr, 20)) {
-				const u32 cluster = 0x8000;
-				GWrite32(ptr, 0x200000);       // max clusters
-				GWrite32(ptr + 4, 0x100000);   // free clusters
-				GWrite32(ptr + 8, 0x100000);   // max sectors
-				GWrite32(ptr + 12, 0x200);     // sector size
-				GWrite32(ptr + 16, cluster / 0x200);
-			}
-			return 0;
-		}
-		case 0x02425823:  // memory stick inserted?
-			if (mem::IsValidRange(outAddr, 4) && outLen >= 4) GWrite32(outAddr, 1);
-			return 0;
-		case 0x02415821:  // register ms callback
-		case 0x02415822:  // unregister ms callback
-		case 0x02025801:  // ms state
-			if (cmd == 0x02025801 && mem::IsValidRange(outAddr, 4)) GWrite32(outAddr, 4);
-			return 0;
-		case 0x02025806:  // inserted
-			if (mem::IsValidRange(outAddr, 4)) GWrite32(outAddr, 1);
-			return 0;
-		default: return Device::Devctl(devName, cmd, inAddr, inLen, outAddr, outLen);
-		}
+	vfs::HostFileSystem *Host() {
+		Fs();
+		return fs_.get();
 	}
 
 private:
-	struct OpenFile {
-		FILE *f;
-		bool append;
-	};
-	struct OpenDir {
-		std::vector<PspIoDirent> ents;
-		size_t pos;
-	};
-	fs::path root_;
+	void Configure(const std::string &name) {
+		vfs::HostFsOptions o;
+		o.readOnly = readOnly_;
+		std::filesystem::path root = std::filesystem::u8path(root_);
+		if (name == "ms0") {
+			// Files the PSP creates keep their case, so no 8.3 uppercasing (io/shortname).
+			cls_ = DevClass::MemoryStick;
+			o.fat = true;
+			std::error_code ec;
+			for (const char *d : {"PSP/GAME", "PSP/SAVEDATA", "PSP/COMMON", "PSP/SYSTEM"}) {
+				std::filesystem::create_directories(root / d, ec);
+			}
+		} else if (name.rfind("flash", 0) == 0) {
+			cls_ = DevClass::Flash;
+			o.fat = true;
+		} else {
+			// usbhostfs modes; names written by a PC appear as the FAT driver would show them
+			// (io/directory).
+			cls_ = DevClass::Host;
+			o.fat = false;
+			o.upperCase83 = true;
+		}
+		fs_ = std::make_shared<vfs::HostFileSystem>(root, o);
+	}
+
+	std::string root_;
 	bool readOnly_;
-	int next_ = 1;
-	std::map<int, OpenFile> files_;
-	std::map<int, OpenDir> dirs_;
+	DevClass cls_ = DevClass::Host;
+	std::shared_ptr<vfs::HostFileSystem> fs_;
+};
+
+class VfsDevice : public Device {
+public:
+	VfsDevice(std::shared_ptr<vfs::FileSystem> fs, DevClass cls) : fs_(std::move(fs)), cls_(cls) {}
+	DevClass Class() const override { return cls_; }
+	vfs::FileSystem *Fs() override { return fs_.get(); }
+
+private:
+	std::shared_ptr<vfs::FileSystem> fs_;
+	DevClass cls_;
 };
 
 class EmulatorDevice : public Device {
 public:
 	explicit EmulatorDevice(bool hasDisplay) : hasDisplay_(hasDisplay) {}
-	int Open(const std::string &, int, int) override { return (int)SCE_KERNEL_ERROR_ERRNO_FILE_NOT_FOUND; }
-	int Close(int) override { return 0; }
-	s64 Read(int, void *, s64) override { return 0; }
-	s64 Write(int, const void *, s64) override { return 0; }
-	s64 Seek(int, s64, int) override { return 0; }
-	int GetStat(const std::string &, PspIoStat &) override { return (int)SCE_KERNEL_ERROR_ERRNO_FILE_NOT_FOUND; }
-	int DOpen(const std::string &) override { return (int)SCE_KERNEL_ERROR_ERRNO_FILE_NOT_FOUND; }
-	int DRead(int, PspIoDirent &) override { return 0; }
-	int DClose(int) override { return 0; }
-	int Devctl(const std::string &, u32 cmd, u32 inAddr, u32 inLen, u32 outAddr, u32 outLen) override {
+	DevClass Class() const override { return DevClass::Emulator; }
+	int Devctl(const std::string &, u32 cmd, u32 inAddr, u32 inLen, u32 outAddr, u32 outLen, u32 *) override {
 		switch (cmd) {
 		case 1:  // GET_HAS_DISPLAY
-			if (mem::IsValidRange(outAddr, 4) && outLen >= 4) GWrite32(outAddr, hasDisplay_ ? 1 : 0);
+			if (mem::IsValidRange(outAddr, 4)) GWrite32(outAddr, hasDisplay_ ? 1 : 0);
 			return 0;
 		case 2:  // SEND_OUTPUT
-			if (mem::IsValidRange(inAddr, inLen)) logging::GuestOutput((const char *)GPtr(inAddr), inLen);
+			if (inLen && mem::IsValidRange(inAddr, inLen)) logging::GuestOutput((const char *)GPtr(inAddr), inLen);
 			return 0;
 		case 3:  // IS_EMULATOR
-			if (mem::IsValidRange(outAddr, 4) && outLen >= 4) GWrite32(outAddr, 1);
+			if (mem::IsValidRange(outAddr, 4)) GWrite32(outAddr, 1);
 			return 0;
+		case 4:     // VERIFY_STATE
 		case 0x10:  // SEND_CTRLDATA
 		case 0x20:  // EMIT_SCREENSHOT
+		case 0x30:  // TOGGLE_FASTFORWARD
 			return 0;
-		default: return (int)SCE_KERNEL_ERROR_ERRNO_FUNCTION_NOT_SUPPORTED;
+		default:
+			return 0;
 		}
 	}
 
@@ -301,82 +214,163 @@ private:
 
 }  // namespace
 
-int Device::Remove(const std::string &) { return (int)SCE_KERNEL_ERROR_ERRNO_READ_ONLY; }
-int Device::Mkdir(const std::string &, int) { return (int)SCE_KERNEL_ERROR_ERRNO_READ_ONLY; }
-int Device::Rmdir(const std::string &) { return (int)SCE_KERNEL_ERROR_ERRNO_READ_ONLY; }
-int Device::Rename(const std::string &, const std::string &) { return (int)SCE_KERNEL_ERROR_ERRNO_READ_ONLY; }
-int Device::Ioctl(int, u32 cmd, u32, u32, u32, u32) {
-	LOGW("IO", "Unsupported ioctl %08x", cmd);
-	return (int)SCE_KERNEL_ERROR_ERRNO_FUNCTION_NOT_SUPPORTED;
+u32 Device::DevType() const { return Class() == DevClass::UmdBlock ? 0x04 : 0x10; }
+
+int Device::Devctl(const std::string &devName, u32 cmd, u32, u32, u32, u32, u32 *) {
+	LOGW("IO", "Unsupported devctl %s: %08x", devName.c_str(), cmd);
+	return (int)SCE_KERNEL_ERROR_UNSUP;
 }
-int Device::Devctl(const std::string &devName, u32 cmd, u32, u32, u32, u32) {
-	LOGW("IO", "Unsupported devctl %s %08x", devName.c_str(), cmd);
-	return (int)SCE_KERNEL_ERROR_ERRNO_FUNCTION_NOT_SUPPORTED;
+
+namespace {
+constexpr int kNoFs = (int)SCE_KERNEL_ERROR_ERRNO_FILE_NOT_FOUND;
+}
+
+int Device::Open(const std::string &path, u32 flags, int mode) { return Fs() ? Fs()->Open(path, flags, mode) : kNoFs; }
+int Device::Close(int h) { return Fs() ? Fs()->Close(h) : kNoFs; }
+s64 Device::Read(int h, void *buf, s64 size) { return Fs() && size >= 0 ? Fs()->Read(h, buf, (u64)size) : kNoFs; }
+s64 Device::Write(int h, const void *buf, s64 size) { return Fs() && size >= 0 ? Fs()->Write(h, buf, (u64)size) : kNoFs; }
+s64 Device::Seek(int h, s64 offset, int whence) { return Fs() ? Fs()->Seek(h, offset, whence) : kNoFs; }
+int Device::GetStat(const std::string &path, PspIoStat &st) {
+	if (!Fs()) return kNoFs;
+	vfs::SceIoStat v;
+	memcpy(&v, &st, sizeof(v));
+	int r = Fs()->GetStat(path, &v);
+	if (r >= 0) memcpy(&st, &v, sizeof(v));
+	return r;
+}
+int Device::ChStat(const std::string &path, const PspIoStat &st, u32 bits) {
+	if (!Fs()) return kNoFs;
+	vfs::SceIoStat v;
+	memcpy(&v, &st, sizeof(v));
+	return Fs()->ChStat(path, v, bits);
+}
+int Device::Remove(const std::string &path) { return Fs() ? Fs()->Remove(path) : kNoFs; }
+int Device::Mkdir(const std::string &path, int mode) { return Fs() ? Fs()->Mkdir(path, mode) : kNoFs; }
+int Device::Rmdir(const std::string &path) { return Fs() ? Fs()->Rmdir(path) : kNoFs; }
+int Device::Rename(const std::string &from, const std::string &to) { return Fs() ? Fs()->Rename(from, to) : kNoFs; }
+int Device::DOpen(const std::string &path) { return Fs() ? Fs()->DOpen(path) : kNoFs; }
+int Device::DRead(int h, PspIoDirent &ent) {
+	if (!Fs()) return kNoFs;
+	vfs::SceIoDirent v;
+	memcpy(&v, &ent, sizeof(v));
+	int r = Fs()->DRead(h, &v);
+	memcpy(&ent, &v, sizeof(v));
+	return r;
+}
+int Device::DClose(int h) { return Fs() ? Fs()->DClose(h) : kNoFs; }
+
+std::string CanonicalDevice(std::string_view device) {
+	while (!device.empty() && device.front() == ' ') device.remove_prefix(1);
+	if (!device.empty() && device.back() == ':') device.remove_suffix(1);
+	std::string d = ToLower(std::string(device));
+	if (d == "fatms0" || d == "fatms" || d == "ms" || d == "memstick" || d == "mscmhc0") return "ms0";
+	if (d.rfind("umd", 0) == 0) return "umd0";  // umd:, umd1:, umd00:... are the same block device
+	if (d == "isofs" || d == "isofs0") return "disc0";
+	if (d.rfind("host", 0) == 0) return "host0";
+	return d;
 }
 
 void Init() {
 	g_mounts.clear();
+	g_threadCwd.clear();
 	g_cwd = "ms0:/";
+	g_msCallbacks.clear();
+	g_msFatCallbacks.clear();
+	g_msFatState = 1;
 }
 
-void Shutdown() { g_mounts.clear(); }
+void Shutdown() {
+	g_mounts.clear();
+	g_threadCwd.clear();
+}
 
-void Mount(const std::string &device, std::shared_ptr<Device> dev) { g_mounts[CanonDevice(device)] = std::move(dev); }
-void Unmount(const std::string &device) { g_mounts.erase(CanonDevice(device)); }
+void Mount(const std::string &device, std::shared_ptr<Device> dev) {
+	std::string name = CanonicalDevice(device);
+	if (dev) dev->OnMount(name);
+	g_mounts[name] = std::move(dev);
+}
+
+void Unmount(const std::string &device) { g_mounts.erase(CanonicalDevice(device)); }
 
 std::shared_ptr<Device> MountedDevice(const std::string &device) {
-	auto it = g_mounts.find(CanonDevice(device));
+	auto it = g_mounts.find(CanonicalDevice(device));
 	return it == g_mounts.end() ? nullptr : it->second;
-}
-
-bool ResolvePath(const std::string &pspPath, std::string &device, std::string &path) {
-	std::string full = pspPath;
-	size_t colon = full.find(':');
-	if (colon == std::string::npos) {
-		std::string cwd = g_cwd;
-		if (!cwd.empty() && cwd.back() != '/') cwd += "/";
-		full = (!pspPath.empty() && pspPath[0] == '/') ? cwd.substr(0, cwd.find(':') + 1) + pspPath : cwd + pspPath;
-		colon = full.find(':');
-		if (colon == std::string::npos) return false;
-	}
-	device = CanonDevice(full.substr(0, colon));
-	path = NormalizePath(full.substr(colon + 1));
-	return g_mounts.count(device) != 0;
 }
 
 void SetCwd(const std::string &pspDir) { g_cwd = pspDir; }
 const std::string &Cwd() { return g_cwd; }
 
-bool ReadFile(const std::string &pspPath, std::vector<u8> &out) {
-	std::string dev, path;
-	if (!ResolvePath(pspPath, dev, path)) return false;
-	auto d = MountedDevice(dev);
-	int h = d->Open(path, PSP_O_RDONLY, 0);
-	if (h < 0) return false;
-	s64 size = d->Seek(h, 0, 2);
-	d->Seek(h, 0, 0);
-	if (size < 0) {
-		d->Close(h);
-		return false;
+std::string ThreadCwd(SceUID thread) {
+	auto it = g_threadCwd.find(thread);
+	return it == g_threadCwd.end() ? g_cwd : it->second;
+}
+
+void SetThreadCwd(SceUID thread, const std::string &dir) { g_threadCwd[thread] = dir; }
+
+int Resolve(std::string_view pspPath, Resolved *out) {
+	std::string_view in = pspPath;
+	if (in.find(':') != std::string_view::npos) {
+		// "   ms0:/x" is "ms0:/x".
+		while (!in.empty() && in.front() == ' ') in.remove_prefix(1);
 	}
-	out.resize((size_t)size);
-	s64 got = size ? d->Read(h, out.data(), size) : 0;
-	d->Close(h);
-	return got == size;
+	std::string_view dev, rest;
+	std::string cwd;
+	if (!vfs::SplitPspDevice(in, &dev, &rest)) {
+		cwd = ThreadCwd(sched::CurrentId());
+		if (cwd.empty()) return (int)SCE_KERNEL_ERROR_NOCWD;
+	}
+	std::string full = vfs::NormalizePspPath(cwd, in);
+	if (!vfs::SplitPspDevice(full, &dev, &rest)) return (int)SCE_KERNEL_ERROR_NODEV;
+	out->device = CanonicalDevice(dev);
+	auto it = g_mounts.find(out->device);
+	if (it == g_mounts.end() || !it->second) return (int)SCE_KERNEL_ERROR_NODEV;
+	out->dev = it->second;
+	out->path = std::string(rest);
+	return 0;
+}
+
+bool ResolvePath(const std::string &pspPath, std::string &device, std::string &path) {
+	Resolved r;
+	if (Resolve(pspPath, &r) < 0) return false;
+	device = r.device;
+	path = r.path;
+	return true;
+}
+
+bool ReadFile(const std::string &pspPath, std::vector<u8> &out) {
+	Resolved r;
+	if (Resolve(pspPath, &r) < 0 || !r.dev->Fs()) return false;
+	vfs::FileSystem *fs = r.dev->Fs();
+	s32 h = fs->Open(r.path, vfs::PSP_O_RDONLY, 0);
+	if (h < 0) return false;
+	vfs::HandleInfo info;
+	bool ok = fs->GetHandleInfo(h, &info) >= 0 && !info.sectorMode;
+	if (ok) {
+		out.resize((size_t)info.size);
+		s64 got = out.empty() ? 0 : fs->Read(h, out.data(), out.size());
+		ok = got == (s64)out.size();
+	}
+	fs->Close(h);
+	return ok;
+}
+
+std::string HostPathFor(const std::string &pspPath) {
+	Resolved r;
+	if (Resolve(pspPath, &r) < 0) return "";
+	auto *h = dynamic_cast<HostDevice *>(r.dev.get());
+	std::filesystem::path p;
+	if (!h || h->Host()->HostPath(r.path, &p) < 0) return "";
+	return PathToUtf8(p);
 }
 
 std::shared_ptr<Device> MakeHostDevice(const std::string &hostRoot, bool readOnly) {
 	return std::make_shared<HostDevice>(hostRoot, readOnly);
 }
 
-std::shared_ptr<Device> MakeEmulatorDevice(bool hasDisplay) { return std::make_shared<EmulatorDevice>(hasDisplay); }
-
-std::string HostPathFor(const std::string &pspPath) {
-	std::string dev, path;
-	if (!ResolvePath(pspPath, dev, path)) return "";
-	auto d = MountedDevice(dev);
-	if (auto *h = dynamic_cast<HostDevice *>(d.get())) return h->Host(path).string();
-	return "";
+std::shared_ptr<Device> MakeVfsDevice(std::shared_ptr<vfs::FileSystem> fs, DevClass cls) {
+	return std::make_shared<VfsDevice>(std::move(fs), cls);
 }
+
+std::shared_ptr<Device> MakeEmulatorDevice(bool hasDisplay) { return std::make_shared<EmulatorDevice>(hasDisplay); }
 
 }  // namespace io

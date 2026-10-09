@@ -363,7 +363,7 @@ static inline void RoundToScreen(RVertex &v, const float scaled[3], const float 
 // The screen position: each clip component times the GE's reciprocal of w, scaled and offset.
 static inline void Viewport(const float clip[4], float scaled[3]) {
 	const float w = TruncateToFloat24(clip[3]);
-	if (!std::isfinite(w) || fabsf(w) < FLT_MIN) {
+	if (!IsFiniteF(w) || fabsf(w) < FLT_MIN) {
 		for (int i = 0; i < 3; ++i)
 			scaled[i] = GEViewport(clip[i], clip[3], ts.screenScale[i], ts.screenAdd[i]);
 		scaled[2] = floorf(scaled[2]);
@@ -371,7 +371,7 @@ static inline void Viewport(const float clip[4], float scaled[3]) {
 	}
 	const double r = GERecip(w);
 	for (int i = 0; i < 3; ++i) {
-		if (!std::isfinite(clip[i])) {
+		if (!IsFiniteF(clip[i])) {
 			scaled[i] = clip[i] * ts.screenScale[i] / clip[3] + ts.screenAdd[i];
 		} else {
 			const float ndc = ProductToFloat24((double)TruncateToFloat24(clip[i]) * r);

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+﻿// SPDX-License-Identifier: GPL-2.0-or-later
 //
 // pspc: run a PSP executable (ELF/PRX), PBP or UMD image natively.
 //
@@ -7,6 +7,8 @@
 #include <cstring>
 #include <filesystem>
 #include <string>
+
+#include <windows.h>
 
 #include "common/fileutil.h"
 #include "common/log.h"
@@ -25,6 +27,8 @@ static void Usage() {
 	        "  --strict-mem         treat bad guest memory accesses as fatal\n"
 	        "  --memstick <dir>     memory stick root (default: <exe>/ms0)\n"
 	        "  --flash0 <dir>       flash0 root (default: <exe>/flash0)\n"
+	        "  --host0 <dir>        host0: root (default: the program's folder)\n"
+	        "  --umd <image>        insert a disc image while running a .prx/.elf/.pbp\n"
 	        "  --fw <ver>           firmware version reported to games, e.g. 6.60 or 4.01\n"
 	        "  --scale <n>          window scale (default 2)\n"
 	        "  --log <level>        trace|debug|info|warn|error (default info)\n"
@@ -44,6 +48,7 @@ int main(int argc, char **argv) {
 	o.aotDir = (exeDir / "cache" / "aot").string();
 	o.memstickDir = (exeDir / "ms0").string();
 	o.flash0Dir = (exeDir / "flash0").string();
+	o.flash1Dir = (exeDir / "flash1").string();
 	o.dataDir = (exeDir / "data").string();
 	o.decryptTool = (exeDir / "pspc-decrypt.exe").string();
 	o.decryptCacheDir = (exeDir / "cache" / "decrypted").string();
@@ -69,6 +74,10 @@ int main(int argc, char **argv) {
 		else if (a == "--strict-mem") o.strictMemory = true;
 		else if (a == "--memstick") o.memstickDir = next();
 		else if (a == "--flash0") o.flash0Dir = next();
+		else if (a == "--flash1") o.flash1Dir = next();
+		else if (a == "--no-plugins") o.plugins = false;
+		else if (a == "--host0") o.host0Dir = next();
+		else if (a == "--umd") o.umdImage = next();
 		else if (a == "--fw") o.firmwareVersion = ParseFw(next());
 		else if (a == "--scale") o.windowScale = atoi(next().c_str());
 		else if (a == "--test-display") o.hasDisplayForTests = true;
@@ -105,5 +114,27 @@ int main(int argc, char **argv) {
 		}
 	}
 	logging::Init(level, logFile.empty() ? nullptr : logFile.c_str());
-	return runtime::Run(o);
+	int rc = runtime::Run(o);
+	std::string next;
+	if (runtime::TakeRelaunch(next)) {
+		// M33 LoadExec: start a fresh runtime for the new executable with the same options.
+		std::wstring cmd = L"\"" + (exeDir / "pspc.exe").wstring() + L"\"";
+		for (int i = 1; i < argc; i++) {
+			std::wstring arg = fs::u8path(argv[i]).wstring();
+			if (argv[i] == o.file) arg = fs::u8path(next).wstring();
+			cmd += L" \"" + arg + L"\"";
+		}
+		STARTUPINFOW si{};
+		si.cb = sizeof(si);
+		PROCESS_INFORMATION pi{};
+		if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+			CloseHandle(pi.hThread);
+			WaitForSingleObject(pi.hProcess, INFINITE);
+			DWORD code = 0;
+			GetExitCodeProcess(pi.hProcess, &code);
+			CloseHandle(pi.hProcess);
+			return (int)code;
+		}
+	}
+	return rc;
 }

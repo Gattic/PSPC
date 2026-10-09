@@ -1,22 +1,23 @@
-﻿// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: GPL-2.0-or-later
 //
-// PSP device namespace ("ms0:", "disc0:", "host0:", "flash0:", "emulator:") for IoFileMgrForUser
-// and the module loader. A Device implements one mounted file system.
+// PSP device namespace ("ms0:", "disc0:", "umd0:", "host0:", "flash0:", "emulator:") for
+// IoFileMgrForUser and the module loader. A Device is one mounted volume: a vfs::FileSystem
+// plus the behaviour the HLE needs to know about (FAT, UMD timing, devctls).
 #pragma once
 
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "common/common.h"
+#include "fs/filesystem.h"
+#include "runtime/kernel/kobject.h"
 
 namespace io {
 
-#pragma pack(push, 1)
-struct PspDateTime {
-	u16 year, month, day, hour, minute, second;
-	u32 microsecond;
-};
+// Guest structures and flags (same layouts as vfs::SceIoStat / vfs::SceIoDirent).
+using PspDateTime = vfs::ScePspDateTime;
 struct PspIoStat {
 	s32 mode;
 	u32 attr;
@@ -30,75 +31,97 @@ struct PspIoDirent {
 	u32 priv;
 	s32 dummy;
 };
-#pragma pack(pop)
-static_assert(sizeof(PspIoStat) == 88, "SceIoStat layout");
-static_assert(sizeof(PspIoDirent) == 352, "SceIoDirent layout");
+static_assert(sizeof(PspIoStat) == sizeof(vfs::SceIoStat), "SceIoStat layout");
+static_assert(sizeof(PspIoDirent) == sizeof(vfs::SceIoDirent), "SceIoDirent layout");
 
-enum : int {
-	PSP_O_RDONLY = 0x0001,
-	PSP_O_WRONLY = 0x0002,
-	PSP_O_RDWR = 0x0003,
-	PSP_O_NBLOCK = 0x0004,
-	PSP_O_DIROPEN = 0x0008,
-	PSP_O_APPEND = 0x0100,
-	PSP_O_CREAT = 0x0200,
-	PSP_O_TRUNC = 0x0400,
-	PSP_O_EXCL = 0x0800,
-	PSP_O_NOWAIT = 0x8000,
-};
+constexpr u32 PSP_O_RDONLY = vfs::PSP_O_RDONLY, PSP_O_WRONLY = vfs::PSP_O_WRONLY, PSP_O_RDWR = vfs::PSP_O_RDWR,
+              PSP_O_APPEND = vfs::PSP_O_APPEND, PSP_O_CREAT = vfs::PSP_O_CREAT, PSP_O_TRUNC = vfs::PSP_O_TRUNC,
+              PSP_O_EXCL = vfs::PSP_O_EXCL;
+constexpr u32 FIO_S_IFDIR = vfs::FIO_S_IFDIR, FIO_S_IFREG = vfs::FIO_S_IFREG, FIO_SO_IFDIR = vfs::FIO_SO_IFDIR,
+              FIO_SO_IFREG = vfs::FIO_SO_IFREG;
 
-enum : u32 {
-	FIO_S_IFLNK = 0x4000,
-	FIO_S_IFDIR = 0x1000,
-	FIO_S_IFREG = 0x2000,
-	FIO_SO_IFLNK = 0x0008,
-	FIO_SO_IFDIR = 0x0010,
-	FIO_SO_IFREG = 0x0020,
+enum class DevClass {
+	MemoryStick,  // ms0: (FAT, d_private short names, memory stick devctls)
+	Flash,        // flash0: (FAT, read-only)
+	Host,         // host0: (PSPLink usbhostfs semantics)
+	UmdFiles,     // disc0: (ISO9660 files)
+	UmdBlock,     // umd0:/umd1:/umd: (the whole disc in sectors)
+	Emulator,     // emulator:/kemulator: (pspautotests output)
 };
 
 class Device {
 public:
 	virtual ~Device() = default;
-	// Handles returned by Open/DOpen are device-local.
-	virtual int Open(const std::string &path, int flags, int mode) = 0;
-	virtual int Close(int h) = 0;
-	virtual s64 Read(int h, void *buf, s64 size) = 0;
-	virtual s64 Write(int h, const void *buf, s64 size) = 0;
-	virtual s64 Seek(int h, s64 offset, int whence) = 0;
-	virtual int GetStat(const std::string &path, PspIoStat &st) = 0;
-	virtual int ChStat(const std::string &path, const PspIoStat &st, u32 bits) { return 0; }
-	virtual int Remove(const std::string &path);
-	virtual int Mkdir(const std::string &path, int mode);
-	virtual int Rmdir(const std::string &path);
-	virtual int Rename(const std::string &from, const std::string &to);
-	virtual int DOpen(const std::string &path) = 0;
-	virtual int DRead(int h, PspIoDirent &ent) = 0;  // 1 = entry, 0 = end, <0 error
-	virtual int DClose(int h) = 0;
-	virtual int Ioctl(int h, u32 cmd, u32 inAddr, u32 inLen, u32 outAddr, u32 outLen);
-	virtual int Devctl(const std::string &devName, u32 cmd, u32 inAddr, u32 inLen, u32 outAddr, u32 outLen);
-	virtual u32 DevType() const { return 0x20; }  // PSP_DEV_TYPE_FILE
+	virtual DevClass Class() const = 0;
+	// Null for character devices.
+	virtual vfs::FileSystem *Fs() { return nullptr; }
+	// sceIoGetDevType: 0x10 file system, 0x04 block device.
+	virtual u32 DevType() const;
+	// Called by Mount with the canonical device name ("ms0", "host0", ...).
+	virtual void OnMount(const std::string &name) {}
+	// sceIoDevctl for this device. `devName` is the name as the guest wrote it ("fatms0:").
+	// Guest addresses; *delayUs may be raised to make the caller wait. SCE_KERNEL_ERROR_UNSUP
+	// when the command is unknown.
+	virtual int Devctl(const std::string &devName, u32 cmd, u32 inAddr, u32 inLen, u32 outAddr, u32 outLen, u32 *delayUs);
+
+	bool IsFat() const { return Class() == DevClass::MemoryStick || Class() == DevClass::Flash; }
+	bool IsUmd() const { return Class() == DevClass::UmdFiles || Class() == DevClass::UmdBlock; }
+
+	// Host-side file access for other runtime modules (savedata, fonts...): forwards to Fs() with
+	// device-relative paths, no guest timing. Errors as from the vfs.
+	int Open(const std::string &path, u32 flags, int mode);
+	int Close(int h);
+	s64 Read(int h, void *buf, s64 size);
+	s64 Write(int h, const void *buf, s64 size);
+	s64 Seek(int h, s64 offset, int whence);
+	int GetStat(const std::string &path, PspIoStat &st);
+	int ChStat(const std::string &path, const PspIoStat &st, u32 bits);
+	int Remove(const std::string &path);
+	int Mkdir(const std::string &path, int mode);
+	int Rmdir(const std::string &path);
+	int Rename(const std::string &from, const std::string &to);
+	int DOpen(const std::string &path);
+	int DRead(int h, PspIoDirent &ent);  // 1 = entry, 0 = end, <0 error
+	int DClose(int h);
 };
 
 void Init();
 void Shutdown();
+// `device` without the colon; aliases are folded ("fatms0" and "memstick" are ms0, "umd1",
+// "umd" and "umd00" are umd0, device names compare case-insensitively).
 void Mount(const std::string &device, std::shared_ptr<Device> dev);
 void Unmount(const std::string &device);
 std::shared_ptr<Device> MountedDevice(const std::string &device);
-// Splits "ms0:/PSP/GAME" into device "ms0" and path "/PSP/GAME", resolving the current
-// directory for relative paths. Returns false for unknown devices.
+std::string CanonicalDevice(std::string_view device);
+
+// A guest path resolved for the calling thread: device plus device-relative path. `path` is ""
+// for the device itself ("umd0:") and starts with '/' otherwise.
+struct Resolved {
+	std::shared_ptr<Device> dev;
+	std::string device;  // canonical name, no colon
+	std::string path;
+};
+// 0, SCE_KERNEL_ERROR_NOCWD for a relative path without a cwd, SCE_KERNEL_ERROR_NODEV.
+int Resolve(std::string_view pspPath, Resolved *out);
+// Same, as device name plus path; false if it doesn't resolve.
 bool ResolvePath(const std::string &pspPath, std::string &device, std::string &path);
+
+// Current directory. Each thread has its own (sceIoChdir); threads that never set one use the
+// default (the boot directory).
 void SetCwd(const std::string &pspDir);
 const std::string &Cwd();
+std::string ThreadCwd(SceUID thread);
+void SetThreadCwd(SceUID thread, const std::string &dir);
 
 // Whole-file read through the PSP namespace (used by the module loader).
 bool ReadFile(const std::string &pspPath, std::vector<u8> &out);
-
-// Host-directory device (memory stick, host0:, flash0:).
-std::shared_ptr<Device> MakeHostDevice(const std::string &hostRoot, bool readOnly);
-// "emulator:" device used by pspautotests to send output.
-std::shared_ptr<Device> MakeEmulatorDevice(bool hasDisplay);
-
-// Host-side access for other modules (savedata, fonts...).
+// Host-side path of a file on a host-directory device, or "" (savedata, fonts...).
 std::string HostPathFor(const std::string &pspPath);
+
+// Host-directory device; its flavour (memory stick, flash, host0) follows the mount name.
+std::shared_ptr<Device> MakeHostDevice(const std::string &hostRoot, bool readOnly);
+std::shared_ptr<Device> MakeVfsDevice(std::shared_ptr<vfs::FileSystem> fs, DevClass cls);
+// "emulator:" device pspautotests send their output through.
+std::shared_ptr<Device> MakeEmulatorDevice(bool hasDisplay);
 
 }  // namespace io

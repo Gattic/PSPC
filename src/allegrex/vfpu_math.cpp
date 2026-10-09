@@ -5,6 +5,8 @@
 // vsin/vcos/vasin, the dot product datapath, the random number generator and the half-float
 // conversions. Ported from Core/MIPS/MIPSVFPUUtils.cpp. Everything works on float bits, since the
 // VFPU's NaN (0x7F800001) is signaling and must not be quieted by a float round trip.
+#include <emmintrin.h>
+
 #include <bit>
 #include <cstdlib>
 
@@ -758,7 +760,7 @@ u32 Rcp(u32 bits) {
 // The hardware dot product (PPSSPP vfpu_dot_reference, see
 // https://github.com/hrydgard/ppsspp/issues/21070): products in extra precision with
 // round-to-odd, aligned by truncation, summed exactly, then rounded to nearest even.
-u32 DotBits(const u32 a[4], const u32 b[4]) {
+u32 DotBitsReference(const u32 a[4], const u32 b[4]) {
 	const int EXTRA_BITS = 2;
 	const u32 I = u32(1) << 23, J = u32(1) << (23 - EXTRA_BITS);
 	int32_t s[4], e[4], ehi = -2 * 127;
@@ -827,6 +829,71 @@ u32 DotBits(const u32 a[4], const u32 b[4]) {
 		m = 0;
 	}
 	return (u32(val < 0) << 31) | (u32(ehi + 127) << 23) | u32(m & 0x007FFFFF);
+}
+
+// The end of the SIMD version: drops the extra bits off the exact sum by truncation, then rounds
+// to 24 bits, nearest even. With the top bit moved to bit 62, adding 2^38 - 1 plus the lowest kept
+// bit and shifting out 39 bits does that for every magnitude, and adding the significand,
+// implicit bit and all, onto the exponent field lets a carry from the rounding bump the exponent
+// by itself. It's done in integers because the host rounding mode may be the game's.
+static inline u32 DotFinish(int32_t val, u32 ehi) {
+	const u32 signBit = (u32)val & 0x80000000u;
+	const u32 m = (val < 0 ? 0u - (u32)val : (u32)val) >> 2;
+	const int lz = 32 + (int)Clz32NonZero(m | 1);  // of m as 64 bits
+	const u64 top = (u64)m << (lz - 1);
+	const u64 q = (top + ((1ULL << 38) - 1) + ((top >> 39) & 1)) >> 39;
+	const int64_t t = ((int64_t)((int)ehi - 88 - lz) << 23) + (int64_t)q;
+	u32 bits = t >= 0x7F800000 ? 0x7F800000u : (u32)t;
+	bits = (t < 0x00800000 || m == 0) ? 0u : bits;
+	return bits | signBit;
+}
+
+// The reference, four lanes at a time with SSE2 (PPSSPP vfpu_dot_sse2). Bit-exact with it.
+u32 DotBits(const u32 a[4], const u32 b[4]) {
+	const __m128i x = _mm_loadu_si128((const __m128i *)a);
+	const __m128i y = _mm_loadu_si128((const __m128i *)b);
+	const __m128i expBits = _mm_set1_epi32(0x7F800000);
+	const __m128i xe = _mm_and_si128(x, expBits), ye = _mm_and_si128(y, expBits);
+	const __m128i zero = _mm_setzero_si128();
+
+	// Zero and subnormal inputs make the product zero, with the lowest exponent. Inf and NaN get
+	// 0x7FF, above any real exponent sum, so one maximum finds the alignment and the specials. All
+	// of these fit in 15 bits, so the 16-bit maximum works on them.
+	const __m128i flush = _mm_or_si128(_mm_cmpeq_epi32(xe, zero), _mm_cmpeq_epi32(ye, zero));
+	const __m128i special = _mm_or_si128(_mm_cmpeq_epi32(xe, expBits), _mm_cmpeq_epi32(ye, expBits));
+	const __m128i e = _mm_or_si128(_mm_andnot_si128(flush, _mm_srli_epi32(_mm_add_epi32(xe, ye), 23)), _mm_srli_epi32(special, 21));
+	__m128i emax = _mm_max_epi16(e, _mm_shuffle_epi32(e, _MM_SHUFFLE(1, 0, 3, 2)));
+	emax = _mm_max_epi16(emax, _mm_shuffle_epi32(emax, _MM_SHUFFLE(2, 3, 0, 1)));
+	const u32 ehi = (u32)_mm_cvtsi128_si32(emax);
+	// Inf and NaN inputs are rare, and the reference handles them.
+	if (ehi >= 0x7FF) return DotBitsReference(a, b);
+
+	// 24x24-bit products, even and odd lanes separately, kept to 2 extra bits with round-to-odd.
+	const __m128i mantMask = _mm_set1_epi32(0x007FFFFF), implicitBit = _mm_set1_epi32(0x00800000);
+	const __m128i mx = _mm_or_si128(_mm_and_si128(x, mantMask), implicitBit);
+	const __m128i my = _mm_or_si128(_mm_and_si128(y, mantMask), implicitBit);
+	const __m128i pEven = _mm_mul_epu32(mx, my);
+	const __m128i pOdd = _mm_mul_epu32(_mm_srli_epi64(mx, 32), _mm_srli_epi64(my, 32));
+	const __m128i kept = _mm_or_si128(_mm_srli_epi64(pEven, 21), _mm_slli_epi64(_mm_srli_epi64(pOdd, 21), 32));
+	const __m128i lowMask = _mm_set_epi32(0, (1 << 21) - 1, 0, (1 << 21) - 1);
+	const __m128i dropped = _mm_or_si128(_mm_and_si128(pEven, lowMask), _mm_slli_epi64(_mm_and_si128(pOdd, lowMask), 32));
+	const __m128i sticky = _mm_andnot_si128(_mm_cmpeq_epi32(dropped, zero), _mm_set1_epi32(1));
+	const __m128i p = _mm_andnot_si128(flush, _mm_or_si128(kept, sticky));
+
+	// Align to the largest exponent by truncation. SSE2 has no per-lane shift, so p >> d is done as
+	// (p * 2^(28 - d)) >> 28, with the power of two built as float bits and converted by truncation.
+	const __m128i d = _mm_min_epi16(_mm_sub_epi32(emax, e), _mm_set1_epi32(28));
+	const __m128i scale = _mm_cvttps_epi32(_mm_castsi128_ps(_mm_slli_epi32(_mm_sub_epi32(_mm_set1_epi32(127 + 28), d), 23)));
+	const __m128i sEven = _mm_srli_epi64(_mm_mul_epu32(p, scale), 28);
+	const __m128i sOdd = _mm_srli_epi64(_mm_mul_epu32(_mm_srli_epi64(p, 32), _mm_srli_epi64(scale, 32)), 28);
+	__m128i v = _mm_or_si128(sEven, _mm_slli_epi64(sOdd, 32));
+
+	// Apply the signs and sum exactly.
+	const __m128i sign = _mm_srai_epi32(_mm_xor_si128(x, y), 31);
+	v = _mm_sub_epi32(_mm_xor_si128(v, sign), sign);
+	v = _mm_add_epi32(v, _mm_shuffle_epi32(v, _MM_SHUFFLE(1, 0, 3, 2)));
+	v = _mm_add_epi32(v, _mm_shuffle_epi32(v, _MM_SHUFFLE(2, 3, 0, 1)));
+	return DotFinish(_mm_cvtsi128_si32(v), ehi);
 }
 
 // ---- Random number generator (https://github.com/hrydgard/ppsspp/issues/16946) ----

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+﻿// SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 
 #include <string>
@@ -19,6 +19,10 @@ struct Options {
 	int timeoutSec = 0;        // stop after this many wall-clock seconds (0 = never)
 	std::string memstickDir;
 	std::string flash0Dir;
+	std::string flash1Dir;
+	std::string host0Dir;      // host0: root (default: the boot file's folder)
+	std::string umdImage;      // disc image to insert when booting a non-disc executable
+	bool plugins = true;      // load ms0:/seplugins/game.txt (M33)
 	std::string dataDir;       // contains nids.csv
 	std::string decryptTool;
 	std::string decryptCacheDir;
@@ -29,5 +33,7 @@ struct Options {
 
 // Boots the program and runs until it exits. Returns the exit code.
 int Run(const Options &opts);
+// After Run(): an M33 LoadExec asked to continue with this host file.
+bool TakeRelaunch(std::string &hostFile);
 
 }  // namespace runtime

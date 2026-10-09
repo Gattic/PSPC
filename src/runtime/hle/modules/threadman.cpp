@@ -367,14 +367,14 @@ int sceKernelDelaySysClockThreadCB(u32 clockPtr) {
 
 u32 sceKernelSuspendDispatchThread() {
 	if (!*g_intrEnabled) return SCE_KERNEL_ERROR_CPUDI;
-	u32 old = sched::DispatchEnabled() ? 1 : 0;
+	u32 old = sched::DispatchFlag() ? 1 : 0;
 	sched::SetDispatchEnabled(false);
 	return old;
 }
 
 u32 sceKernelResumeDispatchThread(u32 enabled) {
 	if (!*g_intrEnabled) return SCE_KERNEL_ERROR_CPUDI;
-	bool was = sched::DispatchEnabled();
+	bool was = sched::DispatchFlag();
 	sched::SetDispatchEnabled(enabled != 0);
 	if (!was && enabled) sched::Reschedule();
 	return 0;

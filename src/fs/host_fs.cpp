@@ -9,6 +9,7 @@
 #include <windows.h>
 
 #include "common/log.h"
+#include "fs/fat_names.h"
 #include "fs/path_util.h"
 
 namespace vfs {
@@ -159,6 +160,40 @@ bool FindNoCase(const std::wstring &dir, const std::wstring &name, std::wstring 
 	return ok;
 }
 
+// Host names of `dir` in listing order (the order DOpen reports them in), without "." and "..".
+std::vector<std::wstring> ListNames(const std::wstring &dir) {
+	std::vector<std::wstring> names;
+	WIN32_FIND_DATAW fd;
+	HANDLE h = FindFirstFileExW((dir + L"\\*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+	if (h == INVALID_HANDLE_VALUE) {
+		return names;
+	}
+	do {
+		if (wcscmp(fd.cFileName, L".") && wcscmp(fd.cFileName, L"..")) {
+			names.push_back(fd.cFileName);
+		}
+	} while (FindNextFileW(h, &fd));
+	FindClose(h);
+	return names;
+}
+
+// Finds the entry of `dir` whose generated FAT short name is `shortName`.
+bool FindShortName(const std::wstring &dir, const std::string &shortName, std::wstring *found) {
+	std::vector<std::wstring> wide = ListNames(dir);
+	std::vector<std::string> names;
+	for (const std::wstring &w : wide) {
+		names.push_back(WideToUtf8(w.c_str()));
+	}
+	std::vector<std::string> shorts = GenerateFatShortNames(names);
+	for (size_t i = 0; i < shorts.size(); i++) {
+		if (EqualsNoCase(shorts[i], shortName)) {
+			*found = wide[i];
+			return true;
+		}
+	}
+	return false;
+}
+
 // Windows writes lowercase 8.3 names as upper case plus a flag the PSP doesn't read. Applies when
 // base and extension fit 8.3 and neither mixes cases.
 std::string UpperCase83(const std::string &name) {
@@ -272,7 +307,19 @@ s32 HostFileSystem::Resolve(std::string_view path, bool allowMissingLast, std::w
 		}
 		const bool last = i + 1 == parts.size();
 		std::wstring cand = cur + L"\\" + w;
-		DWORD attrs = GetFileAttributesW(cand.c_str());
+		DWORD attrs = INVALID_FILE_ATTRIBUTES;
+		if (opt_.fat && parts[i].find('~') != std::string::npos) {
+			// Our own 8.3 names first: Windows' aliases follow other rules (or are disabled).
+			std::wstring found;
+			if (FindShortName(cur, parts[i], &found)) {
+				cand = cur + L"\\" + found;
+				attrs = GetFileAttributesW(cand.c_str());
+			}
+		}
+		if (attrs == INVALID_FILE_ATTRIBUTES) {
+			cand = cur + L"\\" + w;
+			attrs = GetFileAttributesW(cand.c_str());
+		}
 		if (attrs == INVALID_FILE_ATTRIBUTES) {
 			std::wstring found;
 			if (FindNoCase(cur, w, &found)) {
@@ -692,9 +739,9 @@ s32 HostFileSystem::DOpen(std::string_view path) {
 		return SCE_ERRNO_ENOTDIR;
 	}
 	auto d = std::make_shared<OpenDir>();
-	if (!comps.empty()) {
-		// FAT subdirectories start with "." and ".."; the root has neither. io/directory shows
-		// ".." with a size of 4096.
+	{
+		// Listings start with "." and "..", the root's too (io/io sees "." in flash0:/).
+		// io/directory shows ".." with a size of 4096.
 		EntryInfo dot;
 		dot.name = ".";
 		dot.attrs = FILE_ATTRIBUTE_DIRECTORY;
@@ -714,7 +761,7 @@ s32 HostFileSystem::DOpen(std::string_view path) {
 			}
 			EntryInfo e;
 			e.name = WideToUtf8(fd.cFileName);
-			if (opt_.fat && opt_.upperCase83) {
+			if (opt_.upperCase83) {
 				e.name = UpperCase83(e.name);
 			}
 			e.attrs = fd.dwFileAttributes;

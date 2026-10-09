@@ -15,7 +15,9 @@ if errorlevel 1 exit /b 1
 
 where ninja >nul 2>&1 || set "PATH=%LOCALAPPDATA%\Microsoft\WinGet\Links;%PATH%"
 
+rem PSPC_BUILD_DIR lets parallel workers use separate build trees.
 set BUILDDIR=build\%CONFIG%
+if defined PSPC_BUILD_DIR set BUILDDIR=%PSPC_BUILD_DIR%
 cmake -S . -B "%BUILDDIR%" -G Ninja -DCMAKE_BUILD_TYPE=%CONFIG% >nul
 if errorlevel 1 exit /b 1
 cmake --build "%BUILDDIR%" %2 %3 %4 %5

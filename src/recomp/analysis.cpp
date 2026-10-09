@@ -146,7 +146,6 @@ struct Walker {
 	const ModuleImage &img;
 	const std::set<u32> &strong;
 	std::set<u32> &newEntries;
-	size_t &unresolved;
 
 	bool IsTailCall(const Function &f, u32 target) const {
 		if (target == f.entry) return false;
@@ -204,7 +203,7 @@ struct Walker {
 					}
 					f.jumpTables[pc] = std::move(jt);
 				} else {
-					unresolved++;
+					f.unresolvedJumps++;
 				}
 				break;
 			}
@@ -262,14 +261,68 @@ void ScanDataPointers(const ModuleImage &img, std::set<u32> &weak) {
 		if (img.InCode(a)) continue;
 		u32 v = img.Read32(a);
 		if (!img.InCode(v) || (v & 3) || img.IsStub(v)) continue;
-		u32 first = img.Read32(v);
-		bool prologue = ag::Decode(first) == Op::ADDIU && Rs(first) == 29 && Rt(first) == 29 && Simm16(first) < 0;
-		bool afterReturn = img.InCode(v - 8) && img.Read32(v - 8) == 0x03E00008;
-		if (prologue || afterReturn) weak.insert(v);
+		if (LooksLikeFunctionStart(img, v)) weak.insert(v);
+	}
+}
+
+// Walks every entry in `entries` that has no function yet, to a fixpoint over the tail-call
+// targets the walks discover (those become strong entries).
+void WalkEntries(const ModuleImage &img, std::set<u32> &strong, const std::set<u32> &weak,
+                 std::map<u32, Function> &funcs) {
+	for (int round = 0; round < 8; round++) {
+		std::set<u32> all = strong;
+		all.insert(weak.begin(), weak.end());
+		std::set<u32> newEntries;
+		for (u32 e : all) {
+			if (funcs.count(e)) continue;
+			Function f;
+			f.entry = e;
+			auto next = strong.upper_bound(e);
+			f.rangeEnd = next == strong.end() ? 0xFFFFFFFF : *next;
+			Walker w{img, strong, newEntries};
+			w.Walk(f);
+			funcs[e] = std::move(f);
+		}
+		size_t before = strong.size();
+		for (u32 e : newEntries) strong.insert(e);
+		if (strong.size() == before) break;
+		// Range ends changed for functions preceding new entries: re-walk those.
+		for (u32 e : newEntries) {
+			auto it = funcs.lower_bound(e);
+			if (it != funcs.begin()) funcs.erase(std::prev(it));
+		}
 	}
 }
 
 }  // namespace
+
+bool HasDelaySlot(u32 w) {
+	switch (ag::OpKind(ag::Decode(w))) {
+	case Kind::BR:
+	case Kind::BRL:
+	case Kind::BRAL:
+	case Kind::BRALL:
+	case Kind::J:
+	case Kind::JAL:
+	case Kind::JR:
+	case Kind::JALR: return true;
+	default: return false;
+	}
+}
+
+void MarkCovered(const ModuleImage &img, const Function &f, std::vector<bool> &cov) {
+	for (u32 pc : f.body) {
+		cov[(pc - img.low) / 4] = true;
+		if (HasDelaySlot(img.Read32(pc)) && img.InImage(pc + 4)) cov[(pc + 4 - img.low) / 4] = true;
+	}
+}
+
+bool LooksLikeFunctionStart(const ModuleImage &img, u32 v) {
+	u32 first = img.Read32(v);
+	if (ag::Decode(first) == Op::ADDIU && Rs(first) == 29 && Rt(first) == 29 && Simm16(first) < 0) return true;
+	// Two words after a "jr ra" (return + delay slot).
+	return img.InCode(v - 8) && img.Read32(v - 8) == 0x03E00008;
+}
 
 Analysis Analyze(const ModuleImage &img, const AnalysisOptions &opts) {
 	Analysis an;
@@ -283,33 +336,88 @@ Analysis Analyze(const ModuleImage &img, const AnalysisOptions &opts) {
 		if (img.InCode(h) && !(h & 3)) strong.insert(h);
 	ScanCodePointers(img, strong, weak);
 	if (opts.scanDataPointers) ScanDataPointers(img, weak);
+	for (u32 e : strong) weak.erase(e);
 
 	std::map<u32, Function> funcs;
-	for (int round = 0; round < 8; round++) {
-		std::set<u32> all = strong;
-		all.insert(weak.begin(), weak.end());
-		std::set<u32> newEntries;
-		for (u32 e : all) {
-			if (funcs.count(e)) continue;
-			Function f;
-			f.entry = e;
-			auto next = strong.upper_bound(e);
-			f.rangeEnd = next == strong.end() ? 0xFFFFFFFF : *next;
-			Walker w{img, strong, newEntries, an.unresolvedIndirect};
-			w.Walk(f);
-			funcs[e] = std::move(f);
+	WalkEntries(img, strong, {}, funcs);
+
+	// A weak entry inside code the strong functions already cover is almost always a switch case
+	// or a local label whose address was taken; give it a function only if it looks like a start.
+	std::vector<bool> covered((img.high - img.low) / 4 + 1);
+	for (const auto &kv : funcs) MarkCovered(img, kv.second, covered);
+	for (auto it = weak.begin(); it != weak.end();) {
+		if (covered[(*it - img.low) / 4] && !LooksLikeFunctionStart(img, *it)) {
+			it = weak.erase(it);
+			an.droppedWeak++;
+		} else {
+			++it;
 		}
-		size_t before = strong.size();
-		for (u32 e : newEntries) strong.insert(e);
-		if (strong.size() == before) break;
-		// Range ends changed for functions preceding new entries: re-walk those.
+	}
+	WalkEntries(img, strong, weak, funcs);
+
+	// Code nothing reaches is usually still code: functions called only through pointers the
+	// scans miss (vtables in fixed-address executables, computed addresses). An uncovered word
+	// becomes an entry when it sits on a function boundary (range start, prologue, or the first
+	// word after a return/tail jump and its padding) and the next few words decode.
+	if (opts.gapEntries) {
+		std::vector<bool> cov((img.high - img.low) / 4 + 1);
+		for (const auto &kv : funcs) MarkCovered(img, kv.second, cov);
+		auto onBoundary = [&](u32 pc, u32 rangeStart) {
+			if (pc == rangeStart || LooksLikeFunctionStart(img, pc)) return true;
+			u32 q = pc - 4;
+			while (q >= rangeStart && img.Read32(q) == 0) q -= 4;
+			if (q < rangeStart) return true;
+			auto ends = [&](u32 a) {
+				if (a < rangeStart) return false;
+				u32 w = img.Read32(a);
+				return w == 0x03E00008 || ag::OpKind(ag::Decode(w)) == Kind::J;
+			};
+			return ends(q) || ends(q - 4);  // q is the jump (nop delay slot skipped) or its delay slot
+		};
+		std::set<u32> newEntries;
+		for (const auto &r : img.code) {
+			for (u32 pc = r.first; pc + 4 <= r.second; pc += 4) {
+				if (cov[(pc - img.low) / 4] || img.IsStub(pc) || img.Read32(pc) == 0) continue;
+				if (funcs.count(pc) || !onBoundary(pc, r.first)) continue;
+				bool plausible = true;
+				for (u32 a = pc; a < pc + 16 && a + 4 <= r.second; a += 4)
+					if (ag::OpKind(ag::Decode(img.Read32(a))) == Kind::INVALID) plausible = false;
+				if (!plausible) continue;
+				Function f;
+				f.entry = pc;
+				auto next = strong.upper_bound(pc);
+				f.rangeEnd = next == strong.end() ? 0xFFFFFFFF : *next;
+				std::set<u32> tails;
+				Walker w{img, strong, tails};
+				w.Walk(f);
+				// Data decoded as code branches into other functions or hits invalid words; real
+				// unreached functions do neither.
+				bool garbage = false;
+				for (u32 a : f.body) {
+					if (cov[(a - img.low) / 4] || ag::OpKind(ag::Decode(img.Read32(a))) == Kind::INVALID) {
+						garbage = true;
+						break;
+					}
+				}
+				if (garbage) continue;
+				MarkCovered(img, f, cov);
+				newEntries.insert(tails.begin(), tails.end());
+				weak.insert(pc);
+				an.gapEntries++;
+				funcs[pc] = std::move(f);
+			}
+		}
 		for (u32 e : newEntries) {
+			if (!strong.insert(e).second) continue;
 			auto it = funcs.lower_bound(e);
 			if (it != funcs.begin()) funcs.erase(std::prev(it));
 		}
+		WalkEntries(img, strong, weak, funcs);
 	}
+
 	for (auto &kv : funcs) {
 		an.instructions += kv.second.body.size();
+		an.unresolvedIndirect += kv.second.unresolvedJumps;
 		an.functions.push_back(std::move(kv.second));
 	}
 	return an;

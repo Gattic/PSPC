@@ -23,9 +23,9 @@ bool SplitPspDevice(std::string_view path, std::string_view *device, std::string
 //   "ms0:PSP//GAME/./x/../" -> "ms0:/PSP/GAME"     "a\\b" -> "/a/b"     "/../.." -> "/"
 std::string NormalizePspPath(std::string_view path);
 
-// Resolves `path` against a current directory, as sceIoOpen and friends do with the per-thread
-// cwd. `cwd` is a full path such as "ms0:/PSP/GAME" (or device-relative). A path with a device
-// ignores cwd; one starting with '/' keeps only cwd's device; anything else is appended to cwd.
+// Resolves `path` against a current directory, as iofilemgr does with the per-thread cwd. `cwd`
+// is a full path such as "ms0:/PSP/GAME". A path with a device ignores cwd; any other path,
+// even one starting with '/', is appended to cwd ("/PSP" in "ms0:/PSP" is "ms0:/PSP/PSP").
 // An empty path yields cwd. The result is normalized.
 std::string NormalizePspPath(std::string_view cwd, std::string_view path);
 

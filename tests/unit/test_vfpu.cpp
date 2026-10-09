@@ -3,6 +3,8 @@
 // VFPU tests: decoding, register layout, semantics with and without prefixes, disassembly, and
 // replays of hardware-recorded pspautotests results (cpu/vfpu exact, prefix_consume, vrnd) when
 // reference/pspautotests is present.
+#include <xmmintrin.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdarg>
@@ -65,10 +67,13 @@ constexpr u32 V9(u32 sub) { return OP_V9 | (sub << 16); }
 u32 Bits(float f) { return std::bit_cast<u32>(f); }
 float Flt(u32 u) { return std::bit_cast<float>(u); }
 
+// A thread-initialized context with the register file zeroed (InitCtx fills it with NaN, which
+// the tests below don't want).
 Ctx NewCtx() {
 	Ctx c;
 	memset(&c, 0, sizeof(c));
 	vfpu::InitCtx(&c);
+	memset(c.v, 0, sizeof(c.v));
 	return c;
 }
 
@@ -410,6 +415,21 @@ TEST(vfpu_decode_vs_pspdecompiler) {
 		}
 	}
 	CHECK(checked > 2000);
+}
+
+TEST(vfpu_init_ctx) {
+	Ctx c;
+	memset(&c, 0xCC, sizeof(c));
+	vfpu::InitCtx(&c);
+	for (int i = 0; i < 128; i++) CHECK_EQ(c.vi[i], 0x7F800001u);  // cpu/vfpu/vavg reads these
+	CHECK_EQ(c.vfpuCtrl[VFPU_CTRL_SPREFIX], 0xE4u);
+	CHECK_EQ(c.vfpuCtrl[VFPU_CTRL_TPREFIX], 0xE4u);
+	CHECK_EQ(c.vfpuCtrl[VFPU_CTRL_DPREFIX], 0u);
+	CHECK_EQ(c.vfpuCtrl[VFPU_CTRL_CC], 0x3Fu);
+	CHECK_EQ(c.vfpuCtrl[VFPU_CTRL_REV], 0x7772CEABu);
+	CHECK_EQ(c.vfpuCtrl[VFPU_CTRL_RCX0], 0x3F800001u);
+	CHECK_EQ(c.vfpuCtrl[VFPU_CTRL_RCX0 + 7], 0x3F800000u);
+	CHECK(vfpu::HasDefaultPrefixes(&c));
 }
 
 TEST(vfpu_register_layout) {
@@ -813,6 +833,103 @@ TEST(vfpu_transcendental) {
 	CHECK_EQ(c.vi[0], cases[0].cos);
 	CHECK_EQ(c.vi[1], cases[0].sin);
 	CHECK_EQ(c.vi[2], 0u);
+}
+
+// The hardware datapath model (kHardwareFloat): values from the recorded .expected files.
+TEST(vfpu_hw_float_model) {
+	if (!vfpu::kHardwareFloat) return;
+	Ctx c = NewCtx();
+	const u32 specials[4] = {0x7FBFFFFF, 0xFFBFFFFF, 0x7F800000, 0xFF800000};  // psp-gcc NAN, -NAN, inf, -inf
+	const u32 zeros[4] = {0x00000000, 0x80000000, 0x000116C2, 0x800116C2};     // 0, -0, denormals
+	const u32 vadd = OP_VADD | SZ_Q | VD(0) | VS(4) | VT(5);
+	auto run = [&](const u32 *a, u32 d, u32 op) {
+		SetVecBits(&c, 4, 4, a);
+		for (int i = 0; i < 4; i++) c.vi[20 + i] = 0;  // C110 = 0
+		if (d) Exec(&c, OP_VPFXD | d);
+		Exec(&c, op);
+		return Fmt("%08x,%08x,%08x,%08x", c.vi[0], c.vi[1], c.vi[2], c.vi[3]);
+	};
+	// prefix_sat: vadd.q x + 0 with d[0:1] and d[-1:1].
+	CHECK(run(specials, 0x55, vadd) == "7f800001,7f800001,3f800000,00000000");
+	CHECK(run(zeros, 0x55, vadd) == "00000000,00000000,00000000,00000000");
+	CHECK(run(specials, 0xFF, vadd) == "7f800001,7f800001,3f800000,bf800000");
+	CHECK(run(zeros, 0xFF, vadd) == "00000000,00000000,00000000,00000000");
+	// Without saturation: denormals flush to a signed zero (x + x keeps the sign).
+	CHECK(run(zeros, 0, OP_VADD | SZ_Q | VD(0) | VS(4) | VT(4)) == "00000000,80000000,00000000,80000000");
+	// prefix_sat: vdiv.q of nan,-nan,inf,-inf by 1.5,-2.5,3.5,-4.5.
+	const float divisors[4] = {1.5f, -2.5f, 3.5f, -4.5f};
+	SetVec(&c, 5, 4, divisors);
+	SetVecBits(&c, 4, 4, specials);
+	Exec(&c, OP_VDIV | SZ_Q | VD(0) | VS(4) | VT(5));
+	CHECK_EQ(c.vi[0], 0x7F800001u);
+	CHECK_EQ(c.vi[1], 0x7F800001u);  // the divider's NaN has the sign of x ^ y
+	CHECK_EQ(c.vi[2], 0x7F800000u);
+	CHECK_EQ(c.vi[3], 0x7F800000u);
+	// prefixes checkOps: vmul's NaN keeps the sign of x ^ y, vadd's is positive.
+	c.vi[vfpu::VOffset(4)] = 0xFFBFFFFF;
+	c.v[vfpu::VOffset(5)] = 1.0f / 3.0f;
+	Exec(&c, OP_VMUL | SZ_S | VD(0) | VS(4) | VT(5));
+	CHECK_EQ(c.vi[0], 0xFF800001u);
+	Exec(&c, OP_VADD | SZ_S | VD(0) | VS(4) | VT(5));
+	CHECK_EQ(c.vi[0], 0x7F800001u);
+
+	// specials: vcmp reads denormals as zero. s = 0,-0,den,-den against t = 1,nan,0,-inf.
+	SetVecBits(&c, 4, 4, zeros);
+	const u32 t1[4] = {0x3F800000, 0x7FBFFFFF, 0x00000000, 0xFF800000};
+	SetVecBits(&c, 5, 4, t1);
+	const struct {
+		u32 cond, cc;
+	} cmps[] = {{1, 0x14}, {3, 0x15}, {5, 0x1B}, {7, 0x18}, {8, 0x3F}, {12, 0x00}};
+	for (const auto &k : cmps) {
+		Exec(&c, OP_VCMP | SZ_Q | VS(4) | VT(5) | k.cond);
+		CHECK_EQ(c.vfpuCtrl[VFPU_CTRL_CC], k.cc);
+	}
+
+	// minmax_zero: denormals tie with zero and a tie returns t; a denormal that wins is kept.
+	const u32 dz[4] = {0x000116C2, 0x800116C2, 0x000116C2, 0x800116C2};
+	const u32 z4[4] = {0x00000000, 0x00000000, 0x80000000, 0x80000000};
+	const u32 one[4] = {0x3F800000, 0x3F800000, 0xBF800000, 0xBF800000};
+	SetVecBits(&c, 4, 4, dz);
+	SetVecBits(&c, 5, 4, z4);
+	Exec(&c, OP_VMIN | SZ_Q | VD(0) | VS(4) | VT(5));
+	CHECK(Fmt("%08x,%08x,%08x,%08x", c.vi[0], c.vi[1], c.vi[2], c.vi[3]) == "00000000,00000000,80000000,80000000");
+	SetVecBits(&c, 5, 4, one);
+	Exec(&c, OP_VMAX | SZ_Q | VD(0) | VS(4) | VT(5));
+	CHECK(Fmt("%08x,%08x,%08x,%08x", c.vi[0], c.vi[1], c.vi[2], c.vi[3]) == "3f800000,3f800000,000116c2,800116c2");
+
+	// overlap_vcrsp: lanes run z, y, x, each reading the registers the previous one wrote.
+	auto crsp = [&](u32 w) {
+		for (int i = 0; i < 16; i++) {
+			c.v[i] = (float)(i + 1);
+			c.v[16 + i] = (float)(101 + i);
+		}
+		Exec(&c, w);
+		return Fmt("%08x,%08x,%08x,%08x", c.vi[0], c.vi[1], c.vi[2], c.vi[3]);
+	};
+	CHECK(crsp(0xF2848000) == "c97e1450,c61f6c00,c2c80000,40800000");  // vcrsp.t C000, C000, C100
+	CHECK(crsp(0xF2848040) == "3f800000,c69dc400,43480000,c2c80000");  // vcrsp.t C001, C000, C100
+	CHECK(crsp(0xF284C000) == "c625b400,43460000,c2c60000,40800000");  // vcrsp.t C000, C001, C100
+	// The VFPU rounds to nearest even when the FPU's mode (mirrored into MXCSR) says otherwise,
+	// and leaves MXCSR as it found it.
+	const unsigned csr = _mm_getcsr();
+	_mm_setcsr((csr & ~(unsigned)_MM_ROUND_MASK) | _MM_ROUND_TOWARD_ZERO);
+	c.fcr31 = 1;
+	c.v[vfpu::VOffset(4)] = 1.0f;
+	c.vi[vfpu::VOffset(5)] = 0x33C00000;  // 1.5 * 2^-24
+	Exec(&c, OP_VADD | SZ_S | VD(0) | VS(4) | VT(5));
+	const u32 rounded = c.vi[0];
+	const unsigned after = _mm_getcsr();
+	_mm_setcsr(csr);
+	c.fcr31 = 0;
+	CHECK_EQ(rounded, 0x3F800001u);
+	CHECK_EQ(after & _MM_ROUND_MASK, (unsigned)_MM_ROUND_TOWARD_ZERO);
+	// Without overlap it's the cross product.
+	for (int i = 0; i < 16; i++) {
+		c.v[i] = (float)(i + 1);
+		c.v[16 + i] = (float)(101 + i);
+	}
+	Exec(&c, OP_VCRSP | SZ_T | VD(8) | VS(0) | VT(4));
+	CHECK(c.v[32] == 2.0f * 103 - 3.0f * 102 && c.v[33] == 3.0f * 101 - 1.0f * 103 && c.v[34] == 1.0f * 102 - 2.0f * 101);
 }
 
 // Every input in cpu/vfpu/exact.expected (specials, a sweep and random bit patterns), all 11 ops.

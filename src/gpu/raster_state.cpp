@@ -8,6 +8,7 @@
 #include "gpu/color.h"
 #include "gpu/ge_state.h"
 #include "gpu/render.h"
+#include "gpu/sampler.h"
 
 namespace gpu {
 
@@ -231,6 +232,7 @@ static void ComputeSamplerState(SamplerState *s, const u8 *clut) {
 	s->maxLevel = maxLevel;
 	s->texfmt = fmt;
 	s->swizzle = gstate.isTextureSwizzled();
+	s->sample = GetTexSampleFn(fmt, s->swizzle);
 	const int bits = textureBitsPerPixel[fmt];
 	for (int i = 0; i <= maxLevel; ++i) {
 		TexLevel &lv = s->levels[i];

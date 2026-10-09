@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+﻿// SPDX-License-Identifier: GPL-2.0-or-later
 // Registration entry points of every HLE library. Called once from hle::RegisterAllModules().
 #pragma once
 
@@ -24,6 +24,7 @@ void Register_sceAudio();
 void Register_sceUtility();
 void Register_sceHprm();
 void Register_Misc();
+void Register_M33();
 
 namespace hle {
 void RegisterAllModules();

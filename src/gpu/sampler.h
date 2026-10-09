@@ -125,35 +125,36 @@ static inline u32 DXTTexel(int fmt, const u8 *src, int bufw, int u, int v) {
 }
 
 // The texel at (u, v), already wrapped/clamped, of level `level`.
-PSPC_FORCEINLINE u32 FetchTexel(const SamplerState &ss, int level, int u, int v) {
+template <int fmt, bool swz>
+PSPC_FORCEINLINE u32 FetchTexelT(const SamplerState &ss, int level, int u, int v) {
 	const TexLevel &lv = ss.levels[level];
 	const u8 *base = lv.ptr;
 	if (!base)
 		return 0;
-	const int fmt = ss.texfmt;
-	if (fmt >= GE_TFMT_DXT1) {
+	if constexpr (fmt >= GE_TFMT_DXT1) {
 		if (lv.bounded) {
 			const u32 off = ((u32)(v >> 2) * (lv.bufw >> 2) + (u >> 2)) * (fmt == GE_TFMT_DXT1 ? 8 : 16);
 			if (off + 16 > lv.validBytes)
 				return 0;
 		}
 		return DXTTexel(fmt, base, lv.bufw, u, v);
-	}
-	const int bits = kTexelBits[fmt];
-	const u32 off = TexRowOffset(bits, ss.swizzle, lv.bufw, v) + TexColumnOffset(bits, ss.swizzle, u);
-	if (lv.bounded && off + 4 > lv.validBytes)
-		return 0;
-	const u8 *p = base + off;
-	switch (fmt) {
-	case GE_TFMT_5650: return RGB565ToRGBA8888(Rd16(p));
-	case GE_TFMT_5551: return RGBA5551ToRGBA8888(Rd16(p));
-	case GE_TFMT_4444: return RGBA4444ToRGBA8888(Rd16(p));
-	case GE_TFMT_8888: return Rd32(p);
-	case GE_TFMT_CLUT32: return LookupClut(ss, Rd32(p), level);
-	case GE_TFMT_CLUT16: return LookupClut(ss, Rd16(p), level);
-	case GE_TFMT_CLUT8: return LookupClut(ss, *p, level);
-	case GE_TFMT_CLUT4: return LookupClut(ss, (u & 1) ? (*p >> 4) : (*p & 0xF), level);
-	default: return 0;
+	} else {
+		constexpr int bits = kTexelBits[fmt];
+		const u32 off = TexRowOffset(bits, swz, lv.bufw, v) + TexColumnOffset(bits, swz, u);
+		if (lv.bounded && off + 4 > lv.validBytes)
+			return 0;
+		const u8 *p = base + off;
+		switch (fmt) {
+		case GE_TFMT_5650: return RGB565ToRGBA8888(Rd16(p));
+		case GE_TFMT_5551: return RGBA5551ToRGBA8888(Rd16(p));
+		case GE_TFMT_4444: return RGBA4444ToRGBA8888(Rd16(p));
+		case GE_TFMT_8888: return Rd32(p);
+		case GE_TFMT_CLUT32: return LookupClut(ss, Rd32(p), level);
+		case GE_TFMT_CLUT16: return LookupClut(ss, Rd16(p), level);
+		case GE_TFMT_CLUT8: return LookupClut(ss, *p, level);
+		case GE_TFMT_CLUT4: return LookupClut(ss, (u & 1) ? (*p >> 4) : (*p & 0xF), level);
+		default: return 0;
+		}
 	}
 }
 
@@ -176,13 +177,14 @@ PSPC_FORCEINLINE int WrapUV(int v, int size) {
 	return v & (size - 1) & 511;
 }
 
-PSPC_FORCEINLINE u32 SampleNearestLevel(const SamplerState &ss, float s, float t, int level) {
+template <int fmt, bool swz>
+PSPC_FORCEINLINE u32 SampleNearestLevelT(const SamplerState &ss, float s, float t, int level) {
 	const TexLevel &lv = ss.levels[level];
 	int u = TexelFixed(s * lv.w * 16.0f) >> 4;
 	int v = TexelFixed(t * lv.h * 16.0f) >> 4;
 	u = ss.clampS ? ClampUV(u, lv.w) : WrapUV(u, lv.w);
 	v = ss.clampT ? ClampUV(v, lv.h) : WrapUV(v, lv.h);
-	return FetchTexel(ss, level, u, v);
+	return FetchTexelT<fmt, swz>(ss, level, u, v);
 }
 
 PSPC_FORCEINLINE void TexelPair(float st, int size, bool clamp, int &c0, int &c1, int &frac) {
@@ -217,35 +219,44 @@ PSPC_FORCEINLINE u64 LerpSpread(u64 a, u64 b, int f) {
 	return ((a * (u64)(16 - f) + b * (u64)f) >> 4) & 0x00FF00FF00FF00FFULL;
 }
 
-PSPC_FORCEINLINE u32 SampleLinearLevel(const SamplerState &ss, float s, float t, int level) {
+template <int fmt, bool swz>
+PSPC_FORCEINLINE u32 SampleLinearLevelT(const SamplerState &ss, float s, float t, int level) {
 	const TexLevel &lv = ss.levels[level];
 	int u0, u1, v0, v1, fu, fv;
 	TexelPair(s, lv.w, ss.clampS, u0, u1, fu);
 	TexelPair(t, lv.h, ss.clampT, v0, v1, fv);
-	const u64 tl = Spread(FetchTexel(ss, level, u0, v0));
-	const u64 tr = Spread(FetchTexel(ss, level, u1, v0));
-	const u64 bl = Spread(FetchTexel(ss, level, u0, v1));
-	const u64 br = Spread(FetchTexel(ss, level, u1, v1));
+	const u64 tl = Spread(FetchTexelT<fmt, swz>(ss, level, u0, v0));
+	const u64 tr = Spread(FetchTexelT<fmt, swz>(ss, level, u1, v0));
+	const u64 bl = Spread(FetchTexelT<fmt, swz>(ss, level, u0, v1));
+	const u64 br = Spread(FetchTexelT<fmt, swz>(ss, level, u1, v1));
 	// Horizontal lerps truncated to 8 bits, then the vertical one (gpu/probe exp52).
 	return Unspread(LerpSpread(LerpSpread(tl, tr, fu), LerpSpread(bl, br, fu), fv));
 }
 
 // The texel color at a level (with the fraction toward level + 1).
-PSPC_FORCEINLINE u32 SampleTexture(const SamplerState &ss, float s, float t, int level, int levelFrac, bool linear) {
+template <int fmt, bool swz>
+u32 SampleTextureT(const SamplerState &ss, float s, float t, int level, int levelFrac, bool linear) {
 	if (!linear) {
-		u32 c0 = SampleNearestLevel(ss, s, t, level);
+		u32 c0 = SampleNearestLevelT<fmt, swz>(ss, s, t, level);
 		if (levelFrac) {
-			const u32 c1 = SampleNearestLevel(ss, s, t, level + 1);
+			const u32 c1 = SampleNearestLevelT<fmt, swz>(ss, s, t, level + 1);
 			c0 = Unspread(LerpSpread(Spread(c0), Spread(c1), levelFrac));
 		}
 		return c0;
 	}
-	u32 c0 = SampleLinearLevel(ss, s, t, level);
+	u32 c0 = SampleLinearLevelT<fmt, swz>(ss, s, t, level);
 	if (levelFrac) {
-		const u32 c1 = SampleLinearLevel(ss, s, t, level + 1);
+		const u32 c1 = SampleLinearLevelT<fmt, swz>(ss, s, t, level + 1);
 		c0 = Unspread(LerpSpread(Spread(c0), Spread(c1), levelFrac));
 	}
 	return c0;
+}
+
+// The sampler for the state's format and swizzling (SamplerState::sample).
+TexSampleFn GetTexSampleFn(int texfmt, bool swizzle);
+
+PSPC_FORCEINLINE u32 SampleTexture(const SamplerState &ss, float s, float t, int level, int levelFrac, bool linear) {
+	return ss.sample(ss, s, t, level, levelFrac, linear);
 }
 
 // The texture function. prim and tex are RGBA (0-255); out may exceed 255.

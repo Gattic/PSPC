@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+﻿// SPDX-License-Identifier: GPL-2.0-or-later
 #include "runtime/hle/modules/modules.h"
 
 namespace hle {
@@ -26,6 +26,7 @@ void RegisterAllModules() {
 	Register_sceAudio();
 	Register_sceUtility();
 	Register_Misc();
+	Register_M33();
 }
 
 }  // namespace hle

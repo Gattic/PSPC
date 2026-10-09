@@ -142,6 +142,8 @@ u32 SysMemUserForUser_D8DE5C1E() { return 0; }
 
 }  // namespace
 
+u32 kernel::CompiledSdkVersion() { return g_compiledSdkVersion; }
+
 void Register_SysMemUserForUser() {
 	static const hle::HleFunction funcs[] = {
 		HLEFN(0xA291F107, sceKernelMaxFreeMemSize),

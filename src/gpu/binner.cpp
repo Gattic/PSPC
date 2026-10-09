@@ -129,10 +129,13 @@ private:
 	std::condition_variable cv_, doneCv_;
 	std::shared_ptr<Job> current_;
 	std::atomic<u64> gen_{ 0 };
-	bool quit_ = false;
+	std::atomic<bool> quit_{ false };
 };
 
-Pool pool;
+// Never destroyed: a std::thread still joinable at static destruction calls std::terminate, and
+// the CRT may tear down while workers wait. binner::Shutdown (gpu::Shutdown) joins them; without it
+// ExitProcess just ends the idle workers.
+Pool &pool = *new Pool;
 int requestedThreads = 0;
 
 struct Prim {

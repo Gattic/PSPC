@@ -4,9 +4,10 @@
 // VFPU semantics: sem_V*/cond_BV* for every op in vfpu_ops.inc. Included at the end of sem.h.
 //
 // The common instructions get an inline fast path for the state that dominates real code (all
-// three prefixes at their defaults, no write mask). Everything else, including every op with a
-// pending prefix, goes to the out-of-line executors in vfpu_exec.cpp, which implement PPSSPP's
-// prefix rules completely. The fast paths are bit-identical to those executors by construction.
+// three prefixes at their defaults, no write mask, the FPU rounding to nearest). Everything else,
+// including every op with a pending prefix, goes to the out-of-line executors in vfpu_exec.cpp,
+// which implement PPSSPP's prefix rules completely. The fast paths use the same arithmetic
+// helpers (vfpu_regs.h) and are bit-identical to those executors by construction.
 //
 // Prefix consumption: an op that "eats" prefixes resets S/T to 0xE4 and D to 0 afterwards. The
 // fast paths only run when the prefixes already have those values, so they skip the reset.
@@ -27,13 +28,17 @@ namespace vfpu {
 
 PSPC_FORCEINLINE u32 LsAddr(const Ctx *c, u32 w) { return c->r[(w >> 21) & 31] + (u32)LsOffset(w); }
 
-// Element-wise vs (op) vt with default prefixes.
-template <typename Fn>
-PSPC_FORCEINLINE void FastBinary(Ctx *c, u32 w, Fn fn) {
+// Element-wise vs (op) vt with default prefixes, on float bits: hw is the hardware model
+// (vfpu_regs.h), host the plain float operation used when kHardwareFloat is off.
+template <typename Hw, typename Host>
+PSPC_FORCEINLINE void FastBinary(Ctx *c, u32 w, Hw hw, Host host) {
 	const int n = VecSize(w);
-	float d[4];
-	for (int i = 0; i < n; i++) d[i] = fn(c->v[VecElem(Vs(w), n, i)], c->v[VecElem(Vt(w), n, i)]);
-	for (int i = 0; i < n; i++) c->v[VecElem(Vd(w), n, i)] = d[i];
+	u32 d[4];
+	for (int i = 0; i < n; i++) {
+		const u32 a = c->vi[VecElem(Vs(w), n, i)], b = c->vi[VecElem(Vt(w), n, i)];
+		d[i] = kHardwareFloat ? hw(a, b) : std::bit_cast<u32>(host(std::bit_cast<float>(a), std::bit_cast<float>(b)));
+	}
+	for (int i = 0; i < n; i++) c->vi[VecElem(Vd(w), n, i)] = d[i];
 }
 
 // Element-wise unary op on the bits of vs with default prefixes.
@@ -103,53 +108,74 @@ SEM(SVR_Q) { vfpu::ExecSvrq(c, w); }
 // ---- VFPU0 / VFPU1 ----
 SEM(VADD) {
 	VFPU_NO_CONTRACT
-	if (PSPC_LIKELY(vfpu::HasDefaultPrefixes(c))) vfpu::FastBinary(c, w, [](float a, float b) { return a + b; });
-	else vfpu::ExecVecDo3(c, w);
+	if (PSPC_LIKELY(vfpu::FastFloatOk(c))) {
+		vfpu::FastBinary(c, w, [](u32 a, u32 b) { return vfpu::HwAdd(a, b); }, [](float a, float b) { return a + b; });
+	} else {
+		vfpu::ExecVecDo3(c, w);
+	}
 }
 SEM(VSUB) {
 	VFPU_NO_CONTRACT
-	if (PSPC_LIKELY(vfpu::HasDefaultPrefixes(c))) vfpu::FastBinary(c, w, [](float a, float b) { return a - b; });
-	else vfpu::ExecVecDo3(c, w);
+	if (PSPC_LIKELY(vfpu::FastFloatOk(c))) {
+		vfpu::FastBinary(c, w, [](u32 a, u32 b) { return vfpu::HwSub(a, b); }, [](float a, float b) { return a - b; });
+	} else {
+		vfpu::ExecVecDo3(c, w);
+	}
 }
 SEM(VDIV) {
 	VFPU_NO_CONTRACT
-	if (PSPC_LIKELY(vfpu::HasDefaultPrefixes(c))) vfpu::FastBinary(c, w, [](float a, float b) { return a / b; });
-	else vfpu::ExecVecDo3(c, w);
+	if (PSPC_LIKELY(vfpu::FastFloatOk(c))) {
+		vfpu::FastBinary(c, w, [](u32 a, u32 b) { return vfpu::HwDiv(a, b); }, [](float a, float b) { return a / b; });
+	} else {
+		vfpu::ExecVecDo3(c, w);
+	}
 }
 SEM(VMUL) {
 	VFPU_NO_CONTRACT
-	if (PSPC_LIKELY(vfpu::HasDefaultPrefixes(c))) vfpu::FastBinary(c, w, [](float a, float b) { return a * b; });
-	else vfpu::ExecVecDo3(c, w);
+	if (PSPC_LIKELY(vfpu::FastFloatOk(c))) {
+		vfpu::FastBinary(c, w, [](u32 a, u32 b) { return vfpu::HwMul(a, b); }, [](float a, float b) { return a * b; });
+	} else {
+		vfpu::ExecVecDo3(c, w);
+	}
 }
 SEM(VSBN) { vfpu::ExecVsbn(c, w); }
 SEM(VDOT) {
 	VFPU_NO_CONTRACT
 	if (PSPC_LIKELY(vfpu::HasDefaultPrefixes(c))) {
-		// PPSSPP's sum: four products in order, starting from +0, zero-padded past the length.
+		// Four products, zero-padded past the length: the exact datapath, or PPSSPP's in-order
+		// float sum from +0.
 		const int n = vfpu::VecSize(w);
-		float s[4] = {}, t[4] = {};
+		u32 s[4] = {}, t[4] = {};
 		for (int i = 0; i < n; i++) {
-			s[i] = c->v[vfpu::VecElem(vfpu::Vs(w), n, i)];
-			t[i] = c->v[vfpu::VecElem(vfpu::Vt(w), n, i)];
+			s[i] = c->vi[vfpu::VecElem(vfpu::Vs(w), n, i)];
+			t[i] = c->vi[vfpu::VecElem(vfpu::Vt(w), n, i)];
 		}
-		float sum = 0.0f;
-		for (int i = 0; i < 4; i++) {
-			const float p = s[i] * t[i];
-			sum = sum + p;
+		if (vfpu::kHardwareFloat) {
+			c->vi[vfpu::VOffset(vfpu::Vd(w))] = vfpu::DotBits(s, t);
+		} else {
+			float sum = 0.0f;
+			for (int i = 0; i < 4; i++) {
+				const float p = std::bit_cast<float>(s[i]) * std::bit_cast<float>(t[i]);
+				sum = sum + p;
+			}
+			c->v[vfpu::VOffset(vfpu::Vd(w))] = sum;
 		}
-		c->v[vfpu::VOffset(vfpu::Vd(w))] = sum;
 	} else {
 		vfpu::ExecVDot(c, w);
 	}
 }
 SEM(VSCL) {
 	VFPU_NO_CONTRACT
-	if (PSPC_LIKELY(vfpu::HasDefaultPrefixes(c))) {
-		const float k = c->v[vfpu::VOffset(vfpu::Vt(w))];
+	if (PSPC_LIKELY(vfpu::FastFloatOk(c))) {
+		const u32 k = c->vi[vfpu::VOffset(vfpu::Vt(w))];
 		const int n = vfpu::VecSize(w);
-		float d[4];
-		for (int i = 0; i < n; i++) d[i] = c->v[vfpu::VecElem(vfpu::Vs(w), n, i)] * k;
-		for (int i = 0; i < n; i++) c->v[vfpu::VecElem(vfpu::Vd(w), n, i)] = d[i];
+		u32 d[4];
+		for (int i = 0; i < n; i++) {
+			const u32 a = c->vi[vfpu::VecElem(vfpu::Vs(w), n, i)];
+			d[i] = vfpu::kHardwareFloat ? vfpu::HwMul(a, k)
+			                            : std::bit_cast<u32>(std::bit_cast<float>(a) * std::bit_cast<float>(k));
+		}
+		for (int i = 0; i < n; i++) c->vi[vfpu::VecElem(vfpu::Vd(w), n, i)] = d[i];
 	} else {
 		vfpu::ExecVScl(c, w);
 	}
@@ -253,7 +279,7 @@ SEM(VF2IU) { vfpu::ExecVf2i(c, w); }
 SEM(VF2ID) { vfpu::ExecVf2i(c, w); }
 SEM(VI2F) {
 	VFPU_NO_CONTRACT
-	if (PSPC_LIKELY(vfpu::HasDefaultPrefixes(c))) {
+	if (PSPC_LIKELY(vfpu::FastFloatOk(c))) {
 		const float mult = 1.0f / (float)(1ULL << ((w >> 16) & 0x1F));
 		const int n = vfpu::VecSize(w);
 		float d[4];

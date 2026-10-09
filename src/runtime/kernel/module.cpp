@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+﻿// SPDX-License-Identifier: GPL-2.0-or-later
 #include "runtime/kernel/module.h"
 
 #include <windows.h>
@@ -8,6 +8,7 @@
 #include <map>
 
 #include "allegrex/aot_abi.h"
+#include "pspc_sem_version.h"
 #include "allegrex/guestmem.h"
 #include "common/fileutil.h"
 #include "common/log.h"
@@ -166,7 +167,8 @@ bool TryLoadAot(PspModule *m, const loader::ElfFile &elf, u32 *requiredBase) {
 	}
 	auto entry = (PspcAotModuleFn)GetProcAddress(h, PSPC_AOT_ENTRY_NAME);
 	const AotModuleDesc *desc = entry ? entry(cpu::AotApi()) : nullptr;
-	if (!desc || desc->abiVersion != PSPC_AOT_ABI_VERSION || memcmp(desc->sha1, m->sha1.data(), 20) != 0) {
+	if (!desc || desc->abiVersion != PSPC_AOT_ABI_VERSION || desc->semVersion != PSPC_SEM_VERSION ||
+	    memcmp(desc->sha1, m->sha1.data(), 20) != 0) {
 		LOGW("AOT", "%s is stale or mismatched; ignoring", dllPath.string().c_str());
 		FreeLibrary(h);
 		return false;

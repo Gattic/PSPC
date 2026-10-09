@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+﻿// SPDX-License-Identifier: GPL-2.0-or-later
 #include "runtime/core/dispatch.h"
 
 #include <atomic>
@@ -23,6 +23,11 @@ struct Page {
 
 std::unique_ptr<Page> g_pages[NUM_PAGES];
 std::atomic<u32> g_count{0};
+void (*g_missHook)(u32) = nullptr;
+
+void Miss(u32 target) {
+	if (g_missHook) g_missHook(target);
+}
 
 }  // namespace
 
@@ -76,6 +81,7 @@ void Call(Ctx *c, u32 target) {
 		fn(c);
 		return;
 	}
+	Miss(target);
 	interp::Run(c, target, c->r[31], c->r[29]);
 }
 
@@ -90,8 +96,11 @@ void Jump(Ctx *c, u32 target, u32 ra0, u32 sp0) {
 		interp::Run(c, ret, ra0, sp0);
 		return;
 	}
+	Miss(target);
 	interp::Run(c, target, ra0, sp0);
 }
+
+void SetMissHook(void (*hook)(u32)) { g_missHook = hook; }
 
 void NonlocalReturn(Ctx *c, u32 target) {
 	c->pc = target;

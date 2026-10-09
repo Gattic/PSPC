@@ -4,6 +4,14 @@
 // VFPU instruction families with full prefix handling, ported from Core/MIPS/InterpreterVFPU.cpp.
 // The quirks (which prefix lanes an op honours, forced swizzles, last-lane-only D prefixes and so
 // on) are PPSSPP's, which records them from hardware tests (pspautotests tests/cpu/vfpu/*).
+//
+// With kHardwareFloat (vfpu_regs.h) the arithmetic follows the hardware where PPSSPP's
+// interpreter takes host floats: the adder/multiplier/divider flush denormals and give the VFPU
+// NaN, dot products use the exact datapath model, vcmp reads denormals as zero, vmin/vmax use the
+// hardware order, vcrsp.t runs its lanes z, y, x, and float ops round to nearest whatever the
+// FPU's mode. Each of these is backed by a recorded pspautotests result.
+#include <xmmintrin.h>
+
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -20,9 +28,9 @@
 
 namespace vfpu {
 
-// PPSSPP computes dot products (vdot, vmmul, vtfm...) as plain float sums unless a game asks for
-// the bit-exact datapath. We follow its default.
-constexpr bool kAccurateDot = false;
+// Dot products (vdot, vmmul, vtfm...) use the bit-exact datapath model in hardware mode; PPSSPP's
+// interpreter uses plain float sums unless a game asks for it (MoreAccurateVMMUL).
+constexpr bool kAccurateDot = kHardwareFloat;
 
 union Vec4 {
 	float f[4];
@@ -188,18 +196,39 @@ static inline float SumDot4(const float *s, const float *t) {
 	return sum;
 }
 
-// vfpu_dot plus the NaN / flush fixups PPSSPP applies with the accurate path.
+// The exact dot product. PPSSPP's NaN / flush fixups after it are no-ops: DotBits already gives
+// 0x7F800001 for NaN and a signed zero below the normal range.
 static inline float AccurateDot(const float *s, const float *t) {
 	u32 a[4], b[4];
 	for (int i = 0; i < 4; i++) {
 		a[i] = U(s[i]);
 		b[i] = U(t[i]);
 	}
-	u32 r = DotBits(a, b);
-	if ((r & 0x7F800000) == 0x7F800000 && (r & 0x7FFFFF)) r = 0x7F800001;
-	else if ((r & 0x7F800000) == 0) r &= 0xFF800000;
-	return F(r);
+	return F(DotBits(a, b));
 }
+
+// The VFPU rounds to nearest whatever the FPU's mode, which the runtime maps onto MXCSR. Ops that
+// round in host float arithmetic hold one of these (the dot product and the interpolator are
+// integer code and don't need it).
+struct NearestRounding {
+	explicit NearestRounding(const Ctx *c) : active(kHardwareFloat && (c->fcr31 & 3) != 0) {
+		if (active) {
+			saved = _mm_getcsr();
+			_mm_setcsr(saved & ~(unsigned)_MM_ROUND_MASK);
+		}
+	}
+	~NearestRounding() {
+		if (active) _mm_setcsr(saved);
+	}
+	bool active;
+	unsigned saved = 0;
+};
+
+// Element arithmetic: the hardware model or the host's (PPSSPP default).
+static inline u32 AddBits(float a, float b) { return kHardwareFloat ? HwAdd(U(a), U(b)) : U(a + b); }
+static inline u32 SubBits(float a, float b) { return kHardwareFloat ? HwSub(U(a), U(b)) : U(a - b); }
+static inline u32 MulBits(float a, float b) { return kHardwareFloat ? HwMul(U(a), U(b)) : U(a * b); }
+static inline u32 DivBits(float a, float b) { return kHardwareFloat ? HwDiv(U(a), U(b)) : U(a / b); }
 
 // ---- Matrix init: vmidt vmzero vmone ----
 
@@ -321,13 +350,18 @@ void ExecVmmul(Ctx *c, u32 w) {
 // ---- vmscl ----
 
 void ExecVmscl(Ctx *c, u32 w) {
-	float s[16] = {}, t[4] = {}, d[16] = {};
+	const NearestRounding rounding(c);
+	float s[16] = {}, t[4] = {};
+	union {
+		float f[16];
+		u32 u[16];
+	} d = {};
 	const u32 vd = Vd(w), vs = Vs(w), vt = Vt(w);
 	const int n = VecSize(w);
 	ReadMatrix(c, s, n, vs);
 	ReadVector(c, t, 1, vt);
 	for (int a = 0; a < n - 1; a++) {
-		for (int b = 0; b < n; b++) d[a * 4 + b] = s[a * 4 + b] * t[0];
+		for (int b = 0; b < n; b++) d.u[a * 4 + b] = MulBits(s[a * 4 + b], t[0]);
 	}
 	// The S prefix applies to the last row.
 	ApplySwizzleS(c, &s[(n - 1) * 4], 4);
@@ -335,10 +369,10 @@ void ExecVmscl(Ctx *c, u32 w) {
 	const int tlane = (vt >> 5) & 3;
 	t[tlane] = t[0];
 	ApplyPrefixST(t, Rewrite(c, VFPU_CTRL_TPREFIX, AnySwizzle(), Swizzle(tlane, tlane, tlane, tlane)), 4);
-	for (int b = 0; b < n; b++) d[(n - 1) * 4 + b] = s[(n - 1) * 4 + b] * t[b];
+	for (int b = 0; b < n; b++) d.u[(n - 1) * 4 + b] = MulBits(s[(n - 1) * 4 + b], t[b]);
 	// The D prefix is applied to the last row.
-	ApplyPrefixD(c, &d[(n - 1) * 4], 4);
-	WriteMatrix(c, d, n, vd);
+	ApplyPrefixD(c, &d.f[(n - 1) * 4], 4);
+	WriteMatrix(c, d.f, n, vd);
 	EatPrefixes(c);
 }
 
@@ -441,7 +475,9 @@ void ExecVV2Op(Ctx *c, u32 w) {
 // ---- vocp vsocp vsgn ----
 
 void ExecVocp(Ctx *c, u32 w) {
-	float s[4] = {}, t[4] = {}, d[4] = {};
+	const NearestRounding rounding(c);
+	float s[4] = {}, t[4] = {};
+	Vec4 d = {};
 	const int n = VecSize(w);
 	ReadVector(c, s, n, Vs(w));
 	// The S prefix forces the negate flags.
@@ -450,16 +486,17 @@ void ExecVocp(Ctx *c, u32 w) {
 	// different constant.
 	ApplyPrefixST(t, Rewrite(c, VFPU_CTRL_TPREFIX, AnySwizzle(), MakeConstants(C_ONE, C_ONE, C_ONE, C_ONE)), n);
 	for (int i = 0; i < n; i++) {
-		// Always positive NaN. s is always negated from the registers.
-		d[i] = IsNaN(s[i]) ? FAbs(s[i]) : t[i] + s[i];
+		// The adder's NaN is positive. PPSSPP keeps the input NaN with its sign cleared.
+		d.u[i] = kHardwareFloat ? HwAdd(U(t[i]), U(s[i])) : (IsNaN(s[i]) ? U(FAbs(s[i])) : U(t[i] + s[i]));
 	}
-	RetainInvalidSwizzleST(c, d, n);
-	ApplyPrefixD(c, d, n);
-	WriteVector(c, d, n, Vd(w));
+	RetainInvalidSwizzleST(c, d.f, n);
+	ApplyPrefixD(c, d.f, n);
+	WriteVector(c, d.f, n, Vd(w));
 	EatPrefixes(c);
 }
 
 void ExecVsocp(Ctx *c, u32 w) {
+	const NearestRounding rounding(c);
 	float s[4] = {}, t[4] = {}, d[4] = {};
 	const int n = VecSize(w);
 	const int outN = n == 1 ? 2 : 4;
@@ -472,12 +509,7 @@ void ExecVsocp(Ctx *c, u32 w) {
 	// The T prefix forces constants on and regnum to 1, 0, 1, 0.
 	ApplyPrefixST(t, Rewrite(c, VFPU_CTRL_TPREFIX, AnySwizzle(), MakeConstants(C_ONE, C_ZERO, C_ONE, C_ZERO)), outN);
 	// D prefix saturation is effectively forced (PPSSPP nanclamp to [0, 1], the same as Clamp01).
-	d[0] = Clamp01(t[0] + s[0]);
-	d[1] = Clamp01(t[1] + s[1]);
-	if (outN == 4) {
-		d[2] = Clamp01(t[2] + s[2]);
-		d[3] = Clamp01(t[3] + s[3]);
-	}
+	for (int i = 0; i < outN; i++) d[i] = Clamp01(F(AddBits(t[i], s[i])));
 	WriteVector(c, d, outN, Vd(w));
 	EatPrefixes(c);
 }
@@ -551,6 +583,7 @@ void ExecVf2i(Ctx *c, u32 w) {
 }
 
 void ExecVi2f(Ctx *c, u32 w) {
+	const NearestRounding rounding(c);
 	Vec4 s = {}, d = {};
 	const int n = VecSize(w);
 	const int imm = (w >> 16) & 0x1F;
@@ -854,7 +887,9 @@ void ExecVavg(Ctx *c, u32 w) {
 }
 
 void ExecVScl(Ctx *c, u32 w) {
-	float s[4] = {}, t[4] = {}, d[4] = {};
+	const NearestRounding rounding(c);
+	float s[4] = {}, t[4] = {};
+	Vec4 d = {};
 	const u32 vt = Vt(w);
 	const int n = VecSize(w);
 	ReadVector(c, s, n, Vs(w));
@@ -864,14 +899,16 @@ void ExecVScl(Ctx *c, u32 w) {
 	const int tlane = (vt >> 5) & 3;
 	t[tlane] = c->v[VOffset(vt)];
 	ApplyPrefixST(t, Rewrite(c, VFPU_CTRL_TPREFIX, AnySwizzle(), Swizzle(tlane, tlane, tlane, tlane)), 4);
-	for (int i = 0; i < n; i++) d[i] = s[i] * t[i];
-	ApplyPrefixD(c, d, n);
-	WriteVector(c, d, n, Vd(w));
+	for (int i = 0; i < n; i++) d.u[i] = MulBits(s[i], t[i]);
+	ApplyPrefixD(c, d.f, n);
+	WriteVector(c, d.f, n, Vd(w));
 	EatPrefixes(c);
 }
 
 void ExecVbfy(Ctx *c, u32 w) {
-	float s[4] = {}, t[4] = {}, d[4];
+	const NearestRounding rounding(c);
+	float s[4] = {}, t[4] = {};
+	Vec4 d;
 	const u32 vs = Vs(w);
 	const int n = VecSize(w);
 	ReadVector(c, s, n, vs);
@@ -885,9 +922,9 @@ void ExecVbfy(Ctx *c, u32 w) {
 		ApplyPrefixST(s, Rewrite(c, VFPU_CTRL_SPREFIX, 0, PfxNeg(0, 1, 0, 1)), n);
 		ApplyPrefixST(t, Rewrite(c, VFPU_CTRL_TPREFIX, AnySwizzle(), Swizzle(1, 0, 3, 2)), n);
 	}
-	for (int i = 0; i < 4; i++) d[i] = s[i] + t[i];
-	ApplyPrefixD(c, d, n);
-	WriteVector(c, d, n, Vd(w));
+	for (int i = 0; i < 4; i++) d.u[i] = AddBits(s[i], t[i]);
+	ApplyPrefixD(c, d.f, n);
+	WriteVector(c, d.f, n, Vd(w));
 	EatPrefixes(c);
 }
 
@@ -944,28 +981,75 @@ void ExecVsrt3(Ctx *c, u32 w) { Vsrt<3>(c, w); }
 void ExecVsrt4(Ctx *c, u32 w) { Vsrt<4>(c, w); }
 
 void ExecVcrs(Ctx *c, u32 w) {
+	const NearestRounding rounding(c);
 	// Half a cross product.
-	float s[4] = {}, t[4] = {}, d[4];
+	float s[4] = {}, t[4] = {};
+	Vec4 d;
 	const int n = VecSize(w);
 	ReadVector(c, s, n, Vs(w));
 	ReadVector(c, t, n, Vt(w));
 	// S forces a yzx? swizzle, T a zxy? swizzle; negate still works.
 	ApplyPrefixST(s, Rewrite(c, VFPU_CTRL_SPREFIX, Swizzle(3, 3, 3, 0), Swizzle(1, 2, 0, 0)), n);
 	ApplyPrefixST(t, Rewrite(c, VFPU_CTRL_TPREFIX, Swizzle(3, 3, 3, 0), Swizzle(2, 0, 1, 0)), n);
-	for (int i = 0; i < 4; i++) d[i] = s[i] * t[i];
-	ApplyPrefixD(c, d, n);
-	WriteVector(c, d, n, Vd(w));
+	for (int i = 0; i < 4; i++) d.u[i] = MulBits(s[i], t[i]);
+	ApplyPrefixD(c, d.f, n);
+	WriteVector(c, d.f, n, Vd(w));
+	EatPrefixes(c);
+}
+
+static inline u32 DotOf(const float *s, const float *t) {
+	return DotBits(reinterpret_cast<const u32 *>(s), reinterpret_cast<const u32 *>(t));
+}
+
+// vcrsp.t as the hardware runs it: z first (the lane the prefixes reach), then y, then x, each
+// reading the register file after the lane before it was written. Only visible when vd overlaps
+// a source, which assemblers refuse (cpu/vfpu/overlap_vcrsp).
+static void VcrspSequential(Ctx *c, u32 w) {
+	const u32 vd = Vd(w), vs = Vs(w), vt = Vt(w);
+	float s[4] = {}, t[4] = {}, d[4] = {};
+	ReadVector(c, s, 3, vs);
+	ReadVector(c, t, 3, vt);
+	// The T prefix forces swizzle and negate, which can make odd constants.
+	ApplyPrefixST(t, Rewrite(c, VFPU_CTRL_TPREFIX, AnySwizzle() | PfxNeg(1, 1, 1, 1), Swizzle(1, 0, 3, 2) | PfxNeg(0, 1, 0, 0)), 4);
+	ApplySwizzleS(c, s, 4);
+	// Infinities count as zero in this lane (PPSSPP, cpu/vfpu/vector).
+	for (int i = 0; i < 4; ++i) {
+		if (IsInf(s[i])) s[i] = 0.0f;
+		if (IsInf(t[i])) t[i] = 0.0f;
+	}
+	d[2] = F(DotOf(s, t));
+	// The D prefix applies to that lane only.
+	MoveDPrefixToLastLane(c, 3);
+	ApplyPrefixD(c, d, 3);
+	if (!WriteMasked(c, 2)) c->v[VecElem(vd, 3, 2)] = d[2];
+
+	float s1[4] = {}, t1[4] = {};
+	ReadVector(c, s1, 3, vs);
+	ReadVector(c, t1, 3, vt);
+	const float ty[4] = {FNeg(t1[2]), 0.0f, t1[0], 0.0f};
+	c->vi[VecElem(vd, 3, 1)] = DotOf(s1, ty);
+
+	float s0[4] = {}, t0[4] = {};
+	ReadVector(c, s0, 3, vs);
+	ReadVector(c, t0, 3, vt);
+	const float tx[4] = {0.0f, t0[2], FNeg(t0[1]), 0.0f};
+	c->vi[VecElem(vd, 3, 0)] = DotOf(s0, tx);
 	EatPrefixes(c);
 }
 
 void ExecCrossQuat(Ctx *c, u32 w) {
+	const NearestRounding rounding(c);
+	if (kHardwareFloat && VecSize(w) == 3) {
+		VcrspSequential(c, w);
+		return;
+	}
 	float s[4] = {}, t[4] = {}, d[4] = {};
 	const int n = VecSize(w);
 	ReadVector(c, s, n, Vs(w));
 	ReadVector(c, t, n, Vt(w));
 	const u32 tremove = AnySwizzle() | PfxNeg(1, 1, 1, 1);
 	switch (n) {
-	case 3: {  // vcrsp.t
+	case 3: {  // vcrsp.t (PPSSPP: every lane from the original registers)
 		if (kAccurateDot) {
 			const float t0[4] = {0.0f, t[2], FNeg(t[1]), 0.0f};
 			const float t1[4] = {FNeg(t[2]), 0.0f, t[0], 0.0f};
@@ -1082,6 +1166,13 @@ void ExecVcmp(Ctx *c, u32 w) {
 	ApplySwizzleS(c, s, n);
 	ReadVector(c, t, n, Vt(w));
 	ApplySwizzleT(c, t, n);
+	// The comparator reads denormals as zero (cpu/vfpu/specials).
+	if (kHardwareFloat) {
+		for (int i = 0; i < n; i++) {
+			s[i] = F(FlushDenormal(U(s[i])));
+			t[i] = F(FlushDenormal(U(t[i])));
+		}
+	}
 	int cc = 0, orVal = 0, andVal = 1;
 	int affected = (1 << 4) | (1 << 5);
 	for (int i = 0; i < n; i++) {
@@ -1124,7 +1215,11 @@ void ExecVminmax(Ctx *c, u32 w) {
 	// If both are zero, take t's sign. Otherwise -NaN < -inf < real < inf < NaN.
 	const bool isMin = ((w >> 23) & 3) == 2;
 	for (int i = 0; i < n; i++) {
-		if (IsNaNOrInf(s.f[i]) || IsNaNOrInf(t.f[i])) {
+		if (kHardwareFloat) {
+			// The hardware order also ties denormals with zero, and a tie returns t
+			// (cpu/vfpu/minmax_tie, minmax_zero). For everything else it agrees with PPSSPP's below.
+			d.f[i] = isMin ? VMin(s.f[i], t.f[i]) : VMax(s.f[i], t.f[i]);
+		} else if (IsNaNOrInf(s.f[i]) || IsNaNOrInf(t.f[i])) {
 			// If both are negative the comparison flips (not two's complement).
 			const bool bothNeg = s.i[i] < 0 && t.i[i] < 0;
 			if (isMin == bothNeg) d.i[i] = std::max(t.i[i], s.i[i]);
@@ -1214,7 +1309,9 @@ void ExecVcmov(Ctx *c, u32 w) {
 // ---- vadd vsub vdiv vmul ----
 
 void ExecVecDo3(Ctx *c, u32 w) {
-	float s[4] = {}, t[4] = {}, d[4] = {};
+	const NearestRounding rounding(c);
+	float s[4] = {}, t[4] = {};
+	Vec4 d = {};
 	const int n = VecSize(w);
 	// 0 vadd, 1 vsub, 7 vdiv (opcode 24); 8 vmul (opcode 25).
 	const int optype = (w >> 26) == 25 ? 8 : (int)((w >> 23) & 7);
@@ -1231,22 +1328,22 @@ void ExecVecDo3(Ctx *c, u32 w) {
 	}
 	for (int i = 0; i < n; i++) {
 		switch (optype) {
-		case 0: d[i] = s[i] + t[i]; break;
-		case 1: d[i] = s[i] - t[i]; break;
-		case 7: d[i] = s[i] / t[i]; break;
-		default: d[i] = s[i] * t[i]; break;
+		case 0: d.u[i] = AddBits(s[i], t[i]); break;
+		case 1: d.u[i] = SubBits(s[i], t[i]); break;
+		case 7: d.u[i] = DivBits(s[i], t[i]); break;
+		default: d.u[i] = MulBits(s[i], t[i]); break;
 		}
 	}
 	if (optype == 7) {
 		// For vdiv the D prefix also only applies to the last element.
-		if (LastLaneSwizzleInvalid(c, VFPU_CTRL_SPREFIX) || LastLaneSwizzleInvalid(c, VFPU_CTRL_TPREFIX)) d[n - 1] = 0.0f;
+		if (LastLaneSwizzleInvalid(c, VFPU_CTRL_SPREFIX) || LastLaneSwizzleInvalid(c, VFPU_CTRL_TPREFIX)) d.u[n - 1] = 0;
 		MoveDPrefixToLastLane(c, n);
-		ApplyPrefixD(c, d, n);
+		ApplyPrefixD(c, d.f, n);
 	} else {
-		RetainInvalidSwizzleST(c, d, n);
-		ApplyPrefixD(c, d, n);
+		RetainInvalidSwizzleST(c, d.f, n);
+		ApplyPrefixD(c, d.f, n);
 	}
-	WriteVector(c, d, n, Vd(w));
+	WriteVector(c, d.f, n, Vd(w));
 	EatPrefixes(c);
 }
 

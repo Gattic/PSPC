@@ -62,42 +62,84 @@ struct Plane {
 	int64_t At(int64_t x, int64_t y) const { return (base + kx * x + ky * y) >> 14; }
 };
 
-Plane ComputePlane(const int64_t X[3], const int64_t Y[3], const int64_t Z[3]) {
-	Plane plane;
-	const int64_t det = (X[1] - X[0]) * (Y[2] - Y[0]) - (X[2] - X[0]) * (Y[1] - Y[0]);
-	if (det == 0) {
-		plane.base = Z[0] << 14;
+// What the planes of one triangle share: the determinant's reciprocal and the anchor vertex.
+struct PlaneSetup {
+	int64_t X[3], Y[3];
+	int64_t q = 0;
+	int shift = 0;
+	int64_t sign = 1;
+	bool degenerate = true;
+	int anchor = 0;
+	bool rightAnchored = false;
+
+	void Init(const int64_t x[3], const int64_t y[3]) {
+		for (int i = 0; i < 3; ++i) {
+			X[i] = x[i];
+			Y[i] = y[i];
+		}
+		const int64_t det = (X[1] - X[0]) * (Y[2] - Y[0]) - (X[2] - X[0]) * (Y[1] - Y[0]);
+		degenerate = det == 0;
+		if (degenerate)
+			return;
+		const u64 absDet = (u64)(det < 0 ? -det : det);
+		int e;
+		q = GESetupRecip(absDet, &e);
+		shift = e + 2;
+		sign = det < 0 ? -1 : 1;
+		int top = 0, mid = 1, bot = 2;
+		auto above = [&](int a, int b) { return Y[a] < Y[b] || (Y[a] == Y[b] && X[a] < X[b]); };
+		if (above(mid, top)) std::swap(mid, top);
+		if (above(bot, mid)) std::swap(bot, mid);
+		if (above(mid, top)) std::swap(mid, top);
+		const int64_t cross = (X[bot] - X[top]) * (Y[mid] - Y[top]) - (Y[bot] - Y[top]) * (X[mid] - X[top]);
+		const bool flat = Y[top] == Y[mid] || Y[mid] == Y[bot];
+		anchor = 0;
+		rightAnchored = cross > 0 && !flat;
+		if (rightAnchored) {
+			for (int i = 1; i < 3; ++i)
+				if (X[i] > X[anchor] || (X[i] == X[anchor] && Y[i] < Y[anchor]))
+					anchor = i;
+		} else {
+			for (int i = 1; i < 3; ++i)
+				if (X[i] < X[anchor] || (X[i] == X[anchor] && Y[i] < Y[anchor]))
+					anchor = i;
+		}
+	}
+
+	Plane Make(const int64_t Z[3]) const {
+		Plane plane;
+		if (degenerate) {
+			plane.base = Z[0] << 14;
+			return plane;
+		}
+		const int64_t nx = (Z[1] - Z[0]) * (Y[2] - Y[0]) - (Z[2] - Z[0]) * (Y[1] - Y[0]);
+		const int64_t ny = (Z[2] - Z[0]) * (X[1] - X[0]) - (Z[1] - Z[0]) * (X[2] - X[0]);
+		// n / det * 2^14, as floor(n * q / 2^(e + 2)).
+		plane.kx = (sign * nx * q) >> shift;
+		plane.ky = (sign * ny * q) >> shift;
+		plane.rightAnchored = rightAnchored;
+		plane.base = (Z[anchor] << 14) - plane.kx * X[anchor] - plane.ky * Y[anchor];
 		return plane;
 	}
-	const int64_t nx = (Z[1] - Z[0]) * (Y[2] - Y[0]) - (Z[2] - Z[0]) * (Y[1] - Y[0]);
-	const int64_t ny = (Z[2] - Z[0]) * (X[1] - X[0]) - (Z[1] - Z[0]) * (X[2] - X[0]);
-	const u64 absDet = (u64)(det < 0 ? -det : det);
-	int e;
-	const int64_t q = GESetupRecip(absDet, &e);
-	const int64_t sign = det < 0 ? -1 : 1;
-	plane.kx = (sign * nx * q) >> (e + 2);
-	plane.ky = (sign * ny * q) >> (e + 2);
+};
 
-	int top = 0, mid = 1, bot = 2;
-	auto above = [&](int a, int b) { return Y[a] < Y[b] || (Y[a] == Y[b] && X[a] < X[b]); };
-	if (above(mid, top)) std::swap(mid, top);
-	if (above(bot, mid)) std::swap(bot, mid);
-	if (above(mid, top)) std::swap(mid, top);
-	const int64_t cross = (X[bot] - X[top]) * (Y[mid] - Y[top]) - (Y[bot] - Y[top]) * (X[mid] - X[top]);
-	const bool flat = Y[top] == Y[mid] || Y[mid] == Y[bot];
-	int anchor = 0;
-	if (cross > 0 && !flat) {
-		plane.rightAnchored = true;
-		for (int i = 1; i < 3; ++i)
-			if (X[i] > X[anchor] || (X[i] == X[anchor] && Y[i] < Y[anchor]))
-				anchor = i;
-	} else {
-		for (int i = 1; i < 3; ++i)
-			if (X[i] < X[anchor] || (X[i] == X[anchor] && Y[i] < Y[anchor]))
-				anchor = i;
-	}
-	plane.base = (Z[anchor] << 14) - plane.kx * X[anchor] - plane.ky * Y[anchor];
-	return plane;
+Plane ComputePlane(const int64_t X[3], const int64_t Y[3], const int64_t Z[3]) {
+	PlaneSetup setup;
+	setup.Init(X, Y);
+	return setup.Make(Z);
+}
+
+inline double Pow2(int n) {
+	const u64 bits = (u64)(1023 + n) << 52;
+	double d;
+	memcpy(&d, &bits, 8);
+	return d;
+}
+
+inline int DoubleExponent(double d) {
+	u64 bits;
+	memcpy(&bits, &d, 8);
+	return (int)((bits >> 52) & 0x7FF) - 1023;
 }
 
 // Perspective texture coordinates (gpu/probe exp55-56): per vertex q = 1/w and s = u * q as float24s,
@@ -113,18 +155,19 @@ int SharedShift(const double v[3]) {
 	int e = INT_MIN;
 	for (int i = 0; i < 3; ++i) {
 		if (v[i] != 0.0)
-			e = std::max(e, std::ilogb(v[i]));
+			e = std::max(e, DoubleExponent(v[i]));
 	}
 	return e == INT_MIN ? 0 : 14 - e;
 }
 
-UVPlanes ComputeUVPlanesSTQ(const int64_t X[3], const int64_t Y[3], const double s[3], const double t[3], const double q[3]) {
+UVPlanes ComputeUVPlanesSTQ(const PlaneSetup &setup, const double s[3], const double t[3], const double q[3]) {
 	UVPlanes planes;
 	auto fixed = [&](const double v[3], Plane *plane, double *scale) {
 		const int shift = SharedShift(v);
-		const int64_t V[3] = { (int64_t)std::ldexp(v[0], shift), (int64_t)std::ldexp(v[1], shift), (int64_t)std::ldexp(v[2], shift) };
-		*plane = ComputePlane(X, Y, V);
-		*scale = std::ldexp(1.0, -shift);
+		const double m = Pow2(shift);
+		const int64_t V[3] = { (int64_t)(v[0] * m), (int64_t)(v[1] * m), (int64_t)(v[2] * m) };
+		*plane = setup.Make(V);
+		*scale = Pow2(-shift);
 	};
 	fixed(s, &planes.s, &planes.scaleS);
 	fixed(t, &planes.t, &planes.scaleT);
@@ -133,18 +176,30 @@ UVPlanes ComputeUVPlanesSTQ(const int64_t X[3], const int64_t Y[3], const double
 	return planes;
 }
 
-UVPlanes ComputeUVPlanes(const int64_t X[3], const int64_t Y[3], const float u[3], const float v[3], const float w[3], const float *uq) {
+UVPlanes ComputeUVPlanesSTQ(const int64_t X[3], const int64_t Y[3], const double s[3], const double t[3], const double q[3]) {
+	PlaneSetup setup;
+	setup.Init(X, Y);
+	return ComputeUVPlanesSTQ(setup, s, t, q);
+}
+
+UVPlanes ComputeUVPlanes(const PlaneSetup &setup, const float u[3], const float v[3], const float w[3], const float *uq) {
 	double s[3], t[3], q[3];
 	for (int i = 0; i < 3; ++i) {
 		const float w24 = TruncateToFloat24(w[i]);
-		if (!(w24 > 0.0f) || !std::isfinite(w24))
+		if (!(w24 > 0.0f) || !IsFiniteF(w24))
 			return UVPlanes{};
 		const double r = GERecip(w24);
 		q[i] = uq ? ProductToFloat24((double)TruncateToFloat24(uq[i]) * r) : r;
 		s[i] = ProductToFloat24((double)TruncateToFloat24(u[i]) * r);
 		t[i] = ProductToFloat24((double)TruncateToFloat24(v[i]) * r);
 	}
-	return ComputeUVPlanesSTQ(X, Y, s, t, q);
+	return ComputeUVPlanesSTQ(setup, s, t, q);
+}
+
+UVPlanes ComputeUVPlanes(const int64_t X[3], const int64_t Y[3], const float u[3], const float v[3], const float w[3], const float *uq) {
+	PlaneSetup setup;
+	setup.Init(X, Y);
+	return ComputeUVPlanes(setup, u, v, w, uq);
 }
 
 // The largest of the s and t planes' gradients, in texels per pixel.
@@ -174,6 +229,64 @@ inline void UVFromPlaneValues(const UVPlanes &planes, int64_t qs, int64_t ss, in
 	t = GEUVProduct((double)TruncateToFloat24((float)((double)ts * planes.scaleT)) * r);
 }
 
+// Per-pixel texture coordinates from UV planes, walked along a row.
+struct UVWalker {
+	const UVPlanes *planes;
+	bool constQ;
+	bool qValid;
+	float qConst;
+	double rConst;
+	int64_t qv, sv, tv;
+	int64_t qdx, sdx, tdx;
+
+	void Init(const UVPlanes &p) {
+		planes = &p;
+		constQ = p.q.kx == 0 && p.q.ky == 0;
+		qdx = p.q.kx * SUBPIX;
+		sdx = p.s.kx * SUBPIX;
+		tdx = p.t.kx * SUBPIX;
+		if (constQ) {
+			qConst = TruncateToFloat24((float)((double)(p.q.base >> 14) * p.scaleQ));
+			qValid = qConst > 0.0f;
+			rConst = qValid ? (double)GERecip(qConst) : 0.0;
+		}
+	}
+	// At pixel center (cx, cy) in subpixels.
+	void Start(int64_t cx, int64_t cy) {
+		const UVPlanes &p = *planes;
+		qv = p.q.base + p.q.kx * cx + p.q.ky * cy;
+		sv = p.s.base + p.s.kx * cx + p.s.ky * cy;
+		tv = p.t.base + p.t.kx * cx + p.t.ky * cy;
+	}
+	// The pixel i pixels on from the start.
+	PSPC_FORCEINLINE void At(int i, float &s, float &t, float &q) const {
+		const UVPlanes &p = *planes;
+		const int64_t ss = (sv + i * sdx) >> 14, ts = (tv + i * tdx) >> 14;
+		double r;
+		if (constQ) {
+			q = qConst;
+			if (!qValid) {
+				s = t = 0.0f;
+				return;
+			}
+			r = rConst;
+		} else {
+			q = TruncateToFloat24((float)((double)((qv + i * qdx) >> 14) * p.scaleQ));
+			if (!(q > 0.0f)) {
+				s = t = 0.0f;
+				return;
+			}
+			r = GERecip(q);
+		}
+		s = GEUVProduct((double)TruncateToFloat24((float)((double)ss * p.scaleS)) * r);
+		t = GEUVProduct((double)TruncateToFloat24((float)((double)ts * p.scaleT)) * r);
+	}
+	float QAt(int64_t cx, int64_t cy) const {
+		const UVPlanes &p = *planes;
+		return TruncateToFloat24((float)((double)p.q.At(cx, cy) * p.scaleQ));
+	}
+};
+
 inline u8 ClampFogDepth(float fogdepth) {
 	const u32 u = FloatBits(fogdepth);
 	const u32 exp = u >> 23;
@@ -202,32 +315,12 @@ inline bool DoubleSecondaryColor(const RasterState &state) {
 	return state.enableTextures && state.samp.useColorDoubling;
 }
 
-// Final color of a textured pixel: texture function on prim, plus the secondary color.
-inline u32 TexturePixel(const RasterState &state, u32 prim, u32 sec, float s, float t, int level, int levelFrac, bool linear) {
-	const u32 texel = SampleTexture(state.samp, s, t, level, levelFrac, linear);
-	int out[4];
-	TextureFunction(state.samp, prim, texel, out);
-	out[0] += sec & 0xFF;
-	out[1] += (sec >> 8) & 0xFF;
-	out[2] += (sec >> 16) & 0xFF;
-	return PackClamped(out);
-}
-
 inline u32 AddSecondary(u32 prim, u32 sec) {
 	if (sec == 0)
 		return prim;
 	const int c[4] = { (int)(prim & 0xFF) + (int)(sec & 0xFF), (int)((prim >> 8) & 0xFF) + (int)((sec >> 8) & 0xFF),
 		(int)((prim >> 16) & 0xFF) + (int)((sec >> 16) & 0xFF), (int)(prim >> 24) };
 	return PackClamped(c);
-}
-
-// The secondary color as added: doubled with color doubling.
-inline u32 SecondaryOf(const RasterState &state, u32 c1) {
-	c1 &= 0x00FFFFFF;
-	if (!DoubleSecondaryColor(state) || c1 == 0)
-		return c1;
-	// Doubled channels can exceed 255: keep them as 9-bit values in a wider layout via AddSecondary's ints.
-	return c1;
 }
 
 inline bool EarlyDepthFail(const PixelState &ps, u32 zbRow, int x, int z) {
@@ -291,27 +384,29 @@ void DrawTriangle(const RVertex &v0, const RVertex &v1, const RVertex &v2, const
 	const bool flatColor1 = !state.shadeGouraud || (v0.color1 == v1.color1 && v0.color1 == v2.color1);
 	const bool noFog = clearMode || !ps.applyFog || (v0.fog >= 255.0f / 256.0f && v1.fog >= 255.0f / 256.0f && v2.fog >= 255.0f / 256.0f);
 
+	PlaneSetup setup;
+	setup.Init(X, Y);
 	Plane depthPlane;
 	if (!flatZ) {
 		const int64_t Z[3] = { v0.z, v1.z, v2.z };
-		depthPlane = ComputePlane(X, Y, Z);
+		depthPlane = setup.Make(Z);
 	}
 	Plane color0Planes[4], color1Planes[3], fogPlane;
 	if (!flatColor0) {
 		for (int i = 0; i < 4; ++i) {
 			const int64_t C[3] = { (v0.color0 >> (8 * i)) & 0xFF, (v1.color0 >> (8 * i)) & 0xFF, (v2.color0 >> (8 * i)) & 0xFF };
-			color0Planes[i] = ComputePlane(X, Y, C);
+			color0Planes[i] = setup.Make(C);
 		}
 	}
 	if (!flatColor1) {
 		for (int i = 0; i < 3; ++i) {
 			const int64_t C[3] = { (v0.color1 >> (8 * i)) & 0xFF, (v1.color1 >> (8 * i)) & 0xFF, (v2.color1 >> (8 * i)) & 0xFF };
-			color1Planes[i] = ComputePlane(X, Y, C);
+			color1Planes[i] = setup.Make(C);
 		}
 	}
 	if (!noFog) {
 		const int64_t F[3] = { ClampFogDepth(v0.fog), ClampFogDepth(v1.fog), ClampFogDepth(v2.fog) };
-		fogPlane = ComputePlane(X, Y, F);
+		fogPlane = setup.Make(F);
 	}
 
 	const bool textured = state.enableTextures && !clearMode;
@@ -326,7 +421,7 @@ void DrawTriangle(const RVertex &v0, const RVertex &v1, const RVertex &v2, const
 		const float v[3] = { v0.t, v1.t, v2.t };
 		const float w[3] = { v0.clipw, v1.clipw, v2.clipw };
 		const float q[3] = { v0.q, v1.q, v2.q };
-		uvPlanes = ComputeUVPlanes(X, Y, u, v, w, state.textureProj && !state.throughMode ? q : nullptr);
+		uvPlanes = ComputeUVPlanes(setup, u, v, w, state.textureProj && !state.throughMode ? q : nullptr);
 		autoGrad = UVPlaneGradient(uvPlanes, ss, state.throughMode);
 		lod = ConstantLod(ss);
 		const bool lodUsesQ = ss.texLevelMode != GE_TEXLEVEL_MODE_CONST && (ss.maxLevel > 0 || ss.minFilt != ss.magFilt);
@@ -350,6 +445,9 @@ void DrawTriangle(const RVertex &v0, const RVertex &v1, const RVertex &v2, const
 	alignas(16) int zBuf[CHUNK];
 	alignas(16) u8 fogBuf[CHUNK];
 	alignas(16) u32 colorBuf[CHUNK];
+	UVWalker uvw;
+	if (textured && uvPlanes.valid)
+		uvw.Init(uvPlanes);
 
 	for (int64_t curY = minY; curY <= maxY; curY += SUBPIX) {
 		const int64_t yc = curY + SUBPIX / 2;
@@ -376,14 +474,15 @@ void DrawTriangle(const RVertex &v0, const RVertex &v1, const RVertex &v2, const
 		for (int64_t chunk = lo; chunk <= hi; chunk += CHUNK) {
 			const int count = (int)std::min<int64_t>(CHUNK, hi - chunk + 1);
 			const int px0 = (int)chunk;
+			const int64_t cx0 = (int64_t)px0 * SUBPIX + SUBPIX / 2;
+			const int64_t zStart = depthPlane.base + depthPlane.kx * cx0 + depthPlane.ky * yc, zStep = depthPlane.kx * SUBPIX;
 			int anyAlive = 0;
 			for (int i = 0; i < count; ++i) {
-				const int64_t cx = (int64_t)(px0 + i) * SUBPIX + SUBPIX / 2;
 				int z;
 				if (flatZ) {
 					z = v2.z;
 				} else {
-					const int64_t zv = depthPlane.At(cx, yc);
+					const int64_t zv = (zStart + i * zStep) >> 14;
 					z = (int)std::clamp<int64_t>(zv, 0, 65535);
 				}
 				zBuf[i] = z;
@@ -396,23 +495,39 @@ void DrawTriangle(const RVertex &v0, const RVertex &v1, const RVertex &v2, const
 			if (!anyAlive)
 				continue;
 
+			int64_t c0Start[4], c0Step[4], c1Start[3], c1Step[3];
+			if (!flatColor0) {
+				for (int c = 0; c < 4; ++c) {
+					c0Start[c] = color0Planes[c].base + color0Planes[c].kx * cx0 + color0Planes[c].ky * yc;
+					c0Step[c] = color0Planes[c].kx * SUBPIX;
+				}
+			}
+			if (!flatColor1) {
+				for (int c = 0; c < 3; ++c) {
+					c1Start[c] = color1Planes[c].base + color1Planes[c].kx * cx0 + color1Planes[c].ky * yc;
+					c1Step[c] = color1Planes[c].kx * SUBPIX;
+				}
+			}
+			const int64_t fogStart = fogPlane.base + fogPlane.kx * cx0 + fogPlane.ky * yc, fogStep = fogPlane.kx * SUBPIX;
+			if (textured && uvPlanes.valid)
+				uvw.Start(cx0, yc);
 			for (int i = 0; i < count; ++i) {
 				if (!alive[i])
 					continue;
-				const int64_t cx = (int64_t)(px0 + i) * SUBPIX + SUBPIX / 2;
+				const int64_t cx = cx0 + (int64_t)i * SUBPIX;
 				u32 prim;
 				if (flatColor0) {
 					prim = flatC0;
 				} else {
 					prim = 0;
 					for (int c = 0; c < 4; ++c)
-						prim |= (u32)std::clamp<int64_t>(color0Planes[c].At(cx, yc), 0, 255) << (8 * c);
+						prim |= (u32)std::clamp<int64_t>((c0Start[c] + i * c0Step[c]) >> 14, 0, 255) << (8 * c);
 				}
 				u32 sec = 0;
 				if (!clearMode) {
 					int sc[3];
 					for (int c = 0; c < 3; ++c) {
-						sc[c] = flatColor1 ? (int)((v2.color1 >> (8 * c)) & 0xFF) : (int)std::clamp<int64_t>(color1Planes[c].At(cx, yc), 0, 255);
+						sc[c] = flatColor1 ? (int)((v2.color1 >> (8 * c)) & 0xFF) : (int)std::clamp<int64_t>((c1Start[c] + i * c1Step[c]) >> 14, 0, 255);
 						if (dblSec)
 							sc[c] *= 2;
 					}
@@ -420,7 +535,7 @@ void DrawTriangle(const RVertex &v0, const RVertex &v1, const RVertex &v2, const
 					if (textured) {
 						float s, t, q;
 						if (uvPlanes.valid) {
-							UVFromPlaneValues(uvPlanes, uvPlanes.q.At(cx, yc), uvPlanes.s.At(cx, yc), uvPlanes.t.At(cx, yc), s, t, q);
+							uvw.At(i, s, t, q);
 						} else {
 							// No planes (w not positive): perspective barycentrics.
 							const double w0 = (double)(edges[0].a * cx + edges[0].b * yc + edges[0].c);
@@ -469,7 +584,7 @@ void DrawTriangle(const RVertex &v0, const RVertex &v1, const RVertex &v2, const
 				} else {
 					colorBuf[i] = prim;
 				}
-				fogBuf[i] = noFog ? 255 : (u8)std::clamp<int64_t>(fogPlane.At(cx, yc), 0, 255);
+				fogBuf[i] = noFog ? 255 : (u8)std::clamp<int64_t>((fogStart + i * fogStep) >> 14, 0, 255);
 			}
 			run(ps, px0, py, count, alive, zBuf, fogBuf, colorBuf);
 		}
@@ -567,6 +682,9 @@ void DrawRectangle(const RVertex &v0, const RVertex &v1, const Range &range, con
 	}
 
 	const PixelRunFn run = GetPixelRunFn(ps);
+	UVWalker uvw;
+	if (textured)
+		uvw.Init(uvPlanes);
 	alignas(16) u8 alive[CHUNK];
 	alignas(16) int zBuf[CHUNK];
 	alignas(16) u8 fogBuf[CHUNK];
@@ -598,12 +716,12 @@ void DrawRectangle(const RVertex &v0, const RVertex &v1, const Range &range, con
 			if (!anyAlive)
 				continue;
 			if (textured) {
+				uvw.Start((int64_t)x0 * SUBPIX + SUBPIX / 2, cy);
 				for (int i = 0; i < count; ++i) {
 					if (!alive[i])
 						continue;
-					const int64_t cx = (int64_t)(x0 + i) * SUBPIX + SUBPIX / 2;
 					float s, t, q;
-					UVFromPlaneValues(uvPlanes, uvPlanes.q.At(cx, cy), uvPlanes.s.At(cx, cy), uvPlanes.t.At(cx, cy), s, t, q);
+					uvw.At(i, s, t, q);
 					int level = lod.level, levelFrac = lod.levelFrac;
 					bool filt = lod.filt;
 					if (!lod.constant)
@@ -877,7 +995,7 @@ LineUV ComputeLineUV(const RVertex &v0, const RVertex &v1, bool textureProj) {
 	const RVertex *v[2] = { &v0, &v1 };
 	for (int i = 0; i < 2; ++i) {
 		const float w24 = TruncateToFloat24(v[i]->clipw);
-		if (!(w24 > 0.0f) || !std::isfinite(w24))
+		if (!(w24 > 0.0f) || !IsFiniteF(w24))
 			return uv;
 		const double r = GERecip(w24);
 		q[i] = textureProj ? ProductToFloat24((double)TruncateToFloat24(v[i]->q) * r) : r;

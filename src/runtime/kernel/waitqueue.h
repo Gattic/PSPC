@@ -22,6 +22,10 @@ struct WaitQueue {
 		if (std::find(threads.begin(), threads.end(), uid) == threads.end()) threads.push_back(uid);
 	}
 
+	void Remove(SceUID uid) { threads.erase(std::remove(threads.begin(), threads.end(), uid), threads.end()); }
+
+	bool Contains(SceUID uid) const { return std::find(threads.begin(), threads.end(), uid) != threads.end(); }
+
 	void Cleanup(WaitType type, SceUID obj) {
 		threads.erase(std::remove_if(threads.begin(), threads.end(),
 		                             [&](SceUID u) { return !IsWaitingOn(Get<PspThread>(u), type, obj); }),
@@ -33,12 +37,26 @@ struct WaitQueue {
 		return (int)threads.size();
 	}
 
+	// Best priority first; among equals, the order they started waiting in.
 	void SortByPriority() {
 		std::stable_sort(threads.begin(), threads.end(), [](SceUID a, SceUID b) {
 			PspThread *ta = Get<PspThread>(a), *tb = Get<PspThread>(b);
 			int pa = ta ? ta->currentPriority : 0x7FFF, pb = tb ? tb->currentPriority : 0x7FFF;
 			return pa < pb;
 		});
+	}
+
+	// Index of the first waiter with the best priority (without reordering), or -1.
+	int BestPriorityIndex() const {
+		int best = -1, bestPrio = 0x7FFFFFFF;
+		for (size_t i = 0; i < threads.size(); i++) {
+			PspThread *t = Get<PspThread>(threads[i]);
+			if (t && t->currentPriority < bestPrio) {
+				best = (int)i;
+				bestPrio = t->currentPriority;
+			}
+		}
+		return best;
 	}
 
 	// Wake every valid waiter with `result`. Returns true if any thread was woken.

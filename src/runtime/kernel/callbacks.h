@@ -17,11 +17,16 @@ struct Callback : KObject {
 };
 
 SceUID CreateCallback(const char *name, u32 entry, u32 commonArg);
-// Notify a callback (from guest code or from system events like UMD/power).
+// Notify a callback (from guest code or from system events like UMD/power). A thread in a
+// callback-enabled wait is queued to run it when it would get the CPU; the caller decides
+// whether to reschedule.
 int NotifyCallback(SceUID cbId, s32 arg);
 bool HasPendingCallbacks(PspThread *t);
-// Run all pending callbacks of `t` on the current fiber (t must be the current thread).
-// Returns true if any ran.
+// A thread can run its callbacks unless it is already two callbacks deep (on hardware a CB wait
+// that would go deeper never returns).
+bool CanRunCallbacks(PspThread *t);
+// Run all pending callbacks of `t` on the current fiber (t must be the current thread), including
+// ones notified while they run. Returns true if any ran.
 bool RunPendingCallbacks(PspThread *t);
 void DeleteThreadCallbacks(PspThread *t);
 

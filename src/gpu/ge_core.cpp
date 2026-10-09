@@ -48,7 +48,9 @@ struct DisplayList {
 	int id;
 	u32 startpc;
 	u32 pc;
-	u32 stall;
+	u32 stall;    // the firmware's copy, which sceGeListSync compares against
+	u32 hwStall;  // what the GE stops at
+	bool resumeHw;  // restarts with the GE's registers as they are (old-SDK SUSPEND handler)
 	DisplayListState state;
 	SignalBehavior signal;
 	int callbackId;
@@ -64,12 +66,15 @@ struct DisplayList {
 	u32 offsetAddr;
 	bool bboxResult;
 	u32 stackAddr;
+	bool hung;  // an undefined SIGNAL hangs the GE until sceGeBreak(1)
 };
 
 struct PendingInterrupt {
 	int listid;
 	u32 pc;
 	u32 cmd;
+	u16 token;
+	bool stops;  // the GE waits for it (all but HANDLER_CONTINUE signals)
 };
 
 DisplayList dls[MAX_LISTS];
@@ -244,19 +249,38 @@ void CompleteFailedList(DisplayList &list) {
 	NotifyListDone(list);
 }
 
-void TriggerInterrupt(DisplayList &list) {
+void TriggerInterrupt(DisplayList &list, bool stops = true) {
 	const u32 pc = list.pc;
-	pendingIntrs.push_back({ list.id, pc, ReadListWord(pc - 4) >> 24 });
-	list.pendingInterrupt = true;
+	pendingIntrs.push_back({ list.id, pc, ReadListWord(pc - 4) >> 24, list.subIntrToken, stops });
+	if (stops)
+		list.pendingInterrupt = true;
 	if (hooks.onInterruptPending)
 		hooks.onInterruptPending(hooks.user);
+}
+
+bool AnyPendingInterrupt(int listid) {
+	for (const PendingInterrupt &p : pendingIntrs)
+		if (p.listid == listid)
+			return true;
+	return false;
+}
+
+// Whether the GE still waits on an interrupt of this list.
+void UpdatePendingInterrupt(int listid) {
+	DisplayList &dl = dls[listid];
+	dl.pendingInterrupt = false;
+	for (const PendingInterrupt &p : pendingIntrs)
+		if (p.listid == listid && p.stops)
+			dl.pendingInterrupt = true;
 }
 
 void InterruptEnd(int listid) {
 	interruptRunning = false;
 	isbreak = false;
 	DisplayList &dl = dls[listid];
-	dl.pendingInterrupt = false;
+	UpdatePendingInterrupt(listid);
+	if (AnyPendingInterrupt(listid))
+		return;
 	if (dl.state == DL_STATE_COMPLETED || dl.state == DL_STATE_NONE) {
 		if (dl.started && dl.context)
 			RestoreContextFrom(dl.context);
@@ -623,7 +647,11 @@ void Execute_End(u32 op) {
 			list->signal = behaviour;
 			break;
 		case SIGNAL_HANDLER_CONTINUE:
+			// The callback runs while the GE goes on.
+			trigger = false;
 			list->signal = behaviour;
+			if (list->interruptsEnabled)
+				TriggerInterrupt(*list, false);
 			break;
 		case SIGNAL_HANDLER_PAUSE:
 			// Paused from here on, though it runs to the FINISH that delivers it.
@@ -687,8 +715,21 @@ void Execute_End(u32 op) {
 			}
 			break;
 		}
+		case SIGNAL_BREAK1:
+		case SIGNAL_BREAK2:
+			// Breakpoints do nothing without a debugger.
+			trigger = false;
+			break;
 		default:
-			LOGW("gpu", "unknown signal behaviour %02x (%04x %04x)", behaviour, signal, enddata);
+			trigger = false;
+			if (behaviour >= SIGNAL_RTBP0 && behaviour <= SIGNAL_OCBP) {
+				LOGW("gpu", "unimplemented signal behaviour %02x (%04x %04x)", behaviour, signal, enddata);
+				break;
+			}
+			// Undefined: the GE hangs, still drawing, until it's reset.
+			LOGW("gpu", "undefined signal behaviour %02x (%04x %04x): GE hangs", behaviour, signal, enddata);
+			list->hung = true;
+			gpuState = GPUSTATE_STALL;
 			break;
 		}
 		if (list->interruptsEnabled && trigger) {
@@ -895,7 +936,7 @@ void ProcessDLQueue() {
 	while (!dlQueue.empty()) {
 		const int listIndex = dlQueue.front();
 		DisplayList &list = dls[listIndex];
-		if (list.state == DL_STATE_PAUSED)
+		if (list.state == DL_STATE_PAUSED || list.hung)
 			return;
 		// Until the interrupt of a SIGNAL or FINISH has been delivered, nothing runs.
 		if (list.pendingInterrupt)
@@ -912,12 +953,16 @@ void ProcessDLQueue() {
 			RemoveFromQueue(listIndex);
 			continue;
 		}
+		// Starting (or restarting) a list loads the GE's stall register from the firmware's copy.
+		if (list.state != DL_STATE_RUNNING && !list.resumeHw)
+			list.hwStall = list.stall;
+		list.resumeHw = false;
 		list.state = DL_STATE_RUNNING;
 		list.interrupted = false;
-		gpuState = list.pc == list.stall ? GPUSTATE_STALL : GPUSTATE_RUNNING;
+		gpuState = list.pc == list.hwStall ? GPUSTATE_STALL : GPUSTATE_RUNNING;
 
 		while (gpuState == GPUSTATE_RUNNING) {
-			if (list.pc == list.stall) {
+			if (list.pc == list.hwStall) {
 				gpuState = GPUSTATE_STALL;
 				break;
 			}
@@ -995,14 +1040,16 @@ bool InterruptBegin(Interrupt *out) {
 		out->listId = (int)(LIST_ID_MAGIC ^ (u32)intr.listid);
 		out->callbackId = kind ? dl.callbackId : -1;
 		out->isFinish = kind == 2;
-		out->arg = dl.subIntrToken & 0xFFFF;
+		out->arg = intr.token;
 		out->listPc = sdkVersion <= 0x02000010 ? 0 : intr.pc + 4;
 	}
 	if (kind)
 		return true;
 	if (dl.signal == SIGNAL_HANDLER_SUSPEND && cmd == GE_CMD_SIGNAL && sdkVersion <= 0x02000010) {
-		if (dl.state != DL_STATE_NONE && dl.state != DL_STATE_COMPLETED)
+		if (dl.state != DL_STATE_NONE && dl.state != DL_STATE_COMPLETED) {
 			dl.state = DL_STATE_QUEUED;
+			dl.resumeHw = true;
+		}
 	}
 	pendingIntrs.pop_front();
 	InterruptEnd(intr.listid);
@@ -1019,8 +1066,10 @@ void InterruptFinish() {
 	pendingIntrs.pop_front();
 	DisplayList &dl = dls[intr.listid];
 	if (intr.cmd == GE_CMD_SIGNAL && dl.signal == SIGNAL_HANDLER_SUSPEND && sdkVersion <= 0x02000010) {
-		if (dl.state != DL_STATE_NONE && dl.state != DL_STATE_COMPLETED)
+		if (dl.state != DL_STATE_NONE && dl.state != DL_STATE_COMPLETED) {
 			dl.state = DL_STATE_QUEUED;
+			dl.resumeHw = true;
+		}
 	}
 	InterruptEnd(intr.listid);
 }
@@ -1043,7 +1092,7 @@ void DeliverInterruptSync() {
 bool BusyDrawing() {
 	// Stopped for a finish callback, and a signal callback unless it's a CONTINUE one.
 	if (interruptRunning) {
-		const bool continueSignal = gpuState == GPUSTATE_INTERRUPT && currentList && currentList->signal == SIGNAL_HANDLER_CONTINUE;
+		const bool continueSignal = currentList && currentList->signal == SIGNAL_HANDLER_CONTINUE;
 		if (!continueSignal)
 			return false;
 	}
@@ -1235,7 +1284,7 @@ int EnqueueList(u32 listpc, u32 stall, int callbackId, u32 optParamAddr, bool he
 	for (int i = 0; i < MAX_LISTS; ++i) {
 		const int possibleID = (i + nextListID) % MAX_LISTS;
 		const DisplayList &possible = dls[possibleID];
-		if (possible.pendingInterrupt)
+		if (possible.pendingInterrupt || AnyPendingInterrupt(possibleID))
 			continue;
 		if (possible.state == DL_STATE_NONE) {
 			id = possibleID;
@@ -1253,6 +1302,8 @@ int EnqueueList(u32 listpc, u32 stall, int callbackId, u32 optParamAddr, bool he
 	dl.startpc = listpc & 0x0FFFFFFF;
 	dl.pc = listpc & 0x0FFFFFFF;
 	dl.stall = stall & 0x0FFFFFFF;
+	dl.hwStall = dl.stall;
+	dl.resumeHw = false;
 	dl.callbackId = callbackId >= 0 ? callbackId : -1;
 	dl.stackptr = 0;
 	dl.signal = SIGNAL_NONE;
@@ -1263,6 +1314,7 @@ int EnqueueList(u32 listpc, u32 stall, int callbackId, u32 optParamAddr, bool he
 	dl.offsetAddr = 0;
 	dl.bboxResult = false;
 	dl.stackAddr = stackAddr;
+	dl.hung = false;
 	dl.context = 0;
 	if (argsValid && argsSize >= 8) {
 		const u32 ctx = GRead32(optParamAddr + 4);
@@ -1322,6 +1374,10 @@ int UpdateStallAddr(int listId, u32 stallAddr) {
 	if (dl.state == DL_STATE_COMPLETED)
 		return (int)ERR_ALREADY;
 	dl.stall = stallAddr & 0x0FFFFFFF;
+	// A paused list gets the new stall when it's restarted; one paused inside an old-SDK SUSPEND
+	// handler never does, as the GE resumes with its own registers.
+	if (dl.state != DL_STATE_PAUSED)
+		dl.hwStall = dl.stall;
 	Run();
 	return 0;
 }
@@ -1389,14 +1445,15 @@ int Break(int mode, u32 paramAddr) {
 		for (int i = 0; i < MAX_LISTS; ++i) {
 			dls[i].state = DL_STATE_NONE;
 			dls[i].signal = SIGNAL_NONE;
+			dls[i].hung = false;
 		}
 		auto it = pendingIntrs.begin();
 		if (interruptRunning && it != pendingIntrs.end())
 			++it;
-		while (it != pendingIntrs.end()) {
-			dls[it->listid].pendingInterrupt = false;
+		while (it != pendingIntrs.end())
 			it = pendingIntrs.erase(it);
-		}
+		for (int i = 0; i < MAX_LISTS; ++i)
+			UpdatePendingInterrupt(i);
 		nextListID = 0;
 		currentList = nullptr;
 		return 0;
@@ -1429,6 +1486,7 @@ int Continue() {
 	if (!currentList)
 		return 0;
 	if (currentList->state == DL_STATE_PAUSED) {
+		currentList->hwStall = currentList->stall;
 		if (!isbreak) {
 			// Inside the pause window (PAUSE signal seen, FINISH not yet).
 			if (currentList->signal == SIGNAL_HANDLER_PAUSE)

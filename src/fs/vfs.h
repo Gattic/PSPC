@@ -3,6 +3,7 @@
 #pragma once
 
 #include "fs/block_device.h"
+#include "fs/fat_names.h"
 #include "fs/filesystem.h"
 #include "fs/host_fs.h"
 #include "fs/iso_fs.h"

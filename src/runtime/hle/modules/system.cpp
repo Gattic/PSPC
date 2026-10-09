@@ -1,6 +1,6 @@
 ﻿// SPDX-License-Identifier: GPL-2.0-or-later
 //
-// Small system libraries: UtilsForUser, scePower, sceSuspendForUser, sceRtc, sceUmdUser,
+// Small system libraries: UtilsForUser, scePower, sceSuspendForUser, sceRtc,
 // sceImpose, sceDmac, sceHprm.
 #include <chrono>
 #include <ctime>
@@ -581,90 +581,6 @@ int sceRtcGetAlarmTick(u32 tickPtr) {
 }
 int sceRtcIsAlarmed() { return 0; }
 
-// ---------------------------------------------------------------- sceUmdUser
-
-constexpr u32 PSP_UMD_NOT_PRESENT = 0x01, PSP_UMD_PRESENT = 0x02, PSP_UMD_CHANGED = 0x04, PSP_UMD_INITING = 0x08,
-              PSP_UMD_INITED = 0x10, PSP_UMD_READY = 0x20;
-bool g_umdActivated = false;
-SceUID g_umdCallback = 0;
-WaitQueue g_umdWaiters;
-
-bool DiscPresent() { return io::MountedDevice("disc0") != nullptr; }
-u32 DriveStat() {
-	if (!DiscPresent()) return PSP_UMD_NOT_PRESENT;
-	return g_umdActivated ? (PSP_UMD_PRESENT | PSP_UMD_INITED | PSP_UMD_READY) : (PSP_UMD_PRESENT | PSP_UMD_INITED);
-}
-void UmdStatChanged() {
-	if (g_umdCallback) NotifyCallback(g_umdCallback, (s32)DriveStat());
-	g_umdWaiters.Cleanup(WAITTYPE_UMD, 0);
-	std::vector<SceUID> w = g_umdWaiters.threads;
-	g_umdWaiters.threads.clear();
-	for (SceUID id : w) {
-		PspThread *t = Get<PspThread>(id);
-		if (t && (DriveStat() & t->waitValue[0])) sched::Wake(t, 0);
-		else if (t) g_umdWaiters.threads.push_back(id);
-	}
-}
-int sceUmdCheckMedium() { return DiscPresent() ? 1 : 0; }
-int sceUmdGetDriveStat() { return (int)DriveStat(); }
-int sceUmdActivate(int mode, const char *name) {
-	if (mode < 1 || mode > 2) return (int)SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT;
-	if (!name || _stricmp(name, "disc0:") != 0) return (int)SCE_KERNEL_ERROR_ERRNO_NO_SUCH_DEVICE;
-	g_umdActivated = true;
-	UmdStatChanged();
-	return 0;
-}
-int sceUmdDeactivate(int mode, const char *name) {
-	(void)mode;
-	(void)name;
-	g_umdActivated = false;
-	UmdStatChanged();
-	return 0;
-}
-static int UmdWait(u32 stat, u32 timeoutPtr, bool cb) {
-	if ((stat & DriveStat()) != 0) return 0;
-	PspThread *t = sched::Current();
-	t->waitValue[0] = stat;
-	g_umdWaiters.Add(t->uid);
-	return sched::Wait(WAITTYPE_UMD, 0, timeoutPtr, cb);
-}
-int sceUmdWaitDriveStat(u32 stat) { return UmdWait(stat, 0, false); }
-int sceUmdWaitDriveStatWithTimer(u32 stat, u32 timeout) {
-	if ((stat & DriveStat()) != 0) return 0;
-	u32 tmp = kernel::AllocKernelMemory(4, "umd timeout");
-	GWrite32(tmp, timeout);
-	int r = UmdWait(stat, timeout ? tmp : 0, false);
-	g_kernelMem.Free(tmp);
-	return r;
-}
-int sceUmdWaitDriveStatCB(u32 stat, u32 timeout) {
-	(void)timeout;
-	return UmdWait(stat, 0, true);
-}
-int sceUmdCancelWaitDriveStat() {
-	g_umdWaiters.WakeAll(WAITTYPE_UMD, 0, (s32)SCE_KERNEL_ERROR_WAIT_CANCEL);
-	return 0;
-}
-int sceUmdGetErrorStat() { return 0; }
-int sceUmdGetDiscInfo(u32 infoPtr) {
-	if (!mem::IsValidRange(infoPtr, 8)) return (int)SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT;
-	if (GRead32(infoPtr) != 8) return (int)SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT;
-	GWrite32(infoPtr + 4, 0x10);  // PSP_UMD_TYPE_GAME
-	return 0;
-}
-int sceUmdRegisterUMDCallBack(SceUID cb) {
-	if (!Get<Callback>(cb)) return (int)SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT;
-	g_umdCallback = cb;
-	return 0;
-}
-int sceUmdUnRegisterUMDCallBack(SceUID cb) {
-	if (cb != g_umdCallback) return (int)SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT;
-	g_umdCallback = 0;
-	return 0;
-}
-int sceUmdReplaceProhibit() { return 0; }
-int sceUmdReplacePermit() { return 0; }
-
 // ---------------------------------------------------------------- sceImpose
 
 int g_language = 1, g_buttonMode = 1;  // English, X = confirm (western default)
@@ -715,10 +631,6 @@ int sceHprmLatch(u32 ptr) {
 int sceHprmRegisterCallback(SceUID) { return 0; }
 
 }  // namespace
-
-namespace umd {
-void NotifyDiscChanged() { UmdStatChanged(); }
-}  // namespace umd
 
 namespace systemparam {
 int Language() { return g_language; }
@@ -851,26 +763,6 @@ void Register_sceRtc() {
 		HLEFN(0xC2DDBEB5, sceRtcGetAlarmTick),
 	};
 	hle::RegisterModule("sceRtc", funcs);
-}
-
-void Register_sceUmdUser() {
-	static const hle::HleFunction funcs[] = {
-		HLEFN(0xC6183D47, sceUmdActivate),
-		HLEFN(0x6B4A146C, sceUmdGetDriveStat),
-		HLEFN(0x46EBB729, sceUmdCheckMedium),
-		HLEFN(0xE83742BA, sceUmdDeactivate),
-		HLEFN(0x8EF08FCE, sceUmdWaitDriveStat),
-		HLEFN(0x56202973, sceUmdWaitDriveStatWithTimer),
-		HLEFN(0x4A9E5E29, sceUmdWaitDriveStatCB),
-		HLEFN(0x6AF9B50A, sceUmdCancelWaitDriveStat),
-		HLEFN(0x20628E6F, sceUmdGetErrorStat),
-		HLEFN(0x340B7686, sceUmdGetDiscInfo),
-		HLEFN(0xAEE7404D, sceUmdRegisterUMDCallBack),
-		HLEFN(0xBD2BDE07, sceUmdUnRegisterUMDCallBack),
-		HLEFN(0x87533940, sceUmdReplaceProhibit),
-		HLEFN(0xCBE9F02A, sceUmdReplacePermit),
-	};
-	hle::RegisterModule("sceUmdUser", funcs);
 }
 
 void Register_sceImpose() {

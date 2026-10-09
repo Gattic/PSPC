@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
+﻿// SPDX-License-Identifier: GPL-2.0-or-later
 //
 // Guest address -> host function table. Entries are recompiled functions (from AOT DLLs) and
 // HLE thunks (import stubs). Anything not in the table runs in the interpreter.
@@ -21,6 +21,9 @@ u32 RegisteredCount();
 void Call(Ctx *c, u32 target);
 // Tail jump from a function whose entry values of $ra/$sp were ra0/sp0.
 void Jump(Ctx *c, u32 target, u32 ra0, u32 sp0);
+// Called (once per address) when native code has to fall back to the interpreter at `target`.
+void SetMissHook(void (*hook)(u32 target));
+
 // jr $ra with $ra != value at entry: start a non-local return to `target`.
 void NonlocalReturn(Ctx *c, u32 target);
 

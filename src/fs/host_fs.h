@@ -21,7 +21,8 @@ struct HostFsOptions {
 	// 0777 directories, 0664 (0444 read-only) files.
 	bool fat = true;
 	// Show all-lowercase 8.3 names upper case. The PSP's FAT driver ignores the NT "lowercase" flags,
-	// so a "save.dat" written by Windows appears as "SAVE.DAT" on hardware.
+	// so a "save.dat" written by Windows appears as "SAVE.DAT" on hardware (host0: shows the same
+	// in io/directory).
 	bool upperCase83 = false;
 };
 

@@ -903,9 +903,11 @@ void ProfileScenario(int scenario, int frames) {
 	HANDLE target;
 	DuplicateHandle(process, GetCurrentThread(), process, &target, 0, FALSE, DUPLICATE_SAME_ACCESS);
 	std::atomic<bool> done{ false };
+	// No allocation while the thread is suspended (it may hold the heap lock).
 	std::vector<DWORD64> samples;
+	samples.reserve(1 << 20);
 	std::thread sampler([&] {
-		while (!done) {
+		while (!done && samples.size() < samples.capacity()) {
 			SuspendThread(target);
 			CONTEXT ctx{};
 			ctx.ContextFlags = CONTEXT_CONTROL;

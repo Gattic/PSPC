@@ -18,6 +18,7 @@
 #include "runtime/core/dispatch.h"
 #include "runtime/core/memory.h"
 #include "runtime/kernel/scheduler.h"
+#include "runtime/kernel/sysmem.h"
 
 namespace hle {
 
@@ -35,6 +36,7 @@ struct SyscallEntry {
 	std::string name;
 	u64 calls = 0;
 	bool warned = false;
+	u32 redirect = 0;  // guest function replacing this syscall (sctrlHENPatchSyscall)
 };
 
 std::map<std::string, Library> g_libs;
@@ -142,7 +144,9 @@ void Syscall(Ctx *c, u32 insn, u32 pc) {
 	u32 prevPc = g_currentCallerPc;
 	g_current = &e;
 	g_currentCallerPc = c->r[31] - 8;
-	if (e.func && e.func->fn) {
+	if (e.redirect) {
+		dispatch::Call(c, e.redirect);
+	} else if (e.func && e.func->fn) {
 		if (logging::g_level <= LogLevel::Trace) {
 			LOGT("HLE", "%s(%08x, %08x, %08x, %08x, %08x, %08x) from %08x", e.name.c_str(), c->r[4], c->r[5], c->r[6],
 			     c->r[7], c->r[8], c->r[9], c->r[31]);
@@ -160,6 +164,41 @@ void Syscall(Ctx *c, u32 insn, u32 pc) {
 	g_current = prev;
 	g_currentCallerPc = prevPc;
 	_mm_setcsr(guestCsr);
+}
+
+bool AddAlias(const std::string &library, u32 aliasNid, u32 targetNid) {
+	auto it = g_libs.find(library);
+	if (it == g_libs.end()) return false;
+	auto &funcs = it->second.funcs;
+	if (funcs.count(aliasNid)) return false;
+	auto t = funcs.find(targetNid);
+	if (t == funcs.end()) return false;
+	HleFunction f = t->second;
+	f.nid = aliasNid;
+	funcs[aliasNid] = f;
+	return true;
+}
+
+u32 MakeGuestStub(const std::string &library, u32 nid) {
+	if (!FindFunction(library, nid)) return 0;
+	static std::map<std::pair<std::string, u32>, u32> stubs;
+	auto key = std::make_pair(library, nid);
+	auto it = stubs.find(key);
+	if (it != stubs.end()) return it->second;
+	u32 addr = kernel::AllocKernelMemory(8, "hle stub");
+	PatchImportStub(addr, library, nid);
+	stubs[key] = addr;
+	return addr;
+}
+
+bool RedirectStubToGuest(u32 stubAddr, u32 target) {
+	if (!mem::IsValidRange(stubAddr, 8)) return false;
+	u32 w = GRead32(stubAddr + 4);
+	if ((w & 0xFC00003F) != 0x0C) return false;
+	u32 code = (w >> 6) & 0xFFFFF;
+	if (code == 0 || code >= g_syscalls.size()) return false;
+	g_syscalls[code].redirect = target;
+	return true;
 }
 
 void LoadNidDatabase(const std::filesystem::path &csv) {

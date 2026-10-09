@@ -1,4 +1,4 @@
-﻿// SPDX-License-Identifier: GPL-2.0-or-later
+// SPDX-License-Identifier: GPL-2.0-or-later
 #include "runtime/kernel/sysmem.h"
 
 #include "common/log.h"
@@ -144,6 +144,20 @@ BlockAllocator *AllocatorForAddress(u32 addr) {
 	if (g_kernelMem.Contains(addr)) return &g_kernelMem;
 	if (g_volatileMem.Contains(addr)) return &g_volatileMem;
 	return nullptr;
+}
+
+BlockAllocator *AllocatorForPartitionId(int id, bool kernelMode) {
+	switch (id) {
+	case 1:
+	case 3:
+	case 4: return kernelMode ? &g_kernelMem : nullptr;
+	case 2:
+	case 6: return &g_userMem;
+	case 8:
+	case 10: return kernelMode ? &g_userMem : nullptr;
+	case 5: return &g_volatileMem;
+	default: return nullptr;
+	}
 }
 
 u32 AllocKernelMemory(u32 size, const char *tag) {

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstring>
 
+#include "fs/fat_names.h"
 #include "fs/host_fs.h"
 #include "fs/path_util.h"
 #include "test_fs_helpers.h"
@@ -64,7 +65,7 @@ TEST(fs_path_normalize) {
 	CHECK(NormalizePspPath("disc0:/sce_lbn0x10_size0x800") == "disc0:/sce_lbn0x10_size0x800");
 	CHECK(NormalizePspPath("ms0:/PSP/GAME", "EBOOT.PBP") == "ms0:/PSP/GAME/EBOOT.PBP");
 	CHECK(NormalizePspPath("ms0:/PSP/GAME", "../../../x") == "ms0:/x");
-	CHECK(NormalizePspPath("ms0:/PSP/GAME", "/SAVEDATA") == "ms0:/SAVEDATA");
+	CHECK(NormalizePspPath("ms0:/PSP/GAME", "/SAVEDATA") == "ms0:/PSP/GAME/SAVEDATA");  // no device: relative
 	CHECK(NormalizePspPath("ms0:/PSP/GAME", "host0:/a/./b") == "host0:/a/b");
 	CHECK(NormalizePspPath("ms0:/PSP/GAME", "") == "ms0:/PSP/GAME");
 	CHECK(NormalizePspPath("ms0:/PSP", ".\\GAME\\") == "ms0:/PSP/GAME");
@@ -283,11 +284,11 @@ TEST(fs_host_listing) {
 		CHECK_EQ(e->d_stat.st_attr, 16u);
 		CHECK_EQ(e->d_stat.st_mode, (s32)0x11FF);
 	}
-	// The root has no "." or "..".
+	// The root lists "." and ".." too.
 	std::vector<std::string> top = Names(List(fs, "/"));
 	std::sort(top.begin(), top.end());
-	CHECK(top == std::vector<std::string>({"FOLDER", "TOP.DAT"}));
-	CHECK(Names(List(fs, "")).size() == 2);
+	CHECK(top == std::vector<std::string>({".", "..", "FOLDER", "TOP.DAT"}));
+	CHECK(Names(List(fs, "")).size() == 4);
 	CHECK(Names(List(fs, "/FOLDER/SUBFOLDER")) == std::vector<std::string>({".", "..", "SUBTEXT.TXT"}));
 	CHECK_EQ(fs.DOpen("/top.dat"), SCE_ERRNO_ENOTDIR);
 	CHECK_EQ(fs.DOpen("/FakeDir"), SCE_ERRNO_ENOENT);
@@ -396,4 +397,29 @@ TEST(fs_host_readonly_and_host0) {
 	CHECK_EQ(host.Rename("/kd/a.prx", "/other/b.prx"), 0);
 	CHECK(sfs::exists(root / "other" / "b.prx"));
 	CHECK_EQ(host.Rename("/other/b.prx", "/nodir/b.prx"), SCE_ERRNO_ENOENT);
+}
+
+TEST(fs_fat_short_names) {
+	// Hardware values from pspautotests io/shortname, in creation order.
+	std::vector<std::string> names = {".", "..", "readme.txt", "UPPER.TXT", "MiXeD.txt", "LongFileName.txt", "LongFileName2.txt",
+		"LongFileNameThree.txt", "a.b.c.txt", "noextensionhere", "shrt", "sp ace.txt", "+plus[brack].txt", ".hidden",
+		"toolongextension.mpeg", "LongDirectoryName"};
+	std::vector<std::string> want = {".", "..", "README~1.TXT", "UPPER.TXT", "MIXED~1.TXT", "LONGFI~1.TXT", "LONGFI~2.TXT",
+		"LONGFI~3.TXT", "ABC~1.TXT", "NOEXTE~1", "SHRT", "SPACE~1.TXT", "_PLUS_~1.TXT", "HIDDEN~1", "TOOLON~1.MPE", "LONGDI~1"};
+	CHECK(GenerateFatShortNames(names) == want);
+
+	// Files open by their short name on a FAT volume.
+	fstest::TempDir tmp("short");
+	const sfs::path root = tmp.Path() / "ms0";
+	sfs::create_directories(root / "dir");
+	WriteHost(root / "dir" / "LongFileName.txt", "1");
+	WriteHost(root / "dir" / "LongFileName2.txt", "2");
+	HostFileSystem fs(root);
+	char c = 0;
+	s32 fd = fs.Open("/dir/longfi~2.txt", PSP_O_RDONLY, 0);
+	CHECK(fd > 0);
+	CHECK_EQ(fs.Read(fd, &c, 1), (s64)1);
+	CHECK_EQ(c, '2');
+	fs.Close(fd);
+	CHECK_EQ(fs.Open("/dir/NOSUCH~1.TXT", PSP_O_RDONLY, 0), SCE_ERRNO_ENOENT);
 }

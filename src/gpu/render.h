@@ -94,7 +94,11 @@ struct TexLevel {
 	bool bounded;      // reads must be checked against validBytes
 };
 
+struct SamplerState;
+typedef u32 (*TexSampleFn)(const SamplerState &ss, float s, float t, int level, int levelFrac, bool linear);
+
 struct SamplerState {
+	TexSampleFn sample;
 	u8 texfmt;
 	u8 clutfmt;
 	bool clampS, clampT;

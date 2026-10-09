@@ -47,6 +47,14 @@ void PatchImportStubToGuest(u32 stubAddr, const std::string &library, u32 nid, u
 
 void Syscall(Ctx *c, u32 insn, u32 pc);
 
+// Registers `aliasNid` in `library` as another name for `targetNid` (if the target exists and the
+// alias doesn't). Used for the M33 kernel NID resolver.
+bool AddAlias(const std::string &library, u32 aliasNid, u32 targetNid);
+// Allocates a callable guest stub ("jr ra; syscall") for a native function. 0 if unknown.
+u32 MakeGuestStub(const std::string &library, u32 nid);
+// Makes the syscall behind `stubAddr` call guest code at `target` instead (sctrlHENPatchSyscall).
+bool RedirectStubToGuest(u32 stubAddr, u32 target);
+
 // Name database (data/nids.csv) used for logging unimplemented functions.
 void LoadNidDatabase(const std::filesystem::path &csv);
 std::string NidName(const std::string &library, u32 nid);
