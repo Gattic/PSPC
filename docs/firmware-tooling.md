@@ -1,0 +1,226 @@
+# Firmware analysis tooling
+
+How to run PSPC's firmware extraction, inventory, NID and decompilation tools.
+All of them are our own code (GPL-2.0-or-later) and take input paths as
+arguments. Outputs that are derived from copyrighted firmware go under
+`private/` (gitignored); `data/` and `docs/` hold only facts and our words.
+
+Prerequisites:
+- Python 3.12 at `C:\Users\yoelr\AppData\Local\Programs\Python\Python312\python.exe`.
+  **Always run with `-I`** (isolated: ignores `PYTHONPATH`/user site, so a
+  planted module next to an untrusted input cannot be imported). All tools are
+  stdlib-only.
+- Ghidra 12.1.3 at `C:\Users\yoelr\Tools\ghidra_12.1.3_PUBLIC` with the
+  `ghidra-allegrex` extension already unpacked under
+  `Ghidra/Extensions/ghidra-allegrex`.
+- JDK 21 at `C:\Program Files\Eclipse Adoptium\jdk-21*` (an older JDK 8 is also
+  present; the scripts pick jdk-21 explicitly).
+- MSVC + CMake for building pspdecompiler.
+
+Shorthand below: `PY` = the Python path above.
+
+---
+
+## 1. Extract the M33 modules -- `tools/m33extract.py`
+
+Unpacks the modules embedded in the M33 installer's `DATA.PSP`.
+
+```
+PY -I tools/m33extract.py reference/401M33/UPDATE/EBOOT.PBP -o private/fw/401/m33
+```
+
+Produces under `private/fw/401/m33/`:
+- 11 plain PRX files named by their flash0 destinations
+  (`systemctrl.prx`, `systemctrl_02g.prx`, `vshctrl.prx`, `usbdevice.prx`,
+  `satelite.prx`, `recovery.prx`, `popcorn.prx`, `march33.prx`,
+  `idcanager.prx`, `galaxy.prx`, `ipl_update.prx`). Destination names are not
+  guessed -- they come from the `{path, data, size}` write tables and write
+  call sites inside the installer's own `uranium235` ELF.
+- `installer/` -- the installer's own plain ELFs (`u235.prx`, the two
+  `plutonium_updater` stages `data.psp.prx`/`pupd_data.psp.prx`,
+  `plutonium_driver.prx`, `degeneration_driver.prx`, `dl_data.psp.prx`) and the
+  nested `PUPD.PBP` / `DL.PBP`.
+- the `pspbtcnf*.bin` boot configs, `es_recovery.txt`, and `payloads/`
+  (gzip blobs embedded inside systemctrl, e.g. its reboot patch code).
+- `manifest.json` -- name, module name, attributes, size, sha1, source offset,
+  M33 tag and the evidence used to name each file.
+
+## 2. Inventory -- `tools/fwinventory.py`
+
+Parses ELF/PRX (and `~PSP`, PBP, `pspbtcnf`) files: ELF/program/section
+headers, PSP module info (from `.rodata.sceModuleInfo` or, for a PRX with no
+section headers, `phdr[0].p_paddr`), exports (`.lib.ent`) and imports
+(`.lib.stub`) with NIDs, type-A relocation sections (`SHT 0x700000A0`) and
+type-B relocations (program header type `0x700000A1`) with a type histogram,
+and sha1. NIDs are named from `data/nids.csv` when present.
+
+```
+PY -I tools/fwinventory.py private/fw/401/m33 -o private/fw/401/inventory.json
+```
+
+Writes `inventory.json`, `inventory.md` (a readable summary with an
+imports-by-NID table) and `imports.dot` (a Graphviz dependency graph:
+`module -> providing module`, or `module -> external library` when the
+provider is outside the set). Render with
+`dot -Tsvg private/fw/401/imports.dot -o imports.svg` if Graphviz is installed.
+Pass `--relocs` to include every relocation entry in the JSON.
+
+## 3. NID database -- `tools/nidgen.py`
+
+Harvests library/NID/name triples from `reference/pspsdk` (`.S` stubs),
+`reference/ppsspp` (HLE tables + `RegisterHLEModule`), `reference/uofw`
+(`exports.exp`) and the M33 SDK stub archives, dedupes (preferring
+hash-verified names), and writes `data/nids.csv`
+(`library,nid,name,source,hash_ok`) and `data/nids_by_library.json`.
+
+```
+PY -I tools/nidgen.py --pspsdk reference/pspsdk --ppsspp reference/ppsspp \
+   --uofw reference/uofw --m33 reference/401M33 \
+   -o data/nids.csv --json data/nids_by_library.json
+```
+
+`hash_ok=1` means the first 4 bytes of SHA-1(name), little-endian, equal the
+NID (true for user-mode NIDs; many kernel NIDs are randomised). Current output:
+5463 rows across 192 libraries, 60.5% hash-verified.
+
+## 4. M33 NID resolver table -- `tools/extract_m33_nid_resolver.py`
+
+Extracts systemctrl's old->new kernel NID translation tables (facts) to
+`data/m33_nid_resolver.csv` (`library,old_nid,new_nid`).
+
+```
+PY -I tools/extract_m33_nid_resolver.py private/fw/401/m33/systemctrl.prx \
+   -o data/m33_nid_resolver.csv
+```
+
+996 pairs across 26 kernel libraries. (Running it on `systemctrl_02g.prx`
+yields the same set.)
+
+## 5. pspdecompiler (cross-check decompiler)
+
+Humberto Naves' PRX decompiler (AFL-2.0), built **out-of-tree** so its
+GPL-incompatible code is never linked into PSPC. Nothing in `reference/` is
+modified; all Windows fixes live under `tools/pspdecompiler/compat/`.
+
+```
+cmd /c tools\build_pspdecompiler.cmd          REM Release, x64, static CRT
+```
+
+Output: `build\tools\pspdecompiler\pspdecompiler.exe`. Useful options:
+`-vi` module info (needs `-v`; `-vvi` adds relocations), `-c` writes
+`<name>.c`/`.h` to the current directory, `-g` writes per-subroutine `.dot`
+graphs, `-n <psplibdoc.xml>` applies NID names.
+
+### psplibdoc XML -- `tools/nids_to_psplibdoc.py`
+
+Converts `data/nids.csv` into the XML `pspdecompiler -n` reads (also usable by
+prxtool and Ghidra importers).
+
+```
+PY -I tools/nids_to_psplibdoc.py data/nids.csv -o data/psplibdoc.xml
+```
+
+The writer follows the parser's strict rules (lowercase `0x` NIDs, one-line
+names with no whitespace/entities, library `<NAME>` before its functions, one
+entry per (library,nid), `<NUMARGS>-1</NUMARGS>` for unknown arg counts).
+Validate on a few modules (outputs under `private/fw/401/pspdecompiler/`):
+
+```
+build\tools\pspdecompiler\pspdecompiler.exe -vi -n data/psplibdoc.xml \
+   private\fw\401\m33\systemctrl.prx
+build\tools\pspdecompiler\pspdecompiler.exe -vi -n data/psplibdoc.xml \
+   reference\401M33\SDK\samples\bootload\bootload.prx
+```
+
+## 6. Ghidra headless pipeline -- `tools/ghidra_analyze.cmd`
+
+Imports each module into a Ghidra project under `private/ghidra/` with the
+Allegrex loader/language, names imports and exports from `data/nids.csv`
+(`PspcApplyNids.java`, pre-analysis), runs auto-analysis, and exports
+`private/fw/401/analysis/<module>.json` (function boundaries, call graph, jump
+tables, string refs, code pointers) and `private/fw/401/decomp/<module>.c`
+(decompiled C) via `PspcExportAnalysis.java`.
+
+```
+cmd /c tools\ghidra_analyze.cmd private\fw\401\m33
+```
+
+Details:
+- Kernel modules (attribute `0x1000`) load at image base `0x88000000`, all
+  others at `0x08804000`; modules sharing a project folder and base are
+  imported in one `analyzeHeadless` run. Logs go to `private/ghidra/logs/`.
+- The wrapper picks the newest `jdk-21*` (or `%PSPC_JAVA_HOME%`) and sets
+  `JAVA_HOME` before calling `analyzeHeadless.bat`. Override Ghidra with
+  `%GHIDRA_INSTALL_DIR%`.
+- Options (pass through to `tools/ghidra/ghidra_analyze.py`): `--no-decomp`,
+  `--timeout <s>`, `--max-cpu <n>`, `--folder <name>`, `--out <dir>`,
+  `--raw-base <addr>` to import a raw code blob (e.g. a systemctrl reboot
+  payload at `0x88FC0000`) with the BinaryLoader.
+- The JSON schema is documented in `docs/analysis-json.md`; the recompiler
+  consumes it as function-boundary hints.
+- The `ghidra-allegrex` loader has a "Use reboot.bin Type B Relocation
+  Mapping" import option (command line `-psp-useRebootBinTypeBRelocationMapping`)
+  needed only for `sysmem.prx`/`loadcore.prx`, which are relocated by the PSP's
+  reboot code. Headless cannot set loader options, so those two must be
+  imported through the Ghidra GUI with that checkbox; every other module
+  (all M33 modules and all normal game modules) needs no special handling.
+
+---
+
+## 7. When the official Sony 4.01 update arrives
+
+The M33 installer only carries the 11 M33 patch modules; the ~100 Sony modules
+(kernel, drivers, codecs, XMB, fonts, resources) come from Sony's 4.01 update,
+which the user must supply as `401.PBP`. A separate agent is building
+`tools/pspc-decrypt`. Once it exists:
+
+```
+pspc-decrypt psar 401.PBP private\fw\401\flash0
+```
+
+is expected to unpack the PSAR and KIRK-decrypt every module and resource into
+`private/fw/401/flash0/` (mirroring the on-device `flash0:` layout:
+`kd/*.prx`, `vsh/module/*.prx`, `font/*.pgf`, `vsh/resource/*.rco`, `data/*`).
+
+Then this pipeline runs on that tree unchanged:
+
+```
+REM inventory every decrypted module + the M33 modules together
+PY -I tools/fwinventory.py private\fw\401\flash0 private\fw\401\m33 ^
+   -o private\fw\401\inventory.json
+
+REM Ghidra-analyse the kernel + driver modules (kernel ones auto-base 0x88000000)
+cmd /c tools\ghidra_analyze.cmd private\fw\401\flash0\kd
+
+REM and the VSH/user modules (auto-base 0x08804000)
+cmd /c tools\ghidra_analyze.cmd private\fw\401\flash0\vsh\module
+```
+
+Notes for that run:
+- `fwinventory.py` over both trees gives a complete dependency graph: M33
+  modules' imports then resolve to the Sony modules that provide them instead
+  of showing as external.
+- Re-run `tools/nidgen.py` is not needed, but the inventory and Ghidra naming
+  improve automatically as more Sony NIDs land in `data/nids.csv`.
+- `sysmem.prx` and `loadcore.prx` need the GUI import with the reboot type-B
+  relocation option (see 6); script the rest headless.
+- The `pspbtcnf*.bin` files already extracted (and the decrypted
+  `flash0:/kd/pspbtcnf.bin`) list the Sony module load order and modes; feed
+  them to `fwinventory.py` to read the mode/module tables.
+
+## 8. One-shot: everything from the installer
+
+From the repo root, with the toolchain in place:
+
+```
+PY -I tools/m33extract.py reference/401M33/UPDATE/EBOOT.PBP -o private/fw/401/m33
+PY -I tools/nidgen.py --pspsdk reference/pspsdk --ppsspp reference/ppsspp ^
+   --uofw reference/uofw --m33 reference/401M33 ^
+   -o data/nids.csv --json data/nids_by_library.json
+PY -I tools/extract_m33_nid_resolver.py private/fw/401/m33/systemctrl.prx ^
+   -o data/m33_nid_resolver.csv
+PY -I tools/nids_to_psplibdoc.py data/nids.csv -o data/psplibdoc.xml
+PY -I tools/fwinventory.py private/fw/401/m33 -o private/fw/401/inventory.json
+cmd /c tools\build_pspdecompiler.cmd
+cmd /c tools\ghidra_analyze.cmd private\fw\401\m33
+```

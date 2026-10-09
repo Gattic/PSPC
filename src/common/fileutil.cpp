@@ -63,3 +63,8 @@ fs::path ExecutableDir() {
 	return fs::current_path();
 #endif
 }
+
+std::string PathToUtf8(const fs::path &p) {
+	std::u8string s = p.u8string();
+	return std::string(s.begin(), s.end());
+}

@@ -1,0 +1,20 @@
+libkirk - KIRK (PSP crypto engine) algorithms and keys
+=======================================================
+
+These files are copied unmodified from PPSSPP's ext/libkirk
+(https://github.com/hrydgard/ppsspp/tree/master/ext/libkirk), which in turn is
+the "Kirk Engine" by Draan, with help from coyotebean, Davee, hitchhikr, kgsws,
+liquidzigong, Mathieulh, Proxima and SilverSpring, plus amctrl.c by tpu.
+
+Licensing of the individual files:
+
+  kirk_engine.c/.h, kirk_common.h  GPL-3.0-or-later (see the header of kirk_engine.c)
+  bn.c, ec.c                       GPL-2.0 or GPL-3.0 (Segher Boessenkool)
+  AES.c/.h                         public domain (rijndael-alg-fst.c, OpenBSD rijndael.c)
+  SHA1.c/.h                        public domain (David Ireland / A.M. Kuchling / Peter Gutmann)
+  amctrl.c/.h                      reverse engineering of amctrl.prx by tpu, distributed with
+                                   the GPL-3.0-or-later Kirk Engine
+
+Because kirk_engine.c is GPL-3.0-or-later, everything that links these files
+(pspc-decrypt and its tests) is distributed under GPL-3.0-or-later. See ../COPYING.
+Nothing under PSPC's src/ may link or include these files.

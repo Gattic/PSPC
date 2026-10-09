@@ -24,3 +24,6 @@
 .vscode/
 __pycache__/
 *.pyc
+
+# Downloaded third-party binaries (fetched by tools/fetch_deps.ps1)
+/third_party/
