@@ -24,12 +24,17 @@ namespace mediahle {
 
 namespace {
 
-// The name isn't known; it's what an unsupported chroma subsampling (or greyscale) returns.
+// The names aren't known. An unsupported chroma subsampling (or greyscale) returns the first; the
+// second is sceJpegDecodeMJpegYCbCrSuccessively's answer to an unusable output buffer.
 constexpr u32 SCE_JPEG_ERROR_UNSUPPORTED_SAMPLING = 0x80650016;
+constexpr u32 SCE_JPEG_ERROR_INVALID_OUTPUT = 0x80650010;
 
 int g_mjpegInited = 0;
 int g_mjpegWidth = 0;
 int g_mjpegHeight = 0;
+// Init and Finish wait for the Media Engine, except straight after a colour conversion
+// (jpeg/csc, jpeg/mjpegcsc, jpeg/init, jpeg/finish all fit this).
+bool g_cscSinceInitFinish = false;
 
 u32 Delay(u32 result, int us) { return audiohle::DelayResult(result, us); }
 
@@ -46,6 +51,18 @@ u32 convertYCbCrToABGR(int y, int cb, int cr) {
 	g = std::min(255, std::max(0, g));
 	b = std::min(255, std::max(0, b));
 	return (u32)((b << 16) | (g << 8) | (r << 0));
+}
+
+// sceJpegCsc: JFIF (full range BT.601), rounded (jpeg/csc "Bits").
+u32 JfifYCbCrToABGR(int y, int cb, int cr) {
+	const int d = cb - 128, e = cr - 128;
+	int r = y + ((91881 * e + 32768) >> 16);
+	int g = y + ((-22554 * d - 46802 * e + 32768) >> 16);
+	int b = y + ((116130 * d + 32768) >> 16);
+	r = std::min(255, std::max(0, r));
+	g = std::min(255, std::max(0, g));
+	b = std::min(255, std::max(0, b));
+	return (u32)((b << 16) | (g << 8) | r);
 }
 
 int JpegCsc(u32 imageAddr, u32 yCbCrAddr, int widthHeight, int bufferWidth, u32 chroma, int &usec) {
@@ -84,10 +101,10 @@ int JpegCsc(u32 imageAddr, u32 yCbCrAddr, int widthHeight, int bufferWidth, u32 
 				const u8 y3 = Y[width * (y + 1) + x + 1];
 				const u8 cb = Cb[(width >> widthShift) * (y >> heightShift) + (x >> widthShift)];
 				const u8 cr = Cr[(width >> widthShift) * (y >> heightShift) + (x >> widthShift)];
-				imageBuffer[bufferWidth * y + x] = convertYCbCrToABGR(y0, cb, cr);
-				imageBuffer[bufferWidth * y + x + 1] = convertYCbCrToABGR(y1, cb, cr);
-				imageBuffer[bufferWidth * (y + 1) + x] = convertYCbCrToABGR(y2, cb, cr);
-				imageBuffer[bufferWidth * (y + 1) + x + 1] = convertYCbCrToABGR(y3, cb, cr);
+				imageBuffer[bufferWidth * y + x] = JfifYCbCrToABGR(y0, cb, cr);
+				imageBuffer[bufferWidth * y + x + 1] = JfifYCbCrToABGR(y1, cb, cr);
+				imageBuffer[bufferWidth * (y + 1) + x] = JfifYCbCrToABGR(y2, cb, cr);
+				imageBuffer[bufferWidth * (y + 1) + x + 1] = JfifYCbCrToABGR(y3, cb, cr);
 			}
 		}
 	} else {
@@ -96,7 +113,7 @@ int JpegCsc(u32 imageAddr, u32 yCbCrAddr, int widthHeight, int bufferWidth, u32 
 				const u8 yy = Y[width * y + x];
 				const u8 cb = Cb[(width >> widthShift) * (y >> heightShift) + (x >> widthShift)];
 				const u8 cr = Cr[(width >> widthShift) * (y >> heightShift) + (x >> widthShift)];
-				imageBuffer[bufferWidth * y + x] = convertYCbCrToABGR(yy, cb, cr);
+				imageBuffer[bufferWidth * y + x] = JfifYCbCrToABGR(yy, cb, cr);
 			}
 		}
 	}
@@ -162,6 +179,7 @@ int sceJpegMJpegCsc(u32 imageAddr, u32 yCbCrAddr, int widthHeight, int bufferWid
 	if (g_mjpegInited == 0) return (int)0x80000001;
 	int usec = 0;
 	const int result = JpegMJpegCsc(imageAddr, yCbCrAddr, widthHeight, bufferWidth, usec);
+	if (result >= 0) g_cscSinceInitFinish = true;
 	if (usec != 0) return (int)Delay((u32)result, usec);
 	return result;
 }
@@ -229,6 +247,7 @@ int sceJpegDecodeMJpegSuccessively(u32 jpegAddr, int jpegSize, u32 imageAddr, in
 int sceJpegCsc(u32 imageAddr, u32 yCbCrAddr, int widthHeight, int bufferWidth, int colourInfo) {
 	int usec = 0;
 	const int result = JpegCsc(imageAddr, yCbCrAddr, widthHeight, bufferWidth, (u32)colourInfo, usec);
+	if (result >= 0) g_cscSinceInitFinish = true;
 	if (usec != 0) return (int)Delay((u32)result, usec);
 	return result;
 }
@@ -325,8 +344,17 @@ int sceJpegDecodeMJpegYCbCrSuccessively(u32 jpegAddr, int jpegSize, u32 yCbCrAdd
 	(void)dhtMode;
 	if ((jpegAddr | (u32)jpegSize | (jpegAddr + (u32)jpegSize)) & 0x80000000) return (int)SCE_KERNEL_ERROR_PRIV_REQUIRED;
 	if ((yCbCrAddr | (u32)yCbCrSize | (yCbCrAddr + (u32)yCbCrSize)) & 0x80000000) return (int)SCE_KERNEL_ERROR_PRIV_REQUIRED;
-	// The same as sceJpegDecodeMJpegYCbCr() but in smaller blocks.
+	// The same as sceJpegDecodeMJpegYCbCr() but in smaller blocks, and an output it can't write
+	// to is an error (jpeg/decodeycbcrs).
 	int usec = 300;
+	if (mem::IsValidRange(jpegAddr, (u32)jpegSize) && jpegSize >= 2 && !mem::IsValidAddress(yCbCrAddr)) {
+		int width = 0, height = 0;
+		std::vector<u8> rgb;
+		const int err = DecodeToRgb(jpegAddr, jpegSize, &width, &height, &rgb);
+		if (err != 0) return (int)Delay((u32)err, usec);
+		if (yCbCrSize < getYCbCrBufferSize(width, height)) return (int)Delay(SCE_JPEG_ERROR_OUT_OF_MEMORY, usec);
+		return (int)Delay(SCE_JPEG_ERROR_INVALID_OUTPUT, usec);
+	}
 	const int result = JpegDecodeMJpegYCbCr(jpegAddr, jpegSize, yCbCrAddr, yCbCrSize, usec);
 	return (int)Delay((u32)result, usec);
 }
@@ -351,14 +379,18 @@ int sceJpegDeleteMJpeg() {
 int sceJpegInitMJpeg() {
 	if (g_mjpegInited == 1 || g_mjpegInited == 2) return (int)SCE_JPEG_ERROR_ALREADY_INIT;
 	g_mjpegInited = 1;
-	return (int)Delay(0, 130);
+	const bool wait = !g_cscSinceInitFinish;
+	g_cscSinceInitFinish = false;
+	return wait ? (int)Delay(0, 130) : 0;
 }
 
 int sceJpegFinishMJpeg() {
 	if (g_mjpegInited == 0) return (int)SCE_JPEG_ERROR_INVALID_STATE;
 	if (g_mjpegInited == 2) return (int)SCE_JPEG_ERROR_INVALID_STATE;
 	g_mjpegInited = 0;
-	return (int)Delay(0, 120);
+	const bool wait = !g_cscSinceInitFinish;
+	g_cscSinceInitFinish = false;
+	return wait ? (int)Delay(0, 120) : 0;
 }
 
 int sceJpegUnimplemented() {

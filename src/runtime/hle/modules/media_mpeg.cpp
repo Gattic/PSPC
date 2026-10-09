@@ -187,6 +187,8 @@ struct MpegContext {
 	std::map<u32, StreamInfo> streamMap;
 	std::map<u32, bool> streamIgnoreMap;
 	std::unique_ptr<MediaEngine> mediaengine;
+	u32 handle = 0;
+	int registeredStreams = 0;
 };
 
 bool g_isMpegInit = false;
@@ -371,6 +373,7 @@ u32 sceMpegCreate(u32 mpegAddr, u32 dataPtr, u32 size, u32 ringbufferAddr, u32 f
 	g_mpegCtxs[mpegHandle] = ctx;
 
 	ctx->mpegRingbufferAddr = ringbufferAddr;
+	ctx->handle = mpegHandle;
 	ctx->videoPixelMode = GE_CMODE_32BIT_ABGR8888;
 	ctx->defaultFrameWidth = frameWidth;
 	// Detailed "analysis" is done later in Query* for some reason.
@@ -457,7 +460,10 @@ int sceMpegRegistStream(u32 mpeg, u32 streamType, u32 streamNum) {
 	case MPEG_DATA_STREAM: ctx->dataRegistered = true; break;
 	default: LOGD("MPEG", "sceMpegRegistStream(%i): unknown stream type", streamType); break;
 	}
-	const u32 sid = g_streamIdGen++;
+	// On hardware the id is the address of the stream's slot in the mpeg data, 0x440 bytes each
+	// from 0x12C0 past the handle (video/mpeg/basic).
+	u32 sid = ctx->handle + 0x12C0 + 0x440 * (u32)ctx->registeredStreams++;
+	if (!ctx->handle || ctx->streamMap.count(sid)) sid = g_streamIdGen++;
 	StreamInfo info;
 	info.type = (int)streamType;
 	info.num = (int)streamNum;

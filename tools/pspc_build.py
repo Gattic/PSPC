@@ -7,10 +7,14 @@ Usage: pspc_build.py [options] <module.prx|.elf|EBOOT.PBP> [...]
 For each input the plain ELF is located (PBP: DATA.PSP; encrypted ~PSP files go through
 pspc-decrypt), recompiled with pspc-recomp, compiled with clang-cl (or cl) into <sha1>.dll and
 copied into the AOT cache that pspc.exe searches (default: <pspc dir>/cache/aot).
+
+The cache's games.json records, per input (disc image, PBP or module file), the modules it was
+built from and their SHA-1s, so the launcher can tell which games have native code.
 """
 import argparse
 import concurrent.futures
 import hashlib
+import json
 import os
 import pathlib
 import shutil
@@ -19,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 BIN = ROOT / 'build' / 'RelWithDebInfo' / 'bin'
@@ -28,6 +33,7 @@ LINK_LIBS = ('pspc_sem.lib', 'pspc_common.lib')
 
 _seen_lock = threading.Lock()
 _seen = set()
+_module_sha = {}  # module path -> SHA-1 of its plain ELF (for games.json)
 
 
 def source_sem_version():
@@ -106,12 +112,15 @@ def plain_elf(path, work, decrypt_tool):
 DISC_EXTS = {'.iso', '.cso', '.zso', '.dax'}
 
 
-def expand_inputs(args, paths):
-    """UMD images contribute every executable on the disc (EBOOT.BIN, BOOT.BIN, *.PRX)."""
+def expand_inputs(args, paths, origins=None):
+    """UMD images contribute every executable on the disc (EBOOT.BIN, BOOT.BIN, *.PRX).
+    `origins` (if given) maps each module path to (input path, name of the module in it)."""
     out = []
     for p in paths:
         if p.suffix.lower() not in DISC_EXTS:
             out.append(p)
+            if origins is not None:
+                origins[p] = (p, p.name)
             continue
         dest = pathlib.Path(args.work) / ('disc_' + hashlib.sha1(str(p.resolve()).encode()).hexdigest()[:12])
         dest.mkdir(parents=True, exist_ok=True)
@@ -121,8 +130,89 @@ def expand_inputs(args, paths):
             raise RuntimeError('pspc-iso failed on %s: %s' % (p, r.stderr.strip()))
         for line in r.stdout.splitlines():
             if '\t' in line:
-                out.append(pathlib.Path(line.split('\t', 1)[1]))
+                name, extracted = line.split('\t', 1)
+                out.append(pathlib.Path(extracted))
+                if origins is not None:
+                    origins[out[-1]] = (p, name)
     return out
+
+
+def parse_sfo(data):
+    """PARAM.SFO -> {key: string value} (string entries only)."""
+    if data[:4] != b'\0PSF' or len(data) < 20:
+        return {}
+    key_table, data_table, count = struct.unpack_from('<III', data, 8)
+    out = {}
+    for i in range(count):
+        if 20 + 16 * (i + 1) > len(data):
+            break
+        key_off, fmt, length, _, data_off = struct.unpack_from('<HHIII', data, 20 + 16 * i)
+        start = key_table + key_off
+        end = data.find(b'\0', start)
+        if fmt == 0x0204 and end > start:
+            raw = data[data_table + data_off:data_table + data_off + length]
+            out[data[start:end].decode('ascii', 'replace')] = raw.split(b'\0')[0].decode('utf-8', 'replace')
+    return out
+
+
+def game_info(path):
+    """DISC_ID and TITLE of a disc image or PBP ({} for anything else or on error)."""
+    sfo = b''
+    try:
+        if path.suffix.lower() in DISC_EXTS:
+            with tempfile.TemporaryDirectory() as tmp:
+                out = pathlib.Path(tmp) / 'PARAM.SFO'
+                subprocess.run([str(BIN / 'pspc-iso.exe'), 'get', str(path), '/PSP_GAME/PARAM.SFO', str(out)],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if out.exists():
+                    sfo = out.read_bytes()
+        else:
+            with open(path, 'rb') as f:
+                head = f.read(40)
+                if head[:4] == b'\0PBP':
+                    offs = struct.unpack_from('<8I', head, 8)
+                    f.seek(offs[0])
+                    sfo = f.read(max(0, offs[1] - offs[0]))
+    except OSError:
+        pass
+    sfo = parse_sfo(sfo)
+    return {k.lower(): sfo[k] for k in ('DISC_ID', 'TITLE') if sfo.get(k)}
+
+
+def write_index(cache, origins, ok):
+    """Records in <cache>/games.json which modules each input was built from:
+    {"version": 1, "games": {"<input path>": {"disc_id", "title", "size", "built",
+    "modules": [{"name", "sha1", "ok"}]}}}. Entries of other inputs are kept."""
+    games = {}
+    for module, (game, name) in origins.items():
+        games.setdefault(game, []).append({'name': name, 'sha1': _module_sha.get(module), 'ok': ok.get(module, False)})
+    index = pathlib.Path(cache) / 'games.json'
+    try:
+        data = json.loads(index.read_text(encoding='utf-8'))
+        if not isinstance(data, dict) or data.get('version') != 1 or not isinstance(data.get('games'), dict):
+            raise ValueError
+    except (OSError, ValueError):
+        data = {'version': 1, 'games': {}}
+    for game, modules in games.items():
+        try:
+            size = game.stat().st_size
+        except OSError:
+            continue
+        entry = {'size': size, 'built': time.strftime('%Y-%m-%dT%H:%M:%S'),
+                 'modules': sorted(modules, key=lambda m: m['name'])}
+        entry.update(game_info(game))
+        data['games'][str(game.resolve())] = entry
+    index.parent.mkdir(parents=True, exist_ok=True)
+    tmp = index.with_name('games.json.%d.tmp' % os.getpid())
+    tmp.write_text(json.dumps(data, indent=1, ensure_ascii=False, sort_keys=True) + '\n', encoding='utf-8')
+    for attempt in range(20):
+        try:
+            os.replace(tmp, index)
+            return
+        except PermissionError:  # a reader has it open
+            time.sleep(0.1)
+    tmp.unlink(missing_ok=True)
+    print('warning: could not update %s' % index)
 
 
 # Must match the CMakeLists.txt pspc-recomp writes (used with --cmake).
@@ -187,6 +277,7 @@ def build_one(args, env, path):
     elf = plain_elf(path, work, pathlib.Path(args.decrypt))
     sha = hashlib.sha1(elf).hexdigest()
     with _seen_lock:
+        _module_sha[path] = sha
         if sha in _seen:
             return '%s: same module as another input (%s)' % (path.name, sha)
         _seen.add(sha)

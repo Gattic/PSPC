@@ -31,6 +31,13 @@ struct Options {
 	std::string decryptCacheDir;
 	u32 firmwareVersion = 0x06060010;
 	int windowScale = 2;
+	// Window, audio and input (pspc.ini; see common/settings.h and host::Config).
+	bool fullscreen = false;
+	bool vsync = true;
+	int volume = 100;  // 0-100 (0 = muted)
+	std::vector<std::string> keyBindings, padBindings;  // per settings::kControls; empty = defaults
+	std::string padStick = "left";
+	std::string screenshotDir;  // F12 (default: <exe>/screenshots)
 	bool hasDisplayForTests = false;
 	std::string dumpFramesDir;  // write the displayed frame as BMP here every dumpEvery VBlanks
 	int dumpEvery = 60;

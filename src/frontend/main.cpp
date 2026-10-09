@@ -12,6 +12,7 @@
 
 #include "common/fileutil.h"
 #include "common/log.h"
+#include "common/settings.h"
 #include "runtime/runtime.h"
 
 // "<vblank>:<BUTTON[+BUTTON...]>[:<frames>]", e.g. "600:START" or "900:CROSS+UP:4".
@@ -65,6 +66,8 @@ static void Usage() {
 	        "  --umd <image>        insert a disc image while running a .prx/.elf/.pbp\n"
 	        "  --fw <ver>           firmware version reported to games, e.g. 6.60 or 4.01\n"
 	        "  --scale <n>          window scale (default 2)\n"
+	        "  --config <file>      settings file (default: <exe>/pspc.ini; \"none\": built-in defaults)\n"
+	        "  --set <key>=<value>  override one setting of that file, e.g. --set fullscreen=1\n"
 	        "  --log <level>        trace|debug|info|warn|error (default info)\n"
 	        "  --log-file <path>    write the log to a file\n"
 	        "  --test-display       report a display to pspautotests (default: none)\n"
@@ -78,6 +81,34 @@ static u32 ParseFw(const std::string &s) {
 	return ((u32)major << 24) | ((u32)(minor / 10) << 16) | ((u32)(minor % 10) << 8) | 0x10;
 }
 
+// pspc.ini -> options. The command-line options are applied afterwards and override these.
+static void ApplySettings(const settings::Settings &s, runtime::Options &o) {
+	o.windowScale = s.scale;
+	o.fullscreen = s.fullscreen;
+	o.vsync = s.vsync;
+	o.aot = s.aot;
+	o.firmwareVersion = ParseFw(s.fw);
+	o.volume = s.mute ? 0 : s.volume;
+	o.keyBindings = s.keys;
+	o.padBindings = s.pads;
+	o.padStick = s.padStick;
+}
+
+// The effective settings (after command-line overrides), at info level.
+static void LogSettings(const runtime::Options &o) {
+	u32 fw = o.firmwareVersion;
+	LOGI("CONFIG", "scale=%d fullscreen=%d vsync=%d aot=%d fw=%u.%u%u volume=%d", o.windowScale, o.fullscreen,
+	     o.vsync, o.aot, fw >> 24, (fw >> 16) & 0xFF, (fw >> 8) & 0xFF, o.volume);
+	auto quoted = [](const std::string &v) { return v.find(' ') == std::string::npos ? v : "\"" + v + "\""; };
+	std::string keys, pads;
+	for (size_t i = 0; i < settings::kNumControls; i++) {
+		keys += std::string(" ") + settings::kControls[i].name + "=" + quoted(o.keyBindings[i]);
+		pads += std::string(" ") + settings::kControls[i].name + "=" + quoted(o.padBindings[i]);
+	}
+	LOGI("CONFIG", "keys:%s", keys.c_str());
+	LOGI("CONFIG", "pad: stick=%s%s", o.padStick.c_str(), pads.c_str());
+}
+
 int main(int argc, char **argv) {
 	runtime::Options o;
 	fs::path exeDir = ExecutableDir();
@@ -88,8 +119,33 @@ int main(int argc, char **argv) {
 	o.dataDir = (exeDir / "data").string();
 	o.decryptTool = (exeDir / "pspc-decrypt.exe").string();
 	o.decryptCacheDir = (exeDir / "cache" / "decrypted").string();
+	o.screenshotDir = (exeDir / "screenshots").string();
 	LogLevel level = LogLevel::Info;
 	std::string logFile;
+
+	// Settings: pspc.ini (or --config <file>), then --set key=value, then the other options.
+	settings::Settings cfg;
+	std::string cfgPath = PathToUtf8(settings::DefaultPath());
+	bool cfgExplicit = false;
+	std::vector<std::string> cfgSets, cfgWarnings;
+	for (int i = 1; i + 1 < argc; i++) {
+		if (!strcmp(argv[i], "--config")) {
+			cfgPath = argv[++i];
+			cfgExplicit = true;
+		} else if (!strcmp(argv[i], "--set")) {
+			cfgSets.push_back(argv[++i]);
+		}
+	}
+	bool cfgLoaded = cfgPath != "none" && settings::Load(fs::u8path(cfgPath), cfg, &cfgWarnings);
+	for (const std::string &kv : cfgSets) {
+		std::string err = "want <key>=<value>";
+		size_t eq = kv.find('=');
+		if (eq == std::string::npos || !settings::Set(cfg, kv.substr(0, eq), kv.substr(eq + 1), &err)) {
+			fprintf(stderr, "bad --set %s: %s\n", kv.c_str(), err.c_str());
+			return 1;
+		}
+	}
+	ApplySettings(cfg, o);
 
 	for (int i = 1; i < argc; i++) {
 		std::string a = argv[i];
@@ -100,7 +156,8 @@ int main(int argc, char **argv) {
 			}
 			return argv[++i];
 		};
-		if (a == "--headless") o.headless = true;
+		if (a == "--config" || a == "--set") next();  // read above
+		else if (a == "--headless") o.headless = true;
 		else if (a == "--interp") o.aot = false;
 		else if (a == "--aot-dir") o.aotDir = next();
 		else if (a == "--fast-time") o.fastTime = true;
@@ -163,6 +220,11 @@ int main(int argc, char **argv) {
 		}
 	}
 	logging::Init(level, logFile.empty() ? nullptr : logFile.c_str());
+	if (cfgLoaded) LOGI("CONFIG", "Settings from %s", cfgPath.c_str());
+	else if (cfgExplicit && cfgPath != "none") LOGW("CONFIG", "Settings file %s not found; using defaults", cfgPath.c_str());
+	else LOGI("CONFIG", "No settings file (%s); using defaults", cfgPath.c_str());
+	for (const std::string &w : cfgWarnings) LOGW("CONFIG", "%s", w.c_str());
+	LogSettings(o);
 	int rc = runtime::Run(o);
 	std::string next, bootPath, bootArgs;
 	bool m33 = runtime::TakeRelaunch(next);

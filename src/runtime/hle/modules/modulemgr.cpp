@@ -6,6 +6,7 @@
 #include "loader/psp_header.h"
 #include "runtime/boot.h"
 #include "runtime/hle/hle_wrap.h"
+#include "runtime/hle/modules/media_hle.h"
 #include "runtime/hle/modules/modules.h"
 #include "runtime/io/io.h"
 #include "runtime/kernel/callbacks.h"
@@ -61,7 +62,10 @@ SceUID MakePlaceholderModule(const std::string &name, const std::string &path) {
 
 SceUID LoadFromBytes(const std::vector<u8> &data, const std::string &path, u32 optPtr) {
 	std::string name = ModuleNameOf(data);
-	if (!name.empty() && IsNativeModuleName(name)) return MakePlaceholderModule(name, path);
+	if (!name.empty() && IsNativeModuleName(name)) {
+		Media_NotifyNativeModuleLoad(name, data);
+		return MakePlaceholderModule(name, path);
+	}
 	LoadOptions opts;
 	(void)optPtr;
 	return LoadModuleFromMemory(data, path, opts);

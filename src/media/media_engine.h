@@ -61,6 +61,12 @@ public:
 	s64 getLastTimeStamp() const;
 
 	bool IsVideoEnd() const { return m_isVideoEnd; }
+	// The picture stepVideo last returned was the last one: the whole stream has arrived and
+	// nothing is left to decode.
+	bool IsLastFrameDecoded() const { return m_lastFrameDecoded; }
+	// Whether any packet of video stream streamNum / audio channel has arrived so far.
+	bool HasVideoStreamData(int streamNum) const;
+	bool HasAudioStreamData(int channel) const { return channel >= 0 && channel < 16 && (m_seenAudio & (1u << channel)) != 0; }
 	bool IsNoAudioData();
 	bool IsActuallyPlayingAudio() const { return getAudioTimeStamp() >= 0; }
 	int VideoWidth() const { return m_desWidth; }
@@ -82,6 +88,7 @@ private:
 	bool SetupStreams();
 	int getNextAudioFrame(u8 **buf, int *headerCode1, int *headerCode2);
 	bool StreamComplete() const;
+	void NoteStreams(const u8 *data, int size);
 	int VideoStreamIdFor(int streamNum) const;
 
 	int m_bufSize = 0x2000;
@@ -110,6 +117,9 @@ private:
 	// For telling the end of the stream from the ringbuffer running dry.
 	s64 m_streamSize = 0;
 	s64 m_bytesPushed = 0;
+	bool m_lastFrameDecoded = false;
+	u32 m_seenVideo = 0;  // bit n: a packet of stream 0xE0 | n went by
+	u32 m_seenAudio = 0;  // bit n: a private stream 1 packet of channel n went by
 };
 
 }  // namespace media

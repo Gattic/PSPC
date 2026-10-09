@@ -135,6 +135,11 @@ bool MediaEngine::loadStream(const u8 *buffer, int readSize, int ringbufferSize)
 	m_pdata = std::make_unique<BufferQueue>(ringbufferSize + 2048);
 	m_pdata->push(buffer, readSize);
 	m_bytesPushed = readSize;
+	m_lastFrameDecoded = false;
+	m_seenVideo = 0;
+	m_seenAudio = 0;
+	const int headerSize = (int)ReadBE32(buffer + PSMF_STREAM_OFFSET_OFFSET);
+	if (headerSize >= 0 && headerSize < readSize) NoteStreams(buffer + headerSize, readSize - headerSize);
 	m_firstTimeStamp = GetMpegTimeStamp(buffer + PSMF_FIRST_TIMESTAMP_OFFSET);
 	m_lastTimeStamp = GetMpegTimeStamp(buffer + PSMF_LAST_TIMESTAMP_OFFSET);
 	m_streamSize = (s64)ReadBE32(buffer + PSMF_STREAM_SIZE_OFFSET);
@@ -167,6 +172,8 @@ int MediaEngine::addStreamData(const u8 *buffer, int addSize) {
 			size = 0;
 		} else {
 			m_bytesPushed += size;
+			m_lastFrameDecoded = false;
+			NoteStreams(buffer, size);
 		}
 		if (m_demux) m_demux->addStreamData(buffer, addSize);
 		if (!m_contextOpen && m_pdata->getQueueSize() >= 2048) {
@@ -182,6 +189,26 @@ int MediaEngine::addStreamData(const u8 *buffer, int addSize) {
 		m_isVideoEnd = false;
 	}
 	return size;
+}
+
+void MediaEngine::NoteStreams(const u8 *data, int size) {
+	// Packets start right after a pack header, so a plain scan for their start codes is enough.
+	for (int i = 0; i + 4 <= size; i++) {
+		if (data[i] != 0 || data[i + 1] != 0 || data[i + 2] != 1) continue;
+		const u8 code = data[i + 3];
+		if ((code & 0xF0) == 0xE0) {
+			m_seenVideo |= 1u << (code & 0xF);
+		} else if (code == 0xBD && i + 9 <= size) {
+			// MPEG-2 PES header, then the substream (channel) byte.
+			const int at = i + 9 + data[i + 8];
+			if ((data[i + 6] & 0xC0) == 0x80 && at < size) m_seenAudio |= 1u << (data[at] & 0xF);
+		}
+	}
+}
+
+bool MediaEngine::HasVideoStreamData(int streamNum) const {
+	if (streamNum < 0) return false;
+	return (m_seenVideo & (1u << (VideoStreamIdFor(streamNum) & 0xF))) != 0;
 }
 
 bool MediaEngine::StreamComplete() const {
@@ -232,6 +259,9 @@ bool MediaEngine::setAudioStream(int streamNum) {
 
 int MediaEngine::getRemainSize() {
 	if (!m_pdata) return 0;
+	// Until the context opens, the queue holds the PSMF header rather than ringbuffer data: the
+	// ringbuffer is still all free (video/mpeg/basic starts at 512 of 512).
+	if (!m_contextOpen) return std::max(m_pdata->getRemainSize() + std::min(m_pdata->getQueueSize(), 2048) - 2048, 0);
 	return std::max(m_pdata->getRemainSize() - m_decodingsize - 2048, 0);
 }
 
@@ -243,7 +273,7 @@ int MediaEngine::getAudioRemainSize() {
 
 bool MediaEngine::stepVideo(int videoPixelMode, bool skipFrame) {
 	(void)videoPixelMode;
-	if (!m_contextOpen || m_decoderFailed) return false;
+	if (!m_contextOpen) return false;
 
 	YuvFrame frame;
 	bool got = false;
@@ -275,6 +305,14 @@ bool MediaEngine::stepVideo(int videoPixelMode, bool skipFrame) {
 		if (pts < 0) pts = m_lastAuPts >= 0 ? m_lastAuPts + kVideoFrameDuration : m_firstTimeStamp;
 		m_lastAuPts = pts;
 		m_drained = false;
+		if (m_decoderFailed) {
+			// No decoder on this machine: keep time moving (as PPSSPP does without FFmpeg), so
+			// games still reach the end of their movies.
+			frame = YuvFrame();
+			frame.pts = pts;
+			got = true;
+			break;
+		}
 		m_decoder.Decode(au.data.data(), (int)au.data.size(), pts);
 	}
 	if (!got) return false;
@@ -285,11 +323,13 @@ bool MediaEngine::stepVideo(int videoPixelMode, bool skipFrame) {
 		m_videopts += kVideoFrameDuration;
 	}
 	m_lastPts = m_videopts;
-	if (m_desWidth == 0 || m_desHeight == 0 || !skipFrame) {
+	m_lastFrameDecoded = m_pdata && m_pdata->getQueueSize() == 0 && StreamComplete() && m_video.Empty() &&
+	                     m_decoder.PendingFrames() == 0;
+	if (frame.Valid() && (m_desWidth == 0 || m_desHeight == 0 || !skipFrame)) {
 		m_desWidth = frame.width;
 		m_desHeight = frame.height;
 	}
-	if (!skipFrame) m_frame = std::move(frame);
+	if (!skipFrame && frame.Valid()) m_frame = std::move(frame);
 	return true;
 }
 

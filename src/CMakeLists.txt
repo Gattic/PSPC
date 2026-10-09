@@ -4,6 +4,7 @@
 add_library(pspc_common STATIC
 	common/log.cpp
 	common/fileutil.cpp
+	common/settings.cpp
 	common/sha1.cpp
 )
 target_include_directories(pspc_common PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

@@ -126,6 +126,8 @@ public:
 	bool NextAccessUnit(AccessUnit *au, bool endOfStream);
 	// True once the program stream end code went by.
 	bool SawEndCode() const { return sawEndCode_; }
+	// Nothing buffered: neither unparsed program stream nor unclaimed elementary stream.
+	bool Empty() const { return es_.empty() && psPos_ >= ps_.size(); }
 
 private:
 	// Parses one more PS packet out of ps_. Returns false if more input is needed.

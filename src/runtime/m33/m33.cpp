@@ -4,12 +4,15 @@
 // docs/m33-behaviors.md. Each function notes which M33 behaviour it reproduces.
 #include "runtime/m33/m33.h"
 
+#include <algorithm>
 #include <filesystem>
+#include <map>
 #include <fstream>
 #include <sstream>
 
 #include "common/fileutil.h"
 #include "common/log.h"
+#include "runtime/core/cpu.h"
 #include "runtime/hle/hle_wrap.h"
 #include "runtime/hle/modules/modules.h"
 #include "runtime/io/io.h"
@@ -50,10 +53,66 @@ void SaveConfig() {
 	WriteWholeFile(g_configPath, &g_config, sizeof(g_config));
 }
 
+// The firmware's module descriptor (SceModule2 in the M33 SDK's psploadcore.h), which M33 hands to
+// start-module handlers. Built in kernel memory on first use, one per module.
+std::map<SceUID, u32> g_module2;
+
+u32 Module2For(kernel::PspModule *m) {
+	auto it = g_module2.find(m->uid);
+	u32 a = it != g_module2.end() ? it->second : kernel::AllocKernelMemory(0xA0, "SceModule2");
+	if (!a) return 0;
+	g_module2[m->uid] = a;
+	mem::Memset(a, 0, 0xA0);
+	const loader::PspModuleInfoRaw &mi = m->image.modInfo;
+	GWrite32(a + 0x00, 0);  // next
+	GWrite16(a + 0x04, mi.attr);
+	GWrite8(a + 0x06, mi.version[0]);
+	GWrite8(a + 0x07, mi.version[1]);
+	mem::WriteBytes(a + 0x08, m->name.c_str(), (u32)std::min<size_t>(m->name.size(), 27));
+	GWrite8(a + 0x24, (u8)m->status);
+	GWrite32(a + 0x2C, (u32)m->uid);
+	GWrite32(a + 0x40, mi.libent);
+	GWrite32(a + 0x44, mi.libentEnd - mi.libent);
+	GWrite32(a + 0x48, mi.libstub);
+	GWrite32(a + 0x4C, mi.libstubEnd - mi.libstub);
+	GWrite32(a + 0x50, m->moduleStart);
+	GWrite32(a + 0x64, m->moduleStart);
+	GWrite32(a + 0x68, m->gp);
+	u32 textEnd = m->memAddr;
+	for (const auto &r : m->image.codeRanges) textEnd = std::max(textEnd, r.second);
+	GWrite32(a + 0x6C, m->memAddr);
+	GWrite32(a + 0x70, textEnd - m->memAddr);
+	GWrite32(a + 0x74, m->memAddr + m->memSize - textEnd);
+	u32 nseg = 0;
+	for (const auto &seg : m->image.segments) {
+		if (!seg.loadAddr || nseg == 4) continue;
+		GWrite32(a + 0x80 + 4 * nseg, seg.loadAddr);
+		GWrite32(a + 0x90 + 4 * nseg, seg.memsz);
+		nseg++;
+	}
+	GWrite32(a + 0x7C, nseg);
+	return a;
+}
+
+// Runs on a module's start thread just before module_start (kernel::SetModuleStartHook).
+void OnModuleStart(SceUID id) {
+	if (!g_startModuleHandler) return;
+	kernel::PspModule *m = kernel::Get<kernel::PspModule>(id);
+	kernel::PspThread *t = sched::Current();
+	if (!m || !t) return;
+	u32 mod2 = Module2For(m);
+	if (!mod2) return;
+	LOGD("M33", "start-module handler %08x for %s", g_startModuleHandler, m->name.c_str());
+	cpu::CallGuest(&t->ctx, g_startModuleHandler, {mod2});
+}
+
 }  // namespace
 
 void Init(const std::string &flash1HostDir, const BootInfo &boot) {
 	g_boot = boot;
+	g_startModuleHandler = 0;
+	g_module2.clear();
+	kernel::SetModuleStartHook(&OnModuleStart);
 	g_configPath = fs::u8path(flash1HostDir) / "config.se";
 	std::vector<u8> data;
 	if (ReadWholeFile(g_configPath, data) && data.size() >= sizeof(SEConfig)) {

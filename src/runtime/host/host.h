@@ -7,6 +7,7 @@
 
 #include <functional>
 #include <string>
+#include <vector>
 
 #include "common/common.h"
 
@@ -17,6 +18,15 @@ struct Config {
 	int windowScale = 2;
 	std::string title = "PSPC";
 	bool vsync = true;
+	bool fullscreen = false;  // borderless desktop fullscreen; F11 toggles
+	int volume = 100;         // 0-100, applied to everything AudioSubmit queues
+	// Input bindings, one comma-separated list per settings::kControls entry (SDL key names /
+	// game controller names). Empty vectors mean the defaults.
+	std::vector<std::string> keys, pads;
+	std::string padStick = "left";  // controller stick driving the PSP analog: left, right, none
+	// F12 saves the presented frame as <screenshotDir>/<gameName>_<timestamp>.bmp.
+	std::string screenshotDir;
+	std::string gameName = "pspc";
 };
 
 struct CtrlState {

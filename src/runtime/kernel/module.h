@@ -67,6 +67,9 @@ PspModule *ModuleByAddress(u32 addr);
 // functions containing a changed word are dropped so that code runs in the interpreter, which
 // sees the patch (CFW plugins hook game functions this way). Returns how many were dropped.
 int InvalidateNativeCode(u32 addr, u32 size);
+// Called on a guest thread right before a module's module_start runs (or when a module without
+// one is started): M33's start-module handler hooks in here.
+void SetModuleStartHook(void (*hook)(SceUID module));
 PspModule *ModuleByName(const std::string &name);
 const std::vector<SceUID> &LoadedModules();
 

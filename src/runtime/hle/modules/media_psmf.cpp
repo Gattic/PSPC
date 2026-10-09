@@ -10,6 +10,8 @@
 #include <vector>
 
 #include "common/log.h"
+#include "loader/elf.h"
+#include "loader/psp_header.h"
 #include "media/media_engine.h"
 #include "media/mpeg_demux.h"
 #include "runtime/core/cpu.h"
@@ -330,8 +332,15 @@ public:
 	}
 
 	bool HasReachedEnd() {
-		// The pts are ignored: the end is when we're out of data.
-		return mediaengine->IsVideoEnd() && (mediaengine->IsNoAudioData() || !mediaengine->IsActuallyPlayingAudio());
+		// The pts are ignored: the end is when we're out of data. On hardware that's as soon as the
+		// last picture is out (video/psmfplayer/update, getvideodata), and a declared audio stream
+		// that has no data at all ends it too (video/psmfplayer/start with test_streams.pmf).
+		MediaEngine *me = mediaengine.get();
+		const bool audioDone = me->IsNoAudioData() || !me->IsActuallyPlayingAudio();
+		if ((me->IsVideoEnd() || me->IsLastFrameDecoded()) && audioDone) return true;
+		// Audio is interleaved from the start, so 64KB without any says there is none.
+		return totalAudioStreams > 0 && readSize >= std::min(streamSize, 0x10000) && audioStreamNum >= 0 &&
+		       !me->HasAudioStreamData(audioStreamNum) && me->IsNoAudioData();
 	}
 
 	std::shared_ptr<io::Device> dev;
@@ -445,9 +454,11 @@ void ScheduleFinish(u32 psmfPlayer, PsmfPlayer *player) {
 		PlayerFinish(player);
 		return;
 	}
+	// Approximated by the next scheduling point after a short while: the caller normally waits
+	// (sceKernelDelayThread, a decode) soon after.
 	const u32 key = GRead32(psmfPlayer);
 	const u32 generation = player->generation;
-	player->finishEvent = sched::ScheduleEvent(sched::NowUs(), [key, generation]() {
+	player->finishEvent = sched::ScheduleEvent(sched::NowUs() + 1000, [key, generation]() {
 		if (PsmfPlayer *p = findPlayerByKey(key, generation)) PlayerFinish(p);
 	});
 }
@@ -811,7 +822,12 @@ int PsmfPlayerSetPsmfOffset(u32 psmfPlayer, const char *filename, int offset) {
 	delayUs += 2000;
 
 	const u32 magic = (u32)buf[0] | ((u32)buf[1] << 8) | ((u32)buf[2] << 16) | ((u32)buf[3] << 24);
-	if (magic != media::PSMF_MAGIC) LOGW("PSMF", "scePsmfPlayerSetPsmf*: incorrect PSMF magic (%08x), bad data", magic);
+	if (magic != media::PSMF_MAGIC) {
+		// Refused on hardware (video/psmfplayer/setpsmfoffset: an offset that isn't a header).
+		LOGW("PSMF", "scePsmfPlayerSetPsmf*: incorrect PSMF magic (%08x), bad data", magic);
+		player->CloseFile();
+		return (int)Delay(SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT, delayUs);
+	}
 
 	const u16 numStreams = ReadBE16(buf + 0x80);
 	if (numStreams > 128) return (int)Delay(SCE_KERNEL_ERROR_ILLEGAL_ARGUMENT, delayUs);
@@ -1185,7 +1201,10 @@ u32 scePsmfPlayerSelectAudio(u32 psmfPlayer) {
 	if (player->status != PSMF_PLAYER_STATUS_PLAYING) return SCE_PSMFPLAYER_ERROR_INVALID_STATUS;
 	int next = player->audioStreamNum + 1;
 	if (next >= player->totalAudioStreams) next = 0;
-	if (next == player->audioStreamNum || !player->mediaengine->setAudioStream(next)) return SCE_PSMFPLAYER_ERROR_INVALID_STREAM;
+	// Only to a stream that actually has data (video/psmfplayer/selectstream).
+	if (next == player->audioStreamNum || !player->mediaengine->HasAudioStreamData(next) ||
+	    !player->mediaengine->setAudioStream(next))
+		return SCE_PSMFPLAYER_ERROR_INVALID_STREAM;
 	player->audioStreamNum = next;
 	return 0;
 }
@@ -1196,7 +1215,9 @@ u32 scePsmfPlayerSelectVideo(u32 psmfPlayer) {
 	if (player->status != PSMF_PLAYER_STATUS_PLAYING) return SCE_PSMFPLAYER_ERROR_INVALID_STATUS;
 	int next = player->videoStreamNum + 1;
 	if (next >= player->totalVideoStreams) next = 0;
-	if (next == player->videoStreamNum || !player->mediaengine->setVideoStream(next)) return SCE_PSMFPLAYER_ERROR_INVALID_STREAM;
+	if (next == player->videoStreamNum || !player->mediaengine->HasVideoStreamData(next) ||
+	    !player->mediaengine->setVideoStream(next))
+		return SCE_PSMFPLAYER_ERROR_INVALID_STREAM;
 	player->videoStreamNum = next;
 	return 0;
 }
@@ -1252,6 +1273,29 @@ u32 scePsmfPlayerConfigPlayer(u32 psmfPlayer, int configMode, int configAttr) {
 }  // namespace
 
 void PsmfPlayerNotifyLoadModule(int devkitVersion) { g_psmfPlayerLibVersion = devkitVersion; }
+
+}  // namespace mediahle
+
+void Media_NotifyNativeModuleLoad(const std::string &name, const std::vector<u8> &data) {
+	int version = 0;
+	u32 devkit = 0;
+	loader::PspHeader h;
+	loader::ElfFile elf;
+	if (loader::ParsePspHeader(data.data(), data.size(), h)) {
+		version = (h.moduleVerHi << 8) | h.moduleVerLo;
+		devkit = h.devkitVersion;
+	} else if (elf.Parse(data.data(), data.size(), nullptr) && elf.HasModuleInfo()) {
+		version = elf.ModuleInfo().version[0] | (elf.ModuleInfo().version[1] << 8);
+	} else {
+		return;
+	}
+	if (name == "sceMpeg_library") mediahle::MpegNotifyLoadModule(version);
+	if (name == "scePsmfP_library" || name == "scePsmfPlayer" || name == "libpsmfplayer" || name == "psmf_jk" ||
+	    name == "jkPsmfP_library")
+		mediahle::PsmfPlayerNotifyLoadModule((int)devkit);
+}
+
+namespace mediahle {
 
 void Register_scePsmf() {
 	static const hle::HleFunction funcs[] = {

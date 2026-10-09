@@ -6,7 +6,6 @@
 #include <cmath>
 #include <vector>
 
-#include "common/log.h"
 #include "runtime/hle/hle_wrap.h"
 #include "runtime/hle/modules/modules.h"
 #include "runtime/kernel/callbacks.h"
@@ -200,7 +199,7 @@ int VolatileLockNow(int type, u32 addrPtr, u32 sizePtr) {
 int sceKernelVolatileMemTryLock(int type, u32 addrPtr, u32 sizePtr) {
 	const int err = VolatileLockNow(type, addrPtr, sizePtr);
 	// Under 100us on hardware (pspautotests threads/scheduling/syscallkinds).
-	if (err == 0) (void)0; // TEMP sched::ChargeCycles(1200);
+	if (err == 0) sched::ChargeCycles(1200);
 	return err;
 }
 
@@ -213,12 +212,11 @@ int sceKernelVolatileMemLock(int type, u32 addrPtr, u32 sizePtr) {
 	else err = VolatileLockNow(type, addrPtr, sizePtr);
 
 	if (err == 0) {
-		(void)0; // TEMP2
+		sched::ChargeCycles(1200);
 	} else if (err == (int)SCE_KERNEL_ERROR_POWER_VMEM_IN_USE) {
 		PspThread *t = sched::Current();
 		if (!t) return err;
 		g_volatileWaiters.push_back({t->uid, addrPtr, sizePtr});
-		LOGW("POWER", "TEMPDBG volatile lock blocks at %llu", (unsigned long long)sched::NowUs());
 		return sched::Wait(WAITTYPE_VMEM, 1, 0, false);
 	} else if (err == (int)SCE_KERNEL_ERROR_CAN_NOT_WAIT || err == (int)SCE_KERNEL_ERROR_ILLEGAL_CONTEXT) {
 		if ((addrPtr & 3) == 0 && mem::IsValidRange(addrPtr, 4)) GWrite32(addrPtr, kVolatileAddr);

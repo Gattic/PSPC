@@ -1,0 +1,15 @@
+# Scripted input for tools/smoke_games.py: <disc id or file stem> <press> <press> ...
+# A press is <vblank>:<BUTTON[+BUTTON]>[:<frames held>] (pspc --press). 60 VBlanks = 1 second.
+
+# Daxter: title -> New Game -> first level
+NPUG80329 1500:CROSS 1800:CROSS 2100:CROSS 2400:CROSS
+# Syphon Filter: Combat Ops: press start -> save notice -> profile keyboard
+NPUG80114 2000:START 2300:CROSS 2600:CROSS 2900:CROSS
+# Syphon Filter: Logan's Shadow
+UCUS98606 1600:CROSS 1900:CROSS 2200:START 2500:CROSS
+# Monster Hunter Freedom Unite: language -> game menu
+ULUS10391 1500:CROSS 1800:CROSS 2100:CROSS 2400:CROSS
+# Star Wars Battlefront: Elite Squadron: press start -> menus
+ULUS10390 2200:START 2500:CROSS 2800:CROSS 3100:CROSS
+# Star Wars Battlefront: Renegade Squadron: profile prompt -> menus
+ULUS10292 3000:CROSS 3300:CROSS 3600:CROSS 3900:CROSS

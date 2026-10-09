@@ -293,6 +293,21 @@ int Run(const Options &o) {
 	hc.headless = o.headless;
 	hc.windowScale = o.windowScale;
 	hc.title = "PSPC - " + PathToUtf8(fs::u8path(o.file).filename());
+	hc.fullscreen = o.fullscreen;
+	hc.vsync = o.vsync;
+	hc.volume = o.volume;
+	hc.keys = o.keyBindings;
+	hc.pads = o.padBindings;
+	hc.padStick = o.padStick;
+	hc.screenshotDir = o.screenshotDir;
+	{
+		// Screenshot names: the game file's name (its folder's for EBOOT.PBP).
+		fs::path f = fs::u8path(o.file);
+		std::string name = PathToUtf8(ToLower(PathToUtf8(f.filename())) == "eboot.pbp" ? f.parent_path().filename() : f.stem());
+		for (char &ch : name)
+			if (strchr("<>:\"/\\|?* ", ch)) ch = '_';
+		if (!name.empty()) hc.gameName = name;
+	}
 
 	std::atomic<bool> finished{false};
 	std::thread watchdog;

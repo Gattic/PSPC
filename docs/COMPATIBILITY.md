@@ -1,0 +1,34 @@
+# Compatibility
+
+Games tested with PSPC, newest results first. "Native" means the game's modules were built with
+`tools/pspc_build.py` and ran as AOT DLLs; "interpreter" means `--interp`. Testing is mostly
+headless (`--fast-time --dump-frames`, scripted input with `--press`), so "reaches" describes the
+furthest screen confirmed by a frame dump.
+
+| Game | Disc ID | Firmware req. | Native | Interpreter | Notes |
+|---|---|---|---|---|---|
+| Daxter | NPUG80329 | 5.50 | Gameplay (first level) | Gameplay | Intro movie uses sceMpeg (media work in progress). Audio plays. Renderer runs ~1.6x real time headless. |
+| Syphon Filter: Combat Ops | NPUG80114 | 3.71 | Menus (profile, mission modifier, connection) | Same | Intro, save-data notice, keyboard and menus render correctly; online modes report a connection failure (offline). Audio plays. |
+| Syphon Filter: Logan's Shadow | UCUS98606 | 3.52 | Gameplay (training, story episode 1) | Same | Main code lives in USRDIR PRX modules, loaded and run natively. Story cutscenes call sceMpeg (media work in progress). |
+| Monster Hunter Freedom Unite | ULUS10391 | 5.03 | Game menu, character creation | Same | Loads its font library through `sceKernelLoadModuleByID`; needs system fonts (`flash0/font`). Naming the character needs keyboard input (windowed mode). |
+| Star Wars Battlefront: Elite Squadron | ULUS10390 | 5.03 | Profile prompt | Same | Title, in-engine space intro and menus render. |
+| Star Wars Battlefront: Renegade Squadron | ULUS10292 | 3.51 | New-profile screen | Same | Menus render. |
+
+## Test suite
+
+pspautotests (hardware-recorded expectations), run with `tools/run_autotests.py`:
+
+| Run | Passed |
+|---|---|
+| Interpreter | 517 / 559 |
+| AOT (native) | 517 / 559, identical to the interpreter test by test |
+
+Known not-passable tests include `cpu/vfpu/vregs` (the shipped `.prx` predates its `.expected`),
+`cpu/cacheop` (needs a data-cache model), `gpu/simple/simple` (depends on the PSP data cache), and
+several timing tests whose expected output records hardware jitter.
+
+## Reporting a problem
+
+Run the game with `--log info --log-file run.log`; on a crash pspc prints a symbolized backtrace
+(AOT frames are named by guest function) to stderr. `--interp` tells recompiler problems from HLE
+problems: a game that works interpreted but not natively points at the recompiler.

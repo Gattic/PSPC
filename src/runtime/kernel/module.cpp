@@ -420,13 +420,16 @@ int ResolveModuleThreadParams(PspModule *m, u32 prio, u32 stack, u32 attr, u32 o
 
 // Runs a module function in a new thread, which is deleted when it returns. With a waiting
 // caller, blocks until then and returns its exit status in *exitStatus.
+void (*g_moduleStartHook)(SceUID) = nullptr;
+
 int RunModuleThread(PspModule *m, u32 entry, const ModuleThreadParams &p, u32 argSize, u32 argPtr, bool wait,
-                    s32 *exitStatus) {
+                    s32 *exitStatus, std::function<void()> onFirstRun = nullptr) {
 	SceUID tid = CreateThread(m->name.c_str(), entry, p.priority, p.stackSize, p.attr, m->gp, m->uid, m->kernelMode,
 	                          nullptr, p.stackAlloc);
 	if (tid < 0) return tid;
 	PspThread *t = Get<PspThread>(tid);
 	t->deleteOnReturn = true;
+	t->onFirstRun = std::move(onFirstRun);
 	PspThread *caller = sched::Current();
 	if (wait && caller) t->endWaiters.push_back(caller->uid);
 	StartThread(t, argSize, argPtr);
@@ -442,6 +445,7 @@ int RunModuleThread(PspModule *m, u32 entry, const ModuleThreadParams &p, u32 ar
 int StartModule(PspModule *m, u32 argSize, u32 argPtr, u32 statusPtr, bool waitForReturn, u32 smOptionPtr) {
 	if (m->status != MODULE_STATUS_LOADED) return (int)SCE_KERNEL_ERROR_ERROR;
 	if (!m->moduleStart || m->moduleStart == 0xFFFFFFFF) {
+		if (g_moduleStartHook && sched::Current()) g_moduleStartHook(m->uid);
 		m->status = MODULE_STATUS_STARTED;
 		return 0;
 	}
@@ -450,7 +454,13 @@ int StartModule(PspModule *m, u32 argSize, u32 argPtr, u32 statusPtr, bool waitF
 	if (r < 0) return r;
 	m->status = MODULE_STATUS_STARTING;
 	s32 status = 0;
-	r = RunModuleThread(m, m->moduleStart, p, argSize, argPtr, waitForReturn, &status);
+	// The start hook runs on the start thread just before module_start: by then the plugins
+	// started earlier (their threads were queued first) have installed their handlers, as on M33
+	// where they load before the game.
+	SceUID uid = m->uid;
+	r = RunModuleThread(m, m->moduleStart, p, argSize, argPtr, waitForReturn, &status, [uid]() {
+		if (g_moduleStartHook) g_moduleStartHook(uid);
+	});
 	if (r < 0) {
 		m->status = MODULE_STATUS_LOADED;
 		return r;
@@ -488,6 +498,8 @@ int UnloadModule(PspModule *m) {
 	Destroy(m->uid);
 	return 0;
 }
+
+void SetModuleStartHook(void (*hook)(SceUID module)) { g_moduleStartHook = hook; }
 
 int InvalidateNativeCode(u32 addr, u32 size) {
 	int dropped = 0;

@@ -133,6 +133,8 @@ struct PspThread : KObject {
 
 	// A module_start/module_stop thread: deleted (with its stack) when its entry returns.
 	bool deleteOnReturn = false;
+	// Runs on the thread, once, just before its entry function (M33 start-module handlers).
+	std::function<void()> onFirstRun;
 
 	// Host execution.
 	void *fiber = nullptr;

@@ -40,8 +40,11 @@ flowchart TB
 | `src/runtime/io/`, `src/runtime/media/` | The PSP device namespace (`ms0:`, `host0:`, `flash0:`, `flash1:`, `disc0:`, `umd0:`, `emulator:`). |
 | `src/runtime/m33/` | The M33 CFW behaviours (SystemCtrl, KUBridge, VshCtrl, config.se, plugins, NID resolver). |
 | `src/fs/` | Disc images (ISO/CSO/ZSO/DAX), ISO9660, host file system, PBP, PARAM.SFO. |
-| `src/gpu/` | GE display-list processing and software rasterizer. |
-| `src/audio/` | Audio decoders and mixers (ATRAC3/3+, SAS, MP3...). |
+| `src/gpu/` | GE display-list processing, timing and the multithreaded software rasterizer. |
+| `src/audio/` | Audio decoders and mixers (ATRAC3/3+, SAS, MP3/AAC through Media Foundation). |
+| `src/media/` | Video and image decoding for sceMpeg/PSMF/sceJpeg (PS demux, H.264 through Media Foundation, WIC). |
+| `src/runtime/dialogs/` | sceUtility dialogs (message, OSK, save data...) and their host-side prompts. |
+| `src/frontend/` | `pspc.exe` (command line, LoadExec relaunch), `pspc-launcher.exe` (game library), `pspc-iso.exe`. |
 | `tools/pspc-decrypt/` | Separate GPL-3.0 executable (uses libkirk). Never linked into `src/`. |
 | `tools/*.py` | AOT build driver, autotest runner, firmware/M33 extraction and analysis, NID database generation, Ghidra pipeline. |
 
@@ -58,19 +61,32 @@ generated code calls it with the word as a literal, so the compiler folds the fi
 Control flow (delay slots, likely branches, calls, returns) is implemented separately in the
 interpreter and the code generator, against the conventions in `aot_abi.h`.
 
-**Calls and returns.** Guest functions become C functions `void F_addr(Ctx *c)`. A `jal` inside a
-module is a direct C call; anything else goes through `dispatch::Call`, which runs native code if
-registered for that address and otherwise interprets. `jr $ra` returns when `$ra` still holds the
-value it had on entry; otherwise (longjmp-style) a non-local return propagates up the C stack
+**Calls and returns.** Guest functions become C functions `B_addr(Ctx *c, u32 ra0, u32 sp0)`, plus a
+call entry `F_addr(Ctx *c)`. A `jal` inside a module is a direct C call; anything else goes through
+`dispatch::Call`, which runs native code if registered for that address and otherwise interprets.
+A jump into a function (tail call, or a jump to a label that also starts a function) runs its body
+with the jumper's `ra0`/`sp0`, so it returns where the jumper would. `jr $ra` returns when `$ra`
+equals `ra0`; otherwise (longjmp-style) a non-local return propagates up the C stack
 (`c->unwinding`) until a frame whose call site matches. Unknown jump targets fall into the
-interpreter, which calls back into native code whenever it reaches a registered function.
+interpreter, which calls back into native code whenever it reaches a registered function; jumps
+from the interpreter to HLE thunks are run inline so loops that tail-call imports don't nest.
+
+**Time.** `Ctx::budget` counts guest cycles, one per executed instruction in both engines (the
+interpreter per instruction, generated code per straight-line block). With `--fast-time` the
+scheduler's clock is the cycles consumed plus the time HLE functions charge, and idle time is
+skipped, so timing is deterministic and identical with and without native code; otherwise it
+follows the host clock. Back-edges check `budget < 0` to deliver due events and interrupts.
+
+**Self-modifying code.** Native code is compiled from the module as loaded. When the guest flushes
+the instruction cache (`sceKernelIcacheInvalidate*`), changed code words are found by comparison
+with a load-time snapshot, and the functions holding them switch to the interpreter (a per-function
+flag in the DLL catches direct calls from other native code). CFW plugins patch games this way.
 
 **Threads.** Each PSP thread is a Windows fiber with its own guest stack (in guest RAM, laid out
 like the firmware does) and host stack. All fibers run on one host thread, which keeps scheduling
 deterministic. A blocking HLE call (`sched::Wait`) switches to the scheduler fiber; strict
 priority scheduling, callbacks, timeouts and interrupts (VBlank, alarms, GE) follow the PSP's
-rules. Recompiled code yields at backward branches every 20 000 iterations so timer events and
-interrupts are delivered.
+rules. When no thread is left alive the run ends.
 
 **HLE.** Import stubs are rewritten to `jr ra; syscall CODE` and registered in the dispatch table;
 `CODE` indexes a table of (library, NID) -> native function. Functions are declared with
@@ -80,7 +96,17 @@ written to `$v0/$v1/$f0`. Unknown NIDs log once and return 0.
 **Modules.** `kernel::LoadModuleFromMemory` classifies the file (plain ELF, M33 gzip-packed, KIRK
 encrypted -> `pspc-decrypt`), allocates memory (keeping the low 16 bits of an AOT module's
 recompile address so LO16-only relocations stay valid), relocates, binds imports (to other guest
-modules' exports, else native), and loads `cache/aot/<sha1>.dll` when present.
+modules' exports, else native), and loads `cache/aot/<sha1>.dll` when present. Firmware libraries
+a game ships on its disc (codecs, network, fonts...) are recognized by module name and satisfied
+natively instead of being loaded. A second copy of a module that already runs natively is
+interpreted (one DLL instance holds one relocation delta). Before a module's `module_start` runs,
+M33's start-module handler (if a plugin set one) is called with the module's `SceModule2`.
+
+**LoadExec.** `sceKernelLoadExec` (and M33's LoadExec family) restart the runtime in a fresh process
+that boots the requested executable with the same devices mounted, like the PSP's reboot.
+
+**Diagnostics.** `Fatal()`, host stack overflows, breakpoints and illegal instructions print a
+symbolized host backtrace; frames inside AOT DLLs are named after the guest function.
 
 ## AOT DLLs
 

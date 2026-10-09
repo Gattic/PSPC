@@ -351,6 +351,11 @@ PspThread *TakeForcedNext() {
 void WINAPI ThreadFiberProc(void *param) {
 	PspThread *t = (PspThread *)param;
 	Ctx *c = &t->ctx;
+	if (t->onFirstRun) {
+		auto fn = std::move(t->onFirstRun);
+		t->onFirstRun = nullptr;
+		fn();
+	}
 	c->r[31] = t->threadReturnStub;
 	c->unwinding = 0;
 	dispatch::Call(c, t->entry);

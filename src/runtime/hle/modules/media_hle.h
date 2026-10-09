@@ -4,6 +4,9 @@
 // sceVideocodec, sceJpeg, sceMp4). Register_MediaLibraries() registers all of them.
 #pragma once
 
+#include <string>
+#include <vector>
+
 #include "common/common.h"
 
 namespace mediahle {
@@ -35,3 +38,8 @@ void Register_sceMp4();
 }  // namespace mediahle
 
 void Register_MediaLibraries();
+
+// The module loader calls this for a game-shipped module it replaces natively, so the media
+// libraries can follow the version the game was built against (as PPSSPP's __MpegLoadModule and
+// __PsmfPlayerLoadModule do).
+void Media_NotifyNativeModuleLoad(const std::string &name, const std::vector<u8> &data);
