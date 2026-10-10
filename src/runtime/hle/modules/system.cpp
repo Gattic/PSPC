@@ -42,6 +42,82 @@ int sceImposeSetBacklightOffTime(int v) {
 	return 0;
 }
 
+// sceImpose_driver: the settings the VSH's volume/brightness overlay keeps (impose.prx). After
+// PPSSPP's sceImpose.cpp: the parameter ids, the values reported and the change mask that
+// sceImposeChanges hands out. 0x40000000 is a real setting on every firmware up to 5.55 (the
+// 3.xx VSH blanks the display if it is rejected).
+enum : u32 {
+	IMPOSE_MAIN_VOLUME = 0x1,
+	IMPOSE_BACKLIGHT_BRIGHTNESS = 0x2,
+	IMPOSE_EQUALIZER_MODE = 0x4,
+	IMPOSE_MUTE = 0x8,
+	IMPOSE_AVLS = 0x10,
+	IMPOSE_TIME_FORMAT = 0x20,
+	IMPOSE_DATE_FORMAT = 0x40,
+	IMPOSE_LANGUAGE = 0x80,
+	IMPOSE_00000100 = 0x100,
+	IMPOSE_BACKLIGHT_OFF_INTERVAL = 0x200,
+	IMPOSE_SOUND_REDUCTION = 0x400,
+};
+u32 g_imposeChanges = 0, g_imposeAvls = 0, g_imposeVolume = 30, g_imposeBrightness = 3;
+
+int sceImposeGetParam(u32 param) {
+	switch (param) {
+	case IMPOSE_MAIN_VOLUME: return (int)g_imposeVolume;  // 0-30
+	case IMPOSE_BACKLIGHT_BRIGHTNESS: return (int)g_imposeBrightness;
+	case IMPOSE_AVLS: return (int)g_imposeAvls;
+	case IMPOSE_MUTE:
+	case IMPOSE_SOUND_REDUCTION:
+	case IMPOSE_BACKLIGHT_OFF_INTERVAL:
+	case IMPOSE_EQUALIZER_MODE:
+	case IMPOSE_TIME_FORMAT:
+	case IMPOSE_DATE_FORMAT:
+	case IMPOSE_LANGUAGE:
+	case IMPOSE_00000100:
+	case 0x20000000:
+	case 0x40000000: return 0;
+	default:
+		if (param >= 0x80000001 && param <= 0x8000000B) return 0;
+		return (int)SCE_KERNEL_ERROR_INVALID_MODE;
+	}
+}
+
+int sceImposeSetParam(u32 param, int value) {
+	switch (param) {
+	case IMPOSE_AVLS:
+		if (value < 0 || value > 1) return (int)SCE_KERNEL_ERROR_INVALID_VALUE;
+		g_imposeAvls = (u32)value;
+		g_imposeChanges |= IMPOSE_AVLS | IMPOSE_MAIN_VOLUME;
+		break;
+	case IMPOSE_MAIN_VOLUME:
+		if (value < 0 || value >= 31) return (int)SCE_KERNEL_ERROR_INVALID_VALUE;
+		g_imposeVolume = (u32)value;
+		g_imposeChanges |= IMPOSE_MAIN_VOLUME;
+		break;
+	case IMPOSE_BACKLIGHT_BRIGHTNESS:
+		g_imposeBrightness = (u32)value;
+		g_imposeChanges |= param;
+		break;
+	default: g_imposeChanges |= param; break;
+	}
+	return 0;
+}
+
+int sceImposeChanges() {
+	u32 c = g_imposeChanges;
+	g_imposeChanges = 0;
+	return (int)c;
+}
+
+int sceImposeSetStatus(int) { return 0; }
+// No TV cable: nothing to report, nothing to switch.
+int sceImposeCheckVideoOut(u32 outPtr) {
+	if (mem::IsValidRange(outPtr, 4)) GWrite32(outPtr, 0);
+	return 0;
+}
+int sceImposeSetVideoOutMode(int, int, int) { return 0; }
+int sceImpose_FF1A2F07(int) { return 0; }
+
 // ---------------------------------------------------------------- sceDmac / sceHprm
 
 // When the last copy's transfer ends (guest cycles); a copy started before then overlaps it.
@@ -109,6 +185,22 @@ void Register_sceImpose() {
 		HLEFN(0x967F6D4A, sceImposeSetBacklightOffTime),
 	};
 	hle::RegisterModule("sceImpose", funcs);
+
+	// Kernel NIDs as of 1.50 (data/m33_nid_resolver.csv adds the 4.01 ones).
+	static const hle::HleFunction driver[] = {
+		HLEFN(0x531C9778, sceImposeGetParam),
+		HLEFN(0x810FB7FB, sceImposeSetParam),
+		HLEFN(0xB415FC59, sceImposeChanges),
+		HLEFN(0x116CFF64, sceImposeCheckVideoOut),
+		HLEFN(0x116DDED6, sceImposeSetVideoOutMode),
+		HLEFN(0xFF1A2F07, sceImpose_FF1A2F07),
+		// sceImposeSetStatus has the same NID on 3.95-4.05 (PPSSPP).
+		HLEFN(0x8434B075, sceImposeSetStatus),
+		HLEFN(0x24FD7BCF, sceImposeGetLanguageMode),
+		HLEFN(0x36AA6E91, sceImposeSetLanguageMode),
+		HLEFN(0x8C943191, sceImposeGetBatteryIconStatus),
+	};
+	hle::RegisterModule("sceImpose_driver", driver);
 }
 
 void Register_sceDmac() {

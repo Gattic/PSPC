@@ -285,6 +285,15 @@ The XMB also needs a registry backed by flash1, `.pgf` fonts through recompiled 
 
 **Exit (milestone "XMB on Windows"):** the real 4.01 M33 XMB boots, browses ISOs, launches a game and returns to the XMB afterwards. The VSH menu and recovery work.
 
+**Status (2026-10-10), details in [docs/vsh-boot.md](docs/vsh-boot.md):**
+- [x] Install step: `tools/pspc_install_fw.py` copies flash0 (vsh, font, dic, data, kd), M33's satelite/recovery, prepares flash1, AOT-compiles the user-mode firmware modules.
+- [x] `pspc --vsh` and the launcher's "Boot XMB": the real 4.01 XMB boots (opening logo, wave, icons) with vshmain/paf/common_*/plugins as AOT code and every kernel module native; `vshbridge` is native (`sceVshBridge` forwarding table), `index.dat` decrypts through pspc-decrypt.
+- [x] Navigation with scripted input through every category and into Settings submenus.
+- [x] ISOs in `ms0:/ISO` under Game > Memory Stick (native vshctrl overlay), launching one restarts pspc with it, the game's exit (or HOME) returns to the XMB.
+- [x] VSH menu (`satelite.prx`, SELECT) and recovery (`--recovery` or R at boot).
+- [x] Registry writes of the XMB persist in `flash1:/registry/pspc.reg`.
+- [ ] Remaining: a PSP-style HOME screen in games (now a host message box), GAME150/GAME4XX and video ISOs, `sceUtility_private`/`sceChnnlsv` (copying saves)/network pieces the plugins import (not on the boot path), ID storage (System Information), clock setting.
+
 ### Phase 9: Compatibility, performance and polish (ongoing)
 
 - **Compatibility:** a compatibility list (like AnyPS5's `COMPATIBILITY.md`), per-game hint files and crash reports that include the guest PC and a backtrace.

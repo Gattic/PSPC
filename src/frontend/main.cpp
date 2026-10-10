@@ -75,7 +75,9 @@ static void Usage() {
 	        "  --dump-frames <dir>  save the displayed frame as BMP every --dump-every VBlanks (60)\n"
 	        "  --renderer <name>    GE renderer: software (default) or d3d11 (GPU; d3d11-warp: WARP device)\n"
 	        "  --render-scale <n>   d3d11 internal resolution, 1-4 times the PSP's (default 1)\n"
-	        "  --press <v>:<B>[:n]  hold buttons B (e.g. START, CROSS+UP) for n VBlanks (6) from VBlank v\n");
+	        "  --press <v>:<B>[:n]  hold buttons B (e.g. START, CROSS+UP) for n VBlanks (6) from VBlank v\n"
+	        "  --vsh                boot the firmware's XMB (tools/pspc_install_fw.py) instead of a file\n"
+	        "  --recovery           boot M33's recovery menu (also: hold R while the XMB boots)\n");
 }
 
 static u32 ParseFw(const std::string &s) {
@@ -163,6 +165,9 @@ int main(int argc, char **argv) {
 		};
 		if (a == "--config" || a == "--set") next();  // read above
 		else if (a == "--headless") o.headless = true;
+		else if (a == "--vsh") o.vsh = true;
+		else if (a == "--return-to-vsh") o.returnToVsh = true;
+		else if (a == "--recovery") o.vsh = o.recovery = true;
 		else if (a == "--interp") o.aot = false;
 		else if (a == "--aot-dir") o.aotDir = next();
 		else if (a == "--fast-time") o.fastTime = true;
@@ -214,7 +219,7 @@ int main(int argc, char **argv) {
 			o.file = a;
 		}
 	}
-	if (o.file.empty()) {
+	if (o.file.empty() && !o.vsh) {
 		Usage();
 		return 1;
 	}
@@ -237,21 +242,36 @@ int main(int argc, char **argv) {
 	std::string next, bootPath, bootArgs;
 	bool m33 = runtime::TakeRelaunch(next);
 	bool loadExec = !m33 && runtime::TakeLoadExecRelaunch(bootPath, bootArgs);
-	if (m33 || loadExec) {
+	// Back to the XMB: a game the XMB launched exited (or the XMB restarts itself).
+	bool toVsh = !m33 && !loadExec && runtime::TakeExitToVsh() && (o.vsh || o.returnToVsh);
+	if (m33 || loadExec || toVsh) {
 		// LoadExec: a fresh runtime (new process) for the new executable, with the same options.
 		// M33 swaps the host file; plain sceKernelLoadExec boots a guest path with the original
-		// mounts.
+		// mounts. From the XMB the game's file replaces --vsh, and its exit comes back to the XMB.
 		std::wstring cmd = L"\"" + (exeDir / "pspc.exe").wstring() + L"\"";
+		bool fileSeen = false;
 		for (int i = 1; i < argc; i++) {
 			std::string a = argv[i];
 			if ((a == "--boot-path" || a == "--boot-args") && i + 1 < argc) {
 				i++;
 				continue;
 			}
+			if (a == "--vsh" || a == "--return-to-vsh" || a == "--recovery") continue;
+			if (a == "--umd" && i + 1 < argc && (o.vsh || toVsh)) {
+				i++;
+				continue;
+			}
 			std::wstring arg = fs::u8path(a).wstring();
-			if (m33 && a == o.file) arg = fs::u8path(next).wstring();
+			if (!o.file.empty() && a == o.file) {
+				fileSeen = true;
+				if (toVsh) continue;
+				if (m33) arg = fs::u8path(next).wstring();
+			}
 			cmd += L" \"" + arg + L"\"";
 		}
+		if (toVsh) cmd += L" --vsh";
+		else if (m33 && !fileSeen) cmd += L" \"" + fs::u8path(next).wstring() + L"\"";
+		if ((m33 || loadExec) && (o.vsh || o.returnToVsh)) cmd += L" --return-to-vsh";
 		if (loadExec) {
 			cmd += L" --boot-path \"" + fs::u8path(bootPath).wstring() + L"\"";
 			if (!bootArgs.empty()) cmd += L" --boot-args \"" + fs::u8path(bootArgs).wstring() + L"\"";

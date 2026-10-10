@@ -15,6 +15,8 @@
 #include "runtime/kernel/module.h"
 #include "runtime/kernel/scheduler.h"
 #include "runtime/kernel/sysmem.h"
+#include "runtime/m33/m33.h"
+#include "runtime/vsh.h"
 
 using namespace kernel;
 
@@ -31,7 +33,7 @@ const char *const kNativeModules[] = {
 	"sceVideocodec", "sceMpegbase_Driver", "sceMpegbase", "scePsmf_library", "scePsmfP_library", "scePsmfPlayer",
 	"sceSAScore", "sceMp4_library", "mp4msv_module", "sceJpeg", "sceJpeg_library", "sceJpeg_Library",
 	"sceVaudio_driver", "sceUsbGps_Driver", "sceUsbCam_Driver", "sceUsbMic_Driver", "sceCert_Loader",
-	"sceUSB_PSPComm_Driver",
+	"sceUSB_PSPComm_Driver", "sceMpegVsh_library", "sceKernelLibrary",
 };
 
 bool IsNativeModuleName(const std::string &name) {
@@ -60,12 +62,23 @@ SceUID MakePlaceholderModule(const std::string &name, const std::string &path) {
 	return id;
 }
 
+// A kernel-mode module of the firmware's flash0:/kd (the XMB loads drivers such as usbstor.prx):
+// kernel modules are native, so it isn't run.
+bool IsFirmwareKernelModule(const std::vector<u8> &data, const std::string &path) {
+	if (_strnicmp(path.c_str(), "flash0:/kd/", 11) != 0) return false;
+	loader::ElfFile elf;
+	if (elf.Parse(data.data(), data.size(), nullptr)) return elf.IsKernelModule();
+	loader::PspHeader h;
+	return loader::ParsePspHeader(data.data(), data.size(), h) && (h.modAttr & 0x1000) != 0;
+}
+
 SceUID LoadFromBytes(const std::vector<u8> &data, const std::string &path, u32 optPtr) {
 	std::string name = ModuleNameOf(data);
 	if (!name.empty() && IsNativeModuleName(name)) {
 		Media_NotifyNativeModuleLoad(name, data);
 		return MakePlaceholderModule(name, path);
 	}
+	if (IsFirmwareKernelModule(data, path)) return MakePlaceholderModule(name.empty() ? path : name, path);
 	LoadOptions opts;
 	(void)optPtr;
 	return LoadModuleFromMemory(data, path, opts);
@@ -113,6 +126,21 @@ int sceKernelLoadModule(const char *path, u32 flags, u32 optPtr) {
 }
 
 int sceKernelLoadModuleNpDrm(const char *path, u32 flags, u32 optPtr) { return sceKernelLoadModule(path, flags, optPtr); }
+
+// How the XMB loads its plugins (flash0:/vsh/module/*_plugin.prx) and the libraries it needs
+// (ModuleMgrForKernel, reached through sceVshBridge). The apitype only matters for what the loaded
+// module may do; loading is the ordinary path.
+int sceKernelLoadModuleVSH(const char *path, u32 flags, u32 optPtr) { return sceKernelLoadModule(path, flags, optPtr); }
+
+// The uid of a loaded module by the name in its module info.
+int sceKernelSearchModuleByName(const char *name) {
+	if (!name) return (int)SCE_KERNEL_ERROR_ILLEGAL_ADDR;
+	for (SceUID id : LoadedModules()) {
+		PspModule *m = Get<PspModule>(id);
+		if (m && m->name == name) return id;
+	}
+	return (int)SCE_KERNEL_ERROR_UNKNOWN_MODULE;
+}
 int sceKernelLoadModuleDNAS(const char *path, u32 key, u32 flags, u32 optPtr) {
 	(void)key;
 	return sceKernelLoadModule(path, flags, optPtr);
@@ -273,11 +301,19 @@ SceUID g_exitCallback = 0;
 
 void sceKernelExitGame() {
 	LOGI("KERNEL", "sceKernelExitGame");
+	if (vsh::ReturnToXmb()) {
+		m33::ExitToVsh();
+		return;
+	}
 	sched::RequestStop(0);
 }
 
 void sceKernelExitGameWithStatus(int status) {
 	LOGI("KERNEL", "sceKernelExitGameWithStatus(%d)", status);
+	if (vsh::ReturnToXmb()) {
+		m33::ExitToVsh();
+		return;
+	}
 	sched::RequestStop(status);
 }
 
@@ -326,6 +362,11 @@ namespace boot {
 SceUID ExitCallback() { return g_exitCallback; }
 }
 
+namespace modulemgr {
+bool IsNativeModuleName(const std::string &name) { return ::IsNativeModuleName(name); }
+int LoadModuleVsh(const char *path, u32 flags, u32 optPtr) { return sceKernelLoadModuleVSH(path, flags, optPtr); }
+}
+
 void Register_ModuleMgrForUser() {
 	static const hle::HleFunction funcs[] = {
 		HLEFN(0x977DE386, sceKernelLoadModule),
@@ -346,6 +387,12 @@ void Register_ModuleMgrForUser() {
 	};
 	hle::RegisterModule("ModuleMgrForUser", funcs);
 	hle::RegisterModule("ModuleMgrForKernel", funcs);
+	// Kernel-only, under their 1.50 NIDs (data/m33_nid_resolver.csv adds 4.01's).
+	static const hle::HleFunction kfuncs[] = {
+		HLEFN(0xA4370E7C, sceKernelLoadModuleVSH),
+		HLEFN(0x04B7BD22, sceKernelSearchModuleByName),
+	};
+	hle::RegisterModule("ModuleMgrForKernel", kfuncs);
 }
 
 void Register_LoadExecForUser() {

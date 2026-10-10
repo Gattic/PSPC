@@ -25,6 +25,7 @@ enum class FileKind {
 	Png,
 	Pmf,         // PSMF movie (ICON1.PMF)
 	Riff,        // RIFF/WAVE, e.g. ATRAC3 (SND0.AT3)
+	SysResource, // "PSPsysGP": a KIRK-encrypted system file (flash0:/vsh/etc/index*.dat)
 };
 
 FileKind SniffKind(const u8 *data, size_t size);

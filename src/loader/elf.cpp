@@ -147,7 +147,8 @@ bool ElfFile::Load(u32 base, const std::function<u8 *(u32, u32)> &ptr, LoadedIma
 	out.base = Relocatable() ? base : 0;
 	out.lowAddr = out.base + totalStart_;
 	out.size = totalEnd_ - totalStart_;
-	out.entry = entry_ + out.base;
+	// 0xFFFFFFFF: no entry point (a library without module_start), not relocated.
+	out.entry = entry_ == 0xFFFFFFFF ? 0xFFFFFFFF : entry_ + out.base;
 	out.segments = segments_;
 	out.sections = sections_;
 

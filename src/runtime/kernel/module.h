@@ -3,6 +3,7 @@
 #pragma once
 
 #include <array>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -43,6 +44,7 @@ struct PspModule : KObject {
 	std::vector<u32> aotEntries;  // guest addresses of the native functions, sorted (= table order)
 	u8 *aotPatched = nullptr;     // the DLL's per-function "code was rewritten" flags
 	std::vector<u8> pristine;     // the module image as loaded, to spot later code patches
+	std::set<std::string> boundVars;  // variable imports already linked ("library:nid")
 };
 
 struct LoadOptions {
@@ -79,6 +81,8 @@ void SetAotCacheDir(const std::string &dir);
 void SetAotEnabled(bool enabled);
 // Path of the pspc-decrypt helper, used for encrypted modules.
 void SetDecryptTool(const std::string &exe);
+// Runs pspc-decrypt on an encrypted module or system file (results are cached by SHA-1).
+bool DecryptWithTool(const std::vector<u8> &in, std::vector<u8> &out, std::string *err);
 // Directory where decrypted copies of encrypted modules are cached.
 void SetDecryptCacheDir(const std::string &dir);
 

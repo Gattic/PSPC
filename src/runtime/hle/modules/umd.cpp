@@ -36,6 +36,8 @@ constexpr SceUID kUmdWaitId = 1;
 
 bool g_activated = true;
 bool g_inserted = true;
+// The XMB boots with an empty drive: then "inserted" follows whether a disc image is mounted.
+bool g_followMedia = false;
 SceUID g_driveCb = 0;
 u64 g_activateEvent = 0;
 std::vector<SceUID> g_waiters;
@@ -222,14 +224,27 @@ u32 sceUmdUnuseUMDInMsUsbWlan() { return 0; }
 namespace umd {
 // A disc image was mounted or removed.
 void NotifyDiscChanged() {
+	if (g_followMedia) {
+		g_inserted = media::HaveDisc();
+		if (g_driveCb) Notify(g_inserted ? PSP_UMD_PRESENT | PSP_UMD_READABLE | PSP_UMD_CHANGED : PSP_UMD_NOT_PRESENT | PSP_UMD_CHANGED);
+		WakeWaiters();
+		return;
+	}
 	if (g_driveCb) Notify(PSP_UMD_PRESENT | PSP_UMD_READABLE | PSP_UMD_CHANGED);
 	WakeWaiters();
 }
+// The XMB: no disc counts as inserted unless an image is mounted (games always have one).
+void SetDriveEmpty(bool empty) {
+	g_followMedia = true;
+	g_inserted = !empty;
+}
+bool DiscInserted() { return g_inserted; }
 }  // namespace umd
 
 void Register_sceUmdUser() {
 	g_activated = true;
 	g_inserted = true;
+	g_followMedia = false;
 	g_driveCb = 0;
 	g_activateEvent = 0;
 	g_waiters.clear();

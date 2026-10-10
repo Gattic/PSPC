@@ -6,7 +6,8 @@
 //   * the selected game is shown on the right over its PIC1 backdrop;
 //   * Enter/double-click plays the game with pspc.exe, offering to build its native code first;
 //   * the toolbar and the context menu build native code (tools/pspc_build.py), play
-//     interpreted, and open the Settings dialog (pspc.ini).
+//     interpreted, and open the Settings dialog (pspc.ini);
+//   * "Boot XMB" starts the firmware's XMB (pspc --vsh) once tools/pspc_install_fw.py installed it.
 //
 //   pspc-launcher [games dir] [--list]   (--list prints the library to the console and exits)
 //
@@ -54,6 +55,7 @@ enum : int {
 	ID_REFRESH,
 	ID_OPEN_FOLDER,
 	ID_SETTINGS,
+	ID_BOOT_XMB,
 	ID_TIMER_JOBS = 300,
 };
 const COLORREF kBackground = RGB(24, 24, 30), kToolbar = RGB(34, 34, 43), kText = RGB(230, 230, 235);
@@ -648,6 +650,23 @@ void Play(int idx, bool interp, bool offerBuild = true) {
 	Launch((g_exeDir / "pspc.exe").wstring(), args, false);
 }
 
+// The firmware's XMB (pspc --vsh): needs tools\pspc_install_fw.py to have installed it.
+bool XmbInstalled() {
+	std::error_code ec;
+	return fs::exists(g_exeDir / "flash0" / "vsh" / "module" / "vshmain.prx", ec);
+}
+
+void BootXmb() {
+	if (!XmbInstalled()) {
+		MessageBoxW(g_main,
+		            L"The PSP firmware isn't installed.\n\nDecrypt Sony's 4.01 update with pspc-decrypt psar, then run "
+		            L"tools\pspc_install_fw.py (see docs\vsh-boot.md).",
+		            L"PSPC", MB_ICONINFORMATION);
+		return;
+	}
+	Launch((g_exeDir / "pspc.exe").wstring(), L"--vsh", false);
+}
+
 // Polls the running builds; refreshes the status and starts games waiting for theirs.
 void PollJobs() {
 	for (size_t i = 0; i < g_jobs.size();) {
@@ -870,6 +889,7 @@ void ContextMenu(HWND hwnd, LPARAM lp) {
 	AppendMenuW(m, 0, ID_REFRESH, L"&Refresh\tF5");
 	AppendMenuW(m, 0, ID_OPEN_FOLDER, L"&Open Games folder");
 	AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+	AppendMenuW(m, XmbInstalled() ? 0 : MF_GRAYED, ID_BOOT_XMB, L"Boot &XMB (PSP firmware)");
 	AppendMenuW(m, 0, ID_SETTINGS, L"&Settings...");
 	POINT pt{(short)LOWORD(lp), (short)HIWORD(lp)};
 	if (lp == -1) {  // from the keyboard: at the selected item
@@ -894,8 +914,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		ncm.lfMessageFont.lfHeight = -15;
 		g_uiFont = CreateFontIndirectW(&ncm.lfMessageFont);
 		const std::pair<int, const wchar_t *> tools[] = {
-			{ID_PLAY, L"Play"}, {ID_BUILD, L"Build native code"}, {ID_SETTINGS, L"Settings"},
-			{ID_REFRESH, L"Refresh"}, {ID_OPEN_FOLDER, L"Games folder"}};
+			{ID_PLAY, L"Play"}, {ID_BUILD, L"Build native code"}, {ID_BOOT_XMB, L"Boot XMB"},
+			{ID_SETTINGS, L"Settings"}, {ID_REFRESH, L"Refresh"}, {ID_OPEN_FOLDER, L"Games folder"}};
 		for (const auto &t : tools)
 			g_tools.push_back(CreateWindowExW(0, L"BUTTON", t.second, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0,
 			                                  0, hwnd, (HMENU)(INT_PTR)t.first, nullptr, nullptr));
@@ -961,6 +981,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		case ID_REFRESH: Rescan(); break;
 		case ID_OPEN_FOLDER: ShellExecuteW(nullptr, L"open", g_gamesDir.wstring().c_str(), nullptr, nullptr, SW_SHOW); break;
 		case ID_SETTINGS: OpenSettings(); break;
+		case ID_BOOT_XMB: BootXmb(); break;
 		}
 		// Toolbar buttons hand the keyboard back to the list.
 		if ((HWND)lp && GetFocus() == (HWND)lp) SetFocus(g_list);

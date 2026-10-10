@@ -18,6 +18,8 @@ void UnmountDisc();
 void RemountDiscIfAny();
 bool HaveDisc();
 std::string DiscId();
+// Host path of the mounted disc image ("" if none).
+std::string DiscPath();
 std::shared_ptr<vfs::IsoFileSystem> Disc();
 
 }  // namespace media

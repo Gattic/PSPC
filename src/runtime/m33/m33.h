@@ -65,4 +65,14 @@ void RegisterNidResolver(const std::string &csvPath);
 // A sctrlKernelLoadExecVSH* call asked for a relaunch: the host executable to run next.
 bool TakeRelaunch(std::string &hostFile);
 
+// The XMB launches `file` (LoadExecVSH* through sceVshBridge or SystemCtrl): the runtime restarts
+// with it, as the PSP reboots into the game. Returns 0, or an error when the file can't be reached.
+int LoadExecFromVsh(const char *file, u32 apitype, u32 paramPtr);
+// The XMB restarts itself (sceKernelExitVSHVSH), or a game launched from it exits to it.
+int ExitToVsh();
+// After each controller read of the XMB (sceVshBridge): the VSH menu (satelite.prx) on SELECT.
+void OnVshCtrlRead(u32 padPtr, int count);
+// After the run: the program asked to return to the XMB.
+bool TakeExitToVsh();
+
 }  // namespace m33

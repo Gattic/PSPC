@@ -128,9 +128,13 @@ public:
 	DevClass Class() const override { return cls_; }
 	vfs::FileSystem *Fs() override {
 		if (!fs_) Configure("host0");
-		return fs_.get();
+		return overlay_ ? overlay_.get() : fs_.get();
 	}
-	void OnMount(const std::string &name) override { Configure(name); }
+	void OnMount(const std::string &name) override {
+		Configure(name);
+		overlay_.reset();
+	}
+	void SetOverlay(std::shared_ptr<vfs::FileSystem> fs) { overlay_ = std::move(fs); }
 	int Devctl(const std::string &devName, u32 cmd, u32 inAddr, u32 inLen, u32 outAddr, u32 outLen, u32 *delayUs) override {
 		if (cls_ == DevClass::MemoryStick) return MemoryStickDevctl(devName, cmd, inAddr, inLen, outAddr, outLen, delayUs);
 		return Device::Devctl(devName, cmd, inAddr, inLen, outAddr, outLen, delayUs);
@@ -170,6 +174,7 @@ private:
 	bool readOnly_;
 	DevClass cls_ = DevClass::Host;
 	std::shared_ptr<vfs::HostFileSystem> fs_;
+	std::shared_ptr<vfs::FileSystem> overlay_;  // in front of fs_ (see SetFsOverlay)
 };
 
 class VfsDevice : public Device {
@@ -181,6 +186,65 @@ public:
 private:
 	std::shared_ptr<vfs::FileSystem> fs_;
 	DevClass cls_;
+};
+
+// The memory stick's raw partition ("msstor0p1:"), which the XMB's Saved Data Utility opens to
+// ask about the stick: always writable, a Memory Stick PRO Duo. Reads give zeroed sectors; nothing
+// is written. Answers as msstor.prx does: ioctl 0x02125008 "writable" (inserted and not locked),
+// 0x02125009 "write protected", devctl 0x02125802 the stick type (0x11 or 0x41).
+class MsStorFs : public vfs::FileSystem {
+public:
+	u32 Caps() const override { return vfs::FS_CAP_BLOCK_DEVICE; }
+	s32 Open(std::string_view path, u32 flags, s32) override {
+		if (!path.empty() && path != "/") return vfs::SCE_ERRNO_ENOENT;
+		if (flags & vfs::PSP_O_WRONLY) return vfs::SCE_ERRNO_EROFS;
+		return 1;
+	}
+	s32 Close(s32) override { return 0; }
+	s64 Read(s32, void *buf, u64 size) override {
+		memset(buf, 0, (size_t)size);
+		return (s64)size;
+	}
+	s64 Write(s32, const void *, u64) override { return vfs::SCE_ERRNO_EROFS; }
+	s64 Seek(s32, s64 offset, s32 whence) override { return whence == vfs::PSP_SEEK_SET ? offset : 0; }
+	s32 GetHandleInfo(s32, vfs::HandleInfo *out) override {
+		*out = vfs::HandleInfo();
+		out->device = true;
+		out->size = kFakeFreeSpace;
+		return 0;
+	}
+	s32 Ioctl(s32, u32 cmd, const void *, u32, void *out, u32 outLen) override {
+		if (out && outLen) memset(out, 0, outLen);
+		if (cmd == 0x02125008 && out && outLen >= 4) *(u32 *)out = 1;
+		return 0;
+	}
+	s32 GetStat(std::string_view, vfs::SceIoStat *) override { return vfs::SCE_ERRNO_ENOENT; }
+	s32 ChStat(std::string_view, const vfs::SceIoStat &, u32) override { return vfs::SCE_ERRNO_EROFS; }
+	s32 Remove(std::string_view) override { return vfs::SCE_ERRNO_EROFS; }
+	s32 Mkdir(std::string_view, s32) override { return vfs::SCE_ERRNO_EROFS; }
+	s32 Rmdir(std::string_view) override { return vfs::SCE_ERRNO_EROFS; }
+	s32 Rename(std::string_view, std::string_view) override { return vfs::SCE_ERRNO_EROFS; }
+	s32 DOpen(std::string_view) override { return vfs::SCE_ERRNO_ENOTDIR; }
+	s32 DRead(s32, vfs::SceIoDirent *) override { return 0; }
+	s32 DClose(s32) override { return 0; }
+};
+
+class MsStorDevice : public Device {
+public:
+	DevClass Class() const override { return DevClass::Host; }
+	vfs::FileSystem *Fs() override { return &fs_; }
+	u32 DevType() const override { return 0x04; }
+	int Devctl(const std::string &, u32 cmd, u32, u32, u32 outAddr, u32 outLen, u32 *) override {
+		if (cmd == 0x02125802 && mem::IsValidRange(outAddr, 4) && outLen >= 4) {
+			GWrite32(outAddr, 0x41);
+			return 0;
+		}
+		if (outLen && mem::IsValidRange(outAddr, outLen)) mem::Memset(outAddr, 0, outLen);
+		return 0;
+	}
+
+private:
+	MsStorFs fs_;
 };
 
 class EmulatorDevice : public Device {
@@ -367,10 +431,19 @@ std::shared_ptr<Device> MakeHostDevice(const std::string &hostRoot, bool readOnl
 	return std::make_shared<HostDevice>(hostRoot, readOnly);
 }
 
+bool SetFsOverlay(const std::string &device, const std::function<std::shared_ptr<vfs::FileSystem>(vfs::HostFileSystem *)> &make) {
+	auto *h = dynamic_cast<HostDevice *>(MountedDevice(device).get());
+	if (!h) return false;
+	h->SetOverlay(make(h->Host()));
+	return true;
+}
+
 std::shared_ptr<Device> MakeVfsDevice(std::shared_ptr<vfs::FileSystem> fs, DevClass cls) {
 	return std::make_shared<VfsDevice>(std::move(fs), cls);
 }
 
 std::shared_ptr<Device> MakeEmulatorDevice(bool hasDisplay) { return std::make_shared<EmulatorDevice>(hasDisplay); }
+
+std::shared_ptr<Device> MakeMsStorDevice() { return std::make_shared<MsStorDevice>(); }
 
 }  // namespace io

@@ -28,7 +28,7 @@ results in the interpreter and as native code.
 | M33 layer (SystemCtrl, KUBridge, VshCtrl, config.se, plugins, NID resolver) | Working |
 | Video (sceMpeg, PSMF, psmfplayer, videocodec), JPEG | Working. H.264 via Media Foundation; `video/` 24/30, `jpeg/` 8/11; game movies play with sound |
 | Firmware tooling (M33 extraction, inventory, NID database, Ghidra pipeline, pspc-decrypt) | Working |
-| Real 4.01 XMB | Needs the official 4.01 update file (see below) |
+| Real 4.01 XMB (`pspc --vsh`) | Working with the official 4.01 update (see below): boots, navigates, lists and launches ISOs, returns from games; M33 VSH menu and recovery. [docs/vsh-boot.md](docs/vsh-boot.md) |
 
 ## Building
 
@@ -74,6 +74,7 @@ Useful options (`pspc --help` lists them all):
 | `--osk-text <text>` | headless: what the on-screen keyboard returns (e.g. a character name) |
 | `--config <file\|none>`, `--set key=value` | settings file to use (default `pspc.ini`), or override one entry |
 | `--fw 6.60` | firmware version reported to games |
+| `--vsh`, `--recovery` | boot the installed firmware's XMB, or M33's recovery menu, instead of a file |
 | `--timeout <s>`, `--log <level>`, `--log-file <path>` | |
 
 ### Settings
@@ -123,9 +124,13 @@ have it:
 
 ```bat
 build\RelWithDebInfo\bin\pspc-decrypt.exe psar 401.PBP private\fw\401 --model 02g
+python -I tools\pspc_install_fw.py                 :: flash0/flash1 + native code for the XMB
+build\RelWithDebInfo\bin\pspc.exe --vsh            :: the real XMB (or "Boot XMB" in the launcher)
 ```
 
-See [docs/firmware-tooling.md](docs/firmware-tooling.md).
+UMD images in `ms0\ISO` show under Game > Memory Stick; SELECT opens M33's VSH menu, `--recovery`
+boots M33's recovery menu. See [docs/vsh-boot.md](docs/vsh-boot.md) and
+[docs/firmware-tooling.md](docs/firmware-tooling.md).
 
 ## Testing
 

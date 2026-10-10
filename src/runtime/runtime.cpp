@@ -29,7 +29,9 @@
 #include "runtime/kernel/scheduler.h"
 #include "runtime/kernel/sysmem.h"
 #include "runtime/m33/m33.h"
+#include "runtime/m33/vsh_iso.h"
 #include "runtime/media/disc.h"
+#include "runtime/vsh.h"
 #if PSPC_HAVE_GPU
 #include "gpu/backend.h"
 #include "gpu/ge.h"
@@ -44,6 +46,7 @@ void AddScriptedPress(u32 vblank, u32 buttons, u32 frames);
 }
 namespace umd {
 void NotifyDiscChanged();
+void SetDriveEmpty(bool empty);
 }
 
 namespace runtime {
@@ -99,7 +102,9 @@ struct BootTarget {
 u32 Rd32(const u8 *p) { u32 v; memcpy(&v, p, 4); return v; }
 
 fs::path Host0Root(const Options &o) {
-	return o.host0Dir.empty() ? fs::u8path(o.file).parent_path() : fs::u8path(o.host0Dir);
+	if (!o.host0Dir.empty()) return fs::u8path(o.host0Dir);
+	if (o.file.empty()) return ExecutableDir();
+	return fs::u8path(o.file).parent_path();
 }
 
 // host0: path of a host file, relative to the host0 root when the file lies under it.
@@ -113,9 +118,19 @@ std::string Host0PathOf(const Options &o, const fs::path &file) {
 }
 
 bool PrepareBoot(const Options &o, BootTarget &bt) {
+	io::Mount("host0", io::MakeHostDevice(Host0Root(o).string(), false));
+	if (o.vsh) {
+		// The XMB: no executable of our own. A disc is in the drive only with --umd.
+		bt.pspPath = "flash0:/vsh/module/vshmain.prx";
+		bt.cwd = "flash0:/vsh/module/";
+		if (!o.umdImage.empty() && !media::MountDisc(o.umdImage)) {
+			LOGE("BOOT", "Cannot open disc image %s", o.umdImage.c_str());
+			return false;
+		}
+		return true;
+	}
 	fs::path file = fs::u8path(o.file);
 	std::string ext = ToLower(file.extension().string());
-	io::Mount("host0", io::MakeHostDevice(Host0Root(o).string(), false));
 	if (ext == ".iso" || ext == ".cso" || ext == ".zso" || ext == ".dax" || ext == ".jso") {
 		if (!media::MountDisc(file.string())) {
 			LOGE("BOOT", "Cannot open disc image %s", o.file.c_str());
@@ -341,18 +356,30 @@ int RunOnce(const Options &o, BootTarget bt) {
 	}
 
 	// The M33 layer: config.se, kernel NID resolver, plugins (docs/m33-behaviors.md).
+	vsh::SetActive(o.vsh && o.bootPath.empty());
+	vsh::SetReturnToXmb(!vsh::Active() && o.returnToVsh);
 	m33::BootInfo bi;
 	bi.fromDisc = bt.pspPath.rfind("disc0:", 0) == 0;
-	bi.apitype = bi.fromDisc ? m33::APITYPE_GAME_UMD : m33::APITYPE_GAME_MS;
+	bi.apitype = vsh::Active() ? m33::APITYPE_VSH : bi.fromDisc ? m33::APITYPE_GAME_UMD : m33::APITYPE_GAME_MS;
 	bi.initFileName = bt.pspPath;
 	m33::Init(o.flash1Dir, bi);
 	if (!o.dataDir.empty()) m33::RegisterNidResolver((fs::u8path(o.dataDir) / "m33_nid_resolver.csv").string());
 	if (o.plugins) m33::LoadPlugins();
 
-	SceUID mod = boot::BootModule(bt.image, bt.pspPath, bootArgs);
-	if (mod < 0) {
-		LOGE("BOOT", "Failed to load %s: %08x", bt.pspPath.c_str(), mod);
-		return 2;
+	if (vsh::Active()) {
+		// No disc unless one was given: the XMB shows an empty drive. UMD images in ms0:/ISO show
+		// in the Game menu (M33 vshctrl).
+		umd::SetDriveEmpty(!media::HaveDisc());
+		m33::InstallIsoBrowser();
+		io::Mount("msstor0p1", io::MakeMsStorDevice());
+		io::Mount("msstor0", io::MakeMsStorDevice());
+		if (vsh::Boot(o.recovery) < 0) return 2;
+	} else {
+		SceUID mod = boot::BootModule(bt.image, bt.pspPath, bootArgs);
+		if (mod < 0) {
+			LOGE("BOOT", "Failed to load %s: %08x", bt.pspPath.c_str(), mod);
+			return 2;
+		}
 	}
 	int rc = sched::Run();
 	LOGI("RUNTIME", "Exited with code %d after %llu interpreted instructions, %u bad memory accesses", rc,
@@ -364,8 +391,15 @@ int RunOnce(const Options &o, BootTarget bt) {
 
 std::string g_relaunchTarget;
 std::string g_loadExecPath, g_loadExecArgsFile;
+bool g_exitToVsh = false;
 
 }  // namespace
+
+bool TakeExitToVsh() {
+	bool r = g_exitToVsh;
+	g_exitToVsh = false;
+	return r;
+}
 
 bool TakeRelaunch(std::string &hostFile) {
 	if (g_relaunchTarget.empty()) return false;
@@ -386,7 +420,7 @@ int Run(const Options &o) {
 	host::Config hc;
 	hc.headless = o.headless;
 	hc.windowScale = o.windowScale;
-	hc.title = "PSPC - " + PathToUtf8(fs::u8path(o.file).filename());
+	hc.title = o.vsh && o.file.empty() ? std::string("PSPC - XMB") : "PSPC - " + PathToUtf8(fs::u8path(o.file).filename());
 	hc.fullscreen = o.fullscreen;
 	hc.vsync = o.vsync;
 	hc.volume = o.volume;
@@ -396,7 +430,7 @@ int Run(const Options &o) {
 	hc.screenshotDir = o.screenshotDir;
 	{
 		// Screenshot names: the game file's name (its folder's for EBOOT.PBP).
-		fs::path f = fs::u8path(o.file);
+		fs::path f = fs::u8path(o.file.empty() ? std::string("xmb") : o.file);
 		std::string name = PathToUtf8(ToLower(PathToUtf8(f.filename())) == "eboot.pbp" ? f.parent_path().filename() : f.stem());
 		for (char &ch : name)
 			if (strchr("<>:\"/\\|?* ", ch)) ch = '_';
@@ -443,6 +477,17 @@ int Run(const Options &o) {
 				LOGI("RUNTIME", "sceKernelLoadExec(%s): restarting", next.c_str());
 				g_loadExecPath = next;
 				g_loadExecArgsFile = args.empty() ? "" : PathToUtf8(argsFile);
+				code = 0;
+			}
+			// M33's LoadExecVSH family (and the XMB launching a game) swap the host file.
+			std::string m33next;
+			if (m33::TakeRelaunch(m33next)) {
+				LOGI("RUNTIME", "LoadExec %s: restarting", m33next.c_str());
+				g_relaunchTarget = m33next;
+				code = 0;
+			}
+			if (m33::TakeExitToVsh()) {
+				g_exitToVsh = true;
 				code = 0;
 			}
 			return code;

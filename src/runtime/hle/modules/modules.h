@@ -25,6 +25,9 @@ void Register_sceUtility();
 void Register_sceHprm();
 void Register_Misc();
 void Register_M33();
+// vsh_bridge.cpp: sceVshBridge and sceResmgr (the XMB's kernel bridge). Registered last: it
+// forwards to functions of the other libraries.
+void Register_VshLibraries();
 
 namespace hle {
 void RegisterAllModules();

@@ -612,6 +612,18 @@ int sceRtcGetAlarmTick(u32 tickPtr) {
 	return 0;
 }
 
+// The XMB registers a callback for clock changes (alarms, time set); the clock never changes
+// under it here, so it is only remembered.
+SceUID g_rtcCallback = 0;
+int sceRtcRegisterCallback(SceUID cb) {
+	g_rtcCallback = cb;
+	return 0;
+}
+int sceRtcUnregisterCallback(SceUID cb) {
+	if (cb == g_rtcCallback) g_rtcCallback = 0;
+	return 0;
+}
+
 }  // namespace
 
 namespace rtc {
@@ -671,6 +683,8 @@ void Register_sceRtc() {
 		HLEFN(0x7D1FBED3, sceRtcSetAlarmTick),
 		HLEFN(0x81FCDA34, sceRtcIsAlarmed),
 		HLEFN(0xC2DDBEB5, sceRtcGetAlarmTick),
+		HLEFN(0xFB3B18CD, sceRtcRegisterCallback),
+		HLEFN(0x6A676D2D, sceRtcUnregisterCallback),
 	};
 	hle::RegisterModule("sceRtc", funcs);
 	// The kernel-only alias: the same functions, plus sceRtcSetAlarmTick under the NIDs later

@@ -22,6 +22,7 @@ FileKind SniffKind(const u8 *data, size_t size) {
 	if (HasMagic(data, size, "\x89" "PNG", 4)) return FileKind::Png;
 	if (HasMagic(data, size, "PSMF", 4)) return FileKind::Pmf;
 	if (HasMagic(data, size, "RIFF", 4)) return FileKind::Riff;
+	if (HasMagic(data, size, "PSPsysGP", 8)) return FileKind::SysResource;
 	if (IsGzipMagic(data, size)) return FileKind::Gzip;
 	if (size >= 2 && data[0] == 0x78 && IsZlibHeader(data, size)) return FileKind::Zlib;
 	return FileKind::Unknown;
@@ -45,6 +46,7 @@ const char *FileKindName(FileKind kind) {
 	case FileKind::Png: return "PNG";
 	case FileKind::Pmf: return "PSMF";
 	case FileKind::Riff: return "RIFF";
+	case FileKind::SysResource: return "PSPsysGP";
 	default: return "unknown";
 	}
 }

@@ -88,6 +88,42 @@ u32 NotLinkedStub() {
 	return stub;
 }
 
+// Points the references of a variable import at the exported variable (once per import).
+void BindVariable(PspModule *m, const loader::ImportLib &lib, const loader::ImportVar &v, u32 exportAddr) {
+	if (!m->boundVars.insert(lib.name + ":" + std::to_string(v.nid)).second) return;
+	// HI16 relocations are fixed up against the LO16 that follows (see PPSSPP WriteVarSymbol).
+	std::vector<std::pair<u32, u32>> pendingHi;
+	for (const loader::VarRef &ref : v.refs) {
+		u32 op = GRead32(ref.addr);
+		switch (ref.type) {
+		case loader::R_MIPS_32: GWrite32(ref.addr, op + exportAddr); break;
+		case loader::R_MIPS_HI16: pendingHi.push_back({ref.addr, op}); break;
+		case loader::R_MIPS_LO16: {
+			u32 offLo = (u32)(s32)(s16)(op & 0xFFFF);
+			u32 full = offLo + exportAddr;
+			for (auto &hi : pendingHi) {
+				full = (hi.second << 16) + offLo + exportAddr;
+				u16 high = (u16)((full >> 16) + ((full & 0x8000) ? 1 : 0));
+				GWrite32(hi.first, (hi.second & ~0xFFFFu) | high);
+			}
+			pendingHi.clear();
+			GWrite32(ref.addr, (op & ~0xFFFFu) | (full & 0xFFFF));
+			break;
+		}
+		default: break;
+		}
+	}
+	// Native code reads these words at run time; they aren't code changes.
+	if (!m->pristine.empty()) {
+		for (const loader::VarRef &ref : v.refs) {
+			if (ref.addr >= m->memAddr && ref.addr + 4 <= m->memAddr + m->memSize) {
+				u32 w = GRead32(ref.addr);
+				memcpy(&m->pristine[ref.addr - m->memAddr], &w, 4);
+			}
+		}
+	}
+}
+
 // Bind every import of `m` either to a guest export of another loaded module or to HLE.
 void ResolveImports(PspModule *m) {
 	for (const loader::ImportLib &lib : m->imports) {
@@ -125,37 +161,17 @@ void ResolveImports(PspModule *m) {
 				}
 			}
 			if (!exportAddr) {
-				LOGW("LOADER", "%s: unresolved variable import %s::%08x", m->name.c_str(), lib.name.c_str(), v.nid);
+				LOGW("LOADER", "%s: variable import %s::%08x: no loaded module exports it (yet)", m->name.c_str(), lib.name.c_str(), v.nid);
 				continue;
 			}
-			// HI16 relocations are fixed up against the LO16 that follows (see PPSSPP WriteVarSymbol).
-			std::vector<std::pair<u32, u32>> pendingHi;
-			for (const loader::VarRef &ref : v.refs) {
-				u32 op = GRead32(ref.addr);
-				switch (ref.type) {
-				case loader::R_MIPS_32: GWrite32(ref.addr, op + exportAddr); break;
-				case loader::R_MIPS_HI16: pendingHi.push_back({ref.addr, op}); break;
-				case loader::R_MIPS_LO16: {
-					u32 offLo = (u32)(s32)(s16)(op & 0xFFFF);
-					u32 full = offLo + exportAddr;
-					for (auto &hi : pendingHi) {
-						full = (hi.second << 16) + offLo + exportAddr;
-						u16 high = (u16)((full >> 16) + ((full & 0x8000) ? 1 : 0));
-						GWrite32(hi.first, (hi.second & ~0xFFFFu) | high);
-					}
-					pendingHi.clear();
-					GWrite32(ref.addr, (op & ~0xFFFFu) | (full & 0xFFFF));
-					break;
-				}
-				default: break;
-				}
-			}
+			BindVariable(m, lib, v, exportAddr);
 		}
 	}
 }
 
 // A new module exports libraries: rebind earlier modules that imported them but got HLE stubs
-// with no implementation.
+// with no implementation, and bind their variable imports from it (the XMB's plugins load
+// before the libraries whose variables they use, e.g. music_main_plugin before music_browser).
 void RebindImportersOf(PspModule *exporter) {
 	for (SceUID id : g_modules) {
 		PspModule *m = Get<PspModule>(id);
@@ -167,6 +183,10 @@ void RebindImportersOf(PspModule *exporter) {
 					if (hle::FindFunction(lib.name, f.nid)) continue;
 					for (auto &ef : el.funcs)
 						if (ef.first == f.nid) hle::PatchImportStubToGuest(f.stubAddr, lib.name, f.nid, ef.second);
+				}
+				for (const loader::ImportVar &v : lib.vars) {
+					for (auto &ev : el.vars)
+						if (ev.first == v.nid) BindVariable(m, lib, v, ev.second);
 				}
 			}
 		}
@@ -232,6 +252,7 @@ void RegisterAotFunctions(PspModule *m) {
 void SetAotCacheDir(const std::string &dir) { g_aotDir = dir; }
 void SetAotEnabled(bool enabled) { g_aotEnabled = enabled; }
 void SetDecryptTool(const std::string &exe) { g_decryptTool = exe; }
+bool DecryptWithTool(const std::vector<u8> &in, std::vector<u8> &out, std::string *err) { return RunDecryptTool(in, out, err); }
 void SetDecryptCacheDir(const std::string &dir) { g_decryptCache = dir; }
 const std::vector<SceUID> &LoadedModules() { return g_modules; }
 

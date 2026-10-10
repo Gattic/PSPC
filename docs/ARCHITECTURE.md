@@ -38,7 +38,8 @@ flowchart TB
 | `src/runtime/kernel/` | Scheduler (guest threads = Windows fibers on one host thread), threads, callbacks, wait queues, memory partitions, module loading. |
 | `src/runtime/hle/` | HLE framework (`hle.cpp`: syscall table, NID registry; `hle_wrap.h`: automatic PSP-EABI argument marshalling) and one file per library in `modules/`. |
 | `src/runtime/io/`, `src/runtime/media/` | The PSP device namespace (`ms0:`, `host0:`, `flash0:`, `flash1:`, `disc0:`, `umd0:`, `emulator:`). |
-| `src/runtime/m33/` | The M33 CFW behaviours (SystemCtrl, KUBridge, VshCtrl, config.se, plugins, NID resolver). |
+| `src/runtime/m33/` | The M33 CFW behaviours (SystemCtrl, KUBridge, VshCtrl, config.se, plugins, NID resolver, vshctrl's ISO browsing and VSH menu). |
+| `src/runtime/vsh.cpp` | `pspc --vsh`: boots the firmware's XMB modules as guest code, as init.prx does ([vsh-boot.md](vsh-boot.md)). |
 | `src/fs/` | Disc images (ISO/CSO/ZSO/DAX), ISO9660, host file system, PBP, PARAM.SFO. |
 | `src/gpu/` | GE display-list processing, timing and the multithreaded software rasterizer (the default renderer and the accuracy reference). `backend.h` is the renderer seam at the post-transform level. |
 | `src/gpu/hw/` | Optional Direct3D 11 renderer (`--renderer d3d11`, `--render-scale 1-4`): the GE pixel pipeline in a shader over rasterizer-ordered views, surfaces mirroring VRAM framebuffers, written back to guest memory when guest code touches it. |
@@ -121,5 +122,6 @@ the decrypted ELF, sets its relocation delta and registers its functions in the 
 |---|---|
 | kernel (threads, sync, memory, modules, interrupts), I/O, display, controller, power, RTC, UMD | games, homebrew, game-shipped libraries (sceDeflt, sceMd5, sceHeap, sceCcc...) |
 | GE graphics, audio output, SAS, ATRAC/MP3/MPEG codecs, network (offline) | M33 user-level UI (VSH menu, recovery) once firmware is present |
-| sceUtility dialogs and save data | the 4.01 XMB (vshmain, paf, plugins) once firmware is present |
+| sceUtility dialogs and save data | the 4.01 XMB (vshmain, paf, plugins): `pspc --vsh` |
+| every Sony kernel module, `vshbridge` included (`sceVshBridge` in hle/modules/vsh_bridge.cpp) | |
 | M33 SystemCtrl/KUBridge/VshCtrl behaviours | M33 game plugins (`seplugins/game.txt`) |

@@ -24,6 +24,8 @@
 #include "runtime/kernel/errors.h"
 #include "runtime/kernel/scheduler.h"
 #include "runtime/kernel/thread.h"
+#include "runtime/io/io.h"
+#include "runtime/vsh.h"
 
 namespace systemparam {
 int Language();
@@ -1079,11 +1081,98 @@ bool LookupCategory(const std::string &rawPath, std::vector<RegKey> *keys) {
 	return true;
 }
 
+bool g_overlayDirty = false;
+
 void SetOverlay(const std::string &path, const RegKey &key) {
 	auto &list = g_overlay[path];
 	auto it = std::find_if(list.begin(), list.end(), [&](const RegKey &k) { return k.name == key.name; });
 	if (it != list.end()) *it = key;
 	else list.push_back(key);
+	g_overlayDirty = true;
+}
+
+// ---- persistence (the XMB's settings) ----
+//
+// The XMB's writes (System Settings: nickname, language, theme...) survive in
+// flash1:/registry/pspc.reg, one key per line: category <TAB> name <TAB> type <TAB> value (INT in
+// decimal, STR/BIN in hex). Only the XMB saves; the XMB and the games it launches load it (a game
+// started on its own sees the built-in registry, so test results don't depend on it).
+constexpr const char *kRegFile = "flash1:/registry/pspc.reg";
+bool g_persistLoaded = false;
+
+bool PersistLoads() { return vsh::Active() || vsh::ReturnToXmb(); }
+
+void LoadPersisted() {
+	if (g_persistLoaded) return;
+	g_persistLoaded = true;
+	if (!PersistLoads()) return;
+	std::vector<u8> data;
+	if (!io::ReadFile(kRegFile, data)) return;
+	std::string text(data.begin(), data.end());
+	size_t pos = 0, n = 0;
+	while (pos < text.size()) {
+		size_t end = text.find('\n', pos);
+		if (end == std::string::npos) end = text.size();
+		std::string line = text.substr(pos, end - pos);
+		pos = end + 1;
+		if (!line.empty() && line.back() == '\r') line.pop_back();
+		if (line.empty() || line[0] == '#') continue;
+		std::vector<std::string> f;
+		size_t s = 0;
+		for (int i = 0; i < 3; i++) {
+			size_t t = line.find('\t', s);
+			if (t == std::string::npos) break;
+			f.push_back(line.substr(s, t - s));
+			s = t + 1;
+		}
+		if (f.size() != 3) continue;
+		f.push_back(line.substr(s));
+		RegKey k;
+		k.name = f[1];
+		k.type = (ValueType)atoi(f[2].c_str());
+		if (k.type == ValueType::INT) {
+			k.intValue = (s32)strtol(f[3].c_str(), nullptr, 10);
+		} else if (k.type == ValueType::STR || k.type == ValueType::BIN) {
+			for (size_t i = 0; i + 1 < f[3].size(); i += 2) k.data.push_back((char)strtoul(f[3].substr(i, 2).c_str(), nullptr, 16));
+		} else if (k.type != ValueType::DIR) {
+			continue;
+		}
+		auto &list = g_overlay[f[0]];
+		auto it = std::find_if(list.begin(), list.end(), [&](const RegKey &o) { return o.name == k.name; });
+		if (it != list.end()) *it = k;
+		else list.push_back(k);
+		n++;
+	}
+	LOGI(LOG, "%zu registry keys from %s", n, kRegFile);
+}
+
+void SavePersisted() {
+	if (!g_overlayDirty || !vsh::Active()) return;
+	g_overlayDirty = false;
+	std::string out = "# PSPC registry: keys the XMB set (category, name, type, value)\n";
+	char hex[3];
+	for (const auto &cat : g_overlay) {
+		for (const RegKey &k : cat.second) {
+			out += cat.first + "\t" + k.name + "\t" + std::to_string((int)k.type) + "\t";
+			if (k.type == ValueType::INT) out += std::to_string(k.intValue);
+			for (char ch : k.data) {
+				if (k.type != ValueType::STR && k.type != ValueType::BIN) break;
+				snprintf(hex, sizeof(hex), "%02x", (u8)ch);
+				out += hex;
+			}
+			out += "\n";
+		}
+	}
+	std::shared_ptr<io::Device> dev = io::MountedDevice("flash1");
+	if (!dev) return;
+	dev->Mkdir("/registry", 0777);
+	int h = dev->Open("/registry/pspc.reg", io::PSP_O_WRONLY | io::PSP_O_CREAT | io::PSP_O_TRUNC, 0777);
+	if (h < 0) {
+		LOGW(LOG, "Cannot write %s", kRegFile);
+		return;
+	}
+	dev->Write(h, out.data(), (s64)out.size());
+	dev->Close(h);
 }
 
 // ================================================================ sceReg
@@ -1101,6 +1190,7 @@ std::map<int, OpenCategory> g_openCategories;
 
 // The registry (only /system exists) always has handle 0.
 int sceRegOpenRegistry(u32 regParamAddr, int mode, u32 regHandleAddr) {
+	LoadPersisted();
 	if (mem::IsValidRange(regHandleAddr, 4)) GWrite32(regHandleAddr, 0);
 	g_openRegistryCount++;
 	return 0;
@@ -1115,6 +1205,7 @@ int sceRegCloseRegistry(int regHandle) {
 
 int sceRegFlushRegistry(int regHandle) {
 	if (regHandle != 0) return (int)SCE_REG_ERROR_REGISTRY_NOT_FOUND;
+	SavePersisted();
 	return 0;
 }
 
@@ -1144,11 +1235,13 @@ int sceRegOpenCategory(int regHandle, const char *name, int mode, u32 catHandleA
 
 int sceRegCloseCategory(int catHandle) {
 	if (!g_openCategories.erase(catHandle)) return (int)SCE_REG_ERROR_CATEGORY_NOT_FOUND;
+	SavePersisted();
 	return 0;
 }
 
 int sceRegFlushCategory(int catHandle) {
 	if (!g_openCategories.count(catHandle)) return (int)SCE_REG_ERROR_CATEGORY_NOT_FOUND;
+	SavePersisted();
 	return 0;
 }
 

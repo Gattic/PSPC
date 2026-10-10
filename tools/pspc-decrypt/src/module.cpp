@@ -276,6 +276,26 @@ void DecodeExecutable(const u8 *data, size_t size, const DecodeOptions &options,
 			r->status = DecodeStatus::Ok;
 			return;
 		}
+		case FileKind::SysResource: {
+			// Not an executable, but encrypted like one (PRX type 9 keys, tag at 0xD0): the
+			// XMB's index (flash0:/vsh/etc/index*.dat), which the firmware decrypts through
+			// sceResmgr. The plaintext is a short "release:..." text.
+			Bytes payload;
+			PrxDecryptInfo info;
+			if (DecryptPRX(data, size, size, &payload, seed, &info) < 0) {
+				r->tag = info.tag;
+				r->status = info.error == PrxError::UnknownTag ? DecodeStatus::NeedsKey : DecodeStatus::Failed;
+				r->error = StringPrintf("cannot decrypt PSPsysGP resource (tag 0x%08x): %s", info.tag, PrxErrorString(info.error));
+				return;
+			}
+			r->tag = info.tag;
+			r->encrypted = true;
+			r->prxType = info.type;
+			r->steps.push_back(StringPrintf("KIRK decrypt of a system resource (type %d, tag 0x%08x)", info.type, info.tag));
+			r->output = std::move(payload);
+			r->status = DecodeStatus::Ok;
+			return;
+		}
 		default:
 			r->error = std::string("not a PSP executable (") + FileKindName(kind) + ")";
 			return;

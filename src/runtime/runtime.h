@@ -9,7 +9,10 @@
 namespace runtime {
 
 struct Options {
-	std::string file;          // host path of the executable / PBP / ISO
+	std::string file;          // host path of the executable / PBP / ISO (empty with vsh)
+	bool vsh = false;          // boot the firmware's XMB (flash0:/vsh/module) instead of a game
+	bool returnToVsh = false;  // a game launched from the XMB: its exit restarts the XMB
+	bool recovery = false;     // with vsh: M33's recovery menu instead of the XMB (R held at boot)
 	bool headless = false;
 	bool aot = true;
 	std::string aotDir;        // directory with <sha1>.dll module builds
@@ -61,5 +64,7 @@ bool TakeRelaunch(std::string &hostFile);
 // After Run(): the program called sceKernelLoadExec; restart booting this guest path with the
 // argument block stored in argsFile ("" for none). See Options::bootPath.
 bool TakeLoadExecRelaunch(std::string &pspPath, std::string &argsFile);
+// After Run(): the program asked to go back to the XMB (a game launched from it exited).
+bool TakeExitToVsh();
 
 }  // namespace runtime

@@ -17,6 +17,10 @@
 
 using namespace kernel;
 
+namespace umd {
+bool DiscInserted();
+}
+
 namespace {
 
 constexpr u32 kNumBufs = 64;
@@ -56,6 +60,13 @@ struct ScriptedPress {
 	u32 vblank, frames, buttons;
 };
 std::vector<ScriptedPress> g_script;
+
+// Kernel-only status bits of the button word.
+constexpr u32 kCtrlDisc = 0x01000000, kCtrlMs = 0x02000000;
+
+// Runs when HOME goes down (a game the XMB launched: HOME quits back to it).
+constexpr u32 kHomeButton = 0x00010000;
+void (*g_homeHandler)() = nullptr;
 
 u32 ScriptedButtons() {
 	u32 v = display::Vcount(), b = 0;
@@ -99,6 +110,7 @@ void UpdateLatch() {
 	}
 
 	const u32 changed = buttons ^ g_oldButtons;
+	if ((buttons & changed & kHomeButton) && g_homeHandler) sched::ScheduleEvent(sched::NowUs(), g_homeHandler);
 	g_latch.btnMake |= buttons & changed;
 	g_latch.btnBreak |= g_oldButtons & changed;
 	g_latch.btnPress |= buttons;
@@ -111,18 +123,20 @@ void UpdateLatch() {
 	if (g_bufRead == g_buf) g_bufRead = (g_bufRead + 1) % kNumBufs;
 }
 
-int ReadSingleBuffer(u32 ptr, bool negative) {
+int ReadSingleBuffer(u32 ptr, bool negative, bool kernelRead = false) {
 	if (!mem::IsValidRange(ptr, sizeof(CtrlData))) return 0;
 	CtrlData d = g_bufs[g_bufRead];
 	g_bufRead = (g_bufRead + 1) % kNumBufs;
-	// Mask out buttons games aren't allowed to see.
-	d.buttons &= CTRL_MASK_USER;
+	// Mask out buttons games aren't allowed to see. Kernel-mode reads (the XMB, through
+	// sceVshBridge) see every button and the media bits: a memory stick is always inserted.
+	if (kernelRead) d.buttons |= kCtrlMs | (umd::DiscInserted() ? kCtrlDisc : 0);
+	else d.buttons &= CTRL_MASK_USER;
 	if (negative) d.buttons = ~d.buttons;
 	mem::WriteBytes(ptr, &d, sizeof(d));
 	return 1;
 }
 
-int ReadBuffer(u32 ptr, u32 nBufs, bool negative, bool peek) {
+int ReadBuffer(u32 ptr, u32 nBufs, bool negative, bool peek, bool kernelRead = false) {
 	if (nBufs > kNumBufs) return (int)SCE_KERNEL_ERROR_INVALID_SIZE;
 	if (!peek && !sched::DispatchEnabled()) return (int)SCE_KERNEL_ERROR_CAN_NOT_WAIT;
 	if (!peek && sched::InInterrupt()) return (int)SCE_KERNEL_ERROR_ILLEGAL_CONTEXT;
@@ -138,7 +152,7 @@ int ReadBuffer(u32 ptr, u32 nBufs, bool negative, bool peek) {
 	}
 	g_bufRead = (g_buf - avail + kNumBufs) % kNumBufs;
 	int done = 0;
-	for (u32 i = 0; i < avail; i++) done += ReadSingleBuffer(ptr + i * (u32)sizeof(CtrlData), negative);
+	for (u32 i = 0; i < avail; i++) done += ReadSingleBuffer(ptr + i * (u32)sizeof(CtrlData), negative, kernelRead);
 	if (peek) g_bufRead = resetRead;
 	return done;
 }
@@ -155,7 +169,7 @@ void DoSample() {
 		if (t->IsWaitingFor(WAITTYPE_CTRL, CTRL_WAIT_POSITIVE)) kind = CTRL_WAIT_POSITIVE;
 		else if (t->IsWaitingFor(WAITTYPE_CTRL, CTRL_WAIT_NEGATIVE)) kind = CTRL_WAIT_NEGATIVE;
 		if (!kind) continue;  // woken some other way
-		const int ret = ReadSingleBuffer(t->waitValue[0], kind == CTRL_WAIT_NEGATIVE);
+		const int ret = ReadSingleBuffer(t->waitValue[0], kind == CTRL_WAIT_NEGATIVE, t->waitValue[1] != 0);
 		sched::Wake(t, ret);
 		break;
 	}
@@ -205,14 +219,15 @@ int Peek(u32 ptr, u32 n, bool negative) {
 	sched::ChargeCycles(330 + 44 * (s64)(done > 0 ? done : 0));
 	return done;
 }
-int Read(u32 ptr, u32 n, bool negative) {
-	const int done = ReadBuffer(ptr, n, negative, false);
+int Read(u32 ptr, u32 n, bool negative, bool kernelRead = false) {
+	const int done = ReadBuffer(ptr, n, negative, false, kernelRead);
 	sched::ChargeCycles(330);
 	if (done != 0) return done;
 	PspThread *t = sched::Current();
 	if (!t) return 0;
 	g_waiting.push_back(t->uid);
 	t->waitValue[0] = ptr;
+	t->waitValue[1] = kernelRead ? 1 : 0;
 	return sched::Wait(WAITTYPE_CTRL, negative ? CTRL_WAIT_NEGATIVE : CTRL_WAIT_POSITIVE, 0, false);
 }
 int sceCtrlPeekBufferPositive(u32 p, u32 n) { return Peek(p, n, false); }
@@ -265,6 +280,9 @@ void OnVblank() {
 	});
 }
 void AddScriptedPress(u32 vblank, u32 buttons, u32 frames) { g_script.push_back({vblank, frames, buttons}); }
+void SetHomeHandler(void (*fn)()) { g_homeHandler = fn; }
+// sceCtrlReadBufferPositive for a kernel-mode caller (sceVshBridge): nothing masked.
+int ReadBufferPositiveKernel(u32 ptr, u32 n) { return Read(ptr, n, false, true); }
 }  // namespace ctrl
 
 void Register_sceCtrl() {

@@ -232,6 +232,20 @@ Behaviours (from functions and string constants **[dis/str vshctrl]**):
 - `vctrlVSHExitVSHMenu(conf, videoiso, disctype)` applies the new `SEConfig`
   that satelite passed, optionally mounts a video ISO, and unloads the menu.
   [dis vshctrl@0x1058], [hdr]
+- **The hooks, in detail** (how the XMB sees them; PSPC reproduces these natively, see
+  docs/vsh-boot.md): vshctrl redirects the XMB's `sceIoDopen/Dread/Getstat/Open/...` syscalls
+  (`sctrlHENPatchSyscall`) [dis vshctrl@0x90]. Reading `ms0:/PSP/GAME` returns, after its own
+  entries, those of `GAME150`/`GAME4XX` (names suffixed `__150`/`__4XX`) and one directory per
+  image file in `ms0:/ISO`, named `MMMMMISO<n>` (mode 0x11FF, the image's times)
+  [dis vshctrl@0x11D4, 0xD8C]. Paths under `ms0:/PSP/GAME/MMMMMISO<n>` reach a virtual-PBP
+  manager ("VirtualPBPMgr", up to 0x80 images): the folder holds `EBOOT.PBP`, a PBP whose
+  PARAM.SFO is a template filled with the image's TITLE and DISC_ID and whose ICON0/ICON1/PIC0/
+  PIC1/SND0 sections are read from the image through `/sce_lbn` extents [dis vshctrl@0x36E4,
+  0x2D10]. The XMB's controller read is hooked too: with no VSH menu loaded and none of
+  `htmlviewer_plugin_module`, `sceVshOSK_Module`, `camera_plugin_module` loaded, SELECT in the
+  first sample loads `satelite.prx` into partition 5, starts it and clears SELECT; while the menu
+  is loaded its registered callback gets each read; once it unregistered, the menu is stopped and
+  unloaded [dis vshctrl@0x3A4].
 
 ---
 

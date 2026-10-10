@@ -5,6 +5,7 @@
 // plus the behaviour the HLE needs to know about (FAT, UMD timing, devctls).
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -13,6 +14,10 @@
 #include "common/common.h"
 #include "fs/filesystem.h"
 #include "runtime/kernel/kobject.h"
+
+namespace vfs {
+class HostFileSystem;
+}
 
 namespace io {
 
@@ -123,8 +128,15 @@ std::string HostPathFor(const std::string &pspPath);
 
 // Host-directory device; its flavour (memory stick, flash, host0) follows the mount name.
 std::shared_ptr<Device> MakeHostDevice(const std::string &hostRoot, bool readOnly);
+// Puts a file system in front of a mounted host-directory device (the XMB's ISO browsing on ms0:):
+// `make` gets the device's own file system and returns the one the guest sees. HostPathFor keeps
+// answering for the host directory. Until the device is mounted again. False if `device` isn't a
+// host-directory device.
+bool SetFsOverlay(const std::string &device, const std::function<std::shared_ptr<vfs::FileSystem>(vfs::HostFileSystem *)> &make);
 std::shared_ptr<Device> MakeVfsDevice(std::shared_ptr<vfs::FileSystem> fs, DevClass cls);
 // "emulator:" device pspautotests send their output through.
 std::shared_ptr<Device> MakeEmulatorDevice(bool hasDisplay);
+// The memory stick's raw partition ("msstor0p1:") the XMB queries.
+std::shared_ptr<Device> MakeMsStorDevice();
 
 }  // namespace io

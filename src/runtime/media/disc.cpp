@@ -18,6 +18,7 @@ namespace {
 
 std::shared_ptr<vfs::IsoFileSystem> g_iso;
 std::string g_discId;
+std::string g_discPath;
 
 }  // namespace
 
@@ -35,6 +36,7 @@ bool MountDisc(const std::string &hostPath) {
 	}
 	g_iso = iso;
 	g_discId.clear();
+	g_discPath = hostPath;
 	std::vector<u8> sfo;
 	if (iso->ReadWholeFile("/PSP_GAME/PARAM.SFO", sfo) == 0) {
 		vfs::ParamSfo p;
@@ -53,6 +55,7 @@ void UnmountDisc() {
 	io::Unmount("umd0");
 	g_iso.reset();
 	g_discId.clear();
+	g_discPath.clear();
 	umd::NotifyDiscChanged();
 }
 
@@ -64,6 +67,7 @@ void RemountDiscIfAny() {
 
 bool HaveDisc() { return g_iso != nullptr; }
 std::string DiscId() { return g_discId; }
+std::string DiscPath() { return g_discPath; }
 std::shared_ptr<vfs::IsoFileSystem> Disc() { return g_iso; }
 
 }  // namespace media

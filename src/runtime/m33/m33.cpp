@@ -3,6 +3,7 @@
 // SystemCtrlForUser/Kernel, KUBridge and VshCtrlLib, implemented natively from
 // docs/m33-behaviors.md. Each function notes which M33 behaviour it reproduces.
 #include "runtime/m33/m33.h"
+#include "runtime/m33/vsh_iso.h"
 
 #include <algorithm>
 #include <filesystem>
@@ -37,6 +38,7 @@ u32 g_startModuleHandler = 0;
 u32 g_vshMenuCallback = 0;
 std::string g_relaunch;
 bool g_relaunchPending = false;
+bool g_exitToVshPending = false;
 
 constexpr u32 SE_MAGIC = 0x47434553;
 constexpr u32 HEN_VERSION = 0x00000400;   // sctrlHENGetVersion (docs/m33-behaviors.md 2.1)
@@ -134,6 +136,19 @@ bool TakeRelaunch(std::string &hostFile) {
 	g_relaunchPending = false;
 	hostFile = g_relaunch;
 	return true;
+}
+
+bool TakeExitToVsh() {
+	bool r = g_exitToVshPending;
+	g_exitToVshPending = false;
+	return r;
+}
+
+int ExitToVsh() {
+	LOGI("M33", "Exit to the XMB");
+	g_exitToVshPending = true;
+	sched::RequestStop(0x4D33);
+	return 0;
 }
 
 // seplugins/<list>.txt with enable bytes in seplugins/conf.bin (5 slots per list:
@@ -297,8 +312,8 @@ int LoadExecTo(const char *file, u32 apitype) {
 	std::string f = file;
 	std::string host;
 	if (f.rfind("disc0:", 0) == 0 || f.rfind("umd0:", 0) == 0) {
-		// The mounted ISO is the new executable's disc.
-		host = g_umdFile.empty() ? std::string() : io::HostPathFor(g_umdFile);
+		// The mounted ISO is the new executable's disc (mounted by M33, or the disc in the drive).
+		host = g_umdFile.empty() ? media::DiscPath() : io::HostPathFor(g_umdFile);
 	} else {
 		host = io::HostPathFor(f);
 	}
@@ -319,10 +334,8 @@ int sctrlKernelLoadExecVSHMs1(const char *file, u32) { return LoadExecTo(file, 0
 int sctrlKernelLoadExecVSHMs2(const char *file, u32) { return LoadExecTo(file, 0x141); }
 int sctrlKernelLoadExecVSHMs3(const char *file, u32) { return LoadExecTo(file, 0x142); }
 int sctrlKernelLoadExecVSHMs4(const char *file, u32) { return LoadExecTo(file, 0x143); }
-int sctrlKernelExitVSH(u32) {
-	sched::RequestStop(0);
-	return 0;
-}
+// Back to the XMB (the frontend restarts it when it booted it; otherwise the run just ends).
+int sctrlKernelExitVSH(u32) { return ExitToVsh(); }
 
 // ---- SystemCtrl: kernel identity overrides ----
 int sctrlKernelSetInitApitype(int apitype) {
@@ -376,7 +389,8 @@ int kuKernelGetModel() { return mem::g_ramSize > 0x02000000 ? 1 : 0; }
 
 // ---- VshCtrlLib ----
 int vctrlVSHRegisterVshMenu(u32 cb) {
-	g_vshMenuCallback = cb | 0x80000000;
+	// (vshctrl runs it in kernel mode; here it's called as the guest function it is.)
+	g_vshMenuCallback = cb;
 	return 0;
 }
 int vctrlVSHExitVSHMenu(u32 confPtr, const char *videoIso, int discType) {
@@ -394,6 +408,62 @@ int vctrlVSHExitVSHMenu(u32 confPtr, const char *videoIso, int discType) {
 }
 
 }  // namespace
+
+namespace m33 {
+
+// vshctrl's hook on the XMB's controller reads (docs/m33-behaviors.md section 3). SELECT opens
+// the VSH menu: flash0:/vsh/module/satelite.prx is loaded and started (not while the browser,
+// the on-screen keyboard or the camera plugin runs, nor with config.se's novshmenu), and SELECT
+// is taken out of the read. While the menu runs, the callback it registered gets every read
+// (it draws and takes the input); after it unregisters (vctrlVSHExitVSHMenu) it is stopped and
+// unloaded.
+void OnVshCtrlRead(u32 padPtr, int count) {
+	kernel::PspModule *menu = kernel::ModuleByName("VshCtrlSatelite");
+	if (!menu) {
+		if (g_config.novshmenu || count < 1 || !mem::IsValidRange(padPtr, 16)) return;
+		if (!(GRead32(padPtr + 4) & 0x1)) return;  // SELECT
+		for (const char *busy : {"htmlviewer_plugin_module", "sceVshOSK_Module", "camera_plugin_module"})
+			if (kernel::ModuleByName(busy)) return;
+		std::vector<u8> data;
+		if (!io::ReadFile("flash0:/vsh/module/satelite.prx", data)) {
+			LOGW("M33", "VSH menu: flash0:/vsh/module/satelite.prx not installed");
+			return;
+		}
+		kernel::LoadOptions opts;
+		SceUID id = kernel::LoadModuleFromMemory(data, "flash0:/vsh/module/satelite.prx", opts);
+		if (id < 0) return;
+		g_vshMenuCallback = 0;
+		LOGI("M33", "VSH menu opened");
+		kernel::StartModule(kernel::Get<kernel::PspModule>(id), 0, 0, 0, true);
+		GWrite32(padPtr + 4, GRead32(padPtr + 4) & ~1u);
+		return;
+	}
+	if (g_vshMenuCallback) {
+		if (kernel::PspThread *t = sched::Current()) cpu::CallGuest(&t->ctx, g_vshMenuCallback, {padPtr, (u32)count});
+		return;
+	}
+	if (menu->status == kernel::MODULE_STATUS_STARTED && kernel::StopModule(menu, 0, 0, 0) < 0) return;
+	if (menu->status != kernel::MODULE_STATUS_STARTING && menu->status != kernel::MODULE_STATUS_STOPPING) {
+		kernel::UnloadModule(menu);
+		LOGI("M33", "VSH menu closed");
+	}
+}
+
+int LoadExecFromVsh(const char *file, u32 apitype, u32 paramPtr) {
+	(void)paramPtr;
+	// A UMD image the Game menu shows as a memory stick game (vshctrl): boot the image.
+	std::string iso;
+	if (file && IsoForVirtualGamePath(file, &iso)) {
+		LOGI("M33", "LoadExec %s: the UMD image %s", file, iso.c_str());
+		g_umdFile = file;
+		g_relaunch = iso;
+		g_relaunchPending = true;
+		sched::RequestStop(0x4D33);
+		return 0;
+	}
+	return LoadExecTo(file, apitype);
+}
+}  // namespace m33
 
 void Register_M33() {
 	static const hle::HleFunction user[] = {

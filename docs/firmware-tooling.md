@@ -208,6 +208,22 @@ Notes for that run:
   `flash0:/kd/pspbtcnf.bin`) list the Sony module load order and modes; feed
   them to `fwinventory.py` to read the mode/module tables.
 
+## 7b. Installing the firmware for pspc -- `tools/pspc_install_fw.py`
+
+Copies the decrypted firmware's `flash0/{vsh,font,dic,data,kd}` and M33's `satelite.prx` /
+`recovery.prx` into `<pspc dir>/flash0`, prepares `<pspc dir>/flash1`, and AOT-compiles every
+user-mode module of `flash0/vsh/module` with `tools/pspc_build.py`. Then `pspc --vsh` boots the
+XMB (docs/vsh-boot.md).
+
+```
+PY -I tools/pspc_install_fw.py --fw private/fw/401 --build-dir build/RelWithDebInfo
+PY -I tools/pspc_install_fw.py --aot-core      REM only the 16 modules the XMB starts with
+PY -I tools/pspc_install_fw.py --no-aot        REM files only
+```
+
+`pspc-decrypt prx` also decrypts the XMB's index (`flash0/vsh/etc/index.dat`, a `PSPsysGP`
+container keyed like a module); the runtime's sceResmgr calls it for that.
+
 ## 8. One-shot: everything from the installer
 
 From the repo root, with the toolchain in place:
