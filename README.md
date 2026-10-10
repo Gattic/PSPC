@@ -33,9 +33,11 @@ results in the interpreter and as native code.
 ## Building
 
 Requirements: Windows 10/11 x64, Visual Studio 2022 with C++ tools, CMake, Ninja, LLVM (clang-cl,
-for AOT builds), Python 3.12. SDL2 2.32.10 (VC dev package) in `third_party/SDL2-2.32.10`.
+for AOT builds), Python 3.12. SDL2 2.32.10 (VC dev package) in `third_party/SDL2-2.32.10`, which
+`tools\fetch_deps.ps1` downloads from the official libsdl-org release.
 
 ```bat
+powershell -ExecutionPolicy Bypass -File tools\fetch_deps.ps1   :: once: SDL2 into third_party\
 build.cmd                       :: configure + build into build\RelWithDebInfo
 build\RelWithDebInfo\bin\pspc_unittests.exe
 ```

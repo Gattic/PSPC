@@ -1,4 +1,7 @@
 ﻿set(SDL2_ROOT ${CMAKE_SOURCE_DIR}/third_party/SDL2-2.32.10)
+if(NOT EXISTS ${SDL2_ROOT}/lib/x64/SDL2.lib)
+	message(FATAL_ERROR "SDL2 not found in ${SDL2_ROOT}. Run: powershell -ExecutionPolicy Bypass -File tools\\fetch_deps.ps1")
+endif()
 
 add_library(SDL2::SDL2 SHARED IMPORTED)
 set_target_properties(SDL2::SDL2 PROPERTIES
