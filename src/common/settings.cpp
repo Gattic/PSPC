@@ -113,7 +113,8 @@ std::string JoinList(const std::vector<std::string> &names) {
 }
 
 std::vector<std::string> Keys() {
-	std::vector<std::string> k = {"scale", "fullscreen", "vsync", "aot", "fw", "volume", "mute"};
+	std::vector<std::string> k = {"scale", "fullscreen", "vsync", "aot", "fw", "renderer", "render_scale", "volume",
+	                              "mute"};
 	for (size_t i = 0; i < kNumControls; i++) k.push_back(std::string("key.") + kControls[i].name);
 	k.push_back("pad.stick");
 	for (size_t i = 0; i < kNumControls; i++) k.push_back(std::string("pad.") + kControls[i].name);
@@ -137,6 +138,15 @@ bool Set(Settings &s, const std::string &rawKey, const std::string &rawValue, st
 	} else if (key == "fw") {
 		if (!ValidFirmware(v)) return fail("want a version like 6.60");
 		s.fw = v;
+	} else if (key == "renderer") {
+		std::string l = ToLower(v);
+		if (!l.empty() && l != "software" && l != "d3d11" && l != "d3d11-warp")
+			return fail("want software, d3d11 or d3d11-warp");
+		s.renderer = l;
+	} else if (key == "render_scale") {
+		if (v.empty()) s.renderScale = 0;
+		else if (ParseInt(v, 1, 4, n)) s.renderScale = n;
+		else return fail("want 1-4");
 	} else if (key == "volume") {
 		if (ToLower(v) == "mute") s.mute = true;
 		else if (ParseInt(v, 0, 100, n)) s.volume = n;
@@ -170,6 +180,8 @@ std::string Get(const Settings &s, const std::string &key) {
 	if (key == "vsync") return B(s.vsync);
 	if (key == "aot") return B(s.aot);
 	if (key == "fw") return s.fw;
+	if (key == "renderer") return s.renderer;
+	if (key == "render_scale") return s.renderScale ? std::to_string(s.renderScale) : "";
 	if (key == "volume") return std::to_string(s.volume);
 	if (key == "mute") return B(s.mute);
 	if (key == "pad.stick") return s.padStick;
@@ -216,6 +228,10 @@ std::string Template(const Settings &s) {
 	put("aot");
 	t += "\n# Firmware version reported to games.\n";
 	put("fw");
+	t += "\n# Graphics: renderer software (default, the accuracy reference) or d3d11 (GPU; faster, and\n"
+	     "# render_scale 1-4 renders at that many times the PSP's resolution).\n";
+	put("renderer");
+	put("render_scale");
 	t += "\n# Audio: volume 0-100; mute=1 silences the output.\n";
 	put("volume");
 	put("mute");

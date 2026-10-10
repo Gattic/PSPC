@@ -21,7 +21,7 @@ results in the interpreter and as native code.
 | Allegrex CPU: decoder, interpreter, FPU, VFPU (bit-exact hardware model) | Working. `cpu/` 40/42 (the other two can't pass, see docs) |
 | AOT recompiler (`pspc-recomp`) + DLL pipeline | Working. 99%+ code coverage on retail games, whole discs build in about a minute |
 | Kernel: threads (fibers), sync objects, memory, modules, interrupts, timing | Working. `threads/` 148/158; ctrl, power, RTC, intr, modules, sysmem all complete |
-| GE graphics (multithreaded software renderer), display timing | Working. `gpu/` 107/111 |
+| GE graphics: multithreaded software renderer (default, reference) and optional Direct3D 11 renderer with 1-4x upscaling | Working. `gpu/` 107/111 (software) |
 | Audio (sceAudio, SAS, ATRAC3/3+, MP3, AAC, audiocodec) | Working. `audio/` 72/74 |
 | I/O, UMD, memory stick, ISO/CSO/ZSO/DAX | Working |
 | sceUtility (save data, dialogs, OSK), fonts (PGF), network (offline) | Working |
@@ -70,6 +70,7 @@ Useful options (`pspc --help` lists them all):
 | `--press <vblank>:<BUTTONS>[:<frames>]` | scripted input, e.g. `--press 600:START --press 900:CROSS+UP:4` |
 | `--memstick <dir>`, `--flash0 <dir>`, `--host0 <dir>` | device roots |
 | `--umd <image>` | insert a disc while running a .prx/.elf/.pbp |
+| `--renderer software\|d3d11`, `--render-scale <1-4>` | GE renderer: software (default) or the GPU; upscaling with d3d11 |
 | `--osk-text <text>` | headless: what the on-screen keyboard returns (e.g. a character name) |
 | `--config <file\|none>`, `--set key=value` | settings file to use (default `pspc.ini`), or override one entry |
 | `--fw 6.60` | firmware version reported to games |
@@ -86,6 +87,8 @@ fullscreen=0       # 1 = borderless fullscreen
 vsync=1
 aot=1              # 0 = interpreter only (like --interp)
 fw=6.60            # firmware version reported to games (like --fw)
+renderer=d3d11     # software (default) or d3d11 (GPU renderer; needs D3D11.3 rasterizer-ordered views)
+render_scale=2     # d3d11 internal resolution, 1-4 times 480x272
 volume=100         # 0-100 (volume=mute or mute=1 silences)
 key.cross=Z        # SDL key names; several keys: key.select=Space,Right Shift
 pad.cross=a        # SDL controller buttons: a b x y back guide start leftstick rightstick

@@ -259,6 +259,14 @@ int Run(const Config &cfg, const std::function<int()> &emulation, const std::fun
 		}
 		if (screenshot) SaveScreenshot(cfg, shown, shownW, shownH);
 		if (present) {
+			// A GPU renderer at a render scale above 1 presents larger frames: the texture follows.
+			int texW = 0, texH = 0;
+			SDL_QueryTexture(tex, nullptr, nullptr, &texW, &texH);
+			if ((shownW != texW || shownH != texH) && shownW > 0 && shownH > 0) {
+				SDL_DestroyTexture(tex);
+				tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, shownW, shownH);
+				SDL_SetTextureScaleMode(tex, shownW > 480 ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
+			}
 			SDL_UpdateTexture(tex, nullptr, shown.data(), shownW * 4);
 			SDL_RenderClear(ren);
 			SDL_RenderCopy(ren, tex, nullptr, nullptr);

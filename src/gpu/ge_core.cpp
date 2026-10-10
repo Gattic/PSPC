@@ -6,6 +6,7 @@
 // command handlers (GPU/Software/SoftGpu.cpp).
 #include <algorithm>
 #include <cstring>
+#include <chrono>
 #include <deque>
 
 #include "allegrex/guestmem.h"
@@ -1327,6 +1328,7 @@ void Run() {
 		return;
 	}
 	inRun = true;
+	const auto runStart = std::chrono::steady_clock::now();
 	RenderBackend *backend = GetRenderBackend();
 	if (backend)
 		backend->BeginRun();
@@ -1348,6 +1350,7 @@ void Run() {
 		}
 		backend->EndRun();
 	}
+	g_stats.hostNs += (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - runStart).count();
 	inRun = false;
 }
 
@@ -1515,8 +1518,10 @@ int ListSync(int listId, int mode) {
 		}
 	}
 	if (RenderBackend *b = GetRenderBackend()) {
+		const auto t0 = std::chrono::steady_clock::now();
 		binner::Flush();
 		b->Sync();
+		g_stats.hostNs += (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
 	}
 	return dl.waitUntilTicks > NowTicks() ? SYNC_WAIT : 0;
 }
@@ -1526,8 +1531,10 @@ int DrawSync(int mode) {
 		return (int)ERR_INVALID_MODE;
 	if (mode == 0) {
 		if (RenderBackend *b = GetRenderBackend()) {
+			const auto t0 = std::chrono::steady_clock::now();
 			binner::Flush();
 			b->Sync();
+			g_stats.hostNs += (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
 		}
 		if (drawCompleteTicks > NowTicks())
 			return SYNC_WAIT;
@@ -1766,6 +1773,7 @@ Stats GetStats() {
 	s.flushes = g_stats.flushes;
 	s.threadedFlushes = g_stats.threadedFlushes;
 	s.transfers = g_stats.transfers;
+	s.hostNs = g_stats.hostNs;
 	return s;
 }
 

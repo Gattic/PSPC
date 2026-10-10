@@ -91,6 +91,8 @@ static void ApplySettings(const settings::Settings &s, runtime::Options &o) {
 	o.vsync = s.vsync;
 	o.aot = s.aot;
 	o.firmwareVersion = ParseFw(s.fw);
+	o.renderer = s.renderer;
+	o.renderScale = s.renderScale;
 	o.volume = s.mute ? 0 : s.volume;
 	o.keyBindings = s.keys;
 	o.padBindings = s.pads;

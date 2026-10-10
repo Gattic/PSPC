@@ -44,12 +44,15 @@ struct DrawStateGpu {
 	u32 texEnv;
 	u32 dither0;
 	u32 dither1;
-	u32 texLevelMode;
-	float texLevelOffset;
-	float lodSlope;
-	float pad;
+	u32 texMode;
+	s32 texLevelOffset;
+	s32 lodSlopeLog;
+	u32 rtt;
+	u32 texLevels[8];
+	u32 rttY;
+	u32 pad2[3];
 };
-static_assert(sizeof(DrawStateGpu) == 96, "DrawStateGpu layout");
+static_assert(sizeof(DrawStateGpu) == 144, "DrawStateGpu layout");
 
 enum : u32 {
 	F_ALPHA_BLEND = 0x0001,
@@ -77,8 +80,13 @@ struct GpuVertex {
 	u32 c0, c1;      // RGBA
 	float s, t, q;
 	u32 state;
+	float lod;       // the primitive's mip level gradient (same at every vertex), see the pixel shader
 };
-static_assert(sizeof(GpuVertex) == 40, "GpuVertex layout");
+static_assert(sizeof(GpuVertex) == 44, "GpuVertex layout");
+
+// The texture atlas layout of a sampler state's levels (each level at most 512 x 512, side by side):
+// DrawStateGpu::texLevels. Returns the atlas size.
+void TextureAtlasLayout(const SamplerState &ss, u32 levels[8], int *atlasW, int *atlasH);
 
 // A 64-bit hash of guest memory (texture validation).
 u64 HashBytes(const u8 *p, size_t n, u64 seed);
@@ -92,12 +100,14 @@ public:
 	explicit TextureCache(ID3D11Device *dev, ID3D11DeviceContext *ctx) : dev_(dev), ctx_(ctx) {}
 	// The texture for a sampler state; nullptr if it can't be made. syncRange is called with the guest
 	// memory the texture reads before it's hashed or decoded (so rendering there reaches memory first).
-	ID3D11ShaderResourceView *Lookup(const SamplerState &ss, u64 runSeq, void (*syncRange)(void *, u32, u32), void *user, int *levelsOut);
+	ID3D11ShaderResourceView *Lookup(const SamplerState &ss, u64 runSeq, void (*syncRange)(void *, u32, u32), void *user);
 	// Guest memory [start, end) (folded addresses) changed: entries reading it rehash on next use.
 	void Invalidate(u32 start, u32 end);
 	void EndFrame(u64 frame);
 	size_t Size() const { return entries_.size(); }
 	u64 decodes = 0, hashes = 0;
+	double hashSeconds = 0, decodeSeconds = 0, pureHashSeconds = 0;
+	u64 hashBytes = 0, decodeTexels = 0;
 
 private:
 	struct Key {
@@ -121,7 +131,7 @@ private:
 		bool stale = false;
 		u32 memStart = 0, memEnd = 0;
 		u64 lastUse = 0;
-		int w = 0, h = 0, levels = 0;
+		int w = 0, h = 0;
 	};
 	ID3D11Device *dev_;
 	ID3D11DeviceContext *ctx_;

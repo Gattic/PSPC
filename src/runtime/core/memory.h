@@ -44,4 +44,9 @@ void ReadBytes(void *dst, u32 src, u32 size);
 // Number of accesses outside mapped memory so far (each one is logged).
 u32 BadAccessCount();
 
+// A second host view of VRAM (the same memory the guest sees), outside the guest window; nullptr when
+// VRAM isn't a shared section. A GPU renderer that makes guest VRAM pages inaccessible while it holds
+// newer data for them (gpu/hw) does its own accesses through it.
+u8 *PrivateVramView();
+
 }  // namespace mem

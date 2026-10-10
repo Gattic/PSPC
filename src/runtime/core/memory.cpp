@@ -195,4 +195,11 @@ void ReadBytes(void *dst, u32 src, u32 size) {
 
 u32 BadAccessCount() { return g_badAccesses.load(); }
 
+u8 *PrivateVramView() {
+	static u8 *view = nullptr;
+	if (!view && g_placeholders && g_section)
+		view = (u8 *)MapViewOfFile(g_section, FILE_MAP_ALL_ACCESS, (DWORD)(SEC_VRAM >> 32), (DWORD)SEC_VRAM, VRAM_SIZE);
+	return view;
+}
+
 }  // namespace mem

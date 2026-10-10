@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <map>
 #include <set>
@@ -31,6 +32,7 @@
 #include "runtime/media/disc.h"
 #if PSPC_HAVE_GPU
 #include "gpu/backend.h"
+#include "gpu/ge.h"
 #endif
 #if PSPC_HAVE_GPU_HW
 #include "gpu/hw/d3d11_backend.h"
@@ -157,15 +159,9 @@ bool PrepareBoot(const Options &o, BootTarget &bt) {
 	return true;
 }
 
-// --dump-frames: the displayed framebuffer as a 24-bit BMP every N VBlanks (works headless).
-void DumpFrame(const std::string &dir) {
-	u32 addr;
-	int stride, format;
-	display::CurrentFramebuffer(addr, stride, format);
-	if (!addr) return;
-	std::vector<u32> px;
-	display::ConvertFramebuffer(addr, stride, format, 480, 272, px);
-	const int w = 480, h = 272, rowBytes = w * 3;
+// An RGBA8888 image as a 24-bit BMP.
+void WriteBmp(const fs::path &path, const std::vector<u32> &px, int w, int h) {
+	const int rowBytes = (w * 3 + 3) & ~3;
 	std::vector<u8> bmp(54 + (size_t)rowBytes * h);
 	auto put32 = [&](size_t at, u32 v) { memcpy(&bmp[at], &v, 4); };
 	bmp[0] = 'B';
@@ -187,9 +183,47 @@ void DumpFrame(const std::string &dir) {
 			row[x * 3 + 2] = (u8)p;
 		}
 	}
+	WriteWholeFile(path, bmp.data(), bmp.size());
+}
+
+// --dump-frames: the displayed framebuffer as a 24-bit BMP every N VBlanks (works headless). With an
+// upscaling GPU renderer, also what it shows (hires_<vcount>.bmp).
+void DumpFrame(const std::string &dir) {
+	u32 addr;
+	int stride, format;
+	display::CurrentFramebuffer(addr, stride, format);
+	if (!addr) return;
+	std::vector<u32> px;
 	char name[32];
+#if PSPC_HAVE_GPU
+	// (This also writes GPU rendering back to guest memory for the dump below.)
+	int hw = 0, hh = 0;
+	if (gpu::GetBackendDisplayImage(addr, stride, format, 480, 272, px, &hw, &hh)) {
+		snprintf(name, sizeof(name), "hires_%06u.bmp", display::Vcount());
+		WriteBmp(fs::u8path(dir) / name, px, hw, hh);
+	}
+#endif
+	display::ConvertFramebuffer(addr, stride, format, 480, 272, px);
 	snprintf(name, sizeof(name), "frame_%06u.bmp", display::Vcount());
-	WriteWholeFile(fs::u8path(dir) / name, bmp.data(), bmp.size());
+	WriteBmp(fs::u8path(dir) / name, px, 480, 272);
+}
+
+// PSPC_GPU_STATS: GE host time per frame, every 600 VBlanks.
+void ReportGpuStats() {
+#if PSPC_HAVE_GPU
+	static const bool enabled = getenv("PSPC_GPU_STATS") != nullptr;
+	static u64 lastNs = 0, lastPrims = 0;
+	static std::chrono::steady_clock::time_point lastWall = std::chrono::steady_clock::now();
+	if (!enabled || display::Vcount() % 600 != 0) return;
+	const gpu::Stats st = gpu::GetStats();
+	const auto now = std::chrono::steady_clock::now();
+	const double wall = std::chrono::duration<double>(now - lastWall).count();
+	LOGI("GPU", "vblank %u: %.2f ms/frame in the GE, %.0f prims/frame, %.1f frames/s wall", display::Vcount(),
+	     (double)(st.hostNs - lastNs) / 1e6 / 600.0, (double)(st.prims - lastPrims) / 600.0, wall > 0 ? 600.0 / wall : 0.0);
+	lastNs = st.hostNs;
+	lastPrims = st.prims;
+	lastWall = now;
+#endif
 }
 
 #if PSPC_HAVE_GPU
@@ -218,10 +252,13 @@ void SetUpRenderer(const Options &o) {
 			gpu::hw::D3D11Options d;
 			d.scale = scale;
 			d.warp = name == "d3d11-warp";
+			d.privateVram = mem::PrivateVramView();
 			if (const char *a = getenv("PSPC_D3D11_ADAPTER")) d.adapter = atoi(a);
 			std::string err;
 			g_renderBackend = gpu::hw::CreateD3D11Backend(d, &err);
 			if (!g_renderBackend) {
+				// PSPC_RENDERER_REQUIRE=1 (test runs): no silent fallback.
+				if (getenv("PSPC_RENDERER_REQUIRE")) Fatal("D3D11 renderer unavailable: %s", err.c_str());
 				LOGW("RUNTIME", "D3D11 renderer unavailable (%s); using the software renderer", err.c_str());
 				return;
 			}
@@ -277,10 +314,14 @@ int RunOnce(const Options &o, BootTarget bt) {
 		u32 every = (u32)std::max(1, o.dumpEvery);
 		display::SetVblankHook([dir, every]() {
 			ctrl::OnVblank();
+			ReportGpuStats();
 			if (display::Vcount() % every == 0) DumpFrame(dir);
 		});
 	} else {
-		display::SetVblankHook([]() { ctrl::OnVblank(); });
+		display::SetVblankHook([]() {
+			ctrl::OnVblank();
+			ReportGpuStats();
+		});
 	}
 
 	// A sceKernelLoadExec relaunch boots the requested guest path, with every device mounted as

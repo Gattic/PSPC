@@ -55,10 +55,13 @@ struct DrawState {
 	uint texEnv;
 	uint dither0;        // rows 0-1, 4 bits per entry
 	uint dither1;        // rows 2-3
-	uint texLevelMode;
-	float texLevelOffset;
-	float lodSlope;      // SLOPE mode: 1 + log2(slope)
-	float pad;
+	uint texMode;        // clampS | clampT << 1 | minFilt << 2 | magFilt << 3 | mipFilt << 4 | maxLevel << 5 | levelMode << 8
+	int texLevelOffset;  // 1/16 levels
+	int lodSlopeLog;     // GELog16(slope)
+	uint rtt;            // render to texture: format | scale << 4 | 0x100 (texLevels[0]: x in the surface)
+	uint texLevels[8];   // atlas x | log2(w) << 16 | log2(h) << 20
+	uint rttY;           // render to texture: y in the surface (render-scale pixels)
+	uint3 pad2;
 };
 
 cbuffer TargetCB : register(b0) {
@@ -75,6 +78,7 @@ struct PSIn {
 	noperspective float3 stq : TEXCOORD0;
 	noperspective float2 zf : TEXCOORD1;
 	nointerpolation uint state : TEXCOORD2;
+	nointerpolation float lod : TEXCOORD3;
 };
 )HLSL";
 
@@ -86,6 +90,7 @@ struct VSIn {
 	uint4 c1 : COLOR1;
 	float3 stq : TEXCOORD0;
 	uint state : TEXCOORD2;
+	float lod : TEXCOORD3;
 };
 
 PSIn VSMain(VSIn i) {
@@ -96,6 +101,7 @@ PSIn VSMain(VSIn i) {
 	o.stq = i.stq;
 	o.zf = i.zf;
 	o.state = i.state;
+	o.lod = i.lod;
 	return o;
 }
 )HLSL";
@@ -112,8 +118,10 @@ static const char kPixel1[] = R"HLSL(
 #endif
 
 StructuredBuffer<DrawState> states : register(t1);
-Texture2D<float4> tex : register(t0);
-SamplerState smp : register(s0);
+// The texture's levels side by side, RGBA8888 as decoded by sampler.h.
+Texture2D<uint4> tex : register(t0);
+// Render to texture: the surface holding the texture (raw pixels at the render scale).
+Texture2D<uint> rttTex : register(t2);
 RasterizerOrderedTexture2D<uint> fbuf : register(u0);
 RasterizerOrderedTexture2D<uint> zbuf : register(u1);
 
@@ -293,6 +301,107 @@ int3 AlphaBlend(DrawState st, int4 src, int4 dst) {
 
 static const char kPixel2[] = R"HLSL(
 #if TEX
+// Texture sampling as sampler.h does it: texel coordinates in 1/16 texel, wrapping and clamping inside
+// 512 texels, bilinear filtering with 4-bit fractions truncated (horizontal first), mip levels blended
+// with a 4-bit fraction, and the level from rasterizer.cpp's CalculateSamplingParams.
+int GELog16(float v) {
+	return (int)((asuint(v) >> 19) & 0x0FFF) - 127 * 16;
+}
+int TexelFixed(float f) {
+	return f >= -2147483648.0 && f < 2147483648.0 ? (int)f : (int)0x80000000;
+}
+// limit: the last texel the GE reaches (511, times the render scale for render to texture).
+int ClampUV(int v, int size, int limit) {
+	if (v >= size - 1)
+		return min(size - 1, limit);
+	if (v >= limit)
+		return limit;
+	return max(v, 0);
+}
+int WrapUV(int v, int size, int limit) {
+	int period = min(size, limit + 1);
+	return ((v % period) + period) % period;
+}
+uint4 TexelFromRaw(uint raw, uint fmt) {
+	uint c = fmt == 0 ? RGB565ToRGBA8888(raw) : fmt == 1 ? RGBA5551ToRGBA8888(raw) : fmt == 2 ? RGBA4444ToRGBA8888(raw) : raw;
+	return uint4(c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF, c >> 24);
+}
+uint4 Fetch(DrawState st, uint info, int u, int v) {
+	if (st.rtt & 0x100)
+		return TexelFromRaw(rttTex.Load(int3((int)(info & 0xFFFF) + u, (int)st.rttY + v, 0)), st.rtt & 3);
+	return tex.Load(int3((int)(info & 0xFFFF) + u, v, 0));
+}
+uint4 Lerp16(uint4 a, uint4 b, int f) {
+	return (a * (uint)(16 - f) + b * (uint)f) >> 4;
+}
+void TexelPair(float st, int size, bool clampIt, int limit, out int c0, out int c1, out int frac) {
+	int base = TexelFixed(st * (float)size * 16.0) - 8;
+	frac = base & 0x0F;
+	base >>= 4;
+	if (clampIt) {
+		int hi = size > limit + 1 ? limit : size - 1;
+		c0 = max(min(base, hi), 0);
+		c1 = max(min(base + 1, hi), 0);
+	} else {
+		c0 = WrapUV(base, size, limit);
+		c1 = WrapUV(base + 1, size, limit);
+	}
+}
+uint4 SampleLevel(DrawState st, float s, float t, int level, bool bilinear) {
+	uint info = st.texLevels[level];
+	// A rendered texture is sampled at the render scale.
+	int texScale = (st.rtt & 0x100) ? (int)((st.rtt >> 4) & 0xF) : 1;
+	int w = (1 << ((info >> 16) & 0xF)) * texScale, h = (1 << ((info >> 20) & 0xF)) * texScale;
+	int limit = 512 * texScale - 1;
+	bool clampS = (st.texMode & 1) != 0, clampT = (st.texMode & 2) != 0;
+	if (!bilinear) {
+		int u = TexelFixed(s * (float)w * 16.0) >> 4;
+		int v = TexelFixed(t * (float)h * 16.0) >> 4;
+		u = clampS ? ClampUV(u, w, limit) : WrapUV(u, w, limit);
+		v = clampT ? ClampUV(v, h, limit) : WrapUV(v, h, limit);
+		return Fetch(st, info, u, v);
+	}
+	int u0, u1, v0, v1, fu, fv;
+	TexelPair(s, w, clampS, limit, u0, u1, fu);
+	TexelPair(t, h, clampT, limit, v0, v1, fv);
+	uint4 tl = Fetch(st, info, u0, v0), tr = Fetch(st, info, u1, v0);
+	uint4 bl = Fetch(st, info, u0, v1), br = Fetch(st, info, u1, v1);
+	return Lerp16(Lerp16(tl, tr, fu), Lerp16(bl, br, fu), fv);
+}
+uint4 SampleTexture(DrawState st, float s, float t, int level, int levelFrac, bool bilinear) {
+	uint4 c0 = SampleLevel(st, s, t, level, bilinear);
+	if (levelFrac != 0)
+		c0 = Lerp16(c0, SampleLevel(st, s, t, level + 1, bilinear), levelFrac);
+	return c0;
+}
+// lod: the primitive's largest UV gradient in texels per pixel, divided by q at the pixel; negative:
+// the gradient itself (lines, points).
+void SamplingParams(DrawState st, float q, float lod, out int level, out int levelFrac, out bool filt) {
+	uint mode = (st.texMode >> 8) & 3;
+	int maxLevel = (int)((st.texMode >> 5) & 7);
+	bool mipFilt = (st.texMode & 0x10) != 0;
+	int detail = 0;
+	if (mode == 0)
+		detail = lod >= 0.0 ? GELog16(lod) - GELog16(q) : GELog16(lod);  // GELog16 ignores the sign
+	else if (mode == 2)
+		detail = 16 + st.lodSlopeLog - GELog16(q);
+	detail += st.texLevelOffset;
+	level = 0;
+	levelFrac = 0;
+	if (detail > 0 && maxLevel > 0) {
+		int level8 = min(detail, maxLevel * 16);
+		if (!mipFilt)
+			level8 += 8;
+		level = level8 >> 4;
+		levelFrac = mipFilt ? (level8 & 0xF) : 0;
+		if (level >= maxLevel) {
+			level = maxLevel;
+			levelFrac = 0;
+		}
+	}
+	filt = detail > 0 ? (st.texMode & 4) != 0 : (st.texMode & 8) != 0;
+}
+
 // The texture function (sampler.h TextureFunction). prim and t are 0-255.
 int4 TextureFunction(DrawState st, int4 p, int4 t) {
 	uint func = st.texFunc & 7;
@@ -344,17 +453,10 @@ void PSMain(PSIn i) {
 	float q = i.stq.z;
 	// Where q isn't positive the GE samples the last texel (gpu/texmtx/negq).
 	float2 uv = q > 0.0 ? i.stq.xy / q : float2(0.99999994, 0.99999994);
-	float2 gx = ddx(uv), gy = ddy(uv);
-	float4 texel;
-	if (st.texLevelMode == 1) {
-		texel = tex.SampleLevel(smp, uv, st.texLevelOffset);
-	} else if (st.texLevelMode == 2) {
-		texel = tex.SampleLevel(smp, uv, st.lodSlope - log2(max(q, 1e-30)) + st.texLevelOffset);
-	} else {
-		float bias = exp2(st.texLevelOffset);
-		texel = tex.SampleGrad(smp, uv, gx * bias, gy * bias);
-	}
-	int4 t = clamp((int4)round(texel * 255.0), 0, 255);
+	int level, levelFrac;
+	bool filt;
+	SamplingParams(st, q, i.lod, level, levelFrac, filt);
+	int4 t = (int4)SampleTexture(st, uv.x, uv.y, level, levelFrac, filt);
 	int4 o = TextureFunction(st, prim, t);
 	o.rgb += sec;
 	c = clamp(o, 0, 255);
@@ -476,13 +578,41 @@ void CSExpand(uint3 id : SV_DispatchThreadID) {
 	dstTex[origin * copyScale + hp] = srcTex[hp / copyScale];
 }
 
-// Render-scale surface -> 1x (at 0,0 in dstTex): the middle sample of each block.
+uint4 RawChannels(uint raw) {
+	if (format == 0)
+		return uint4(((raw & 0x1F) << 3) | ((raw >> 2) & 7), ((raw >> 3) & 0xFC) | ((raw >> 9) & 3), ((raw >> 8) & 0xF8) | ((raw >> 13) & 7), 0);
+	if (format == 1)
+		return uint4(((raw & 0x1F) << 3) | ((raw >> 2) & 7), ((raw >> 2) & 0xF8) | ((raw >> 7) & 7), ((raw >> 7) & 0xF8) | ((raw >> 12) & 7), 0);
+	if (format == 2)
+		return uint4((raw & 0xF) * 17, ((raw >> 4) & 0xF) * 17, ((raw >> 8) & 0xF) * 17, 0);
+	return uint4(raw & 0xFF, (raw >> 8) & 0xFF, (raw >> 16) & 0xFF, 0);
+}
+// RGB (8-bit) with the stencil bits of keep.
+uint PackRaw(uint3 c, uint keep) {
+	if (format == 0)
+		return (c.r >> 3) | ((c.g >> 2) << 5) | ((c.b >> 3) << 11);
+	if (format == 1)
+		return (c.r >> 3) | ((c.g >> 3) << 5) | ((c.b >> 3) << 10) | (keep & 0x8000);
+	if (format == 2)
+		return (c.r >> 4) | ((c.g >> 4) << 4) | ((c.b >> 4) << 8) | (keep & 0xF000);
+	return c.r | (c.g << 8) | (c.b << 16) | (keep & 0xFF000000);
+}
+
+// Render-scale surface -> 1x (at 0,0 in dstTex): the sample at the pixel's center (odd scales), or the
+// average color of the four around it (even scales; stencil and depth from one of them).
 [numthreads(8, 8, 1)]
 void CSReduce(uint3 id : SV_DispatchThreadID) {
 	uint2 p = id.xy;
 	if (p.x >= size.x || p.y >= size.y)
 		return;
-	dstTex[p] = srcTex[(origin + p) * copyScale + copyScale / 2];
+	uint2 c = (origin + p) * copyScale + copyScale / 2;
+	if ((copyScale & 1) != 0 || format > 3) {
+		dstTex[p] = srcTex[c];
+		return;
+	}
+	uint a = srcTex[c - uint2(1, 1)], b = srcTex[c - uint2(0, 1)], d = srcTex[c - uint2(1, 0)], e = srcTex[c];
+	uint3 sum = RawChannels(a).rgb + RawChannels(b).rgb + RawChannels(d).rgb + RawChannels(e).rgb;
+	dstTex[p] = PackRaw((sum + 2) / 4, e);
 }
 
 uint ToRGBA(uint raw) {

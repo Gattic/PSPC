@@ -171,6 +171,7 @@ void FlushIfOverlap(u32 addr, u32 size, bool modifying);
 // Per-frame counters (ge.h Stats).
 struct InternalStats {
 	u64 commands, prims, vertices, pixels, flushes, threadedFlushes, transfers;
+	u64 hostNs;  // host time in Run and in the syncs
 };
 extern InternalStats g_stats;
 

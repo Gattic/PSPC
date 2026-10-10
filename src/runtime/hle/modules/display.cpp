@@ -9,6 +9,9 @@
 #include <vector>
 
 #include "common/log.h"
+#if PSPC_HAVE_GPU
+#include "gpu/backend.h"
+#endif
 #include "runtime/hle/display.h"
 #include "runtime/hle/hle_wrap.h"
 #include "runtime/hle/modules/modules.h"
@@ -62,6 +65,14 @@ u64 EnterUs(u64 frame) { return (u64)std::llround(g_bootUs + kFrameUs - kVblankU
 
 void Present() {
 	if (host::IsHeadless() || !g_current.addr) return;
+#if PSPC_HAVE_GPU
+	// A GPU renderer: its own (upscaled) image of the framebuffer, or guest memory made current.
+	int w = 0, h = 0;
+	if (gpu::GetBackendDisplayImage(g_current.addr, g_current.stride, g_current.format, 480, 272, g_rgba, &w, &h)) {
+		host::PresentFrame(g_rgba.data(), w, h, w);
+		return;
+	}
+#endif
 	ConvertFramebuffer(g_current.addr, g_current.stride, g_current.format, 480, 272, g_rgba);
 	host::PresentFrame(g_rgba.data(), 480, 272, 480);
 }

@@ -40,7 +40,8 @@ flowchart TB
 | `src/runtime/io/`, `src/runtime/media/` | The PSP device namespace (`ms0:`, `host0:`, `flash0:`, `flash1:`, `disc0:`, `umd0:`, `emulator:`). |
 | `src/runtime/m33/` | The M33 CFW behaviours (SystemCtrl, KUBridge, VshCtrl, config.se, plugins, NID resolver). |
 | `src/fs/` | Disc images (ISO/CSO/ZSO/DAX), ISO9660, host file system, PBP, PARAM.SFO. |
-| `src/gpu/` | GE display-list processing, timing and the multithreaded software rasterizer. |
+| `src/gpu/` | GE display-list processing, timing and the multithreaded software rasterizer (the default renderer and the accuracy reference). `backend.h` is the renderer seam at the post-transform level. |
+| `src/gpu/hw/` | Optional Direct3D 11 renderer (`--renderer d3d11`, `--render-scale 1-4`): the GE pixel pipeline in a shader over rasterizer-ordered views, surfaces mirroring VRAM framebuffers, written back to guest memory when guest code touches it. |
 | `src/audio/` | Audio decoders and mixers (ATRAC3/3+, SAS, MP3/AAC through Media Foundation). |
 | `src/media/` | The Media Engine's video side: PSMF program stream demuxing, H.264 through the Media Foundation decoder, JPEG through WIC, YCbCr conversion. Used by the `media_*.cpp` HLE libraries (sceMpeg, scePsmfPlayer, sceVideocodec, sceJpeg). |
 | `src/media/` | Video and image decoding for sceMpeg/PSMF/sceJpeg (PS demux, H.264 through Media Foundation, WIC). |

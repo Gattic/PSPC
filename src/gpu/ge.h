@@ -115,6 +115,7 @@ struct Stats {
 	u64 flushes;
 	u64 threadedFlushes;
 	u64 transfers;
+	u64 hostNs;  // host time spent processing lists (and writing GPU rendering back), in ns
 };
 Stats GetStats();
 void ResetStats();

@@ -38,6 +38,8 @@ struct Settings {
 	bool vsync = true;
 	bool aot = true;                // use AOT-compiled module DLLs (false = interpreter only)
 	std::string fw = "6.60";        // firmware version reported to games
+	std::string renderer;           // "software", "d3d11", "d3d11-warp"; "" = $PSPC_RENDERER or software
+	int renderScale = 0;            // d3d11 internal resolution 1-4; 0 = default (1)
 	int volume = 100;               // 0-100
 	bool mute = false;
 	std::string padStick = "left";  // controller stick that drives the PSP analog: left, right, none

@@ -43,8 +43,8 @@ public:
 	virtual void SyncRange(u32 addr, u32 size) { (void)addr; (void)size; }
 	// The GE wrote guest memory [addr, addr + size) itself (block transfer).
 	virtual void Invalidate(u32 addr, u32 size) { (void)addr; (void)size; }
-	// A list finished, or the guest waits for the GE (sceGeDrawSync, sceGeListSync): write everything
-	// rendered back to guest memory.
+	// A list finished, or the guest waits for the GE (sceGeDrawSync, sceGeListSync): from now on the guest
+	// must see everything rendered in guest memory (written back now, or at its first access to it).
 	virtual void Sync() {}
 	// The end of a Run (the GE stalled or went idle): submit queued work.
 	virtual void EndRun() {}
@@ -60,10 +60,6 @@ public:
 // Installs a backend (not owned; nullptr = the software rasterizer). Flushes what's queued first.
 void SetRenderBackend(RenderBackend *backend);
 RenderBackend *GetRenderBackend();
-
-}  // namespace gpu
-
-namespace gpu {
 
 // sceDisplay's view of RenderBackend::GetDisplayImage (false without a backend).
 inline bool GetBackendDisplayImage(u32 addr, int stride, int format, int width, int height, std::vector<u32> &out, int *outW, int *outH) {

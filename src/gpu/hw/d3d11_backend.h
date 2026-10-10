@@ -16,6 +16,10 @@ struct D3D11Options {
 	int scale = 1;      // internal render scale, 1-4
 	bool warp = false;  // the WARP software device instead of a GPU
 	int adapter = -1;   // adapter index by GPU preference (high performance first); -1 = the first
+	// A private host view of VRAM (mem::PrivateVramView). With it, guest VRAM pages holding rendering
+	// not yet written back are made inaccessible and written back when touched; without it, everything
+	// rendered is written back at each list end and sceGeDrawSync/ListSync.
+	u8 *privateVram = nullptr;
 };
 
 // Creates the backend; nullptr (with the reason in *error) when this machine can't run it (no D3D11

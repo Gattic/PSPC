@@ -7,6 +7,7 @@
 // hashing its texel data once per GE run (the CPU may have rewritten it in between), or when the GE
 // itself wrote the memory (block transfer, rendering written back).
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 
 #include "common/log.h"
@@ -16,6 +17,14 @@
 namespace gpu::hw {
 
 namespace {
+
+// log2 of a power of two (texture sizes are 1 << n).
+inline u32 Log2Pow2(u32 v) {
+	u32 n = 0;
+	while (n < 31 && (v >> n) > 1)
+		++n;
+	return n;
+}
 
 inline u64 Rotl(u64 x, int r) {
 	return (x << r) | (x >> (64 - r));
@@ -29,24 +38,52 @@ inline u64 Round(u64 acc, u64 v) {
 	return Rotl(acc + v * P2, 31) * P1;
 }
 
-typedef void (*DecodeFn)(const SamplerState &ss, int level, int w, int h, bool clampS, bool clampT, u32 *out);
+typedef void (*DecodeFn)(const SamplerState &ss, int level, int w, int h, u32 *out, size_t pitch);
 
-// One level, with the sampler's wrapping and clamping inside 512 texels (sampler.h ClampUV/WrapUV)
-// applied to sizes above 512.
+// One level's first w x h texels (the sampler never reads past 512 in either direction).
 template <int fmt, bool swz>
-void DecodeLevelT(const SamplerState &ss, int level, int w, int h, bool clampS, bool clampT, u32 *out) {
+void DecodeLevelT(const SamplerState &ss, int level, int w, int h, u32 *out, size_t pitch) {
 	for (int v = 0; v < h; ++v) {
-		const int vv = v > 511 ? (clampT ? 511 : (v & 511)) : v;
-		u32 *row = out + (size_t)v * w;
-		for (int u = 0; u < w; ++u) {
-			const int uu = u > 511 ? (clampS ? 511 : (u & 511)) : u;
-			row[u] = FetchTexelT<fmt, swz>(ss, level, uu, vv);
+		u32 *row = out + (size_t)v * pitch;
+		for (int u = 0; u < w; ++u)
+			row[u] = FetchTexelT<fmt, swz>(ss, level, u, v);
+	}
+}
+
+// Linear direct-color levels whose rows are all in memory: whole rows at a time (same results).
+template <int fmt>
+void DecodeLinearDirect(const SamplerState &ss, int level, int w, int h, u32 *out, size_t pitch) {
+	const TexLevel &lv = ss.levels[level];
+	constexpr int bpp = fmt == GE_TFMT_8888 ? 4 : 2;
+	if (!lv.ptr || (u64)(h - 1) * lv.bufw * bpp + (u64)w * bpp + 4 > lv.validBytes) {
+		DecodeLevelT<fmt, false>(ss, level, w, h, out, pitch);
+		return;
+	}
+	for (int v = 0; v < h; ++v) {
+		const u8 *src = lv.ptr + (size_t)v * lv.bufw * bpp;
+		u32 *row = out + (size_t)v * pitch;
+		if constexpr (fmt == GE_TFMT_8888) {
+			memcpy(row, src, (size_t)w * 4);
+		} else {
+			const u16 *s16 = (const u16 *)src;
+			for (int u = 0; u < w; ++u) {
+				if constexpr (fmt == GE_TFMT_5650)
+					row[u] = RGB565ToRGBA8888(s16[u]);
+				else if constexpr (fmt == GE_TFMT_5551)
+					row[u] = RGBA5551ToRGBA8888(s16[u]);
+				else
+					row[u] = RGBA4444ToRGBA8888(s16[u]);
+			}
 		}
 	}
 }
 
 template <int fmt>
 DecodeFn PickDecode(bool swizzle) {
+	if constexpr (fmt <= GE_TFMT_8888) {
+		if (!swizzle)
+			return &DecodeLinearDirect<fmt>;
+	}
 	return swizzle ? &DecodeLevelT<fmt, true> : &DecodeLevelT<fmt, false>;
 }
 
@@ -115,36 +152,45 @@ size_t TextureCache::KeyHash::operator()(const Key &k) const {
 	return (size_t)(h ^ (h >> 29));
 }
 
-ID3D11ShaderResourceView *TextureCache::Lookup(const SamplerState &ss, u64 runSeq, void (*syncRange)(void *, u32, u32), void *user, int *levelsOut) {
-	// A mip chain the GPU can use: each level half the previous one. Otherwise level 0 only.
-	int levels = 1;
-	for (int i = 1; i <= ss.maxLevel; ++i) {
-		const TexLevel &a = ss.levels[i - 1], &b = ss.levels[i];
-		if (b.w != std::max(1, a.w / 2) || b.h != std::max(1, a.h / 2))
-			break;
-		levels = i + 1;
+void TextureAtlasLayout(const SamplerState &ss, u32 levels[8], int *atlasW, int *atlasH) {
+	int x = 0, h = 1;
+	for (int i = 0; i < 8; ++i) {
+		const TexLevel &lv = ss.levels[i];
+		if (i > ss.maxLevel) {
+			levels[i] = levels[i > 0 ? i - 1 : 0];
+			continue;
+		}
+		const int ws = lv.w ? (int)Log2Pow2(lv.w) : 0, hs = lv.h ? (int)Log2Pow2(lv.h) : 0;
+		levels[i] = (u32)x | ((u32)ws << 16) | ((u32)hs << 20);
+		x += std::min<int>(lv.w, 512);
+		h = std::max(h, std::min<int>(lv.h, 512));
 	}
+	*atlasW = std::max(x, 1);
+	*atlasH = h;
+}
+
+ID3D11ShaderResourceView *TextureCache::Lookup(const SamplerState &ss, u64 runSeq, void (*syncRange)(void *, u32, u32), void *user) {
+	const int levels = ss.maxLevel + 1;
 	const TexLevel &l0 = ss.levels[0];
-	const int w = std::min<int>(l0.w, 1024), h = std::min<int>(l0.h, 1024);
 	Key k{};
 	k.addr = l0.addr;
 	k.fmt = ss.texfmt;
 	k.levels = (u8)levels;
-	k.flags = (u8)((ss.swizzle ? 1 : 0) | (w > 512 && ss.clampS ? 2 : 0) | (h > 512 && ss.clampT ? 4 : 0) | (ss.useSharedClut ? 8 : 0));
+	k.flags = (u8)((ss.swizzle ? 1 : 0) | (ss.useSharedClut ? 8 : 0));
 	k.bufw = l0.bufw;
-	k.w = (u16)w;
-	k.h = (u16)h;
+	k.w = l0.w;
+	k.h = l0.h;
 	const bool indexed = ss.texfmt >= GE_TFMT_CLUT4 && ss.texfmt <= GE_TFMT_CLUT32;
 	if (indexed) {
 		const u64 params = (u64)ss.clutfmt | ((u64)ss.clutShift << 8) | ((u64)ss.clutMask << 16) | ((u64)ss.clutOffset << 24);
 		k.clutHash = HashBytes(ss.clut, 1024, params) | 1;
 	}
 	for (int i = 1; i < levels; ++i) {
-		// Other levels' addresses are part of what's decoded.
-		k.clutHash ^= HashBytes((const u8 *)&ss.levels[i].addr, 4, i) * (2 * (u64)i + 1);
-		k.clutHash ^= (u64)ss.levels[i].bufw << (i * 4);
+		// The other levels' addresses and sizes are part of what's decoded.
+		const TexLevel &lv = ss.levels[i];
+		const u64 v = (u64)lv.addr | ((u64)lv.bufw << 32) | ((u64)Log2Pow2(lv.w) << 48) | ((u64)Log2Pow2(lv.h) << 56);
+		k.clutHash ^= HashBytes((const u8 *)&v, 8, (u64)i) * (2 * (u64)i + 1);
 	}
-	*levelsOut = levels;
 
 	auto ins = entries_.try_emplace(k);
 	Entry &e = ins.first->second;
@@ -153,6 +199,7 @@ ID3D11ShaderResourceView *TextureCache::Lookup(const SamplerState &ss, u64 runSe
 		return e.srv.Get();
 
 	// Guest memory first gets what was rendered there, then the data is hashed.
+	auto t0 = std::chrono::steady_clock::now();
 	u64 hash = 0;
 	u32 memStart = ~0u, memEnd = 0;
 	for (int i = 0; i < levels; ++i) {
@@ -163,11 +210,16 @@ ID3D11ShaderResourceView *TextureCache::Lookup(const SamplerState &ss, u64 runSe
 		const u32 start = FoldAddress(lv.addr);
 		if (syncRange)
 			syncRange(user, start, bytes);
-		hash = HashBytes(lv.ptr, bytes, hash + i);
+		const auto th = std::chrono::steady_clock::now();
+		hash = HashBytes(lv.ptr, bytes, hash + (u64)i);
+		pureHashSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - th).count();
+		hashBytes += bytes;
 		memStart = std::min(memStart, start);
 		memEnd = std::max(memEnd, start + bytes);
 	}
 	hashes++;
+	auto t1 = std::chrono::steady_clock::now();
+	hashSeconds += std::chrono::duration<double>(t1 - t0).count();
 	e.checkedRun = runSeq;
 	e.stale = false;
 	e.memStart = memStart;
@@ -177,39 +229,35 @@ ID3D11ShaderResourceView *TextureCache::Lookup(const SamplerState &ss, u64 runSe
 	e.dataHash = hash;
 	decodes++;
 
-	// Decode every level.
+	// Decode every level into the atlas.
+	u32 layout[8];
+	int w, h;
+	TextureAtlasLayout(ss, layout, &w, &h);
+	decodeBuf_.assign((size_t)w * h, 0);
 	const DecodeFn decode = GetDecodeFn(ss.texfmt, ss.swizzle);
-	size_t total = 0;
-	for (int i = 0; i < levels; ++i)
-		total += (size_t)std::max(1, w >> i) * std::max(1, h >> i);
-	decodeBuf_.resize(total);
-	D3D11_SUBRESOURCE_DATA init[8];
-	size_t at = 0;
 	for (int i = 0; i < levels; ++i) {
-		const int lw = std::max(1, w >> i), lh = std::max(1, h >> i);
-		decode(ss, i, lw, lh, ss.clampS, ss.clampT, decodeBuf_.data() + at);
-		init[i].pSysMem = decodeBuf_.data() + at;
-		init[i].SysMemPitch = (UINT)lw * 4;
-		init[i].SysMemSlicePitch = 0;
-		at += (size_t)lw * lh;
+		const TexLevel &lv = ss.levels[i];
+		decode(ss, i, std::min<int>(lv.w, 512), std::min<int>(lv.h, 512), decodeBuf_.data() + (layout[i] & 0xFFFF), (size_t)w);
 	}
-	if (e.tex && e.w == w && e.h == h && e.levels == levels) {
-		for (int i = 0; i < levels; ++i)
-			ctx_->UpdateSubresource(e.tex.Get(), (UINT)i, nullptr, init[i].pSysMem, init[i].SysMemPitch, 0);
+	decodeTexels += (u64)w * h;
+	decodeSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
+	if (e.tex && e.w == w && e.h == h) {
+		ctx_->UpdateSubresource(e.tex.Get(), 0, nullptr, decodeBuf_.data(), (UINT)w * 4, 0);
 		return e.srv.Get();
 	}
 	D3D11_TEXTURE2D_DESC td{};
 	td.Width = (UINT)w;
 	td.Height = (UINT)h;
-	td.MipLevels = (UINT)levels;
+	td.MipLevels = 1;
 	td.ArraySize = 1;
-	td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	td.Format = DXGI_FORMAT_R8G8B8A8_UINT;
 	td.SampleDesc.Count = 1;
 	td.Usage = D3D11_USAGE_DEFAULT;
 	td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	D3D11_SUBRESOURCE_DATA init{ decodeBuf_.data(), (UINT)w * 4, 0 };
 	e.tex.Reset();
 	e.srv.Reset();
-	if (FAILED(dev_->CreateTexture2D(&td, init, &e.tex)) || FAILED(dev_->CreateShaderResourceView(e.tex.Get(), nullptr, &e.srv))) {
+	if (FAILED(dev_->CreateTexture2D(&td, &init, &e.tex)) || FAILED(dev_->CreateShaderResourceView(e.tex.Get(), nullptr, &e.srv))) {
 		LOGW("d3d11", "texture %dx%d (format %d) could not be created", w, h, ss.texfmt);
 		e.tex.Reset();
 		e.srv.Reset();
@@ -217,7 +265,6 @@ ID3D11ShaderResourceView *TextureCache::Lookup(const SamplerState &ss, u64 runSe
 	}
 	e.w = w;
 	e.h = h;
-	e.levels = levels;
 	return e.srv.Get();
 }
 
