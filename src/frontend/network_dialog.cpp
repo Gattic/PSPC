@@ -163,6 +163,22 @@ void Init(HWND dlg, Dialog &d) {
 
 void Fail(HWND dlg, const np::Result &r) { MessageBoxW(dlg, Widen(r.message).c_str(), L"PSPC Network", MB_ICONWARNING); }
 
+// Writes the network keys to pspc.ini (the rest of it stays as it is). Sign-ins and sign-outs are
+// saved as they happen, so closing the dialog any way keeps them.
+bool Save(HWND dlg, Dialog &d) {
+	settings::Settings s;
+	settings::Load(d.ini, s);
+	s.npServer = d.s.npServer;
+	s.npOnlineId = d.s.npOnlineId;
+	s.npToken = d.s.npToken;
+	if (!settings::Save(d.ini, s)) {
+		MessageBoxW(dlg, (L"Could not write " + d.ini.wstring()).c_str(), L"PSPC Network", MB_ICONERROR);
+		return false;
+	}
+	d.changed = true;
+	return true;
+}
+
 void SignIn(HWND dlg, Dialog &d, bool create) {
 	const std::string server = np::NormalizeServerUrl(Text(dlg, IDC_SERVER));
 	const std::string id = Text(dlg, IDC_ID), password = Text(dlg, IDC_PASSWORD);
@@ -190,7 +206,7 @@ void SignIn(HWND dlg, Dialog &d, bool create) {
 	d.s.npServer = client.Server();
 	d.s.npOnlineId = profile.onlineId;
 	d.s.npToken = token;
-	d.changed = true;
+	Save(dlg, d);
 	SetDlgItemTextW(dlg, IDC_SERVER, Widen(d.s.npServer).c_str());
 	SetDlgItemTextW(dlg, IDC_PASSWORD, L"");
 	UpdateUi(dlg, d);
@@ -205,7 +221,7 @@ void SignOut(HWND dlg, Dialog &d) {
 		client.SignOut();  // forgetting the token is what matters
 	}
 	d.s.npToken.clear();
-	d.changed = true;
+	Save(dlg, d);
 	UpdateUi(dlg, d);
 	FillFriends(dlg, d);
 }
@@ -235,9 +251,10 @@ void FriendAction(HWND dlg, Dialog &d, bool add) {
 }
 
 bool Apply(HWND dlg, Dialog &d) {
+	bool changed = false;
 	if (!Hosted(dlg)) {
 		const std::string id = Text(dlg, IDC_LOCAL_ID);
-		if (!d.s.npServer.empty() || id != d.s.npOnlineId) d.changed = true;
+		changed = !d.s.npServer.empty() || id != d.s.npOnlineId;
 		d.s.npServer.clear();
 		d.s.npToken.clear();
 		d.s.npOnlineId = id;
@@ -245,19 +262,9 @@ bool Apply(HWND dlg, Dialog &d) {
 		// A different server: its accounts are its own.
 		d.s.npServer = np::NormalizeServerUrl(Text(dlg, IDC_SERVER));
 		d.s.npToken.clear();
-		d.changed = true;
+		changed = true;
 	}
-	if (!d.changed) return true;
-	settings::Settings s;
-	settings::Load(d.ini, s);  // only the network keys change
-	s.npServer = d.s.npServer;
-	s.npOnlineId = d.s.npOnlineId;
-	s.npToken = d.s.npToken;
-	if (!settings::Save(d.ini, s)) {
-		MessageBoxW(dlg, (L"Could not write " + d.ini.wstring()).c_str(), L"PSPC Network", MB_ICONERROR);
-		return false;
-	}
-	return true;
+	return !changed || Save(dlg, d);
 }
 
 INT_PTR CALLBACK DialogProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
@@ -271,7 +278,7 @@ INT_PTR CALLBACK DialogProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
 		case IDOK:
 			if (Apply(dlg, *d)) EndDialog(dlg, IDOK);
 			return TRUE;
-		case IDCANCEL: EndDialog(dlg, d->changed ? IDOK : IDCANCEL); return TRUE;  // sign-ins already happened
+		case IDCANCEL: EndDialog(dlg, d->changed ? IDOK : IDCANCEL); return TRUE;  // sign-ins are saved already
 		case IDC_LOCAL:
 		case IDC_HOSTED:
 			UpdateUi(dlg, *d);

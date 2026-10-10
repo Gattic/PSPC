@@ -792,9 +792,35 @@ int sceNetInetShutdown(int s, int how) {
 	return 0;
 }
 
+// UDP ports Windows' own services hold on every interface address (SSDP Discovery: 1900, mDNS:
+// 5353, LLMNR: 5355). On a PSP the game has them to itself: SCE-RT games bind 1900 for UPnP. They
+// bind here sharing the port (SO_REUSEADDR), as Windows UPnP clients do, unless one of this game's
+// own sockets has it.
+bool SharedSystemPort(u16 port) { return port == 1900 || port == 5353 || port == 5355; }
+
+bool GuestHoldsUdpPort(const InetSocket *self, u16 port) {
+	for (int s = INET_MIN_SOCKET; s < INET_MAX_SOCKETS; s++) {
+		const InetSocket &o = g_inetSockets[s];
+		if (&o == self || !o.used || !o.bound || o.type != INET_SOCK_DGRAM || !o.host.Valid()) continue;
+		sockaddr_in got{};
+		int len = sizeof(got);
+		if (getsockname(o.host.s, (sockaddr *)&got, &len) == 0 && ntohs(got.sin_port) == port) return true;
+	}
+	return false;
+}
+
 int BindHost(InetSocket *sock, sockaddr_in a) {
 	if (a.sin_addr.s_addr == htonl(INADDR_ANY)) a.sin_addr.s_addr = InterfaceAddress();
-	if (bind(sock->host.s, (const sockaddr *)&a, sizeof(a)) != 0) return SetErrnoFromWsa(WSAGetLastError());
+	if (bind(sock->host.s, (const sockaddr *)&a, sizeof(a)) != 0) {
+		const int e = WSAGetLastError();
+		const u16 port = ntohs(a.sin_port);
+		if (e != WSAEADDRINUSE || sock->type != INET_SOCK_DGRAM || !SharedSystemPort(port) || GuestHoldsUdpPort(sock, port))
+			return SetErrnoFromWsa(e);
+		BOOL on = TRUE;
+		setsockopt(sock->host.s, SOL_SOCKET, SO_REUSEADDR, (const char *)&on, sizeof(on));
+		if (bind(sock->host.s, (const sockaddr *)&a, sizeof(a)) != 0) return SetErrnoFromWsa(WSAGetLastError());
+		LOGI(LOG, "  UDP port %u is held by a Windows service too: shared", port);
+	}
 	sock->bound = true;
 	if (logging::g_level <= LogLevel::Debug) {
 		sockaddr_in got{};

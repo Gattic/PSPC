@@ -23,6 +23,11 @@
 /cache/
 *.log
 
+# PSPC Network server databases (accounts, the ticket key): never commit
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
 # Editors / tools
 .vs/
 .vscode/
