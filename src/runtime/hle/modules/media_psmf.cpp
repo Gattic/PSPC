@@ -1290,6 +1290,9 @@ void Media_NotifyNativeModuleLoad(const std::string &name, const std::vector<u8>
 		return;
 	}
 	if (name == "sceMpeg_library") mediahle::MpegNotifyLoadModule(version);
+	// The library version sets how many atrac contexts exist (4 up to 0x101, else 6). A native
+	// placeholder has no bss of its own, so the contexts stay in kernel memory.
+	if (name == "sceATRAC3plus_Library") audiohle::AtracNotifyLoadModule(version, 0, 0, 0);
 	if (name == "scePsmfP_library" || name == "scePsmfPlayer" || name == "libpsmfplayer" || name == "psmf_jk" ||
 	    name == "jkPsmfP_library")
 		mediahle::PsmfPlayerNotifyLoadModule((int)devkit);

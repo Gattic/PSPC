@@ -10,6 +10,7 @@
 
 #include "allegrex/guestmem.h"
 #include "common/log.h"
+#include "gpu/backend.h"
 #include "gpu/color.h"
 #include "gpu/ge.h"
 #include "gpu/ge_state.h"
@@ -100,6 +101,8 @@ bool inRun = false;
 bool rerun = false;
 u32 intrListPc = 0;
 bool asyncTaken = false;
+// A list finished during this Run: the backend writes its rendering back to guest memory at the end.
+bool backendSyncPending = false;
 u32 edramTranslation = 0x400;
 
 // The CLUT as LOADCLUT leaves it (a partial load keeps the rest).
@@ -488,6 +491,8 @@ void LoadClut() {
 	if (bytes == 0)
 		return;
 	binner::FlushIfOverlap(clutAddr, bytes, false);
+	if (RenderBackend *b = GetRenderBackend())
+		b->SyncRange(clutAddr, bytes);
 	const u32 valid = ValidBytesAt(clutAddr);
 	if (valid) {
 		const u32 n = std::min(valid, bytes);
@@ -581,6 +586,11 @@ void Execute_BlockTransfer() {
 	const u32 dstSize = (u32)(height - 1) * dstStride * bpp + bytesPerRow;
 	binner::FlushIfOverlap(src, srcSize, false);
 	binner::FlushIfOverlap(dst, dstSize, true);
+	RenderBackend *backend = GetRenderBackend();
+	if (backend) {
+		backend->SyncRange(src, srcSize);
+		backend->SyncRange(dst, dstSize);
+	}
 
 	for (int y = 0; y < height; ++y) {
 		const u32 s = WrapVram(srcBase + (u32)((y + srcY) * srcStride + srcX) * bpp);
@@ -602,6 +612,8 @@ void Execute_BlockTransfer() {
 			}
 		}
 	}
+	if (backend)
+		backend->Invalidate(dst, dstSize);
 }
 
 // --- Matrices (SoftGPU) ---
@@ -832,6 +844,7 @@ void Execute_End(u32 op) {
 			FlushImm();
 			list->subIntrToken = (u16)(prev & 0xFFFF);
 			gpuState = GPUSTATE_DONE;
+			backendSyncPending = true;
 			if (list->interruptsEnabled) {
 				// The context is restored once the finish callback has run.
 				TriggerInterrupt(*list);
@@ -1314,6 +1327,9 @@ void Run() {
 		return;
 	}
 	inRun = true;
+	RenderBackend *backend = GetRenderBackend();
+	if (backend)
+		backend->BeginRun();
 	do {
 		rerun = false;
 		ProcessDLQueue();
@@ -1325,6 +1341,13 @@ void Run() {
 		}
 	} while (rerun);
 	binner::Flush();
+	if (backend) {
+		if (backendSyncPending) {
+			backendSyncPending = false;
+			backend->Sync();
+		}
+		backend->EndRun();
+	}
 	inRun = false;
 }
 
@@ -1491,6 +1514,10 @@ int ListSync(int listId, int mode) {
 		default: return (int)ERR_INVALID_ID;
 		}
 	}
+	if (RenderBackend *b = GetRenderBackend()) {
+		binner::Flush();
+		b->Sync();
+	}
 	return dl.waitUntilTicks > NowTicks() ? SYNC_WAIT : 0;
 }
 
@@ -1498,6 +1525,10 @@ int DrawSync(int mode) {
 	if (mode < 0 || mode > 1)
 		return (int)ERR_INVALID_MODE;
 	if (mode == 0) {
+		if (RenderBackend *b = GetRenderBackend()) {
+			binner::Flush();
+			b->Sync();
+		}
 		if (drawCompleteTicks > NowTicks())
 			return SYNC_WAIT;
 		DrawSyncWoken();
@@ -1703,6 +1734,8 @@ int SetEdramAddrTranslation(u32 value) {
 void ReadFramebuffer(u32 addr, int stride, int pixelFormat, int width, int height, u32 *outRgba) {
 	binner::Flush();
 	const int bpp = pixelFormat == 3 ? 4 : 2;
+	if (RenderBackend *b = GetRenderBackend())
+		b->SyncRange(addr, (u32)(height * stride * bpp));
 	for (int y = 0; y < height; ++y) {
 		u32 *out = outRgba + (size_t)y * width;
 		const u32 row = addr + (u32)(y * stride * bpp);

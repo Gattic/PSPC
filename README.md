@@ -10,21 +10,23 @@ and [docs/RECOMPILER.md](docs/RECOMPILER.md) for how it works.
 
 ## Status
 
-Retail games boot and play: Daxter reaches gameplay, Syphon Filter: Combat Ops and Logan's Shadow
-reach their profile screens, Monster Hunter Freedom Unite its game menu - natively (AOT) and in the
-interpreter. pspautotests: about 460 of 559 pass; the interpreter and AOT give the same results.
+Retail games boot and play natively (AOT) and in the interpreter: Daxter (intro movie and
+gameplay), Syphon Filter: Logan's Shadow (story mode), Syphon Filter: Combat Ops, Monster Hunter
+Freedom Unite, Star Wars Battlefront: Elite Squadron and Renegade Squadron - see
+[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md). pspautotests: 517 of 559 pass, with identical
+results in the interpreter and as native code.
 
 | Area | State |
 |---|---|
 | Allegrex CPU: decoder, interpreter, FPU, VFPU (bit-exact hardware model) | Working. `cpu/` 40/42 (the other two can't pass, see docs) |
 | AOT recompiler (`pspc-recomp`) + DLL pipeline | Working. 99%+ code coverage on retail games, whole discs build in about a minute |
-| Kernel: threads (fibers), sync objects, memory, modules, interrupts, timing | Working. `threads/` 148/158 |
-| GE graphics (multithreaded software renderer), display timing | Working. `gpu/` ~80/111 |
+| Kernel: threads (fibers), sync objects, memory, modules, interrupts, timing | Working. `threads/` 148/158; ctrl, power, RTC, intr, modules, sysmem all complete |
+| GE graphics (multithreaded software renderer), display timing | Working. `gpu/` 107/111 |
 | Audio (sceAudio, SAS, ATRAC3/3+, MP3, AAC, audiocodec) | Working. `audio/` 72/74 |
 | I/O, UMD, memory stick, ISO/CSO/ZSO/DAX | Working |
 | sceUtility (save data, dialogs, OSK), fonts (PGF), network (offline) | Working |
 | M33 layer (SystemCtrl, KUBridge, VshCtrl, config.se, plugins, NID resolver) | Working |
-| Video (sceMpeg/PSMF), JPEG | In progress |
+| Video (sceMpeg, PSMF, psmfplayer, videocodec), JPEG | Working. H.264 via Media Foundation; `video/` 24/30, `jpeg/` 8/11; game movies play with sound |
 | Firmware tooling (M33 extraction, inventory, NID database, Ghidra pipeline, pspc-decrypt) | Working |
 | Real 4.01 XMB | Needs the official 4.01 update file (see below) |
 

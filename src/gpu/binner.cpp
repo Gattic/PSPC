@@ -19,6 +19,7 @@
 #include <intrin.h>
 #endif
 
+#include "gpu/backend.h"
 #include "gpu/ge_state.h"
 #include "gpu/render.h"
 
@@ -138,12 +139,10 @@ private:
 Pool &pool = *new Pool;
 int requestedThreads = 0;
 
-struct Prim {
-	PrimType type;
-	u32 stateIndex;
-	Range range;
-	RVertex v[3];
-};
+using Prim = BatchPrim;
+
+// The installed hardware backend (backend.h); nullptr draws with the software rasterizer below.
+RenderBackend *g_backend = nullptr;
 
 struct AddrRange {
 	u32 start, end;  // folded guest addresses, [start, end)
@@ -444,6 +443,11 @@ void Flush() {
 		return;
 	}
 	g_stats.flushes++;
+	if (g_backend) {
+		g_backend->DrawBatch(prims.data(), prims.size(), states.data(), states.size());
+		ResetBatch();
+		return;
+	}
 	bool single = batchSingleThread || pool.Workers() == 0 || batchPixels < THREAD_MIN_PIXELS;
 	if (!single) {
 		// Texturing from what the batch draws, or depth sharing memory with color: keep it in order.
@@ -487,5 +491,15 @@ void FlushIfOverlap(u32 addr, u32 size, bool modifying) {
 }
 
 }  // namespace binner
+
+void SetRenderBackend(RenderBackend *backend) {
+	binner::Flush();
+	g_backend = backend;
+	binner::DirtyState();
+}
+
+RenderBackend *GetRenderBackend() {
+	return g_backend;
+}
 
 }  // namespace gpu

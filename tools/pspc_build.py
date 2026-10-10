@@ -344,16 +344,22 @@ def main():
     env = vs_env()
     args.sem_version = sem_version()
     args.lib_dir = snapshot_libs(pathlib.Path(args.work), args.sem_version)
-    paths = expand_inputs(args, [pathlib.Path(p) for p in args.inputs])
+    origins, ok = {}, {}
+    paths = expand_inputs(args, [pathlib.Path(p) for p in args.inputs], origins)
     failures = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.modules_in_parallel) as ex:
         futs = {ex.submit(build_one, args, env, p): p for p in paths}
         for f in concurrent.futures.as_completed(futs):
             try:
                 print(f.result())
+                ok[futs[f]] = True
             except Exception as e:  # noqa: BLE001 - report and continue with other modules
                 failures += 1
                 print('FAILED %s: %s' % (futs[f], e))
+    try:
+        write_index(args.cache, origins, ok)
+    except Exception as e:  # noqa: BLE001 - the index is a convenience for the launcher
+        print('warning: games.json not updated: %s' % e)
     return 1 if failures else 0
 
 

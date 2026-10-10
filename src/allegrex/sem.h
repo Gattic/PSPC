@@ -31,6 +31,7 @@ constexpr u32 FCR0_VALUE = 0x00003351;
 PSPC_FORCEINLINE void SetR(Ctx *c, u32 reg, u32 v) {
 	if (reg != 0) c->r[reg] = v;
 }
+PSPC_FORCEINLINE u32 R(const Ctx *c, u32 reg) { return reg != 0 ? c->r[reg] : 0u; }
 
 PSPC_FORCEINLINE s32 SatF2I(double d) {
 	if (d >= 2147483648.0) return 0x7FFFFFFF;
@@ -115,8 +116,10 @@ PSPC_FORCEINLINE u32 Swap32(u32 v) {
 #define RT_ insn::Rt(w)
 #define RD_ insn::Rd(w)
 #define SA_ insn::Sa(w)
-#define VRS c->r[insn::Rs(w)]
-#define VRT c->r[insn::Rt(w)]
+// $zero is never written (SetR), so it reads as a constant: with a literal instruction word the
+// compiler folds the read away instead of loading c->r[0].
+#define VRS sem::R(c, insn::Rs(w))
+#define VRT sem::R(c, insn::Rt(w))
 #define ADDR_ (VRS + (u32)insn::Simm16(w))
 
 // ---- SPECIAL ----

@@ -42,6 +42,7 @@ flowchart TB
 | `src/fs/` | Disc images (ISO/CSO/ZSO/DAX), ISO9660, host file system, PBP, PARAM.SFO. |
 | `src/gpu/` | GE display-list processing, timing and the multithreaded software rasterizer. |
 | `src/audio/` | Audio decoders and mixers (ATRAC3/3+, SAS, MP3/AAC through Media Foundation). |
+| `src/media/` | The Media Engine's video side: PSMF program stream demuxing, H.264 through the Media Foundation decoder, JPEG through WIC, YCbCr conversion. Used by the `media_*.cpp` HLE libraries (sceMpeg, scePsmfPlayer, sceVideocodec, sceJpeg). |
 | `src/media/` | Video and image decoding for sceMpeg/PSMF/sceJpeg (PS demux, H.264 through Media Foundation, WIC). |
 | `src/runtime/dialogs/` | sceUtility dialogs (message, OSK, save data...) and their host-side prompts. |
 | `src/frontend/` | `pspc.exe` (command line, LoadExec relaunch), `pspc-launcher.exe` (game library), `pspc-iso.exe`. |

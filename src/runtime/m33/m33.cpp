@@ -187,9 +187,13 @@ void RegisterNidResolver(const std::string &csvPath) {
 		if (!std::getline(ss, lib, ',') || !std::getline(ss, oldNid, ',') || !std::getline(ss, newNid, ',')) continue;
 		if (oldNid.rfind("0x", 0) != 0) continue;
 		u32 o = (u32)strtoul(oldNid.c_str(), nullptr, 16), n = (u32)strtoul(newNid.c_str(), nullptr, 16);
+		// Plugins import the old (SDK) NIDs; 4.01's own modules (the XMB once firmware is supplied)
+		// import the new ones. Native functions are registered under one or the other: alias both
+		// ways so either finds them.
 		if (hle::AddAlias(lib, o, n)) added++;
+		if (hle::AddAlias(lib, n, o)) added++;
 	}
-	LOGI("M33", "NID resolver: %d old kernel NIDs mapped onto native functions", added);
+	LOGI("M33", "NID resolver: %d kernel NID aliases added (old <-> 4.01)", added);
 }
 
 }  // namespace m33

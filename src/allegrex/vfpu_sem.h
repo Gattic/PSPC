@@ -68,11 +68,11 @@ SEM(MFVC) {
 }
 // mfvc of the CC right behind vcmp, which reads the CC from before it (ag::SeesStaleCondition).
 SEM(MFVC_PREV) { sem::SetR(c, insn::Rt(w), c->ccPrev); }
-SEM(MTV) { c->vi[vfpu::VOffset(w & 0x7F)] = c->r[insn::Rt(w)]; }
+SEM(MTV) { c->vi[vfpu::VOffset(w & 0x7F)] = sem::R(c, insn::Rt(w)); }
 SEM(MTVC) {
 	const u32 reg = (w & 0xFF) - 128;
 	if (reg == VFPU_CTRL_CC) c->ccPrev = c->vfpuCtrl[VFPU_CTRL_CC];
-	vfpu::WriteCtrl(c, reg, c->r[insn::Rt(w)]);
+	vfpu::WriteCtrl(c, reg, sem::R(c, insn::Rt(w)));
 }
 
 // Condition bit imm3 (bits 18-20) of the CC register: x, y, z, w, any, all.
