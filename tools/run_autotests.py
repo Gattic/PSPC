@@ -53,6 +53,11 @@ def run_one(args, rel, prx, exp):
     shutil.rmtree(ms, ignore_errors=True)
     ms.mkdir(parents=True, exist_ok=True)
     cmd += ['--memstick', str(ms)]
+    # A disc image shipped next to the test is inserted as the UMD.
+    for ext in ('.iso', '.cso'):
+        if prx.with_suffix(ext).exists():
+            cmd += ['--umd', str(prx.with_suffix(ext))]
+            break
     cmd.append(str(prx))
     start = time.time()
     try:
