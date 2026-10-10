@@ -8,8 +8,9 @@ built for: SCE-RT/Medius (lobby and game servers) and SVO (the game's web portal
 SSL 3.0 login page). Python 3.9 or later, standard library only; one SQLite database file.
 
 **State.** Two PSPC instances on one PC sign in, meet in the lobby, host and join a game, download
-the mission, and play a match together through it. Play across the internet hasn't been tried yet
-(see [Hosting on the internet](#hosting-on-the-internet)).
+the mission, play a full match together through it, rate the mission afterwards and return to the
+lobby (unranked games so far: ranked rules need more players). Play across the internet hasn't
+been tried yet (see [Hosting on the internet](#hosting-on-the-internet)).
 
 ## Quick start (one PC)
 
