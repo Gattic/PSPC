@@ -26,7 +26,8 @@ results in the interpreter and as native code.
 | I/O, UMD, memory stick, ISO/CSO/ZSO/DAX | Working |
 | sceUtility (save data, dialogs, OSK), fonts (PGF) | Working |
 | Network: infrastructure (virtual access point on the host's network, BSD sockets, DNS, HTTP/HTTPS) and ad hoc play (PPSSPP-compatible ad hoc server, `pspc --adhoc-server`) | Working. [docs/networking.md](docs/networking.md) |
-| PlayStation Network stand-in (PSPC Network: accounts, signed NP tickets, friend lists; redirects to revival servers, PPSSPP infra-dns.json compatible) | Working: Combat Ops signs in and reaches its lobby server lookup. [docs/pspc-network.md](docs/pspc-network.md), server in [server/](server/README.md) |
+| PlayStation Network stand-in (PSPC Network: accounts, signed NP tickets, friend lists; redirects to revival servers, PPSSPP infra-dns.json compatible) | Working: Combat Ops signs in. [docs/pspc-network.md](docs/pspc-network.md), server in [server/](server/README.md) |
+| Combat Ops game server (`server/pspc_medius`: SCE-RT/Medius lobby and game servers, SVO portal, mission sharing) | Working on one PC: two instances meet in the lobby and play a match. [docs/combat-ops-server.md](docs/combat-ops-server.md) |
 | M33 layer (SystemCtrl, KUBridge, VshCtrl, config.se, plugins, NID resolver) | Working |
 | Video (sceMpeg, PSMF, psmfplayer, videocodec), JPEG | Working. H.264 via Media Foundation; `video/` 24/30, `jpeg/` 8/11; game movies play with sound |
 | Firmware tooling (M33 extraction, inventory, NID database, Ghidra pipeline, pspc-decrypt) | Working |
@@ -147,7 +148,8 @@ It speaks PPSSPP's protocol, so PPSSPP players and public PPSSPP servers work to
 address, and create an account or sign in; the same dialog manages friends. Without a server,
 games sign in locally under the name you choose. Games' old server names can be pointed at
 community revival servers with an `infrastructure.json` (PPSSPP's `infra-dns.json` format works
-too). See [docs/pspc-network.md](docs/pspc-network.md).
+too). See [docs/pspc-network.md](docs/pspc-network.md). Combat Ops has a server of its own in this
+repository: [docs/combat-ops-server.md](docs/combat-ops-server.md).
 
 ```bat
 build\RelWithDebInfo\bin\pspc.exe --np register --server https://np.example.org --id Gabe_Logan

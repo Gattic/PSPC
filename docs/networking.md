@@ -27,7 +27,8 @@ Network stand-in (accounts, tickets, friends; see [pspc-network.md](pspc-network
 services are mostly gone, so a game usually gets as far as its own server and then reports that
 the server can't be reached - unless a community-run replacement server exists and the game's
 server names are redirected to it (`infrastructure.json`, PPSSPP's `infra-dns.json`, or a revival
-DNS server: [pspc-network.md](pspc-network.md#redirects)).
+DNS server: [pspc-network.md](pspc-network.md#redirects)). Syphon Filter: Combat Ops has one in this
+repository: [combat-ops-server.md](combat-ops-server.md).
 
 **The XMB** (`pspc --vsh`):
 

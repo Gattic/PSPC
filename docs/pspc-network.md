@@ -69,7 +69,7 @@ PSPC can answer those lookups with a revival server's address. The table is read
 
 1. `infrastructure.json` next to pspc.exe (your own),
 2. `data/infrastructure.json` (shipped with PSPC: lists the servers each supported game uses,
-   no revival servers yet),
+   no revival servers yet; for Combat Ops, run [its server](combat-ops-server.md)),
 3. PPSSPP's `infra-dns.json`, next to pspc.exe or in `data/`.
 
 The format is PPSSPP's, so community revival tables work unchanged:
@@ -190,7 +190,7 @@ attempts a minute per address.
 
 | Game | Online services | State |
 |---|---|---|
-| Syphon Filter: Combat Ops (NPUG80114) | PSN sign-in, ticket and friend list, then SCE-RT Medius lobby `combatops.psp.online.scea.com:10071` (resolved by the game's own DNS queries) and SVML (`combatopspsp.online.scee.com:10070`) | Signs in to PSPC Network, gets its ticket and friend list, then looks for the lobby server ("Failed to connect to the Combat Ops lobby server" until one exists) |
+| Syphon Filter: Combat Ops (NPUG80114) | PSN sign-in, ticket and friend list, then SCE-RT Medius lobby `combatops.psp.online.scea.com:10071` (resolved by the game's own DNS queries) and SVML (`combatopspsp.online.scee.com:10070`) | Works with PSPC's own server, `server/pspc_medius`: lobby, games, matches, mission sharing ([combat-ops-server.md](combat-ops-server.md)) |
 | Syphon Filter: Logan's Shadow (UCUS98606) | SVML (same servers), no PSN | Needs a revival server |
 | Star Wars Battlefront: Renegade Squadron (ULUS10292), Elite Squadron (ULUS10390) | GameSpy (presence, master server, NAT negotiation, stats), no PSN | Needs GameSpy-compatible servers (redirect `*.gamespy.com`) |
 | Monster Hunter Freedom Unite, Daxter | ad hoc (and HTTP downloads for MHFU) | Ad hoc works through `pspc --adhoc-server` |
@@ -201,7 +201,7 @@ None of these use DNAS.
 
 ```bat
 build\RelWithDebInfo\bin\pspc_unittests.exe json_reader np_ticket_layout np_server_url dns_messages
-python -I -m unittest discover -s server\tests       :: server: accounts, tickets, verify, friends, limits
+python -I -m unittest discover -s server\tests       :: servers: accounts, tickets, verify, friends, limits; Combat Ops
 ```
 
 End to end: run a server on 127.0.0.1, `pspc --np register` against it, and start Combat Ops'

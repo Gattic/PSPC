@@ -591,6 +591,7 @@ struct InetSocket {
 	u64 abortKey = 0;
 	std::map<u64, u32> options;  // (level << 32 | name) -> value, for getsockopt
 	u8 localAddr[16] = {};       // offline: the sockaddr given to bind
+	bool wildcard = false;       // bound to 0.0.0.0 on the host for a guest wildcard bind (getsockname shows the AP's address)
 	// Datagrams pspc answered itself (DNS for redirected names, net_infra.cpp), received before
 	// anything from the host.
 	std::deque<std::pair<std::vector<u8>, sockaddr_in>> injected;
@@ -810,16 +811,35 @@ bool GuestHoldsUdpPort(const InetSocket *self, u16 port) {
 }
 
 int BindHost(InetSocket *sock, sockaddr_in a) {
-	if (a.sin_addr.s_addr == htonl(INADDR_ANY)) a.sin_addr.s_addr = InterfaceAddress();
+	// A wildcard bind takes the access point's address (what getsockname reports), but binds the host
+	// socket to all interfaces once connected: Windows won't send from a LAN-bound socket to loopback,
+	// where a game server on the same PC listens. Before the access point connects: loopback only.
+	if (a.sin_addr.s_addr == htonl(INADDR_ANY)) {
+		if (InterfaceAddress() == htonl(INADDR_LOOPBACK)) a.sin_addr.s_addr = InterfaceAddress();
+		else sock->wildcard = true;
+	}
 	if (bind(sock->host.s, (const sockaddr *)&a, sizeof(a)) != 0) {
 		const int e = WSAGetLastError();
 		const u16 port = ntohs(a.sin_port);
-		if (e != WSAEADDRINUSE || sock->type != INET_SOCK_DGRAM || !SharedSystemPort(port) || GuestHoldsUdpPort(sock, port))
+		if ((e != WSAEADDRINUSE && e != WSAEACCES) || sock->type != INET_SOCK_DGRAM || port == 0 ||
+		    GuestHoldsUdpPort(sock, port))
 			return SetErrnoFromWsa(e);
-		BOOL on = TRUE;
-		setsockopt(sock->host.s, SOL_SOCKET, SO_REUSEADDR, (const char *)&on, sizeof(on));
-		if (bind(sock->host.s, (const sockaddr *)&a, sizeof(a)) != 0) return SetErrnoFromWsa(WSAGetLastError());
-		LOGI(LOG, "  UDP port %u is held by a Windows service too: shared", port);
+		if (SharedSystemPort(port)) {
+			BOOL on = TRUE;
+			setsockopt(sock->host.s, SOL_SOCKET, SO_REUSEADDR, (const char *)&on, sizeof(on));
+			if (bind(sock->host.s, (const sockaddr *)&a, sizeof(a)) != 0) return SetErrnoFromWsa(WSAGetLastError());
+			LOGI(LOG, "  UDP port %u is held by a Windows service too: shared", port);
+		} else {
+			// Another program - or another PSPC instance on this PC - has the port (or Windows reserved
+			// it): take a free one. getsockname reports the real port, so a game that tells other players
+			// where to reach it (peer-to-peer games) gives them an address that works.
+			a.sin_port = 0;
+			if (bind(sock->host.s, (const sockaddr *)&a, sizeof(a)) != 0) return SetErrnoFromWsa(WSAGetLastError());
+			sockaddr_in got{};
+			int len = sizeof(got);
+			getsockname(sock->host.s, (sockaddr *)&got, &len);
+			LOGI(LOG, "  UDP port %u is in use on this PC: using %u instead", port, ntohs(got.sin_port));
+		}
 	}
 	sock->bound = true;
 	if (logging::g_level <= LogLevel::Debug) {
@@ -1045,6 +1065,8 @@ int RecvCommon(int s, u32 buf, u32 len, u32 flags, u32 fromPtr, u32 fromLenPtr) 
 			e = 0;
 		}
 		if (n >= 0) {
+			if (sock->type == INET_SOCK_DGRAM && fromLen >= (int)sizeof(sockaddr_in))
+				LOGD(LOG, "recv(%d): %d bytes from %s:%u", s, n, hostnet::Ipv4ToString(from.sin_addr.s_addr).c_str(), ntohs(from.sin_port));
 			if (fromPtr && fromLen >= (int)sizeof(sockaddr_in) && from.sin_family == AF_INET) WriteSockaddr(fromPtr, fromLenPtr, from);
 			got += (u32)n;
 			if (n == 0 || !waitAll || got >= len) return (int)got;
@@ -1114,6 +1136,8 @@ int sceNetInetSendto(int s, u32 buf, u32 len, u32 flags, u32 toPtr, u32 toLen) {
 	sockaddr_in to;
 	int err;
 	if (!ReadSockaddr(toPtr, (int)toLen, &to, &err)) return SetErrno(err);
+	LOGD(LOG, "sceNetInetSendto(%d, %u bytes) to %s:%u", s, len, hostnet::Ipv4ToString(to.sin_addr.s_addr).c_str(),
+	     ntohs(to.sin_port));
 	if (sock->type == INET_SOCK_DGRAM && IsDnsServer(to)) {
 		const int r = TryAnswerDns(s, buf, len, to);
 		if (r >= 0) return r;
@@ -1374,6 +1398,7 @@ int sceNetInetGetsockname(int s, u32 namePtr, u32 nameLenPtr) {
 		a = sockaddr_in{};  // not bound yet: BSD reports 0.0.0.0:0
 		a.sin_family = AF_INET;
 	}
+	if (sock->wildcard && a.sin_addr.s_addr == htonl(INADDR_ANY)) a.sin_addr.s_addr = InterfaceAddress();
 	WriteSockaddr(namePtr, nameLenPtr, a);
 	return 0;
 }

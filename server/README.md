@@ -118,6 +118,15 @@ The ticket layout is described in [docs/pspc-network.md](../docs/pspc-network.md
 `pspc_network/ticket.py` parses it if you want the fields without a round trip, but only the
 server can check the signature.
 
+## Game servers
+
+`pspc_medius` is a game server for Syphon Filter: Combat Ops (lobby, games, mission sharing), which
+checks players' tickets with this server: see [docs/combat-ops-server.md](../docs/combat-ops-server.md).
+
+```sh
+python -m pspc_medius --db sfco.sqlite serve --public-host 203.0.113.7 --umd SFCO.iso --network https://np.example.org
+```
+
 ## Tests
 
 ```sh

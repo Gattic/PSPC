@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "runtime/core/interp.h"
 
+#include <cstdlib>
+#include <vector>
+
 #include "allegrex/decode.h"
 #include "allegrex/guestmem.h"
 #include "allegrex/insn.h"
@@ -20,6 +23,44 @@ using ag::Op;
 static u64 g_icount = 0;
 
 u64 InstructionCount() { return g_icount; }
+
+// Reverse-engineering aids (run with --interp so every call is interpreted):
+//   PSPC_TRACE_PC=<hex addr>[,<hex addr>...]  logs a0-a3, ra and sp each time code reaches an address;
+//   PSPC_TRACE_AFTER=<hex addr>,<n>           logs the next n function calls after reaching addr.
+static std::vector<u32> g_tracePcs;
+static u32 g_traceAfterPc = 0, g_traceAfterCount = 0, g_traceCallsLeft = 0;
+static bool g_traceOn = [] {
+	const char *env = getenv("PSPC_TRACE_PC");
+	for (const char *p = env; p && *p;) {
+		char *end = nullptr;
+		u32 a = (u32)strtoul(p, &end, 16);
+		if (end == p) break;
+		g_tracePcs.push_back(a);
+		p = *end ? end + 1 : end;
+	}
+	if (const char *after = getenv("PSPC_TRACE_AFTER")) {
+		char *end = nullptr;
+		g_traceAfterPc = (u32)strtoul(after, &end, 16);
+		g_traceAfterCount = end && *end == ',' ? (u32)strtoul(end + 1, nullptr, 10) : 200;
+	}
+	return !g_tracePcs.empty() || g_traceAfterPc != 0;
+}();
+
+static void TraceCall(Ctx *c, u32 target, u32 from) {
+	g_traceCallsLeft--;
+	LOGI("TRACE", "  call %08x from %08x a0=%08x a1=%08x a2=%08x a3=%08x", target, from, c->r[4], c->r[5], c->r[6], c->r[7]);
+}
+
+static void TracePc(Ctx *c, u32 pc) {
+	if (pc == g_traceAfterPc) g_traceCallsLeft = g_traceAfterCount;
+	for (u32 a : g_tracePcs) {
+		if (a == pc) {
+			LOGI("TRACE", "%08x v0=%08x a0=%08x a1=%08x a2=%08x a3=%08x ra=%08x sp=%08x", pc, c->r[2], c->r[4], c->r[5], c->r[6], c->r[7],
+			     c->r[31], c->r[29]);
+			return;
+		}
+	}
+}
 
 [[noreturn]] static void BadPc(Ctx *c, u32 pc, u32 from) {
 	Fatal("Guest jumped to invalid address %08x (from %08x, ra=%08x sp=%08x)", pc, from, c->r[31], c->r[29]);
@@ -121,6 +162,7 @@ void Run(Ctx *c, u32 pc, u32 ra0, u32 sp0) {
 
 	for (;;) {
 		c->pc = pc;
+		if (PSPC_UNLIKELY(g_traceOn)) TracePc(c, pc);
 		u32 w = GRead32(pc);
 		Op op = ag::Decode(w);
 		Kind k = ag::OpKind(op);
@@ -185,6 +227,7 @@ void Run(Ctx *c, u32 pc, u32 ra0, u32 sp0) {
 
 		case Kind::JAL: {
 			u32 target = insn::JumpTarget(pc, w);
+			if (PSPC_UNLIKELY(g_traceCallsLeft)) TraceCall(c, target, pc);
 			c->r[31] = pc + 8;
 			ExecDelaySlot(c, pc + 4);
 			bool propagate = false;
@@ -222,6 +265,7 @@ void Run(Ctx *c, u32 pc, u32 ra0, u32 sp0) {
 
 		case Kind::JALR: {
 			u32 target = c->r[insn::Rs(w)];
+			if (PSPC_UNLIKELY(g_traceCallsLeft)) TraceCall(c, target, pc);
 			u32 rd = insn::Rd(w);
 			if (rd) c->r[rd] = pc + 8;
 			ExecDelaySlot(c, pc + 4);
