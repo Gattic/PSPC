@@ -41,11 +41,17 @@ struct Options {
 	bool hasDisplayForTests = false;
 	std::string dumpFramesDir;  // write the displayed frame as BMP here every dumpEvery VBlanks
 	int dumpEvery = 60;
+	// GE renderer: "software" (the default, the accuracy reference), "d3d11" or "d3d11-warp" (the
+	// optional GPU backend, src/gpu/hw). Empty: $PSPC_RENDERER, else software. renderScale (1-4): the
+	// GPU backend's internal resolution; 0: $PSPC_RENDER_SCALE, else 1.
+	std::string renderer;
+	int renderScale = 0;
 	// Scripted input: hold `buttons` (PSP_CTRL_* bits) for `frames` VBlanks from VBlank `vblank`.
 	struct Press {
 		u32 vblank, buttons, frames;
 	};
 	std::vector<Press> presses;
+	std::string oskText;  // headless: what the on-screen keyboard returns
 };
 
 // Boots the program and runs until it exits. Returns the exit code.

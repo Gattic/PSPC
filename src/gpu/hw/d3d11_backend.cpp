@@ -1,0 +1,1271 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Portions derived from PPSSPP (https://github.com/hrydgard/ppsspp), Copyright (c) 2012- PPSSPP Project, GPL-2.0-or-later.
+//
+// The Direct3D 11 renderer backend.
+//
+// Drawing. The binner hands over batches of screen-space primitives with their raster states. Each
+// becomes GPU vertices (triangles as they are; sprites, clears and points as quads over exactly the
+// pixels the software rasterizer covers, from rasterizer.cpp's edge rules; lines as lines), with
+// colors, depth and fog interpolating linearly in screen space and texture coordinates as s/q, t/q
+// planes, like the GE. Consecutive states that share a texture, sampler, scissor and shader variant go
+// in one draw: the per-draw state (d3d11_shaders.cpp) is indexed per vertex.
+//
+// Surfaces. Every framebuffer and depth buffer the GE draws to (VRAM address, stride, format) is
+// mirrored by an R32_UINT texture at the render scale holding raw PSP pixel values, written through
+// rasterizer-ordered views by the pixel shader.
+//
+// Coherence (the simple, correct scheme):
+//  * Each surface keeps a shadow copy of the guest VRAM rows it last exchanged with guest memory. Before
+//    the GPU draws rows of a surface, rows whose VRAM differs from the shadow (the CPU, a block transfer
+//    or another surface wrote them) are uploaded again; the others keep their (upscaled) GPU contents.
+//  * Rows the GPU drew are "dirty" until written back: at list end and sceGeDrawSync/ListSync, when the
+//    GE reads that memory itself (block transfer source, CLUT, a texture), before a block transfer
+//    writes it, and before another surface overlapping it is validated. At a render scale above 1 the
+//    surface is reduced to 1x first. A pixel the CPU changed meanwhile keeps the CPU's value.
+//  * Textures are hashed (d3d11_texcache.cpp) after their memory was made current, so render-to-texture
+//    and CPU-written textures both read correctly.
+//  * sceDisplay at a render scale above 1 presents the surface itself, converted to RGBA8888.
+#include "gpu/hw/d3d11_backend.h"
+
+#include <d3dcompiler.h>
+#include <dxgi1_6.h>
+
+#include <algorithm>
+#include <chrono>
+#include <climits>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+
+#include "common/log.h"
+#include "gpu/gemath.h"
+#include "gpu/hw/d3d11_internal.h"
+
+namespace gpu::hw {
+
+namespace {
+
+constexpr int FMT_DEPTH = 4;
+constexpr u32 VRAM_MASK = VRAM_SIZE - 1;
+constexpr int MAX_SURFACE_W = 2048;
+constexpr int MAX_SURFACE_H = 1024;
+
+struct TargetCB {
+	float ndcScale[2];
+	float ndcOffset[2];
+	u32 scale;
+	u32 pad[3];
+};
+
+struct CopyCB {
+	u32 origin[2];
+	u32 size[2];
+	u32 scale;
+	u32 format;
+	u32 pad[2];
+};
+
+// rasterizer.cpp ClampFogDepth: the fog factor 0-255 from a vertex's fog depth.
+inline float ClampFogDepth(float fogdepth) {
+	const u32 u = FloatBits(fogdepth);
+	const u32 exp = u >> 23;
+	if ((u & 0x80000000) != 0 || exp <= 126 - 8)
+		return 0.0f;
+	if (exp > 126)
+		return 255.0f;
+	const u32 mantissa = (u & 0x007FFFFF) | 0x00800000;
+	return (float)(u8)(mantissa >> (16 + 126 - exp));
+}
+
+// A linear function of screen subpixels through three points (a sprite's UV planes).
+struct LinearFn {
+	double a = 0, b = 0, c = 0;
+	double At(double x, double y) const { return a + b * x + c * y; }
+};
+
+LinearFn PlaneThrough(const int64_t X[3], const int64_t Y[3], const double F[3]) {
+	LinearFn f;
+	const double det = (double)(X[1] - X[0]) * (double)(Y[2] - Y[0]) - (double)(X[2] - X[0]) * (double)(Y[1] - Y[0]);
+	if (det == 0.0) {
+		f.a = F[0];
+		return f;
+	}
+	f.b = ((F[1] - F[0]) * (double)(Y[2] - Y[0]) - (F[2] - F[0]) * (double)(Y[1] - Y[0])) / det;
+	f.c = ((F[2] - F[0]) * (double)(X[1] - X[0]) - (F[1] - F[0]) * (double)(X[2] - X[0])) / det;
+	f.a = F[0] - f.b * (double)X[0] - f.c * (double)Y[0];
+	return f;
+}
+
+// The pixels DrawRectangle (rasterizer.cpp) fills, inclusive.
+bool RectBounds(const RVertex &v0, const RVertex &v1, const Range &range, int *px0, int *py0, int *px1, int *py1) {
+	const int entireX1 = std::min(v0.x, v1.x);
+	const int entireY1 = std::min(v0.y, v1.y);
+	const int entireX2 = std::max(v0.x, v1.x) - 1;
+	const int entireY2 = std::max(v0.y, v1.y) - 1;
+	int minX = std::max(entireX1 & ~(SUBPIX - 1), range.x1) | (SUBPIX / 2 - 1);
+	int minY = std::max(entireY1 & ~(SUBPIX - 1), range.y1) | (SUBPIX / 2 - 1);
+	const int maxX = std::min(entireX2 - 1, range.x2);
+	const int maxY = std::min(entireY2 - 1, range.y2);
+	if (minX < entireX1 - 2)
+		minX += SUBPIX;
+	const bool rotated = v0.x < v1.x && v0.y > v1.y;
+	if (minY < entireY1 - (rotated ? 2 : 1))
+		minY += SUBPIX;
+	if (minX > maxX || minY > maxY)
+		return false;
+	*px0 = minX / SUBPIX;
+	*py0 = minY / SUBPIX;
+	*px1 = *px0 + (maxX - minX) / SUBPIX;
+	*py1 = *py0 + (maxY - minY) / SUBPIX;
+	return true;
+}
+
+// The pixels ClearRectangle (rasterizer.cpp) fills, inclusive.
+bool ClearBounds(const RVertex &v0, const RVertex &v1, const Range &range, int *px0, int *py0, int *px1, int *py1) {
+	const int entireX1 = std::min(v0.x, v1.x);
+	const int entireY1 = std::min(v0.y, v1.y);
+	const int entireX2 = std::max(v0.x, v1.x) - 1;
+	const int entireY2 = std::max(v0.y, v1.y) - 1;
+	int minX = std::max(entireX1 & ~(SUBPIX - 1), range.x1) | (SUBPIX / 2 - 1);
+	int minY = std::max(entireY1 & ~(SUBPIX - 1), range.y1) | (SUBPIX / 2 - 1);
+	const int maxX = std::min(entireX2, range.x2);
+	const int maxY = std::min(entireY2, range.y2);
+	if (minX < entireX1 - 1)
+		minX += SUBPIX;
+	if (minY < entireY1 - 1)
+		minY += SUBPIX;
+	*px0 = minX / SUBPIX;
+	*py0 = minY / SUBPIX;
+	*px1 = (maxX - SUBPIX / 2) / SUBPIX;
+	*py1 = (maxY - SUBPIX / 2) / SUBPIX;
+	return *px1 >= *px0 && *py1 >= *py0;
+}
+
+bool SameTexture(const SamplerState &a, const SamplerState &b) {
+	if (a.texfmt != b.texfmt || a.swizzle != b.swizzle || a.maxLevel != b.maxLevel || a.clut != b.clut ||
+		a.clutfmt != b.clutfmt || a.clutShift != b.clutShift || a.clutMask != b.clutMask || a.clutOffset != b.clutOffset ||
+		a.useSharedClut != b.useSharedClut)
+		return false;
+	for (int i = 0; i <= a.maxLevel; ++i) {
+		const TexLevel &x = a.levels[i], &y = b.levels[i];
+		if (x.addr != y.addr || x.bufw != y.bufw || x.w != y.w || x.h != y.h)
+			return false;
+	}
+	return a.clampS == b.clampS && a.clampT == b.clampT && a.minFilt == b.minFilt && a.magFilt == b.magFilt && a.mipFilt == b.mipFilt;
+}
+
+// Whether two states can share a draw call.
+bool Compatible(const RasterState &a, const RasterState &b) {
+	if (a.pix.fbFormat != b.pix.fbFormat || a.pix.clearMode != b.pix.clearMode)
+		return false;
+	const bool ta = a.enableTextures && !a.pix.clearMode, tb = b.enableTextures && !b.pix.clearMode;
+	if (ta != tb || memcmp(&a.scissor, &b.scissor, sizeof(Range)) != 0)
+		return false;
+	return !ta || SameTexture(a.samp, b.samp);
+}
+
+struct Surface {
+	u32 addr = 0;  // VRAM offset
+	int stride = 0;
+	int fmt = 0;   // GE_FORMAT_*, FMT_DEPTH
+	int bpp = 2;
+	int width = 0, height = 0;  // PSP pixels
+	ComPtr<ID3D11Texture2D> tex;
+	ComPtr<ID3D11UnorderedAccessView> uav;
+	ComPtr<ID3D11ShaderResourceView> srv;
+	std::vector<u8> shadow;    // guest VRAM rows as last exchanged
+	std::vector<u8> rowValid;  // the GPU copy of the row matches the shadow
+	int dirtyY0 = INT_MAX, dirtyY1 = -1;  // rows drawn and not written back
+	u64 validRun = 0, validGen = 0;
+	int validY0 = 0, validY1 = -1;
+	u64 lastUse = 0;
+	bool drawn = false;
+
+	u32 RowBytes() const { return (u32)stride * (u32)bpp; }
+	u32 Start(int y) const { return addr + (u32)y * RowBytes(); }
+	bool Dirty() const { return dirtyY1 >= dirtyY0; }
+};
+
+inline bool Overlaps(u64 a0, u64 a1, u64 b0, u64 b1) {
+	return a0 < b1 && b0 < a1 && a1 > a0 && b1 > b0;
+}
+
+// Guest VRAM bytes at an offset, wrapping at its end.
+void ReadVram(u32 off, u8 *out, u32 n) {
+	const u8 *v = VramPtr();
+	off &= VRAM_MASK;
+	const u32 first = std::min(n, VRAM_SIZE - off);
+	memcpy(out, v + off, first);
+	if (first < n)
+		memcpy(out + first, v, n - first);
+}
+
+void WriteVram(u32 off, const u8 *in, u32 n) {
+	u8 *v = VramPtr();
+	off &= VRAM_MASK;
+	const u32 first = std::min(n, VRAM_SIZE - off);
+	memcpy(v + off, in, first);
+	if (first < n)
+		memcpy(v, in + first, n - first);
+}
+
+struct Segment {
+	u32 first, count;
+	u32 state, lastState;
+	bool lines;
+};
+
+class D3D11Backend final : public RenderBackend {
+public:
+	~D3D11Backend() override;
+	bool Init(const D3D11Options &o, std::string *err);
+	const char *Name() const override { return "d3d11"; }
+	void BeginRun() override { runSeq_++; }
+	void DrawBatch(const BatchPrim *prims, size_t primCount, const RasterState *states, size_t stateCount) override;
+	void SyncRange(u32 addr, u32 size) override;
+	void Invalidate(u32 addr, u32 size) override;
+	void Sync() override;
+	void EndRun() override {}
+	bool GetDisplayImage(u32 addr, int stride, int format, int width, int height, std::vector<u32> &out, int *outW, int *outH) override;
+
+private:
+	ComPtr<ID3DBlob> Compile(ShaderKind kind, const char *entry, const char *target, const D3D_SHADER_MACRO *defines, std::string *err);
+	ID3D11PixelShader *PixelShader(int fmt, bool clear, bool tex);
+	ID3D11SamplerState *Sampler(const SamplerState &ss, int levels);
+	bool MakeTexture(int w, int h, bool staging, ComPtr<ID3D11Texture2D> *tex, ComPtr<ID3D11UnorderedAccessView> *uav, ComPtr<ID3D11ShaderResourceView> *srv);
+	bool EnsureScratch(ComPtr<ID3D11Texture2D> &tex, ComPtr<ID3D11UnorderedAccessView> *uav, ComPtr<ID3D11ShaderResourceView> *srv, int w, int h, int *curW, int *curH, bool staging);
+
+	Surface *FindSurface(u32 addr, int stride, int fmt);
+	Surface *GetSurface(u32 addr, int stride, int fmt, int rowsNeeded);
+	bool ResizeSurface(Surface *s, int height);
+	void ValidateRows(Surface *s, int y0, int y1);
+	void UploadRows(Surface *s, int y0, int y1);
+	void Download(Surface *s);
+	void MarkDirty(Surface *s, int y0, int y1);
+	void UnbindOM();
+	void RunCompute(ID3D11ComputeShader *cs, ID3D11ShaderResourceView *srv, ID3D11UnorderedAccessView *uav, const CopyCB &cb, UINT gx, UINT gy);
+	static void SyncRangeThunk(void *user, u32 addr, u32 size) { static_cast<D3D11Backend *>(user)->SyncRange(addr, size); }
+
+	void BuildVertices(const BatchPrim *prims, size_t n, const RasterState *states);
+	void EmitTriangle(const BatchPrim &p, const RasterState &st);
+	void EmitRect(const BatchPrim &p, const RasterState &st, bool clear);
+	void EmitPoint(const BatchPrim &p, const RasterState &st);
+	void EmitLine(const BatchPrim &p, const RasterState &st);
+	void FillStates(const RasterState *states, size_t n);
+	void BindDraw(Surface *color, Surface *depth);
+	void PrintStats();
+
+	int scale_ = 1;
+	ComPtr<ID3D11Device> dev_;
+	ComPtr<ID3D11DeviceContext> ctx_;
+	ComPtr<ID3D11VertexShader> vs_;
+	ComPtr<ID3D11InputLayout> layout_;
+	ComPtr<ID3D11PixelShader> ps_[16];
+	ComPtr<ID3D11ComputeShader> csExpand_, csReduce_, csDisplay_;
+	ComPtr<ID3D11RasterizerState> raster_;
+	ComPtr<ID3D11DepthStencilState> noDepth_;
+	ComPtr<ID3D11Buffer> targetCB_, copyCB_;
+	ComPtr<ID3D11Buffer> vb_;
+	size_t vbBytes_ = 0;
+	ComPtr<ID3D11Buffer> stateBuf_;
+	ComPtr<ID3D11ShaderResourceView> stateSrv_;
+	size_t stateCap_ = 0;
+	ComPtr<ID3D11Texture2D> dummyTex_;
+	ComPtr<ID3D11UnorderedAccessView> dummyUav_;
+	std::unordered_map<u32, ComPtr<ID3D11SamplerState>> samplers_;
+
+	// Scratch: 1x upload source, 1x reduce target, readback staging, display conversion.
+	ComPtr<ID3D11Texture2D> uploadTex_, reduceTex_, stagingTex_, displayTex_, displayStaging_;
+	ComPtr<ID3D11ShaderResourceView> uploadSrv_;
+	ComPtr<ID3D11UnorderedAccessView> reduceUav_, displayUav_;
+	int uploadW_ = 0, uploadH_ = 0, reduceW_ = 0, reduceH_ = 0, stagingW_ = 0, stagingH_ = 0;
+	int displayW_ = 0, displayH_ = 0, displayStagingW_ = 0, displayStagingH_ = 0;
+
+	std::vector<std::unique_ptr<Surface>> surfaces_;
+	std::unique_ptr<TextureCache> texCache_;
+	std::vector<GpuVertex> verts_;
+	std::vector<Segment> segs_;
+	std::vector<DrawStateGpu> gpuStates_;
+	std::vector<u32> uploadBuf_;
+	std::vector<u8> rowTmp_, rowTmp2_;
+
+	u64 runSeq_ = 1;   // GE runs (the CPU may write memory between them)
+	u64 vramGen_ = 1;  // the GE wrote VRAM (written back rendering, block transfers)
+	u64 syncs_ = 0;
+	bool omDirty_ = true;
+
+	struct Stats {
+		u64 batches = 0, draws = 0, prims = 0, verts = 0;
+		u64 downloads = 0, downloadRows = 0, uploads = 0, uploadRows = 0;
+		double seconds = 0;
+	} stats_;
+	bool printStats_ = false;
+	std::chrono::steady_clock::time_point statsStart_ = std::chrono::steady_clock::now();
+};
+
+struct ScopedTimer {
+	double *acc;
+	std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+	explicit ScopedTimer(double *a) : acc(a) {}
+	~ScopedTimer() { *acc += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); }
+};
+
+D3D11Backend::~D3D11Backend() {
+	if (ctx_) {
+		ctx_->ClearState();
+		ctx_->Flush();
+	}
+}
+
+ComPtr<ID3DBlob> D3D11Backend::Compile(ShaderKind kind, const char *entry, const char *target, const D3D_SHADER_MACRO *defines, std::string *err) {
+	const std::string src = ShaderSource(kind);
+	ComPtr<ID3DBlob> code, errors;
+	const HRESULT hr = D3DCompile(src.data(), src.size(), entry, defines, nullptr, entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
+	if (FAILED(hr)) {
+		std::string msg = errors ? std::string((const char *)errors->GetBufferPointer(), errors->GetBufferSize()) : "D3DCompile failed";
+		if (err)
+			*err = msg;
+		LOGE("d3d11", "%s (%s): %s", entry, target, msg.c_str());
+		return nullptr;
+	}
+	return code;
+}
+
+bool D3D11Backend::Init(const D3D11Options &o, std::string *err) {
+	scale_ = std::clamp(o.scale, 1, 4);
+	printStats_ = getenv("PSPC_GPU_STATS") != nullptr;
+	UINT flags = 0;
+	if (getenv("PSPC_D3D11_DEBUG"))
+		flags |= D3D11_CREATE_DEVICE_DEBUG;
+	const D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
+	ComPtr<IDXGIAdapter1> adapter;
+	if (!o.warp) {
+		ComPtr<IDXGIFactory6> factory;
+		if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
+			factory->EnumAdapterByGpuPreference((UINT)std::max(o.adapter, 0), DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter));
+	}
+	D3D_FEATURE_LEVEL fl{};
+	auto create = [&](UINT f) {
+		const D3D_DRIVER_TYPE type = adapter ? D3D_DRIVER_TYPE_UNKNOWN : (o.warp ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE);
+		return D3D11CreateDevice(adapter.Get(), type, nullptr, f, levels, 2, D3D11_SDK_VERSION, &dev_, &fl, &ctx_);
+	};
+	HRESULT hr = create(flags);
+	if (FAILED(hr) && (flags & D3D11_CREATE_DEVICE_DEBUG))
+		hr = create(0);
+	if (FAILED(hr)) {
+		*err = "D3D11CreateDevice failed";
+		return false;
+	}
+	D3D11_FEATURE_DATA_D3D11_OPTIONS2 o2{};
+	if (FAILED(dev_->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS2, &o2, sizeof(o2))) || !o2.ROVsSupported) {
+		*err = "the device has no rasterizer ordered views (D3D11.3 ROVs)";
+		return false;
+	}
+	std::string name = o.warp ? "WARP" : "?";
+	{
+		ComPtr<IDXGIDevice> dxgiDev;
+		ComPtr<IDXGIAdapter> ad;
+		DXGI_ADAPTER_DESC desc{};
+		if (SUCCEEDED(dev_.As(&dxgiDev)) && SUCCEEDED(dxgiDev->GetAdapter(&ad)) && SUCCEEDED(ad->GetDesc(&desc))) {
+			char buf[128];
+			WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, buf, sizeof(buf), nullptr, nullptr);
+			name = buf;
+		}
+	}
+
+	ComPtr<ID3DBlob> vsCode = Compile(ShaderKind::Vertex, "VSMain", "vs_5_0", nullptr, err);
+	if (!vsCode || FAILED(dev_->CreateVertexShader(vsCode->GetBufferPointer(), vsCode->GetBufferSize(), nullptr, &vs_)))
+		return false;
+	const D3D11_INPUT_ELEMENT_DESC elems[] = {
+		{ "POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+		{ "TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT, 0, 8, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+		{ "COLOR", 0, DXGI_FORMAT_R8G8B8A8_UINT, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+		{ "COLOR", 1, DXGI_FORMAT_R8G8B8A8_UINT, 0, 20, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+		{ "TEXCOORD", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+		{ "TEXCOORD", 2, DXGI_FORMAT_R32_UINT, 0, 36, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+	};
+	if (FAILED(dev_->CreateInputLayout(elems, 6, vsCode->GetBufferPointer(), vsCode->GetBufferSize(), &layout_))) {
+		*err = "CreateInputLayout failed";
+		return false;
+	}
+	struct { const char *entry; ComPtr<ID3D11ComputeShader> *cs; } computes[] = {
+		{ "CSExpand", &csExpand_ }, { "CSReduce", &csReduce_ }, { "CSDisplay", &csDisplay_ },
+	};
+	for (auto &c : computes) {
+		ComPtr<ID3DBlob> code = Compile(ShaderKind::Compute, c.entry, "cs_5_0", nullptr, err);
+		if (!code || FAILED(dev_->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, c.cs->GetAddressOf())))
+			return false;
+	}
+	// The pixel shader variants used by nearly everything, so a compile error shows at startup.
+	if (!PixelShader(GE_FORMAT_8888, false, true) || !PixelShader(GE_FORMAT_565, true, false)) {
+		*err = "pixel shader compile failed";
+		return false;
+	}
+
+	D3D11_RASTERIZER_DESC rd{};
+	rd.FillMode = D3D11_FILL_SOLID;
+	rd.CullMode = D3D11_CULL_NONE;
+	rd.DepthClipEnable = FALSE;
+	rd.ScissorEnable = TRUE;
+	D3D11_DEPTH_STENCIL_DESC dd{};
+	dd.DepthEnable = FALSE;
+	dd.StencilEnable = FALSE;
+	D3D11_BUFFER_DESC cbd{};
+	cbd.ByteWidth = 32;
+	cbd.Usage = D3D11_USAGE_DEFAULT;
+	cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	if (FAILED(dev_->CreateRasterizerState(&rd, &raster_)) || FAILED(dev_->CreateDepthStencilState(&dd, &noDepth_)) ||
+		FAILED(dev_->CreateBuffer(&cbd, nullptr, &targetCB_)) || FAILED(dev_->CreateBuffer(&cbd, nullptr, &copyCB_)) ||
+		!MakeTexture(1, 1, false, &dummyTex_, &dummyUav_, nullptr)) {
+		*err = "D3D11 state creation failed";
+		return false;
+	}
+	texCache_ = std::make_unique<TextureCache>(dev_.Get(), ctx_.Get());
+	LOGI("d3d11", "D3D11 renderer on %s (feature level %x), render scale %d", name.c_str(), (unsigned)fl, scale_);
+	return true;
+}
+
+ID3D11PixelShader *D3D11Backend::PixelShader(int fmt, bool clear, bool tex) {
+	if (clear)
+		tex = false;
+	const int idx = (fmt & 3) * 4 + (clear ? 2 : 0) + (tex ? 1 : 0);
+	if (!ps_[idx]) {
+		const char fmtStr[2] = { (char)('0' + (fmt & 3)), 0 };
+		const D3D_SHADER_MACRO defines[] = { { "FMT", fmtStr }, { "CLEAR", clear ? "1" : "0" }, { "TEX", tex ? "1" : "0" }, { nullptr, nullptr } };
+		ComPtr<ID3DBlob> code = Compile(ShaderKind::Pixel, "PSMain", "ps_5_0", defines, nullptr);
+		if (!code || FAILED(dev_->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &ps_[idx])))
+			return nullptr;
+	}
+	return ps_[idx].Get();
+}
+
+ID3D11SamplerState *D3D11Backend::Sampler(const SamplerState &ss, int levels) {
+	const u32 filter = (ss.minFilt ? 0x10 : 0) | (ss.magFilt ? 0x4 : 0) | (ss.mipFilt && levels > 1 ? 0x1 : 0);
+	const u32 key = filter | (ss.clampS ? 0x100 : 0) | (ss.clampT ? 0x200 : 0) | ((u32)levels << 12);
+	auto it = samplers_.find(key);
+	if (it != samplers_.end())
+		return it->second.Get();
+	D3D11_SAMPLER_DESC sd{};
+	sd.Filter = (D3D11_FILTER)filter;
+	sd.AddressU = ss.clampS ? D3D11_TEXTURE_ADDRESS_CLAMP : D3D11_TEXTURE_ADDRESS_WRAP;
+	sd.AddressV = ss.clampT ? D3D11_TEXTURE_ADDRESS_CLAMP : D3D11_TEXTURE_ADDRESS_WRAP;
+	sd.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+	sd.MaxAnisotropy = 1;
+	sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+	sd.MinLOD = 0.0f;
+	sd.MaxLOD = (float)(levels - 1);
+	ComPtr<ID3D11SamplerState> s;
+	if (FAILED(dev_->CreateSamplerState(&sd, &s)))
+		return nullptr;
+	return (samplers_[key] = s).Get();
+}
+
+bool D3D11Backend::MakeTexture(int w, int h, bool staging, ComPtr<ID3D11Texture2D> *tex, ComPtr<ID3D11UnorderedAccessView> *uav, ComPtr<ID3D11ShaderResourceView> *srv) {
+	D3D11_TEXTURE2D_DESC td{};
+	td.Width = (UINT)w;
+	td.Height = (UINT)h;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R32_UINT;
+	td.SampleDesc.Count = 1;
+	if (staging) {
+		td.Usage = D3D11_USAGE_STAGING;
+		td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	} else {
+		td.Usage = D3D11_USAGE_DEFAULT;
+		td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+	}
+	tex->Reset();
+	if (FAILED(dev_->CreateTexture2D(&td, nullptr, tex->GetAddressOf())))
+		return false;
+	if (uav) {
+		uav->Reset();
+		if (FAILED(dev_->CreateUnorderedAccessView(tex->Get(), nullptr, uav->GetAddressOf())))
+			return false;
+	}
+	if (srv) {
+		srv->Reset();
+		if (FAILED(dev_->CreateShaderResourceView(tex->Get(), nullptr, srv->GetAddressOf())))
+			return false;
+	}
+	return true;
+}
+
+bool D3D11Backend::EnsureScratch(ComPtr<ID3D11Texture2D> &tex, ComPtr<ID3D11UnorderedAccessView> *uav, ComPtr<ID3D11ShaderResourceView> *srv, int w, int h, int *curW, int *curH, bool staging) {
+	if (tex && *curW >= w && *curH >= h)
+		return true;
+	const int nw = std::max(w, *curW), nh = std::max(h, *curH);
+	if (!MakeTexture(nw, nh, staging, &tex, uav, srv))
+		return false;
+	*curW = nw;
+	*curH = nh;
+	return true;
+}
+
+// --- Surfaces ---
+
+Surface *D3D11Backend::FindSurface(u32 addr, int stride, int fmt) {
+	for (auto &s : surfaces_) {
+		if (s->addr == addr && s->stride == stride && s->fmt == fmt)
+			return s.get();
+	}
+	return nullptr;
+}
+
+bool D3D11Backend::ResizeSurface(Surface *s, int height) {
+	ComPtr<ID3D11Texture2D> tex;
+	ComPtr<ID3D11UnorderedAccessView> uav;
+	ComPtr<ID3D11ShaderResourceView> srv;
+	if (!MakeTexture(s->width * scale_, height * scale_, false, &tex, &uav, &srv))
+		return false;
+	if (s->tex) {
+		UnbindOM();
+		D3D11_BOX box{ 0, 0, 0, (UINT)(s->width * scale_), (UINT)(s->height * scale_), 1 };
+		ctx_->CopySubresourceRegion(tex.Get(), 0, 0, 0, 0, s->tex.Get(), 0, &box);
+	}
+	s->tex = tex;
+	s->uav = uav;
+	s->srv = srv;
+	s->height = height;
+	s->shadow.resize((size_t)height * s->RowBytes());
+	s->rowValid.resize((size_t)height, 0);
+	omDirty_ = true;
+	return true;
+}
+
+Surface *D3D11Backend::GetSurface(u32 addr, int stride, int fmt, int rowsNeeded) {
+	if (stride <= 0)
+		return nullptr;
+	rowsNeeded = std::clamp(rowsNeeded, 1, MAX_SURFACE_H);
+	Surface *s = FindSurface(addr, stride, fmt);
+	if (!s) {
+		surfaces_.push_back(std::make_unique<Surface>());
+		s = surfaces_.back().get();
+		s->addr = addr;
+		s->stride = stride;
+		s->fmt = fmt;
+		s->bpp = fmt == GE_FORMAT_8888 ? 4 : 2;
+		s->width = std::min(stride, MAX_SURFACE_W);
+	}
+	if (s->height < rowsNeeded) {
+		const int h = std::min(MAX_SURFACE_H, std::max((rowsNeeded + 15) & ~15, s->height == 0 ? 272 : 0));
+		if (!ResizeSurface(s, std::max(h, rowsNeeded)))
+			return nullptr;
+	}
+	s->lastUse = syncs_;
+	return s;
+}
+
+void D3D11Backend::UnbindOM() {
+	ctx_->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, 0, nullptr, nullptr);
+	omDirty_ = true;
+}
+
+void D3D11Backend::RunCompute(ID3D11ComputeShader *cs, ID3D11ShaderResourceView *srv, ID3D11UnorderedAccessView *uav, const CopyCB &cb, UINT gx, UINT gy) {
+	UnbindOM();
+	ctx_->UpdateSubresource(copyCB_.Get(), 0, nullptr, &cb, 0, 0);
+	ctx_->CSSetShader(cs, nullptr, 0);
+	ctx_->CSSetConstantBuffers(0, 1, copyCB_.GetAddressOf());
+	ctx_->CSSetShaderResources(0, 1, &srv);
+	ctx_->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+	ctx_->Dispatch(gx, gy, 1);
+	ID3D11ShaderResourceView *nullSrv = nullptr;
+	ID3D11UnorderedAccessView *nullUav = nullptr;
+	ctx_->CSSetShaderResources(0, 1, &nullSrv);
+	ctx_->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+}
+
+void D3D11Backend::UploadRows(Surface *s, int y0, int y1) {
+	const int rows = y1 - y0 + 1, w = s->width;
+	const u32 rb = s->RowBytes();
+	uploadBuf_.resize((size_t)w * rows);
+	rowTmp_.resize(rb);
+	for (int r = 0; r < rows; ++r) {
+		const int y = y0 + r;
+		ReadVram(s->Start(y), rowTmp_.data(), rb);
+		u32 *dst = &uploadBuf_[(size_t)r * w];
+		if (s->bpp == 4) {
+			memcpy(dst, rowTmp_.data(), (size_t)w * 4);
+		} else {
+			const u16 *src = (const u16 *)rowTmp_.data();
+			for (int x = 0; x < w; ++x)
+				dst[x] = src[x];
+		}
+		memcpy(&s->shadow[(size_t)y * rb], rowTmp_.data(), rb);
+		s->rowValid[y] = 1;
+	}
+	stats_.uploads++;
+	stats_.uploadRows += (u64)rows;
+	if (scale_ == 1) {
+		const D3D11_BOX box{ 0, (UINT)y0, 0, (UINT)w, (UINT)(y1 + 1), 1 };
+		ctx_->UpdateSubresource(s->tex.Get(), 0, &box, uploadBuf_.data(), (UINT)w * 4, 0);
+		return;
+	}
+	if (!EnsureScratch(uploadTex_, nullptr, &uploadSrv_, w, rows, &uploadW_, &uploadH_, false))
+		return;
+	const D3D11_BOX box{ 0, 0, 0, (UINT)w, (UINT)rows, 1 };
+	ctx_->UpdateSubresource(uploadTex_.Get(), 0, &box, uploadBuf_.data(), (UINT)w * 4, 0);
+	CopyCB cb{};
+	cb.origin[1] = (u32)y0;
+	cb.size[0] = (u32)w;
+	cb.size[1] = (u32)rows;
+	cb.scale = (u32)scale_;
+	RunCompute(csExpand_.Get(), uploadSrv_.Get(), s->uav.Get(), cb, (UINT)(w * scale_ + 7) / 8, (UINT)(rows * scale_ + 7) / 8);
+}
+
+void D3D11Backend::Download(Surface *s) {
+	if (!s->Dirty())
+		return;
+	const int y0 = std::max(s->dirtyY0, 0), y1 = std::min(s->dirtyY1, s->height - 1);
+	s->dirtyY0 = INT_MAX;
+	s->dirtyY1 = -1;
+	if (y0 > y1)
+		return;
+	const int rows = y1 - y0 + 1, w = s->width;
+	ID3D11Texture2D *src = s->tex.Get();
+	UINT srcY = (UINT)y0;
+	UnbindOM();
+	if (scale_ > 1) {
+		if (!EnsureScratch(reduceTex_, &reduceUav_, nullptr, w, rows, &reduceW_, &reduceH_, false))
+			return;
+		CopyCB cb{};
+		cb.origin[1] = (u32)y0;
+		cb.size[0] = (u32)w;
+		cb.size[1] = (u32)rows;
+		cb.scale = (u32)scale_;
+		RunCompute(csReduce_.Get(), s->srv.Get(), reduceUav_.Get(), cb, (UINT)(w + 7) / 8, (UINT)(rows + 7) / 8);
+		src = reduceTex_.Get();
+		srcY = 0;
+	}
+	if (!EnsureScratch(stagingTex_, nullptr, nullptr, w, rows, &stagingW_, &stagingH_, true))
+		return;
+	const D3D11_BOX box{ 0, srcY, 0, (UINT)w, srcY + (UINT)rows, 1 };
+	ctx_->CopySubresourceRegion(stagingTex_.Get(), 0, 0, 0, 0, src, 0, &box);
+	D3D11_MAPPED_SUBRESOURCE m{};
+	if (FAILED(ctx_->Map(stagingTex_.Get(), 0, D3D11_MAP_READ, 0, &m))) {
+		LOGW("d3d11", "readback failed");
+		return;
+	}
+	const u32 rb = s->RowBytes(), bpp = (u32)s->bpp;
+	const u32 gpuBytes = std::min(rb, (u32)w * bpp);
+	rowTmp_.resize(rb);
+	rowTmp2_.resize(rb);
+	for (int r = 0; r < rows; ++r) {
+		const int y = y0 + r;
+		const u32 *g = (const u32 *)((const u8 *)m.pData + (size_t)r * m.RowPitch);
+		u8 *gpu = rowTmp_.data();
+		u8 *vram = rowTmp2_.data();
+		u8 *shadow = &s->shadow[(size_t)y * rb];
+		ReadVram(s->Start(y), vram, rb);
+		// Bytes past the surface's width (a stride above 2048) stay as they are.
+		memcpy(gpu, vram, rb);
+		if (bpp == 4) {
+			memcpy(gpu, g, (size_t)w * 4);
+		} else {
+			u16 *d = (u16 *)gpu;
+			for (int x = 0; x < w; ++x)
+				d[x] = (u16)g[x];
+		}
+		if (!s->rowValid[y] || memcmp(vram, shadow, rb) == 0) {
+			WriteVram(s->Start(y), gpu, rb);
+			memcpy(shadow, gpu, rb);
+			s->rowValid[y] = 1;
+			continue;
+		}
+		// The CPU changed some pixels of the row since: they keep the CPU's value, the GPU's copy of the
+		// row is stale and is uploaded again before the next draw.
+		for (u32 x = 0; x < gpuBytes; x += bpp) {
+			if (memcmp(vram + x, shadow + x, bpp) == 0)
+				memcpy(vram + x, gpu + x, bpp);
+		}
+		WriteVram(s->Start(y), vram, rb);
+		memcpy(shadow, vram, rb);
+		s->rowValid[y] = 0;
+	}
+	ctx_->Unmap(stagingTex_.Get(), 0);
+	stats_.downloads++;
+	stats_.downloadRows += (u64)rows;
+	vramGen_++;
+	texCache_->Invalidate(VRAM_BASE + s->Start(y0), VRAM_BASE + s->Start(y1 + 1));
+}
+
+void D3D11Backend::ValidateRows(Surface *s, int y0, int y1) {
+	y0 = std::max(y0, 0);
+	y1 = std::min(y1, s->height - 1);
+	if (y0 > y1)
+		return;
+	if (s->validRun == runSeq_ && s->validGen == vramGen_ && y0 >= s->validY0 && y1 <= s->validY1)
+		return;
+	// What other surfaces rendered into this memory reaches VRAM first.
+	const u32 start = s->Start(y0), end = s->Start(y1 + 1);
+	for (auto &o : surfaces_) {
+		if (o.get() != s && o->Dirty() && Overlaps(start, end, o->Start(o->dirtyY0), o->Start(o->dirtyY1 + 1)))
+			Download(o.get());
+	}
+	const u32 rb = s->RowBytes();
+	rowTmp_.resize(rb);
+	// Rows the GPU drew and the CPU changed too: merge them (Download keeps the CPU's pixels).
+	if (s->Dirty()) {
+		const int a = std::max(y0, s->dirtyY0), b = std::min(y1, s->dirtyY1);
+		for (int y = a; y <= b; ++y) {
+			ReadVram(s->Start(y), rowTmp_.data(), rb);
+			if (s->rowValid[y] && memcmp(rowTmp_.data(), &s->shadow[(size_t)y * rb], rb) != 0) {
+				Download(s);
+				break;
+			}
+		}
+	}
+	// Rows whose memory changed since the GPU copy was made are uploaded again.
+	int runStart = -1;
+	for (int y = y0; y <= y1 + 1; ++y) {
+		bool changed = false;
+		if (y <= y1) {
+			if (!s->rowValid[y]) {
+				changed = true;
+			} else {
+				const u32 off = s->Start(y) & VRAM_MASK;
+				if (off + rb <= VRAM_SIZE) {
+					changed = memcmp(VramPtr() + off, &s->shadow[(size_t)y * rb], rb) != 0;
+				} else {
+					ReadVram(off, rowTmp_.data(), rb);
+					changed = memcmp(rowTmp_.data(), &s->shadow[(size_t)y * rb], rb) != 0;
+				}
+			}
+		}
+		if (changed && runStart < 0) {
+			runStart = y;
+		} else if (!changed && runStart >= 0) {
+			UploadRows(s, runStart, y - 1);
+			runStart = -1;
+		}
+	}
+	if (s->validRun == runSeq_ && s->validGen == vramGen_) {
+		s->validY0 = std::min(s->validY0, y0);
+		s->validY1 = std::max(s->validY1, y1);
+	} else {
+		s->validRun = runSeq_;
+		s->validGen = vramGen_;
+		s->validY0 = y0;
+		s->validY1 = y1;
+	}
+}
+
+void D3D11Backend::MarkDirty(Surface *s, int y0, int y1) {
+	y1 = std::min(y1, s->height - 1);
+	if (y0 > y1)
+		return;
+	s->dirtyY0 = std::min(s->dirtyY0, y0);
+	s->dirtyY1 = std::max(s->dirtyY1, y1);
+	s->drawn = true;
+}
+
+void D3D11Backend::SyncRange(u32 addr, u32 size) {
+	const u32 a = FoldAddress(addr);
+	if (a < VRAM_BASE || a >= VRAM_BASE + VRAM_SIZE || size == 0)
+		return;
+	const u64 off = a - VRAM_BASE, end = off + size;
+	for (auto &s : surfaces_) {
+		if (s->Dirty() && Overlaps(off, end, s->Start(s->dirtyY0), s->Start(s->dirtyY1 + 1)))
+			Download(s.get());
+	}
+}
+
+void D3D11Backend::Invalidate(u32 addr, u32 size) {
+	const u32 a = FoldAddress(addr);
+	if (size == 0)
+		return;
+	if (a >= VRAM_BASE && a < VRAM_BASE + VRAM_SIZE)
+		vramGen_++;
+	texCache_->Invalidate(a, a + size);
+}
+
+void D3D11Backend::Sync() {
+	ScopedTimer t(&stats_.seconds);
+	for (auto &s : surfaces_)
+		Download(s.get());
+	syncs_++;
+	texCache_->EndFrame(syncs_);
+	if (printStats_ && syncs_ % 300 == 0)
+		PrintStats();
+}
+
+void D3D11Backend::PrintStats() {
+	const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - statsStart_).count();
+	LOGI("d3d11", "%.1fs: %llu batches, %llu draws, %llu prims, %llu downloads (%llu rows), %llu uploads (%llu rows), %zu textures "
+		"(%llu decodes, %llu hashes), %zu surfaces, %.3fs in the backend",
+		wall, (unsigned long long)stats_.batches, (unsigned long long)stats_.draws, (unsigned long long)stats_.prims,
+		(unsigned long long)stats_.downloads, (unsigned long long)stats_.downloadRows, (unsigned long long)stats_.uploads,
+		(unsigned long long)stats_.uploadRows, texCache_->Size(), (unsigned long long)texCache_->decodes,
+		(unsigned long long)texCache_->hashes, surfaces_.size(), stats_.seconds);
+}
+
+// --- Primitives ---
+
+void TexCoordsPerspective(const RVertex &v, bool proj, GpuVertex &g) {
+	const float w24 = TruncateToFloat24(v.clipw);
+	double r;
+	if (w24 > 0.0f && IsFiniteF(w24))
+		r = GERecip(w24);
+	else
+		r = v.clipw != 0.0f ? 1.0 / v.clipw : 1.0;
+	g.s = (float)(v.s * r);
+	g.t = (float)(v.t * r);
+	g.q = (float)((proj ? v.q : 1.0f) * r);
+}
+
+void D3D11Backend::EmitTriangle(const BatchPrim &p, const RasterState &st) {
+	const bool textured = st.enableTextures && !st.pix.clearMode;
+	const bool flat = !st.shadeGouraud;
+	const bool proj = st.textureProj && !st.throughMode;
+	const RVertex &pv = p.v[2];
+	float iw = 1.0f, ih = 1.0f;
+	if (textured && st.throughMode) {
+		iw = 1.0f / (float)(1 << st.samp.width0Shift);
+		ih = 1.0f / (float)(1 << st.samp.height0Shift);
+	}
+	for (int k = 0; k < 3; ++k) {
+		const RVertex &v = p.v[k];
+		GpuVertex g;
+		g.x = (float)v.x * (1.0f / SUBPIX);
+		g.y = (float)v.y * (1.0f / SUBPIX);
+		g.z = (float)v.z;
+		g.fog = st.pix.applyFog ? ClampFogDepth(v.fog) : 255.0f;
+		g.c0 = flat ? pv.color0 : v.color0;
+		g.c1 = flat ? pv.color1 : v.color1;
+		g.s = g.t = 0.0f;
+		g.q = 1.0f;
+		if (textured) {
+			if (st.throughMode) {
+				g.s = v.s * iw;
+				g.t = v.t * ih;
+			} else {
+				TexCoordsPerspective(v, proj, g);
+			}
+		}
+		g.state = p.stateIndex;
+		verts_.push_back(g);
+	}
+}
+
+void D3D11Backend::EmitRect(const BatchPrim &p, const RasterState &st, bool clear) {
+	const RVertex &v0 = p.v[0], &v1 = p.v[1];
+	int px0, py0, px1, py1;
+	if (clear ? !ClearBounds(v0, v1, p.range, &px0, &py0, &px1, &py1) : !RectBounds(v0, v1, p.range, &px0, &py0, &px1, &py1))
+		return;
+	GpuVertex base{};
+	base.z = (float)v1.z;
+	base.fog = st.pix.applyFog ? ClampFogDepth(v1.fog) : 255.0f;
+	base.c0 = v1.color0;
+	base.c1 = clear ? 0 : v1.color1;
+	base.q = 1.0f;
+	base.state = p.stateIndex;
+	const bool textured = !clear && st.enableTextures && !st.pix.clearMode;
+	LinearFn fs, ft, fq;
+	if (textured) {
+		// rasterizer.cpp DrawRectangle: UV planes from three corners whose s, t and q come from the two
+		// vertices component by component (gpu/probe exp57, exp122, exp129).
+		float tc0s = v0.s, tc0t = v0.t, tc1s = v1.s, tc1t = v1.t;
+		if (st.throughMode) {
+			const float iw = 1.0f / (float)(1 << st.samp.width0Shift), ih = 1.0f / (float)(1 << st.samp.height0Shift);
+			tc0s *= iw;
+			tc1s *= iw;
+			tc0t *= ih;
+			tc1t *= ih;
+		}
+		const bool right = v0.x < v1.x, down = v0.y < v1.y;
+		const bool swapST = right != down;
+		const RVertex *vv[2] = { &v0, &v1 };
+		double S[2], T[2], Q[2];
+		for (int k = 0; k < 2; ++k) {
+			const double r = st.throughMode ? 1.0 : GERecip(TruncateToFloat24(vv[k]->clipw));
+			Q[k] = r;
+			S[k] = (double)(k == 0 ? tc0s : tc1s) * r;
+			T[k] = (double)(k == 0 ? tc0t : tc1t) * r;
+		}
+		const int64_t left = std::min(v0.x, v1.x), top = std::min(v0.y, v1.y);
+		const int64_t rightX = std::max(v0.x, v1.x), bottom = std::max(v0.y, v1.y);
+		const bool bottomLeftFirst = right && !down;
+		const int64_t CX[3] = { left, rightX, bottomLeftFirst ? rightX : left };
+		const int64_t CY[3] = { bottomLeftFirst ? bottom : top, top, bottom };
+		double cs[3], ct[3], cq[3];
+		for (int k = 0; k < 3; ++k) {
+			const int xs = CX[k] == v0.x ? 0 : 1, ys = CY[k] == v0.y ? 0 : 1;
+			cs[k] = S[swapST ? ys : xs];
+			ct[k] = T[swapST ? xs : ys];
+			cq[k] = Q[xs];
+		}
+		fs = PlaneThrough(CX, CY, cs);
+		ft = PlaneThrough(CX, CY, ct);
+		fq = PlaneThrough(CX, CY, cq);
+	}
+	const int xs[2] = { px0, px1 + 1 }, ys[2] = { py0, py1 + 1 };
+	GpuVertex c[4];
+	for (int k = 0; k < 4; ++k) {
+		c[k] = base;
+		c[k].x = (float)xs[k & 1];
+		c[k].y = (float)ys[k >> 1];
+		if (textured) {
+			const double sx = (double)xs[k & 1] * SUBPIX, sy = (double)ys[k >> 1] * SUBPIX;
+			c[k].s = (float)fs.At(sx, sy);
+			c[k].t = (float)ft.At(sx, sy);
+			c[k].q = (float)fq.At(sx, sy);
+		}
+	}
+	verts_.push_back(c[0]);
+	verts_.push_back(c[1]);
+	verts_.push_back(c[2]);
+	verts_.push_back(c[2]);
+	verts_.push_back(c[1]);
+	verts_.push_back(c[3]);
+}
+
+void D3D11Backend::EmitPoint(const BatchPrim &p, const RasterState &st) {
+	const RVertex &v = p.v[0];
+	const int px = v.x / SUBPIX, py = v.y / SUBPIX;
+	GpuVertex base{};
+	base.z = (float)v.z;
+	base.fog = st.pix.applyFog ? ClampFogDepth(v.fog) : 255.0f;
+	base.c0 = v.color0;
+	base.c1 = v.color1 & 0x00FFFFFF;
+	base.q = 1.0f;
+	base.state = p.stateIndex;
+	if (st.enableTextures && !st.pix.clearMode) {
+		if (st.throughMode) {
+			base.s = GETruncateTexCoord(v.s) * (1.0f / (float)(1 << st.samp.width0Shift));
+			base.t = GETruncateTexCoord(v.t) * (1.0f / (float)(1 << st.samp.height0Shift));
+		} else {
+			base.s = v.s;
+			base.t = v.t;
+			base.q = st.textureProj ? v.q : 1.0f;
+		}
+	}
+	GpuVertex c[4];
+	for (int k = 0; k < 4; ++k) {
+		c[k] = base;
+		c[k].x = (float)(px + (k & 1));
+		c[k].y = (float)(py + (k >> 1));
+	}
+	verts_.push_back(c[0]);
+	verts_.push_back(c[1]);
+	verts_.push_back(c[2]);
+	verts_.push_back(c[2]);
+	verts_.push_back(c[1]);
+	verts_.push_back(c[3]);
+}
+
+void D3D11Backend::EmitLine(const BatchPrim &p, const RasterState &st) {
+	const bool textured = st.enableTextures && !st.pix.clearMode;
+	const RVertex &v0 = p.v[0], &v1 = p.v[1];
+	const bool interpolate = st.shadeGouraud && !(v0.color0 == v1.color0 && v0.color1 == v1.color1);
+	const bool proj = st.textureProj && !st.throughMode;
+	for (int k = 0; k < 2; ++k) {
+		const RVertex &v = p.v[k];
+		GpuVertex g;
+		g.x = (float)v.x * (1.0f / SUBPIX);
+		g.y = (float)v.y * (1.0f / SUBPIX);
+		g.z = (float)v.z;
+		g.fog = st.pix.applyFog ? ClampFogDepth(v.fog) : 255.0f;
+		g.c0 = interpolate ? v.color0 : v1.color0;
+		g.c1 = interpolate ? v.color1 : v1.color1;
+		g.s = g.t = 0.0f;
+		g.q = 1.0f;
+		if (textured) {
+			if (st.throughMode) {
+				g.s = v.s * (1.0f / (float)(1 << st.samp.width0Shift));
+				g.t = v.t * (1.0f / (float)(1 << st.samp.height0Shift));
+			} else {
+				TexCoordsPerspective(v, proj, g);
+			}
+		}
+		g.state = p.stateIndex;
+		verts_.push_back(g);
+	}
+}
+
+void D3D11Backend::BuildVertices(const BatchPrim *prims, size_t n, const RasterState *states) {
+	verts_.clear();
+	segs_.clear();
+	for (size_t i = 0; i < n; ++i) {
+		const BatchPrim &p = prims[i];
+		const RasterState &st = states[p.stateIndex];
+		const bool lines = p.type == PrimType::Line;
+		if (segs_.empty() || segs_.back().lines != lines ||
+			(p.stateIndex != segs_.back().lastState && !Compatible(states[segs_.back().state], st))) {
+			segs_.push_back({ (u32)verts_.size(), 0, p.stateIndex, p.stateIndex, lines });
+		}
+		Segment &seg = segs_.back();
+		seg.lastState = p.stateIndex;
+		const size_t before = verts_.size();
+		switch (p.type) {
+		case PrimType::Triangle: EmitTriangle(p, st); break;
+		case PrimType::Rect: EmitRect(p, st, false); break;
+		case PrimType::ClearRect: EmitRect(p, st, true); break;
+		case PrimType::Point: EmitPoint(p, st); break;
+		case PrimType::Line: EmitLine(p, st); break;
+		}
+		seg.count += (u32)(verts_.size() - before);
+	}
+}
+
+void D3D11Backend::FillStates(const RasterState *states, size_t n) {
+	gpuStates_.resize(n);
+	for (size_t i = 0; i < n; ++i) {
+		const RasterState &rs = states[i];
+		const PixelState &ps = rs.pix;
+		DrawStateGpu &d = gpuStates_[i];
+		memset(&d, 0, sizeof(d));
+		u32 f = 0;
+		if (ps.alphaBlend) f |= F_ALPHA_BLEND;
+		if (ps.applyLogicOp) f |= F_LOGIC_OP;
+		if (ps.applyFog) f |= F_FOG;
+		if (ps.colorTest) f |= F_COLOR_TEST;
+		if (ps.stencilTest) f |= F_STENCIL_TEST;
+		if (ps.applyDepthRange) f |= F_DEPTH_RANGE;
+		if (ps.dithering) f |= F_DITHER;
+		if (ps.applyColorWriteMask) f |= F_WRITE_MASK;
+		if (ps.hasAlphaTestMask) f |= F_ALPHA_MASK;
+		if (ps.hasStencilTestMask) f |= F_STENCIL_MASK;
+		if (ps.depthWrite) f |= F_DEPTH_WRITE;
+		if (ps.colorClear) f |= F_COLOR_CLEAR;
+		if (ps.stencilClear) f |= F_STENCIL_CLEAR;
+		if (ps.depthClear) f |= F_DEPTH_CLEAR;
+		const bool textured = rs.enableTextures && !ps.clearMode;
+		if (textured && rs.samp.useColorDoubling) f |= F_DBL_SEC;
+		d.flags = f;
+		d.alphaTest = (u32)ps.alphaTestFunc | ((u32)ps.alphaTestRef << 8) | ((u32)ps.alphaTestMask << 16);
+		d.colorTestFunc = ps.colorTestFunc;
+		d.colorTestRef = ps.colorTestRef;
+		d.colorTestMask = ps.colorTestMask;
+		d.stencilTest = (u32)ps.stencilTestFunc | ((u32)ps.stencilTestRef << 8) | ((u32)ps.stencilRef << 16) | ((u32)ps.stencilTestMask << 24);
+		d.stencilOps = (u32)ps.sFail | ((u32)ps.zFail << 4) | ((u32)ps.zPass << 8);
+		d.depthFunc = ps.depthTestFunc;
+		d.minz = (u32)ps.minz;
+		d.maxz = (u32)ps.maxz;
+		d.blend = (u32)ps.blendEq | ((u32)ps.blendSrc << 4) | ((u32)ps.blendDst << 8);
+		d.fixA = ps.fixA;
+		d.fixB = ps.fixB;
+		d.fogColor = ps.fogColor;
+		d.writeMask = ps.colorWriteMask;
+		d.logicOp = ps.logicOp;
+		if (ps.dithering) {
+			for (int k = 0; k < 16; ++k) {
+				const u32 nib = (u32)(u8)ps.ditherMatrix[k] & 0xF;
+				if (k < 8)
+					d.dither0 |= nib << (k * 4);
+				else
+					d.dither1 |= nib << ((k - 8) * 4);
+			}
+		}
+		if (textured) {
+			const SamplerState &ss = rs.samp;
+			d.texFunc = (u32)ss.texFunc | (ss.useTextureAlpha ? 0x10u : 0u) | (ss.useColorDoubling ? 0x20u : 0u);
+			d.texEnv = ss.texBlendColor;
+			d.texLevelMode = ss.texLevelMode;
+			d.texLevelOffset = (float)ss.texLevelOffset / 16.0f;
+			d.lodSlope = ss.lodSlope > 0.0f ? 1.0f + std::log2(ss.lodSlope) : -100.0f;
+		}
+	}
+}
+
+void D3D11Backend::BindDraw(Surface *color, Surface *depth) {
+	const UINT stride = sizeof(GpuVertex), offset = 0;
+	ctx_->IASetInputLayout(layout_.Get());
+	ctx_->IASetVertexBuffers(0, 1, vb_.GetAddressOf(), &stride, &offset);
+	ctx_->VSSetShader(vs_.Get(), nullptr, 0);
+	ctx_->VSSetConstantBuffers(0, 1, targetCB_.GetAddressOf());
+	ctx_->PSSetConstantBuffers(0, 1, targetCB_.GetAddressOf());
+	ctx_->PSSetShaderResources(1, 1, stateSrv_.GetAddressOf());
+	ctx_->RSSetState(raster_.Get());
+	ctx_->OMSetDepthStencilState(noDepth_.Get(), 0);
+	ctx_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+	D3D11_VIEWPORT vp{ 0.0f, 0.0f, (float)(color->width * scale_), (float)(color->height * scale_), 0.0f, 1.0f };
+	ctx_->RSSetViewports(1, &vp);
+	ID3D11UnorderedAccessView *uavs[2] = { color->uav.Get(), depth ? depth->uav.Get() : dummyUav_.Get() };
+	ctx_->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, 2, uavs, nullptr);
+	omDirty_ = false;
+}
+
+void D3D11Backend::DrawBatch(const BatchPrim *prims, size_t n, const RasterState *states, size_t ns) {
+	if (n == 0 || ns == 0)
+		return;
+	ScopedTimer timer(&stats_.seconds);
+	stats_.batches++;
+	stats_.prims += n;
+	const PixelState &p0 = states[0].pix;
+	int minRow = INT_MAX, maxRow = -1;
+	for (size_t i = 0; i < n; ++i) {
+		minRow = std::min(minRow, prims[i].range.y1 / SUBPIX);
+		maxRow = std::max(maxRow, prims[i].range.y2 / SUBPIX);
+	}
+	bool usesDepth = false, writesDepth = false;
+	for (size_t i = 0; i < ns; ++i) {
+		const PixelState &ps = states[i].pix;
+		const bool clearZ = ps.clearMode && ps.depthClear;
+		usesDepth |= ps.depthWrite || ps.depthTestFunc != GE_COMP_ALWAYS || clearZ;
+		writesDepth |= ps.depthWrite || clearZ;
+	}
+	minRow = std::max(minRow, 0);
+	maxRow = std::min(maxRow, MAX_SURFACE_H - 1);
+	if (minRow > maxRow)
+		return;
+	Surface *color = GetSurface(p0.fbOffset, p0.fbStride, p0.fbFormat, maxRow + 1);
+	if (!color)
+		return;
+	Surface *depth = usesDepth ? GetSurface(p0.zbOffset, p0.zbStride, FMT_DEPTH, maxRow + 1) : nullptr;
+	ValidateRows(color, minRow, maxRow);
+	if (depth)
+		ValidateRows(depth, minRow, maxRow);
+
+	BuildVertices(prims, n, states);
+	if (verts_.empty())
+		return;
+	stats_.verts += verts_.size();
+	FillStates(states, ns);
+
+	// Vertex and state buffers for the whole batch.
+	const size_t vbNeed = verts_.size() * sizeof(GpuVertex);
+	if (vbBytes_ < vbNeed) {
+		size_t cap = std::max<size_t>(vbBytes_ * 2, 1 << 20);
+		while (cap < vbNeed)
+			cap *= 2;
+		D3D11_BUFFER_DESC bd{};
+		bd.ByteWidth = (UINT)cap;
+		bd.Usage = D3D11_USAGE_DYNAMIC;
+		bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+		bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		vb_.Reset();
+		if (FAILED(dev_->CreateBuffer(&bd, nullptr, &vb_)))
+			return;
+		vbBytes_ = cap;
+	}
+	if (stateCap_ < ns) {
+		size_t cap = std::max<size_t>(stateCap_ * 2, 256);
+		while (cap < ns)
+			cap *= 2;
+		D3D11_BUFFER_DESC bd{};
+		bd.ByteWidth = (UINT)(cap * sizeof(DrawStateGpu));
+		bd.Usage = D3D11_USAGE_DYNAMIC;
+		bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+		bd.StructureByteStride = sizeof(DrawStateGpu);
+		stateBuf_.Reset();
+		stateSrv_.Reset();
+		if (FAILED(dev_->CreateBuffer(&bd, nullptr, &stateBuf_)) || FAILED(dev_->CreateShaderResourceView(stateBuf_.Get(), nullptr, &stateSrv_)))
+			return;
+		stateCap_ = cap;
+	}
+	D3D11_MAPPED_SUBRESOURCE m{};
+	if (FAILED(ctx_->Map(vb_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+		return;
+	memcpy(m.pData, verts_.data(), vbNeed);
+	ctx_->Unmap(vb_.Get(), 0);
+	if (FAILED(ctx_->Map(stateBuf_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+		return;
+	memcpy(m.pData, gpuStates_.data(), ns * sizeof(DrawStateGpu));
+	ctx_->Unmap(stateBuf_.Get(), 0);
+	TargetCB tcb{};
+	tcb.ndcScale[0] = 2.0f / (float)color->width;
+	tcb.ndcScale[1] = -2.0f / (float)color->height;
+	tcb.ndcOffset[0] = -1.0f;
+	tcb.ndcOffset[1] = 1.0f;
+	tcb.scale = (u32)scale_;
+	ctx_->UpdateSubresource(targetCB_.Get(), 0, nullptr, &tcb, 0, 0);
+	BindDraw(color, depth);
+
+	D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+	for (const Segment &seg : segs_) {
+		if (seg.count == 0)
+			continue;
+		const RasterState &st = states[seg.state];
+		const bool textured = st.enableTextures && !st.pix.clearMode;
+		ID3D11ShaderResourceView *srv = nullptr;
+		ID3D11SamplerState *smp = nullptr;
+		if (textured) {
+			// May write rendering back to guest memory first (render to texture).
+			int levels = 1;
+			srv = texCache_->Lookup(st.samp, runSeq_, &SyncRangeThunk, this, &levels);
+			smp = Sampler(st.samp, levels);
+			if (!srv)
+				continue;
+		}
+		ID3D11PixelShader *ps = PixelShader(st.pix.fbFormat, st.pix.clearMode, textured);
+		if (!ps)
+			continue;
+		if (omDirty_)
+			BindDraw(color, depth);
+		ctx_->PSSetShader(ps, nullptr, 0);
+		ctx_->PSSetShaderResources(0, 1, &srv);
+		ctx_->PSSetSamplers(0, 1, &smp);
+		D3D11_RECT sc;
+		sc.left = std::clamp(st.scissor.x1 / SUBPIX, 0, color->width) * scale_;
+		sc.top = std::clamp(st.scissor.y1 / SUBPIX, 0, color->height) * scale_;
+		sc.right = std::clamp(st.scissor.x2 / SUBPIX + 1, 0, color->width) * scale_;
+		sc.bottom = std::clamp(st.scissor.y2 / SUBPIX + 1, 0, color->height) * scale_;
+		ctx_->RSSetScissorRects(1, &sc);
+		const D3D11_PRIMITIVE_TOPOLOGY want = seg.lines ? D3D11_PRIMITIVE_TOPOLOGY_LINELIST : D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+		if (want != topo) {
+			ctx_->IASetPrimitiveTopology(want);
+			topo = want;
+		}
+		MarkDirty(color, minRow, maxRow);
+		if (depth && writesDepth)
+			MarkDirty(depth, minRow, maxRow);
+		ctx_->Draw(seg.count, seg.first);
+		stats_.draws++;
+	}
+}
+
+bool D3D11Backend::GetDisplayImage(u32 addr, int stride, int format, int width, int height, std::vector<u32> &out, int *outW, int *outH) {
+	const u32 a = FoldAddress(addr);
+	const int bpp = format == GE_FORMAT_8888 ? 4 : 2;
+	if (a < VRAM_BASE || a >= VRAM_BASE + VRAM_SIZE || stride <= 0) {
+		SyncRange(addr, (u32)(height * stride * bpp));
+		return false;
+	}
+	Surface *s = scale_ > 1 ? FindSurface(a - VRAM_BASE, stride, format & 3) : nullptr;
+	if (!s || !s->drawn || s->width < width) {
+		SyncRange(addr, (u32)(height * stride * bpp));
+		return false;
+	}
+	ScopedTimer timer(&stats_.seconds);
+	height = std::min(height, s->height);
+	ValidateRows(s, 0, height - 1);
+	const int w = width * scale_, h = height * scale_;
+	if (!EnsureScratch(displayTex_, &displayUav_, nullptr, w, h, &displayW_, &displayH_, false) ||
+		!EnsureScratch(displayStaging_, nullptr, nullptr, w, h, &displayStagingW_, &displayStagingH_, true))
+		return false;
+	CopyCB cb{};
+	cb.size[0] = (u32)width;
+	cb.size[1] = (u32)height;
+	cb.scale = (u32)scale_;
+	cb.format = (u32)(format & 3);
+	RunCompute(csDisplay_.Get(), s->srv.Get(), displayUav_.Get(), cb, (UINT)(w + 7) / 8, (UINT)(h + 7) / 8);
+	const D3D11_BOX box{ 0, 0, 0, (UINT)w, (UINT)h, 1 };
+	ctx_->CopySubresourceRegion(displayStaging_.Get(), 0, 0, 0, 0, displayTex_.Get(), 0, &box);
+	D3D11_MAPPED_SUBRESOURCE m{};
+	if (FAILED(ctx_->Map(displayStaging_.Get(), 0, D3D11_MAP_READ, 0, &m)))
+		return false;
+	out.resize((size_t)w * h);
+	for (int y = 0; y < h; ++y)
+		memcpy(&out[(size_t)y * w], (const u8 *)m.pData + (size_t)y * m.RowPitch, (size_t)w * 4);
+	ctx_->Unmap(displayStaging_.Get(), 0);
+	*outW = w;
+	*outH = h;
+	return true;
+}
+
+}  // namespace
+
+std::unique_ptr<RenderBackend> CreateD3D11Backend(const D3D11Options &opts, std::string *error) {
+	auto b = std::make_unique<D3D11Backend>();
+	std::string err;
+	if (!b->Init(opts, &err)) {
+		if (error)
+			*error = err;
+		return nullptr;
+	}
+	return b;
+}
+
+}  // namespace gpu::hw

@@ -14,6 +14,8 @@ namespace utility {
 
 namespace {
 
+std::string g_headlessOskText;  // --osk-text
+
 constexpr int OSK_INIT_DELAY_US = 300000;
 constexpr int OSK_SHUTDOWN_DELAY_US = 40000;
 constexpr s32 OSK_RESULT_CHANGED = 2;
@@ -154,9 +156,16 @@ int OskDialog::Update(int animSpeed) {
 	framesRun_++;
 
 	if (Headless()) {
-		// Nobody to type: accept the initial text.
+		// Nobody to type: the --osk-text answer if one was given, else the initial text.
 		if (framesRun_ >= 2 && !IsFadingOut() && pendingStatus_ != STATUS_FINISHED) {
-			LOGI("UTIL", "OSK: returning the initial text (headless)");
+			if (!g_headlessOskText.empty()) {
+				inputChars_ = Utf8ToUtf16(g_headlessOskText);
+				u32 maxLen = FieldMaxLength();
+				if (inputChars_.size() > maxLen) inputChars_.resize(maxLen);
+				LOGI("UTIL", "OSK: returning \"%s\" (headless, --osk-text)", g_headlessOskText.c_str());
+			} else {
+				LOGI("UTIL", "OSK: returning the initial text (headless)");
+			}
 			ChangeStatus(STATUS_FINISHED, 0);
 		}
 	} else {
@@ -187,5 +196,7 @@ int OskDialog::Shutdown(bool force) {
 	prompt_.reset();
 	return 0;
 }
+
+void SetHeadlessOskText(const std::string &text) { g_headlessOskText = text; }
 
 }  // namespace utility

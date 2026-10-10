@@ -14,6 +14,7 @@
 #include "common/log.h"
 #include "runtime/boot.h"
 #include "runtime/core/backtrace.h"
+#include "runtime/dialogs/osk_dialog.h"
 #include "runtime/core/cpu.h"
 #include "runtime/core/dispatch.h"
 #include "runtime/core/interp.h"
@@ -28,6 +29,12 @@
 #include "runtime/kernel/sysmem.h"
 #include "runtime/m33/m33.h"
 #include "runtime/media/disc.h"
+#if PSPC_HAVE_GPU
+#include "gpu/backend.h"
+#endif
+#if PSPC_HAVE_GPU_HW
+#include "gpu/hw/d3d11_backend.h"
+#endif
 
 namespace ctrl {
 void OnVblank();
@@ -185,6 +192,48 @@ void DumpFrame(const std::string &dir) {
 	WriteWholeFile(fs::u8path(dir) / name, bmp.data(), bmp.size());
 }
 
+#if PSPC_HAVE_GPU
+// The GE renderer (Options::renderer). Lives until the process ends.
+std::unique_ptr<gpu::RenderBackend> g_renderBackend;
+
+void SetUpRenderer(const Options &o) {
+	std::string name = o.renderer;
+	if (name.empty()) {
+		const char *env = getenv("PSPC_RENDERER");
+		name = env && *env ? env : "software";
+	}
+	name = ToLower(name);
+	int scale = o.renderScale;
+	if (scale <= 0) {
+		const char *env = getenv("PSPC_RENDER_SCALE");
+		scale = env ? atoi(env) : 1;
+	}
+	scale = std::clamp(scale, 1, 4);
+	gpu::SetRenderBackend(nullptr);
+	if (name == "software")
+		return;
+#if PSPC_HAVE_GPU_HW
+	if (name == "d3d11" || name == "d3d11-warp") {
+		if (!g_renderBackend) {
+			gpu::hw::D3D11Options d;
+			d.scale = scale;
+			d.warp = name == "d3d11-warp";
+			if (const char *a = getenv("PSPC_D3D11_ADAPTER")) d.adapter = atoi(a);
+			std::string err;
+			g_renderBackend = gpu::hw::CreateD3D11Backend(d, &err);
+			if (!g_renderBackend) {
+				LOGW("RUNTIME", "D3D11 renderer unavailable (%s); using the software renderer", err.c_str());
+				return;
+			}
+		}
+		gpu::SetRenderBackend(g_renderBackend.get());
+		return;
+	}
+#endif
+	LOGW("RUNTIME", "Unknown renderer \"%s\"; using the software renderer", name.c_str());
+}
+#endif
+
 int RunOnce(const Options &o, BootTarget bt) {
 	backtrace::InstallFatalHook();
 	if (!mem::Init((u32)o.ramMB << 20)) Fatal("Cannot reserve guest memory");
@@ -196,6 +245,9 @@ int RunOnce(const Options &o, BootTarget bt) {
 	hle::Init();
 	if (!o.dataDir.empty()) hle::LoadNidDatabase(fs::u8path(o.dataDir) / "nids.csv");
 	hle::RegisterAllModules();
+#if PSPC_HAVE_GPU
+	SetUpRenderer(o);
+#endif
 	sched::Init(o.fastTime);
 	io::Init();
 	io::Mount("ms0", io::MakeHostDevice(o.memstickDir, false));
@@ -217,6 +269,7 @@ int RunOnce(const Options &o, BootTarget bt) {
 
 	display::Init();
 	for (const Options::Press &p : o.presses) ctrl::AddScriptedPress(p.vblank, p.buttons, p.frames);
+	utility::SetHeadlessOskText(o.oskText);
 	if (!o.dumpFramesDir.empty()) {
 		std::error_code ec;
 		fs::create_directories(fs::u8path(o.dumpFramesDir), ec);

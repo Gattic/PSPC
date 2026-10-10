@@ -64,6 +64,7 @@ static void Usage() {
 	        "  --flash0 <dir>       flash0 root (default: <exe>/flash0)\n"
 	        "  --host0 <dir>        host0: root (default: the program's folder)\n"
 	        "  --umd <image>        insert a disc image while running a .prx/.elf/.pbp\n"
+	        "  --osk-text <text>    headless: what the on-screen keyboard returns\n"
 	        "  --fw <ver>           firmware version reported to games, e.g. 6.60 or 4.01\n"
 	        "  --scale <n>          window scale (default 2)\n"
 	        "  --config <file>      settings file (default: <exe>/pspc.ini; \"none\": built-in defaults)\n"
@@ -72,6 +73,8 @@ static void Usage() {
 	        "  --log-file <path>    write the log to a file\n"
 	        "  --test-display       report a display to pspautotests (default: none)\n"
 	        "  --dump-frames <dir>  save the displayed frame as BMP every --dump-every VBlanks (60)\n"
+	        "  --renderer <name>    GE renderer: software (default) or d3d11 (GPU; d3d11-warp: WARP device)\n"
+	        "  --render-scale <n>   d3d11 internal resolution, 1-4 times the PSP's (default 1)\n"
 	        "  --press <v>:<B>[:n]  hold buttons B (e.g. START, CROSS+UP) for n VBlanks (6) from VBlank v\n");
 }
 
@@ -171,6 +174,7 @@ int main(int argc, char **argv) {
 		else if (a == "--no-plugins") o.plugins = false;
 		else if (a == "--host0") o.host0Dir = next();
 		else if (a == "--umd") o.umdImage = next();
+		else if (a == "--osk-text") o.oskText = next();
 		else if (a == "--boot-path") o.bootPath = next();
 		else if (a == "--boot-args") o.bootArgsFile = next();
 		else if (a == "--fw") o.firmwareVersion = ParseFw(next());
@@ -178,6 +182,8 @@ int main(int argc, char **argv) {
 		else if (a == "--test-display") o.hasDisplayForTests = true;
 		else if (a == "--dump-frames") o.dumpFramesDir = next();
 		else if (a == "--dump-every") o.dumpEvery = atoi(next().c_str());
+		else if (a == "--renderer") o.renderer = next();
+		else if (a == "--render-scale") o.renderScale = atoi(next().c_str());
 		else if (a == "--press") {
 			runtime::Options::Press p;
 			std::string spec = next();

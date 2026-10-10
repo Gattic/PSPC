@@ -62,4 +62,8 @@ private:
 	std::shared_ptr<prompt::State> prompt_;
 };
 
+// Headless runs have nobody to type: the on-screen keyboard returns this text (pspc --osk-text)
+// instead of the initial text when it is not empty.
+void SetHeadlessOskText(const std::string &text);
+
 }  // namespace utility

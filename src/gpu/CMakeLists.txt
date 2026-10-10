@@ -17,3 +17,7 @@ if(MSVC)
 	# The rasterizer is the hot path even in debug-info builds.
 	target_compile_options(pspc_gpu PRIVATE $<$<CONFIG:RelWithDebInfo>:/O2 /Ob2>)
 endif()
+
+if(WIN32)
+	add_subdirectory(hw)
+endif()

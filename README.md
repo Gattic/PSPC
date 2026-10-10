@@ -70,8 +70,36 @@ Useful options (`pspc --help` lists them all):
 | `--press <vblank>:<BUTTONS>[:<frames>]` | scripted input, e.g. `--press 600:START --press 900:CROSS+UP:4` |
 | `--memstick <dir>`, `--flash0 <dir>`, `--host0 <dir>` | device roots |
 | `--umd <image>` | insert a disc while running a .prx/.elf/.pbp |
+| `--osk-text <text>` | headless: what the on-screen keyboard returns (e.g. a character name) |
+| `--config <file\|none>`, `--set key=value` | settings file to use (default `pspc.ini`), or override one entry |
 | `--fw 6.60` | firmware version reported to games |
 | `--timeout <s>`, `--log <level>`, `--log-file <path>` | |
+
+### Settings
+
+pspc.exe reads `pspc.ini` from its own folder at startup; command-line options override it. The
+launcher's Settings button edits it, or edit it by hand:
+
+```ini
+scale=2            # window scale 1-4
+fullscreen=0       # 1 = borderless fullscreen
+vsync=1
+aot=1              # 0 = interpreter only (like --interp)
+fw=6.60            # firmware version reported to games (like --fw)
+volume=100         # 0-100 (volume=mute or mute=1 silences)
+key.cross=Z        # SDL key names; several keys: key.select=Space,Right Shift
+pad.cross=a        # SDL controller buttons: a b x y back guide start leftstick rightstick
+                   # leftshoulder rightshoulder dpup dpdown dpleft dpright lefttrigger righttrigger
+pad.stick=left     # stick that drives the PSP analog stick: left, right or none
+```
+
+Inputs: up down left right cross circle square triangle l r start select home analog_up
+analog_down analog_left analog_right. While playing: **F11** fullscreen, **F12** screenshot
+(`screenshots\<game>_<date>_<time>.bmp`), **Ctrl+Q** quit.
+
+The launcher tags games whose native code is built (NATIVE), partly built (PARTIAL) or out of date
+(REBUILD); Play offers to build it first (`tools\pspc_build.py` records builds in
+`cache\aot\games.json`).
 
 Save data goes to `<pspc dir>\ms0\PSP\SAVEDATA`, and M33 settings to `<pspc dir>\flash1\config.se`.
 Plugins listed in `ms0\seplugins\game.txt` are loaded the way M33 loads them. A game that chains

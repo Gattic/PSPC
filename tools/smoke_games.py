@@ -51,7 +51,7 @@ def run_one(args, game, presses):
     out.mkdir(parents=True, exist_ok=True)
     for f in out.glob('frame_*.bmp'):
         f.unlink()
-    cmd = [args.pspc, '--headless', '--fast-time', '--timeout', str(args.seconds), '--log', 'warn',
+    cmd = [args.pspc, '--config', 'none', '--headless', '--fast-time', '--timeout', str(args.seconds), '--log', 'warn',
            '--dump-frames', str(out), '--dump-every', str(args.every)]
     if args.interp:
         cmd.append('--interp')

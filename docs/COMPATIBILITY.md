@@ -10,7 +10,7 @@ furthest screen confirmed by a frame dump.
 | Daxter | NPUG80329 | 5.50 | Gameplay (first level) | Gameplay | Intro movie plays with sound (sceMpeg, H.264 via Media Foundation). Renderer runs ~1.6x real time headless. |
 | Syphon Filter: Combat Ops | NPUG80114 | 3.71 | Menus (profile, mission modifier, connection) | Same | Intro, save-data notice, keyboard and menus render correctly; online modes report a connection failure (offline). Audio plays. |
 | Syphon Filter: Logan's Shadow | UCUS98606 | 3.52 | Gameplay (training, story episode 1) | Same | Main code lives in USRDIR PRX modules, loaded and run natively. Story cutscenes use sceMpeg (now implemented). |
-| Monster Hunter Freedom Unite | ULUS10391 | 5.03 | Game menu, character creation | Same | Loads its font library through `sceKernelLoadModuleByID`; needs system fonts (`flash0/font`). Naming the character needs keyboard input (windowed mode). |
+| Monster Hunter Freedom Unite | ULUS10391 | 5.03 | Game menu, character creation | Same | Loads its font library through `sceKernelLoadModuleByID`; needs system fonts (`flash0/font`). Naming the character uses the keyboard dialog (windowed: a text box; headless: `--osk-text`). |
 | Star Wars Battlefront: Elite Squadron | ULUS10390 | 5.03 | Profile prompt | Same | Title, in-engine space intro and menus render. |
 | Star Wars Battlefront: Renegade Squadron | ULUS10292 | 3.51 | New-profile screen | Same | Menus render. |
 
