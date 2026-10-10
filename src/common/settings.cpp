@@ -21,6 +21,12 @@ const Control kControls[] = {
 	{"start", "Start", 0x000008, 0, 0, "Return", "start"},
 	{"select", "Select", 0x000001, 0, 0, "Space,Right Shift", "back"},
 	{"home", "Home", 0x010000, 0, 0, "Escape", "guide"},
+	// Kernel-only buttons games never see; M33 plugins use them (DarkFrost: VOL+ and VOL- together
+	// open its menu, both sticks clicked on a controller).
+	{"vol_up", "Volume +", 0x100000, 0, 0, "PageUp", "rightstick"},
+	{"vol_down", "Volume -", 0x200000, 0, 0, "PageDown", "leftstick"},
+	{"note", "Note", 0x800000, 0, 0, "N", "misc1"},
+	{"screen", "Screen", 0x400000, 0, 0, "B", ""},
 	{"analog_up", "Analog up", 0, 1, -1, "I", ""},
 	{"analog_down", "Analog down", 0, 1, +1, "K", ""},
 	{"analog_left", "Analog left", 0, 0, -1, "J", ""},
@@ -114,7 +120,8 @@ std::string JoinList(const std::vector<std::string> &names) {
 
 std::vector<std::string> Keys() {
 	std::vector<std::string> k = {"scale",  "fullscreen", "vsync",  "aot",  "fw",
-	                              "renderer", "render_scale", "games_dir", "volume", "mute"};
+	                              "renderer", "render_scale", "games_dir", "plugins", "plugins_dir", "volume", "mute",
+	                              "network", "adhoc_server"};
 	for (size_t i = 0; i < kNumControls; i++) k.push_back(std::string("key.") + kControls[i].name);
 	k.push_back("pad.stick");
 	for (size_t i = 0; i < kNumControls; i++) k.push_back(std::string("pad.") + kControls[i].name);
@@ -132,9 +139,16 @@ bool Set(Settings &s, const std::string &rawKey, const std::string &rawValue, st
 	if (key == "scale") {
 		if (!ParseInt(v, 1, 4, n)) return fail("want 1-4");
 		s.scale = n;
-	} else if (key == "fullscreen" || key == "vsync" || key == "aot" || key == "mute") {
+	} else if (key == "fullscreen" || key == "vsync" || key == "aot" || key == "mute" || key == "network") {
 		if (!ParseBool(v, b)) return fail("want 0 or 1");
-		(key == "fullscreen" ? s.fullscreen : key == "vsync" ? s.vsync : key == "aot" ? s.aot : s.mute) = b;
+		(key == "fullscreen" ? s.fullscreen
+		 : key == "vsync"    ? s.vsync
+		 : key == "aot"      ? s.aot
+		 : key == "network"  ? s.network
+		                     : s.mute) = b;
+	} else if (key == "adhoc_server") {
+		if (v.empty() || v.find_first_of(" \t/") != std::string::npos) return fail("want a host name or address");
+		s.adhocServer = v;
 	} else if (key == "fw") {
 		if (!ValidFirmware(v)) return fail("want a version like 6.60");
 		s.fw = v;
@@ -145,6 +159,10 @@ bool Set(Settings &s, const std::string &rawKey, const std::string &rawValue, st
 		s.renderer = l;
 	} else if (key == "games_dir") {
 		s.gamesDir = v;
+	} else if (key == "plugins_dir") {
+		s.pluginsDir = v;
+	} else if (key == "plugins") {
+		if (!ParseBool(v, s.plugins)) return fail("want 0 or 1");
 	} else if (key == "render_scale") {
 		if (v.empty()) s.renderScale = 0;
 		else if (ParseInt(v, 1, 4, n)) s.renderScale = n;
@@ -184,9 +202,13 @@ std::string Get(const Settings &s, const std::string &key) {
 	if (key == "fw") return s.fw;
 	if (key == "renderer") return s.renderer;
 	if (key == "games_dir") return s.gamesDir;
+	if (key == "plugins") return B(s.plugins);
+	if (key == "plugins_dir") return s.pluginsDir;
 	if (key == "render_scale") return s.renderScale ? std::to_string(s.renderScale) : "";
 	if (key == "volume") return std::to_string(s.volume);
 	if (key == "mute") return B(s.mute);
+	if (key == "network") return B(s.network);
+	if (key == "adhoc_server") return s.adhocServer;
 	if (key == "pad.stick") return s.padStick;
 	if (key.size() > 4) {
 		int i = ControlIndex(key.substr(4));
@@ -237,9 +259,20 @@ std::string Template(const Settings &s) {
 	put("render_scale");
 	t += "\n# Folder of game images (ISO/CSO) the XMB lists besides ms0:/ISO; empty = pspc's Games folder.\n";
 	put("games_dir");
+	t += "\n# M33 plugins: 1 = load the PRX files listed in seplugins/game.txt, vsh.txt and pops.txt (a\n"
+	     "# trailing 0/1 on a line, or conf.bin, turns one plugin off or on). plugins_dir is laid over the\n"
+	     "# memory stick, so its seplugins/ and the plugins' own folders appear in ms0:; empty = pspc's\n"
+	     "# plugins folder.\n";
+	put("plugins");
+	put("plugins_dir");
 	t += "\n# Audio: volume 0-100; mute=1 silences the output.\n";
 	put("volume");
 	put("mute");
+	t += "\n# Network: 1 = the virtual access point and ad hoc play work (WLAN switch on), 0 = offline.\n"
+	     "# adhoc_server: the ad hoc server to meet other players through (PPSSPP-compatible; run one\n"
+	     "# with pspc --adhoc-server). localhost when playing two pspc instances on one PC.\n";
+	put("network");
+	put("adhoc_server");
 	t += "\n# Keyboard: key.<control>=<SDL key name>[,<another>]. Names as SDL spells them: A-Z, 0-9,\n"
 	     "# F1-F10, Up, Down, Left, Right, Return, Space, Escape, Tab, Backspace, Left Shift, Right Shift,\n"
 	     "# Left Ctrl, Right Ctrl, Left Alt, Right Alt, Keypad 0-9, Keypad Enter, Comma, ... (empty =\n"

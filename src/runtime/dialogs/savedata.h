@@ -5,10 +5,13 @@
 // Ported from PPSSPP (Core/Dialog/SavedataParam.cpp/.h, Core/HW/MemoryStick.cpp), Copyright (c)
 // 2012- PPSSPP Project, GPL-2.0-or-later.
 //
-// Secure saves are stored unencrypted: PSPC has no KIRK engine in the runtime. The data file of a
-// secure save is still listed in PARAM.SFO's SAVEDATA_FILE_LIST (with a zero hash), and
-// SAVEDATA_PARAMS stays zero, which marks the save as not encrypted. Saves encrypted by a real PSP
-// can't be decrypted and load as their raw bytes (with a warning).
+// Saves are written the way a PSP writes them: the data file of a secure save is encrypted, its MAC
+// goes in PARAM.SFO's SAVEDATA_FILE_LIST, and SAVEDATA_PARAMS holds the PARAM.SFO hashes the XMB
+// checks (save_crypto.h; the KIRK commands run in the pspc-decrypt service). Saves from a PSP or
+// PPSSPP load too. Without the service (no pspc-decrypt.exe), and in saves made by older PSPC
+// builds, secure files are stored in the clear: SAVEDATA_PARAMS then carries a "PSPC-PLAINTEXT"
+// marker at 0x40 and the file list a made-up hash (KeyHash) that still tells keys apart. Those
+// saves keep loading; the next full save of one encrypts it.
 #pragma once
 
 #include <cstddef>

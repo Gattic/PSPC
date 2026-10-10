@@ -18,6 +18,7 @@
 #include "runtime/core/cpu.h"
 #include "runtime/dialogs/msg_dialog.h"
 #include "runtime/dialogs/osk_dialog.h"
+#include "runtime/dialogs/ppge.h"
 #include "runtime/dialogs/save_dialog.h"
 #include "runtime/dialogs/simple_dialogs.h"
 #include "runtime/hle/hle_wrap.h"
@@ -28,11 +29,15 @@
 #include "runtime/kernel/scheduler.h"
 #include "runtime/kernel/sysmem.h"
 #include "runtime/kernel/threads.h"
+#include "runtime/kernel/module.h"
 
 namespace systemparam {
 int Language();
 int ButtonMode();
 }  // namespace systemparam
+namespace modulemgr {
+int LoadModuleVsh(const char *path, u32 flags, u32 optPtr);
+}  // namespace modulemgr
 
 using namespace kernel;
 using utility::Dialog;
@@ -773,6 +778,60 @@ int sceUtilityGetNetParamLatestID(u32 idAddr) {
 	return 0;
 }
 
+// sceUtility_netparam_internal (kd/utility.prx, 4.01 NIDs): the XMB's network settings and its
+// connection list (netconf_plugin) read and edit configurations with these. They see the same fixed
+// configuration as games ("PSPC 1", reaching the host's network); edits are accepted, not kept.
+int sceUtilityNetparamInternalGet(int id, int param, u32 dataAddr) {
+	if (id < 0) return (int)0x80110602;
+	if (!dataAddr) return (int)0x80110603;
+	if (param < 0 || param > 28) return (int)SCE_ERROR_NETPARAM_BAD_PARAM;
+	if (id > PSP_NETPARAM_MAX_NUMBER_DUMMY_ENTRIES) return (int)SCE_ERROR_NETPARAM_BAD_NETCONF;
+	if (param > 24) {  // the internal-only fields: nothing set
+		if (mem::IsValidRange(dataAddr, 4)) GWrite32(dataAddr, 0);
+		return 0;
+	}
+	return sceUtilityGetNetParam(id, param, dataAddr);
+}
+int sceUtilityNetparamInternalAccept(int id) { return id < 0 ? (int)0x80110602 : 0; }                    // create / delete
+int sceUtilityNetparamInternalCopy(int src, int dst) { return (src | dst) < 0 ? (int)0x80110602 : 0; }
+int sceUtilityNetparamInternalSet(int param, u32 dataAddr) {
+	if (!dataAddr) return (int)0x80110603;
+	return param < 0 || param > 28 ? (int)SCE_ERROR_NETPARAM_BAD_PARAM : 0;
+}
+int sceUtilityNetparamInternalSetLatestId(int id) {
+	if (id >= 0 && id <= PSP_NETPARAM_MAX_NUMBER_DUMMY_ENTRIES) g_netParamLatestId = id;
+	return 0;
+}
+// The Go!Messenger account the network settings show: none.
+int sceUtilityGetGoMessengerAuth(u32 bufAddr) {
+	if (!bufAddr) return (int)0x80110603;
+	if (mem::IsValidRange(bufAddr, 0x40)) mem::Memset(bufAddr, 0, 0x40);
+	return 0;
+}
+
+// sceUtility_private (kd/utility.prx): the XMB's Internet Browser loads its modules by short name
+// (htmlviewer_plugin -> htmlviewer_ui, netfront, libwww, ...); it starts and stops them itself.
+int sceUtilityPrivateLoadModule(const char *name, u32 flags, u32 optPtr) {
+	static const char *const kModules[] = {"libslim", "libwww", "libfont_hv", "htmlviewer_ui", "hvauth_r",
+	                                       "hvauth_t", "mm_flash", "netfront"};
+	if (!name) return (int)0x80110002;
+	for (const char *m : kModules) {
+		if (strcmp(name, m) == 0) {
+			std::string path = std::string("flash0:/vsh/module/") + m + ".prx";
+			int r = modulemgr::LoadModuleVsh(path.c_str(), flags, optPtr);
+			LOGI("UTIL", "sceUtility_private load %s -> %08x", path.c_str(), (u32)r);
+			return r;
+		}
+	}
+	LOGW("UTIL", "sceUtility_private load %s: unknown module", name);
+	return (int)0x80010002;  // ENOENT
+}
+int sceUtilityPrivateUnloadModule(int moduleId) {
+	kernel::PspModule *m = kernel::Get<kernel::PspModule>(moduleId);
+	if (!m) return (int)SCE_KERNEL_ERROR_UNKNOWN_MODULE;
+	return kernel::UnloadModule(m);
+}
+
 // ---------------------------------------------------------------- other dialogs nobody uses
 
 int sceUtilityUnsupportedDialog() {
@@ -817,7 +876,9 @@ int VolatileMemUnlock() { return (int)CallHle("sceSuspendForUser", 0xA569E425, {
 int SystemLanguage() { return systemparam::Language(); }
 int SystemButtonPreference() { return systemparam::ButtonMode(); }
 u32 CompiledSdkVersion() { return CallHle("SysMemUserForUser", 0xFC114573, {}); }
-bool Headless() { return host::IsHeadless(); }
+bool Headless() { return !ppge::Enabled(); }
+int SystemDateFormat() { return Settings().dateFormat; }
+int SystemTimeFormat() { return Settings().timeFormat; }
 
 }  // namespace utility
 
@@ -842,6 +903,8 @@ void Register_sceUtility() {
 		HLEFN(0x5EEE6548, sceUtilityCheckNetParam),
 		HLEFN(0x434D4B3A, sceUtilityGetNetParam),
 		HLEFN(0x4FED24D8, sceUtilityGetNetParamLatestID),
+		HLEFN(0x28D35634, sceUtilityGetGoMessengerAuth),  // Go!Messenger auth name
+		HLEFN(0xEF3582B2, sceUtilityGetGoMessengerAuth),  // Go!Messenger auth key
 
 		HLEFN(0x67AF3428, sceUtilityMsgDialogShutdownStart),
 		HLEFN(0x2AD8E239, sceUtilityMsgDialogInitStart),
@@ -954,4 +1017,21 @@ void Register_sceUtility() {
 		HLERAW(NID_DIALOG_THREAD, DialogThreadMain),
 	};
 	hle::RegisterModule(LIB, funcs);
+
+	static const hle::HleFunction netparamInternal[] = {
+		HLEFN(0xC15E5EC8, sceUtilityNetparamInternalGet),
+		HLEFN(0xC43B42B7, sceUtilityNetparamInternalAccept),  // create configuration n
+		HLEFN(0x157244CD, sceUtilityNetparamInternalAccept),  // delete configuration n
+		HLEFN(0x82B169DC, sceUtilityNetparamInternalCopy),
+		HLEFN(0x05E1354C, sceUtilityNetparamInternalSet),
+		HLEFN(0xB2C6FD5D, sceUtilityNetparamInternalSet),
+		HLEFN(0x983D06F3, sceUtilityNetparamInternalSetLatestId),
+	};
+	hle::RegisterModule("sceUtility_netparam_internal", netparamInternal);
+
+	static const hle::HleFunction utilityPrivate[] = {
+		HLEFN(0x77838187, sceUtilityPrivateLoadModule),
+		HLEFN(0xFA8F6D15, sceUtilityPrivateUnloadModule),
+	};
+	hle::RegisterModule("sceUtility_private", utilityPrivate);
 }

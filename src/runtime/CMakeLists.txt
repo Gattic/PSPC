@@ -32,7 +32,7 @@ add_library(pspc_runtime STATIC
 	${PSPC_HLE_MODULES}
 )
 target_include_directories(pspc_runtime PUBLIC ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(pspc_runtime PUBLIC pspc_sem pspc_loader pspc_fs pspc_common SDL2::SDL2 winmm)
+target_link_libraries(pspc_runtime PUBLIC pspc_sem pspc_loader pspc_fs pspc_net pspc_common SDL2::SDL2 winmm)
 if(TARGET pspc_gpu)
 	target_link_libraries(pspc_runtime PUBLIC pspc_gpu)
 	target_compile_definitions(pspc_runtime PUBLIC PSPC_HAVE_GPU=1)
@@ -53,6 +53,7 @@ target_link_libraries(pspc-iso PRIVATE pspc_fs pspc_common)
 
 add_executable(pspc-launcher WIN32
 	${CMAKE_SOURCE_DIR}/src/frontend/launcher.cpp
+	${CMAKE_SOURCE_DIR}/src/frontend/plugins_dialog.cpp
 	${CMAKE_SOURCE_DIR}/src/frontend/settings_dialog.cpp
 )
 target_link_libraries(pspc-launcher PRIVATE pspc_fs pspc_common comctl32 gdiplus)

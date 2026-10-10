@@ -16,6 +16,7 @@
 #include "common/log.h"
 #include "runtime/core/cpu.h"
 #include "runtime/core/dispatch.h"
+#include "runtime/core/interp.h"
 #include "runtime/core/memory.h"
 #include "runtime/kernel/scheduler.h"
 #include "runtime/kernel/sysmem.h"
@@ -72,6 +73,13 @@ void StubThunk(Ctx *c) {
 	// The stub's second word is "syscall CODE"; run it as if executed in the jr delay slot.
 	u32 stub = c->pc;
 	u32 w = GRead32(stub + 4);
+	if (GRead32(stub) != 0x03E00008 || (w & 0xFC00003F) != 0x0C) {
+		// The guest rewrote the stub (a plugin hooking an import with "j hook"): from now on
+		// the stub is ordinary guest code.
+		dispatch::UnregisterRange(stub, 8);
+		interp::Run(c, stub, c->r[31], c->r[29]);
+		return;
+	}
 	Syscall(c, w, stub + 4);
 }
 

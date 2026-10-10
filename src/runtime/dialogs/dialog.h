@@ -1,16 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
 // sceUtility dialogs: the shared status state machine (NONE -> INIT -> RUNNING -> FINISHED ->
-// SHUTDOWN -> NONE), volatile memory handling and button helpers.
+// SHUTDOWN -> NONE), volatile memory handling, buttons, and the drawing helpers the dialogs share.
 // Ported from PPSSPP (Core/Dialog/PSPDialog.cpp/.h), Copyright (c) 2012- PPSSPP Project,
-// GPL-2.0-or-later. Drawing (PPGe) is not ported: dialogs draw nothing; see host_prompt.h for the
-// windowed-mode prompts.
+// GPL-2.0-or-later.
+//
+// With overlays (a window; see ppge.h) the dialogs draw themselves as the PSP does and the player
+// answers them with the PSP buttons. Without (headless runs) they draw nothing and answer by
+// themselves, each in its own way (Headless()).
 #pragma once
 
 #include <initializer_list>
 #include <string>
+#include <string_view>
 
 #include "common/common.h"
+#include "runtime/dialogs/ppge.h"
 
 namespace utility {
 
@@ -63,6 +68,14 @@ enum : u32 {
 	CTRL_CIRCLE = 0x2000,
 	CTRL_CROSS = 0x4000,
 	CTRL_SQUARE = 0x8000,
+};
+
+// What DisplayButtons shows.
+enum : int {
+	DS_BUTTON_NONE = 0x00,
+	DS_BUTTON_OK = 0x01,
+	DS_BUTTON_CANCEL = 0x02,
+	DS_BUTTON_BOTH = 0x03,
 };
 
 class Dialog {
@@ -122,6 +135,24 @@ protected:
 	bool IsFadingOut() const { return isFading_ && !fadeIn_; }
 	virtual void FinishFadeOut();
 
+	// Held for at least `threshold` Updates: true every `repeatRate` Updates (menus that scroll
+	// while a direction is held).
+	bool IsButtonHeld(u32 button, int &framesHeld, int threshold = 30, int repeatRate = 10) const;
+
+	// Drawing (only with overlays; see ppge.h). StartDraw begins this Update's frame, EndDraw shows it.
+	void StartDraw();
+	void EndDraw();
+	u32 CalcFadedColor(u32 color) const;
+	ppge::Style FadedStyle(ppge::Align align, float scale) const;
+	ppge::Style FadedImageStyle() const;
+	ppge::Icon OkIcon() const { return okButtonFlag_ == CTRL_CROSS ? ppge::Icon::Cross : ppge::Icon::Circle; }
+	ppge::Icon CancelIcon() const { return cancelButtonFlag_ == CTRL_CROSS ? ppge::Icon::Cross : ppge::Icon::Circle; }
+	// The button guide at the bottom ("Enter" / "Back", or the caption).
+	void DisplayButtons(int flags, std::string_view caption = {});
+	// A status screen (network, sign-in, installs...): a banner with the title, the message in the
+	// middle, a progress bar when progress is 0-1, and the button guide.
+	void DisplayStatusScreen(std::string_view title, std::string_view message, int buttons, float progress = -1.0f);
+
 	Status pendingStatus_ = STATUS_NONE;
 	u64 pendingStatusUs_ = 0;
 
@@ -158,7 +189,10 @@ int SystemLanguage();
 int SystemButtonPreference();  // 0 = O confirms, 1 = X confirms
 // Firmware/SDK version the game was built with (sceKernelGetCompiledSdkVersion).
 u32 CompiledSdkVersion();
-// True when there is no window: dialogs answer by themselves.
+// True without overlays (no window): dialogs draw nothing and answer by themselves.
 bool Headless();
+// System settings for showing dates: 0 YYYY/MM/DD, 1 MM/DD/YYYY, 2 DD/MM/YYYY; 0 24-hour, 1 12-hour.
+int SystemDateFormat();
+int SystemTimeFormat();
 
 }  // namespace utility

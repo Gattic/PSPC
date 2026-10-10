@@ -56,8 +56,13 @@ const SEConfig &Config();
 void SetConfig(const SEConfig &c);
 
 // Loads and starts the plugins listed for the current boot type (seplugins/game.txt etc.).
-// Called before the main module starts.
-void LoadPlugins();
+// Called before the main module starts. Before the first plugin it publishes the firmware
+// modules listed in `bootModulesCsv` (data/fw_boot_modules.csv) for plugins to find.
+void LoadPlugins(const std::string &bootModulesCsv);
+
+// The firmware's module descriptor (SceModule2) for a loaded module, in kernel memory; 0 if `uid`
+// isn't one. LoadCoreForKernel's module lookups return it.
+u32 ModuleDescriptor(int uid);
 
 // NID aliases from data/m33_nid_resolver.csv: old (1.50-era) kernel NIDs -> 4.01 NIDs.
 void RegisterNidResolver(const std::string &csvPath);
@@ -74,5 +79,8 @@ int ExitToVsh();
 void OnVshCtrlRead(u32 padPtr, int count);
 // After the run: the program asked to return to the XMB.
 bool TakeExitToVsh();
+// After an XMB launch: the vshmain_args block it passed (vshmain gets it back when the game
+// exits, see vsh::SetVshmainArgs).
+bool TakeVshmainArgs(std::vector<u8> &out);
 
 }  // namespace m33

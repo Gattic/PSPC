@@ -62,6 +62,46 @@ int ParseVirtual(std::string_view path, std::string *rest) {
 
 void PutU32(std::vector<u8> &v, size_t at, u32 x) { memcpy(&v[at], &x, 4); }
 
+// "/PSP/GAME/<name>[/rest]" -> name and rest. False for other paths (and /PSP/GAME itself).
+bool SplitGamePath(std::string_view path, std::string *name, std::string *rest) {
+	std::string p = Normalize(path);
+	const std::string dir = std::string(kGameDir) + "/";
+	if (Lower(p).rfind(dir, 0) != 0 || p.size() == dir.size()) return false;
+	size_t slash = p.find('/', dir.size());
+	*name = p.substr(dir.size(), slash == std::string::npos ? std::string::npos : slash - dir.size());
+	*rest = slash == std::string::npos ? "" : p.substr(slash);
+	return !name->empty();
+}
+
+// vshctrl's GAME150 / GAME4XX folders: listing ms0:/PSP/GAME adds their entries with "__150" /
+// "__4XX" appended, and "/PSP/GAME/<name>__150/..." is "/PSP/GAME150/<name>/..." (likewise 4XX).
+// The 1.50-kernel homebrew of GAME150 then runs in PSPC's one kernel, like any other.
+const struct {
+	const char *suffix;  // lower case
+	const char *folder;
+} kSubfolders[] = {{"__150", "/PSP/GAME150"}, {"__4xx", "/PSP/GAME4XX"}};
+
+bool MapSubfolderGame(std::string_view path, std::string *out) {
+	std::string name, rest;
+	if (!SplitGamePath(path, &name, &rest)) return false;
+	const std::string low = Lower(name);
+	for (const auto &s : kSubfolders) {
+		const size_t n = strlen(s.suffix);
+		if (low.size() > n && low.compare(low.size() - n, n, s.suffix) == 0) {
+			*out = std::string(s.folder) + "/" + name.substr(0, name.size() - n) + rest;
+			return true;
+		}
+	}
+	return false;
+}
+
+// An EBOOT.PBP game folder in pspc's Games folder (the PSN / homebrew layout), listed in
+// ms0:/PSP/GAME under its folder's name without being on the memory stick.
+struct PbpGame {
+	std::string name;
+	std::filesystem::path dir;
+};
+
 // The images the Game menu shows, by index (n of MMMMMISO<n>).
 struct Image {
 	std::string name;     // file name (in /ISO, or in a games folder)
@@ -119,9 +159,23 @@ public:
 	u32 Caps() const override { return inner_->Caps(); }
 
 	s32 Open(std::string_view path, u32 flags, s32 mode) override {
-		std::string rest;
+		std::string rest, mapped;
 		int n = ParseVirtual(path, &rest);
-		if (n < 0) return inner_->Open(path, flags, mode);
+		if (n < 0) {
+			if (MapSubfolderGame(path, &mapped)) return inner_->Open(mapped, flags, mode);
+			std::filesystem::path host;
+			int r = PbpHostPath(path, &host);
+			if (r == 0) return inner_->Open(path, flags, mode);
+			if (r < 0) return r;
+			if ((flags & vfs::PSP_O_WRONLY) || (flags & (vfs::PSP_O_CREAT | vfs::PSP_O_TRUNC))) return vfs::SCE_ERRNO_EACCES;
+			HANDLE h = CreateFileW(host.wstring().c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+			                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+			if (h == INVALID_HANDLE_VALUE) return vfs::SCE_ERRNO_ENOENT;
+			std::lock_guard<std::mutex> lock(mu_);
+			s32 fd = next_++;
+			files_[fd] = VFile{-1, 0, flags, h};
+			return fd;
+		}
 		std::lock_guard<std::mutex> lock(mu_);
 		Image *img = Built(n);
 		if (!img) return vfs::SCE_ERRNO_ENOENT;
@@ -135,7 +189,11 @@ public:
 	s32 Close(s32 fd) override {
 		if (fd < kFirstHandle) return inner_->Close(fd);
 		std::lock_guard<std::mutex> lock(mu_);
-		return files_.erase(fd) ? 0 : vfs::SCE_KERNEL_ERROR_BADF;
+		auto it = files_.find(fd);
+		if (it == files_.end()) return vfs::SCE_KERNEL_ERROR_BADF;
+		if (it->second.host) CloseHandle(it->second.host);
+		files_.erase(it);
+		return 0;
 	}
 
 	s64 Read(s32 fd, void *buf, u64 size) override {
@@ -143,6 +201,11 @@ public:
 		std::lock_guard<std::mutex> lock(mu_);
 		auto it = files_.find(fd);
 		if (it == files_.end()) return vfs::SCE_KERNEL_ERROR_BADF;
+		if (it->second.host) {
+			DWORD got = 0;
+			if (!ReadFile(it->second.host, buf, (DWORD)std::min<u64>(size, 0x7FFFFFFF), &got, nullptr)) return vfs::SCE_ERRNO_EIO;
+			return (s64)got;
+		}
 		const std::vector<u8> &pbp = images_[it->second.image].pbp;
 		u64 pos = it->second.pos;
 		u64 n = pos >= pbp.size() ? 0 : std::min<u64>(size, pbp.size() - pos);
@@ -161,6 +224,13 @@ public:
 		std::lock_guard<std::mutex> lock(mu_);
 		auto it = files_.find(fd);
 		if (it == files_.end()) return vfs::SCE_KERNEL_ERROR_BADF;
+		if (it->second.host) {
+			LARGE_INTEGER to, now;
+			to.QuadPart = offset;
+			if (!SetFilePointerEx(it->second.host, to, &now, whence == 1 ? FILE_CURRENT : whence == 2 ? FILE_END : FILE_BEGIN))
+				return -1;
+			return now.QuadPart;
+		}
 		s64 base = whence == 1 ? (s64)it->second.pos : whence == 2 ? (s64)images_[it->second.image].pbp.size() : 0;
 		if (base + offset < 0) return -1;
 		it->second.pos = (u64)(base + offset);
@@ -174,6 +244,14 @@ public:
 		if (it == files_.end()) return vfs::SCE_KERNEL_ERROR_BADF;
 		*out = vfs::HandleInfo();
 		out->flags = it->second.flags;
+		if (it->second.host) {
+			LARGE_INTEGER size{}, zero{}, pos{};
+			GetFileSizeEx(it->second.host, &size);
+			SetFilePointerEx(it->second.host, zero, &pos, FILE_CURRENT);
+			out->size = (u64)size.QuadPart;
+			out->position = (u64)pos.QuadPart;
+			return 0;
+		}
 		out->size = images_[it->second.image].pbp.size();
 		out->position = it->second.pos;
 		return 0;
@@ -185,9 +263,24 @@ public:
 	}
 
 	s32 GetStat(std::string_view path, vfs::SceIoStat *out) override {
-		std::string rest;
+		std::string rest, mapped;
 		int n = ParseVirtual(path, &rest);
-		if (n < 0) return inner_->GetStat(path, out);
+		if (n < 0) {
+			if (MapSubfolderGame(path, &mapped)) return inner_->GetStat(mapped, out);
+			std::filesystem::path host;
+			int r = PbpHostPath(path, &host);
+			if (r == 0) return inner_->GetStat(path, out);
+			if (r < 0) return r;
+			std::error_code ec;
+			if (!std::filesystem::exists(host, ec)) return vfs::SCE_ERRNO_ENOENT;
+			*out = HostFileStat(host);
+			if (std::filesystem::is_directory(host, ec)) {
+				out->st_mode = (s32)(vfs::FIO_S_IFDIR | 0777);
+				out->st_attr = vfs::FIO_SO_IFDIR;
+				out->st_size = 0;
+			}
+			return 0;
+		}
 		std::lock_guard<std::mutex> lock(mu_);
 		if (n >= (int)images_.size()) RefreshImages();
 		if (n >= (int)images_.size()) return vfs::SCE_ERRNO_ENOENT;
@@ -202,30 +295,88 @@ public:
 	}
 
 	s32 ChStat(std::string_view path, const vfs::SceIoStat &in, u32 bits) override {
+		std::string mapped;
 		if (ParseVirtual(path, nullptr) >= 0) return 0;
+		if (MapSubfolderGame(path, &mapped)) return inner_->ChStat(mapped, in, bits);
+		std::filesystem::path host;
+		if (PbpHostPath(path, &host) > 0) return 0;
 		return inner_->ChStat(path, in, bits);
 	}
-	// Deleting an image's entry from the XMB would delete the user's image: refused.
+	// Deleting an image's entry (or a game folder from pspc's Games folder) from the XMB would
+	// delete the user's files there: refused.
 	s32 Remove(std::string_view path) override {
+		std::string mapped;
 		if (ParseVirtual(path, nullptr) >= 0) return vfs::SCE_ERRNO_EACCES;
+		if (MapSubfolderGame(path, &mapped)) return inner_->Remove(mapped);
+		std::filesystem::path host;
+		if (PbpHostPath(path, &host) > 0) return vfs::SCE_ERRNO_EACCES;
 		return inner_->Remove(path);
 	}
 	s32 Mkdir(std::string_view path, s32 mode) override {
+		std::string mapped;
 		if (ParseVirtual(path, nullptr) >= 0) return vfs::SCE_ERRNO_EEXIST;
-		return inner_->Mkdir(path, mode);
+		if (MapSubfolderGame(path, &mapped)) return inner_->Mkdir(mapped, mode);
+		std::filesystem::path host;
+		if (PbpHostPath(path, &host) > 0) return vfs::SCE_ERRNO_EACCES;
+		s32 r = inner_->Mkdir(path, mode);
+		// vshctrl creates GAME150 and GAME4XX along with GAME.
+		if (r >= 0 && Lower(Normalize(path)) == kGameDir)
+			for (const auto &s : kSubfolders) inner_->Mkdir(s.folder, mode);
+		return r;
 	}
 	s32 Rmdir(std::string_view path) override {
+		std::string mapped;
 		if (ParseVirtual(path, nullptr) >= 0) return vfs::SCE_ERRNO_EACCES;
+		if (MapSubfolderGame(path, &mapped)) return inner_->Rmdir(mapped);
+		std::filesystem::path host;
+		if (PbpHostPath(path, &host) > 0) return vfs::SCE_ERRNO_EACCES;
 		return inner_->Rmdir(path);
 	}
 	s32 Rename(std::string_view from, std::string_view to) override {
 		if (ParseVirtual(from, nullptr) >= 0 || ParseVirtual(to, nullptr) >= 0) return vfs::SCE_ERRNO_EACCES;
-		return inner_->Rename(from, to);
+		std::string mf(from), mt(to);
+		MapSubfolderGame(from, &mf);
+		MapSubfolderGame(to, &mt);
+		std::filesystem::path host;
+		if (PbpHostPath(mf, &host) > 0 || PbpHostPath(mt, &host) > 0) return vfs::SCE_ERRNO_EACCES;
+		return inner_->Rename(mf, mt);
 	}
 
 	s32 DOpen(std::string_view path) override {
-		std::string rest;
+		std::string rest, mapped;
 		int n = ParseVirtual(path, &rest);
+		if (n < 0 && MapSubfolderGame(path, &mapped)) return inner_->DOpen(mapped);
+		if (n < 0) {
+			std::filesystem::path host;
+			int r = PbpHostPath(path, &host);
+			if (r < 0) return r;
+			if (r > 0) {
+				// A game folder of pspc's Games folder: its files, read-only.
+				std::error_code ec;
+				if (!std::filesystem::is_directory(host, ec)) return vfs::SCE_ERRNO_ENOTDIR;
+				VDir d;
+				vfs::SceIoStat self = HostFileStat(host);
+				self.st_mode = (s32)(vfs::FIO_S_IFDIR | 0777);
+				self.st_attr = vfs::FIO_SO_IFDIR;
+				self.st_size = 0;
+				d.entries.push_back(Entry(".", self));
+				d.entries.push_back(Entry("..", self));
+				for (auto it = std::filesystem::directory_iterator(host, ec); !ec && it != std::filesystem::directory_iterator();
+				     it.increment(ec)) {
+					vfs::SceIoStat st = HostFileStat(it->path());
+					if (it->is_directory(ec)) {
+						st.st_mode = (s32)(vfs::FIO_S_IFDIR | 0777);
+						st.st_attr = vfs::FIO_SO_IFDIR;
+						st.st_size = 0;
+					}
+					d.entries.push_back(Entry(PathToUtf8(it->path().filename()), st));
+				}
+				std::lock_guard<std::mutex> lock(mu_);
+				s32 h = next_++;
+				dirs_[h] = std::move(d);
+				return h;
+			}
+		}
 		std::lock_guard<std::mutex> lock(mu_);
 		if (n >= 0) {
 			if (!rest.empty()) return vfs::SCE_ERRNO_ENOENT;
@@ -240,18 +391,42 @@ public:
 			return h;
 		}
 		if (Lower(Normalize(path)) != kGameDir) return inner_->DOpen(path);
-		// The game folder: the real entries, then one folder per image.
+		// The game folder: the real entries, those of GAME150 and GAME4XX, the game folders of
+		// pspc's Games folder, then one folder per image (vshctrl's order).
 		s32 inner = inner_->DOpen(path);
 		if (inner < 0) return inner;
 		VDir d;
 		vfs::SceIoDirent e;
+		std::vector<std::string> names;
 		for (;;) {
 			memset(&e, 0, sizeof(e));
 			if (inner_->DRead(inner, &e) <= 0) break;
 			d.entries.push_back(e);
+			names.push_back(Lower(e.d_name));
 		}
 		inner_->DClose(inner);
+		for (const auto &s : kSubfolders) {
+			s32 sub = inner_->DOpen(s.folder);
+			if (sub < 0) continue;
+			for (;;) {
+				memset(&e, 0, sizeof(e));
+				if (inner_->DRead(sub, &e) <= 0) break;
+				if (!strcmp(e.d_name, ".") || !strcmp(e.d_name, "..")) continue;
+				std::string name = std::string(e.d_name) + (s.suffix[2] == '4' ? "__4XX" : "__150");
+				strncpy(e.d_name, name.c_str(), sizeof(e.d_name) - 1);
+				d.entries.push_back(e);
+			}
+			inner_->DClose(sub);
+		}
 		RefreshImages();
+		for (const PbpGame &g : pbpGames_) {
+			if (std::find(names.begin(), names.end(), Lower(g.name)) != names.end()) continue;  // the stick's own
+			vfs::SceIoStat st = HostFileStat(g.dir);
+			st.st_mode = (s32)(vfs::FIO_S_IFDIR | 0777);
+			st.st_attr = vfs::FIO_SO_IFDIR;
+			st.st_size = 0;
+			d.entries.push_back(Entry(g.name, st));
+		}
 		for (size_t i = 0; i < images_.size(); i++) {
 			d.entries.push_back(Entry(std::string(kVirtualPrefix) + std::to_string(i), DirStat(images_[i])));
 		}
@@ -281,14 +456,51 @@ public:
 		return dirs_.erase(dd) ? 0 : vfs::SCE_KERNEL_ERROR_BADF;
 	}
 
+	// The host file a GAME150/GAME4XX or Games folder game's path stands for ("" if none).
+	std::string GameHostPath(std::string_view path) {
+		std::string mapped;
+		std::filesystem::path host;
+		if (MapSubfolderGame(path, &mapped)) return inner_->HostPath(mapped, &host) >= 0 ? PathToUtf8(host) : "";
+		return PbpHostPath(path, &host) > 0 ? PathToUtf8(host) : "";
+	}
+
+	// "/PSP/GAME/<name>[/rest]" of a game folder in pspc's Games folder: 1 and its host path,
+	// 0 if the path isn't one (the memory stick's own folder of that name wins), or an error.
+	int PbpHostPath(std::string_view path, std::filesystem::path *host) {
+		std::string name, rest;
+		if (!SplitGamePath(path, &name, &rest) || ParseVirtual(path, nullptr) >= 0) return 0;
+		vfs::SceIoStat st;
+		if (inner_->GetStat(std::string("/PSP/GAME/") + name, &st) >= 0) return 0;
+		std::lock_guard<std::mutex> lock(mu_);
+		const PbpGame *g = FindPbp(name);
+		if (!g) {
+			RefreshImages();
+			g = FindPbp(name);
+		}
+		if (!g) return 0;
+		std::string rel = rest.empty() ? "" : rest.substr(1);
+		if (rel.find("..") != std::string::npos || rel.find(':') != std::string::npos) return vfs::SCE_ERRNO_ENOENT;
+		*host = rel.empty() ? g->dir : g->dir / std::filesystem::u8path(rel);
+		return 1;
+	}
+
+
 	bool QueryFreeSpace(u64 *freeBytes, u64 *totalBytes) override { return inner_->QueryFreeSpace(freeBytes, totalBytes); }
 
 private:
 	struct VFile {
-		int image;
+		int image;  // -1: a file of a Games folder game (host)
 		u64 pos;
 		u32 flags;
+		HANDLE host = nullptr;
 	};
+
+	const PbpGame *FindPbp(const std::string &name) const {
+		const std::string low = Lower(name);
+		for (const PbpGame &g : pbpGames_)
+			if (Lower(g.name) == low) return &g;
+		return nullptr;
+	}
 	struct VDir {
 		std::vector<vfs::SceIoDirent> entries;
 		size_t next = 0;
@@ -336,7 +548,9 @@ private:
 			}
 			inner_->DClose(d);
 		}
-		// pspc's Games folder too, so the XMB shows what the launcher shows without copying.
+		// pspc's Games folder too, so the XMB shows what the launcher shows without copying: its
+		// UMD images, and its EBOOT.PBP game folders (Games\<name>\EBOOT.PBP).
+		std::vector<PbpGame> pbps;
 		for (const std::filesystem::path &dir : g_extraDirs) {
 			std::error_code ec;
 			auto opts = std::filesystem::directory_options::skip_permission_denied;
@@ -344,6 +558,17 @@ private:
 			     !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
 				if (it.depth() > 3 || !it->is_regular_file(ec)) continue;
 				std::string name = PathToUtf8(it->path().filename());
+				if (Lower(name) == "eboot.pbp" && it.depth() > 0) {
+					PbpGame g;
+					g.dir = it->path().parent_path();
+					g.name = PathToUtf8(g.dir.filename());
+					bool dup = g.name.empty() || ParseVirtual("/PSP/GAME/" + g.name, nullptr) >= 0;
+					std::string mapped;
+					dup |= MapSubfolderGame("/PSP/GAME/" + g.name, &mapped);
+					for (const PbpGame &o : pbps) dup |= Lower(o.name) == Lower(g.name);
+					if (!dup) pbps.push_back(std::move(g));
+					continue;
+				}
 				if (!IsImageName(name)) continue;
 				bool dup = false;
 				for (const Image &f : found)
@@ -366,6 +591,7 @@ private:
 			}
 		}
 		images_ = std::move(found);
+		pbpGames_ = std::move(pbps);
 	}
 
 	Image *Built(int n) {
@@ -419,6 +645,7 @@ private:
 	vfs::HostFileSystem *inner_;
 	std::mutex mu_;
 	std::vector<Image> images_;
+	std::vector<PbpGame> pbpGames_;
 	std::map<s32, VFile> files_;
 	std::map<s32, VDir> dirs_;
 	s32 next_ = kFirstHandle;
@@ -443,6 +670,13 @@ bool IsoForVirtualGamePath(const std::string &pspPath, std::string *hostPath) {
 	int n = ParseVirtual(path, nullptr);
 	if (n < 0) return false;
 	*hostPath = g_browser->HostPathOf(n);
+	return !hostPath->empty();
+}
+
+bool HostPathForVirtualGame(const std::string &pspPath, std::string *hostPath) {
+	std::string device, path;
+	if (!g_browser || !io::ResolvePath(pspPath, device, path) || device != "ms0") return false;
+	*hostPath = g_browser->GameHostPath(path);
 	return !hostPath->empty();
 }
 

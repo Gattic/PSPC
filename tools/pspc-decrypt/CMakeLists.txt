@@ -52,6 +52,7 @@ add_library(pspc_decrypt_core STATIC
 	src/inflate.cpp
 	src/ipl.cpp
 	src/json.cpp
+	src/kirk_service.cpp
 	src/kl4e.cpp
 	src/lzrc.cpp
 	src/module.cpp

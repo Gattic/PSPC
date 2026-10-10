@@ -352,7 +352,12 @@ void PgfFont::GlyphBufferSizes(int code, int altCode, GlyphKind kind, u32 &recor
 	recordBytes = bitmapBytes = 0;
 	Glyph g;
 	if (!LookupWithAlt(code, altCode, kind, g)) return;
-	recordBytes = g.recordBytes;
+	// libfont reads a character's fixed header (8 bytes from revision 2 on, 6 before) into a stack
+	// buffer, then allocates the rest of the record (its 14-bit size minus that header) and reads
+	// it there (4.01 libfont_hv.prx, the glyph loader at module offset 0x42A4; pspautotests
+	// font/fonttest).
+	const u32 header = kind == GlyphKind::Char ? (layout_.revision >= 2 ? 8u : 6u) : 0u;
+	recordBytes = g.recordBytes > header ? g.recordBytes - header : 0;
 	bitmapBytes = (u32)(g.w * g.h);
 }
 
@@ -403,6 +408,26 @@ void PgfFont::DecodeBitmap(const Glyph &g, std::vector<u8> &out) const {
 			for (u32 k = 0; k < 16 - n && i < total; k++, bit += 4) out[i++] = (u8)Bits(bit, 4);
 		}
 	}
+}
+
+bool PgfFont::RenderHostGlyph(int code, HostGlyph &out) const {
+	out = HostGlyph{};
+	Glyph g;
+	if (blank_ || !Lookup(code, GlyphKind::Char, g)) return false;
+	out.advH = g.advH;
+	out.left = g.left;
+	out.top = g.top;
+	const int order = g.flags & 3;
+	if (g.w <= 0 || g.h <= 0 || (order != 1 && order != 2)) return true;  // a space
+	std::vector<u8> pixels;
+	DecodeBitmap(g, pixels);
+	out.w = g.w;
+	out.h = g.h;
+	out.ink.resize((size_t)g.w * g.h);
+	for (int y = 0; y < g.h; y++)
+		for (int x = 0; x < g.w; x++)
+			out.ink[(size_t)y * g.w + x] = pixels[order == 1 ? (size_t)y * g.w + x : (size_t)x * g.h + y];
+	return true;
 }
 
 void PgfFont::Draw(const GlyphImage &img, int clipX, int clipY, int clipW, int clipH, int code, int altCode,

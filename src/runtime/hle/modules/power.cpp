@@ -117,6 +117,8 @@ int scePowerIsBatteryCharging() { return 0; }
 int scePowerGetBatteryChargingStatus() { return 0; }
 int scePowerIsLowBattery() { return 0; }
 int scePowerIsSuspendRequired() { return 0; }
+// The power switch was never slid (the camera plugin polls this while it runs).
+int scePowerIsRequest() { return 0; }
 int scePowerGetBatteryLifePercent() { return 100; }
 int scePowerGetBatteryLifeTime() { return 0; }  // 0: on AC power
 int scePowerGetBatteryTemp() { return 0; }
@@ -257,6 +259,7 @@ void Register_scePower() {
 		HLEFN(0xB4432BC8, scePowerGetBatteryChargingStatus),
 		HLEFN(0xD3075926, scePowerIsLowBattery),
 		HLEFN(0x78A1A796, scePowerIsSuspendRequired),
+		HLEFN(0x7FA406DD, scePowerIsRequest),
 		HLEFN(0x2085D15D, scePowerGetBatteryLifePercent),
 		HLEFN(0x8EFB3FA2, scePowerGetBatteryLifeTime),
 		HLEFN(0x28E12023, scePowerGetBatteryTemp),

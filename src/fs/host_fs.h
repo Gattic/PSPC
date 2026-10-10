@@ -35,6 +35,10 @@ public:
 	~HostFileSystem() override;
 
 	const std::filesystem::path &Root() const { return root_; }
+	// Overlays another host directory onto the volume: a path missing from the root is looked up
+	// there, listings merge (the root's entries first), and a new file goes wherever its folder
+	// exists, the root preferred. Not thread-safe against concurrent I/O; add roots at setup.
+	void AddFallbackRoot(const std::filesystem::path &dir);
 	// Host path of a volume path, existing components matched case-insensitively (the last one
 	// may be missing). Returns 0, or an error for invalid names or a missing parent.
 	s32 HostPath(std::string_view path, std::filesystem::path *out);
@@ -65,12 +69,16 @@ private:
 
 	// Result >= 0: 1 if the path exists, 0 if only its parent does (allowMissingLast).
 	s32 Resolve(std::string_view path, bool allowMissingLast, std::wstring *hostPath, std::vector<std::string> *comps);
+	s32 ResolveIn(const std::wstring &rootW, std::string_view path, bool allowMissingLast, std::wstring *hostPath,
+		std::vector<std::string> *comps);
+	void ListInto(const std::wstring &dir, std::vector<EntryInfo> *entries) const;
 	void FillStat(const EntryInfo &e, SceIoStat *out) const;
 	s32 AllocHandle();
 	std::shared_ptr<OpenFile> GetFile(s32 fd);
 
 	std::filesystem::path root_;
 	std::wstring rootW_;  // "\\?\" form, no trailing separator
+	std::vector<std::wstring> fallbackW_;  // AddFallbackRoot, same form
 	HostFsOptions opt_;
 
 	std::mutex mutex_;

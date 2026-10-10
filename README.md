@@ -24,11 +24,12 @@ results in the interpreter and as native code.
 | GE graphics: multithreaded software renderer (default, reference) and optional Direct3D 11 renderer with 1-4x upscaling | Working. `gpu/` 107/111 (software) |
 | Audio (sceAudio, SAS, ATRAC3/3+, MP3, AAC, audiocodec) | Working. `audio/` 72/74 |
 | I/O, UMD, memory stick, ISO/CSO/ZSO/DAX | Working |
-| sceUtility (save data, dialogs, OSK), fonts (PGF), network (offline) | Working |
+| sceUtility (save data, dialogs, OSK), fonts (PGF) | Working |
+| Network: infrastructure (virtual access point on the host's network, BSD sockets, DNS, HTTP/HTTPS) and ad hoc play (PPSSPP-compatible ad hoc server, `pspc --adhoc-server`) | Working. [docs/networking.md](docs/networking.md) |
 | M33 layer (SystemCtrl, KUBridge, VshCtrl, config.se, plugins, NID resolver) | Working |
 | Video (sceMpeg, PSMF, psmfplayer, videocodec), JPEG | Working. H.264 via Media Foundation; `video/` 24/30, `jpeg/` 8/11; game movies play with sound |
 | Firmware tooling (M33 extraction, inventory, NID database, Ghidra pipeline, pspc-decrypt) | Working |
-| Real 4.01 XMB (`pspc --vsh`) | Working with the official 4.01 update (see below): boots, navigates, lists and launches ISOs, returns from games; M33 VSH menu and recovery. [docs/vsh-boot.md](docs/vsh-boot.md) |
+| Real 4.01 XMB (`pspc --vsh`) | Working with the official 4.01 update (see below): boots, navigates, lists and launches ISOs and EBOOT.PBP folders, returns from games; Saved Data Utility (including Copy), clock setting, Memory Stick Video MP4 playback; M33 VSH menu and recovery. [docs/vsh-boot.md](docs/vsh-boot.md) |
 
 ## Building
 
@@ -60,7 +61,12 @@ build\RelWithDebInfo\bin\pspc.exe Games\MyGame.iso
 ```
 
 Keyboard: arrows = D-pad, Z = Cross, X = Circle, A = Square, S = Triangle, Q/W = L/R,
-Enter = Start, Space = Select, Esc = Home, I/J/K/L = analog stick. Game controllers work through SDL.
+Enter = Start, Space = Select, Esc = Home, I/J/K/L = analog stick, Page Up/Page Down = VOL+/VOL-,
+N = Note, B = Screen (the last four are for plugins; games never see them). Game controllers work
+through SDL; both sticks drive the PSP analog stick, and clicking them is VOL- (left) and VOL+ (right).
+Home (Esc, or the controller's guide button) brings up the PSP's "Quit the game?" screen; the
+sceUtility dialogs (messages, save/load screens, on-screen keyboard) are drawn over the game as
+on a PSP and answered with the PSP buttons.
 
 Useful options (`pspc --help` lists them all):
 
@@ -71,6 +77,7 @@ Useful options (`pspc --help` lists them all):
 | `--dump-frames <dir> --dump-every <n>` | save the displayed frame as BMP every n VBlanks |
 | `--press <vblank>:<BUTTONS>[:<frames>]` | scripted input, e.g. `--press 600:START --press 900:CROSS+UP:4` |
 | `--memstick <dir>`, `--flash0 <dir>`, `--host0 <dir>` | device roots |
+| `--plugins <dir>`, `--no-plugins` | M33 plugins folder laid over ms0: (default: `plugins`), or none |
 | `--umd <image>` | insert a disc while running a .prx/.elf/.pbp |
 | `--renderer software\|d3d11`, `--render-scale <1-4>` | GE renderer: software (default) or the GPU; upscaling with d3d11 |
 | `--osk-text <text>` | headless: what the on-screen keyboard returns (e.g. a character name) |
@@ -96,10 +103,14 @@ volume=100         # 0-100 (volume=mute or mute=1 silences)
 key.cross=Z        # SDL key names; several keys: key.select=Space,Right Shift
 pad.cross=a        # SDL controller buttons: a b x y back guide start leftstick rightstick
                    # leftshoulder rightshoulder dpup dpdown dpleft dpright lefttrigger righttrigger
-pad.stick=left     # stick that drives the PSP analog stick: left, right or none
+pad.stick=both     # stick(s) that drive the PSP analog stick: both, left, right or none
+plugins=1          # load M33 plugins (see Plugins below)
+plugins_dir=       # folder laid over the memory stick; empty = the plugins folder
+network=1          # 0 = offline: the WLAN switch reads off
+adhoc_server=localhost  # ad hoc server (host or host:port) to meet other players through
 ```
 
-Inputs: up down left right cross circle square triangle l r start select home analog_up
+Inputs: up down left right cross circle square triangle l r start select home vol_up vol_down note screen analog_up
 analog_down analog_left analog_right. While playing: **F11** fullscreen, **F12** screenshot
 (`screenshots\<game>_<date>_<time>.bmp`), **Ctrl+Q** quit.
 
@@ -108,8 +119,31 @@ The launcher tags games whose native code is built (NATIVE), partly built (PARTI
 `cache\aot\games.json`).
 
 Save data goes to `<pspc dir>\ms0\PSP\SAVEDATA`, and M33 settings to `<pspc dir>\flash1\config.se`.
-Plugins listed in `ms0\seplugins\game.txt` are loaded the way M33 loads them. A game that chains
-to another executable (`sceKernelLoadExec`) is restarted in a fresh runtime automatically.
+A game that chains to another executable (`sceKernelLoadExec`) is restarted in a fresh runtime
+automatically.
+
+### Network and ad hoc play
+
+Games and the XMB are online through the host's network: connect with the network configuration
+"PSPC 1" when asked. For ad hoc multiplayer run an ad hoc server and start the game in two
+instances (or on two PCs, with `adhoc_server=` set to the server PC's address):
+
+```bat
+build\RelWithDebInfo\bin\pspc.exe --adhoc-server --adhoc-bind 127.0.0.1   :: two instances on this PC
+build\RelWithDebInfo\bin\pspc.exe --adhoc-server                          :: LAN (allow it through the firewall)
+```
+
+It speaks PPSSPP's protocol, so PPSSPP players and public PPSSPP servers work too. See
+[docs/networking.md](docs/networking.md) (LAN setup, the XMB's browser and Network Update, limits).
+
+### Plugins
+
+M33 plugins (cheat devices such as DarkFrost or CWCheat, screenshot and button-remap plugins) run as
+on a PSP with 4.01 M33. The `plugins` folder is laid over the memory stick, so put them there as you
+would in `ms0:/` and list them in `plugins\seplugins\game.txt` (games), `vsh.txt` (XMB) or
+`pops.txt` (PS1). Listed plugins load when the game starts: no Pandora battery or recovery menu.
+The launcher's **Plugins** button turns them on and off and adds new ones. See
+[plugins/README.md](plugins/README.md) and [docs/plugins.md](docs/plugins.md).
 
 **Game files:** use dumps of discs and downloads you own. Encrypted executables are decrypted by
 `pspc-decrypt.exe`, which must sit next to `pspc.exe`. PSN titles need your own license files.

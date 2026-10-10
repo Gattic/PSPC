@@ -3,6 +3,7 @@
 // GPL-2.0-or-later.
 #include "runtime/dialogs/msg_dialog.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -34,11 +35,22 @@ constexpr u32 OPTION_SUPPORTED = 0x000001B3;
 // Updates (about 2 s), long enough for games (and tests) that Abort the dialog themselves.
 constexpr int HEADLESS_ANSWER_UPDATES = 120;
 
+constexpr float FONT_SCALE = 0.55f;
+
 void CopyCString(char *dst, size_t dstSize, const char *src, size_t srcMax) {
 	size_t n = strnlen(src, srcMax);
 	if (n >= dstSize) n = dstSize - 1;
 	memcpy(dst, src, n);
 	dst[n] = 0;
+}
+
+std::string_view FixedField(const char *s, size_t maxLen) { return std::string_view(s, strnlen(s, maxLen)); }
+
+int NonAsciiCount(const std::string &s) {
+	int n = 0;
+	for (unsigned char c : s)
+		if (c >= 0xC0) n++;  // lead bytes
+	return n;
 }
 
 }  // namespace
@@ -58,7 +70,8 @@ int MsgDialog::Init(u32 paramAddr) {
 
 	flag_ = 0;
 	framesRun_ = 0;
-	prompt_.reset();
+	scrollPos_ = 0.0f;
+	framesUpHeld_ = framesDownHeld_ = 0;
 
 	// Check request invalidity.
 	if (params_.type == 0 && !(params_.errorNum & 0x80000000)) {
@@ -141,6 +154,86 @@ void MsgDialog::FormatErrorCode(u32 code) {
 	}
 }
 
+void MsgDialog::DisplayMessage(const std::string &text, bool hasYesNo, bool hasOK) {
+	ppge::Style buttonStyle = FadedStyle(ppge::BOX_CENTER, FONT_SCALE);
+	ppge::Style messageStyle = FadedStyle(ppge::BOX_HCENTER, FONT_SCALE);
+
+	// Without the scrollbar, we have 390 total pixels.
+	float WRAP_WIDTH = 340.0f;
+	if ((size_t)NonAsciiCount(text) >= text.size() / 4) {
+		WRAP_WIDTH = 376.0f;
+		if (text.size() > 12) messageStyle.scale = 0.6f;
+	}
+
+	float totalHeight = 0.0f;
+	ppge::MeasureString(nullptr, &totalHeight, text, FONT_SCALE, ppge::LINE_WRAP_WORD, WRAP_WIDTH);
+	// The PSP normally only shows about 8 lines at a time. For improved UX, we intentionally show
+	// part of the next line.
+	float visibleHeight = std::min(totalHeight, 175.0f);
+	float h2 = visibleHeight / 2.0f;
+
+	float centerY = 135.0f;
+	float sy = centerY - h2 - 15.0f;
+	float ey = centerY + h2 + 20.0f;
+	float buttonY = centerY + h2 + 5.0f;
+
+	auto drawSelectionBoxAndAdjust = [&](float x) {
+		// Box has a fixed size.
+		float w = 15.0f;
+		float h = 8.0f;
+		ppge::DrawRect(x - w, buttonY - h, x + w, buttonY + h, CalcFadedColor(0x6DCFCFCF));
+		centerY -= h + 5.0f;
+		sy -= h + 5.0f;
+		ey = buttonY + h * 2.0f + 5.0f;
+	};
+
+	if (hasYesNo) {
+		drawSelectionBoxAndAdjust(yesnoChoice_ == 1 ? 204.0f : 273.0f);
+		ppge::DrawString("Yes", 203.0f, buttonY - 1.0f, buttonStyle);
+		ppge::DrawString("No", 272.0f, buttonY - 1.0f, buttonStyle);
+		if (IsButtonPressed(CTRL_LEFT) && yesnoChoice_ == 0) {
+			yesnoChoice_ = 1;
+		} else if (IsButtonPressed(CTRL_RIGHT) && yesnoChoice_ == 1) {
+			yesnoChoice_ = 0;
+		}
+		buttonY += 8.0f + 5.0f;
+	}
+
+	if (hasOK) {
+		drawSelectionBoxAndAdjust(240.0f);
+		ppge::DrawString("OK", 239.0f, buttonY - 1.0f, buttonStyle);
+		buttonY += 8.0f + 5.0f;
+	}
+
+	ppge::Scissor(0, (int)(centerY - h2 - 2), 480, (int)(centerY + h2 + 2));
+	ppge::DrawStringWrapped(text, 240.0f, centerY - h2 - scrollPos_, WRAP_WIDTH, 0, messageStyle);
+	ppge::ScissorReset();
+
+	// Do we need a scrollbar?
+	if (visibleHeight < totalHeight) {
+		float scrollSpeed = 5.0f;
+		float scrollMax = totalHeight - visibleHeight;
+
+		float bobHeight = (visibleHeight / totalHeight) * visibleHeight;
+		float bobOffset = (scrollPos_ / scrollMax) * (visibleHeight - bobHeight);
+		float bobY1 = centerY - h2 + bobOffset;
+		ppge::DrawRect(435.0f, bobY1, 440.0f, bobY1 + bobHeight, CalcFadedColor(0xFFCCCCCC));
+
+		auto buttonDown = [this](u32 btn, int &held) {
+			if (IsButtonPressed(btn)) {
+				held = 0;
+				return true;
+			}
+			return IsButtonHeld(btn, held, 1, 1);
+		};
+		if (buttonDown(CTRL_DOWN, framesDownHeld_) && scrollPos_ < scrollMax) scrollPos_ = std::min(scrollMax, scrollPos_ + scrollSpeed);
+		if (buttonDown(CTRL_UP, framesUpHeld_) && scrollPos_ > 0.0f) scrollPos_ = std::max(0.0f, scrollPos_ - scrollSpeed);
+	}
+
+	ppge::DrawRect(40.0f, sy, 440.0f, sy + 1.0f, CalcFadedColor(0xFFFFFFFF));
+	ppge::DrawRect(40.0f, ey, 440.0f, ey + 1.0f, CalcFadedColor(0xFFFFFFFF));
+}
+
 // The player made a choice: cancel/back, or the button under yesnoChoice_.
 void MsgDialog::Choose(bool cancel) {
 	const u32 size = params_.common.size;
@@ -169,37 +262,32 @@ int MsgDialog::Update(int animSpeed) {
 		const bool wasFadingOut = IsFadingOut();
 		UpdateFade(animSpeed);
 
-		if (!wasFadingOut && !IsFadingOut()) {
-			const bool canCancel = (flag_ & DS_CANCELBUTTON) != 0;
-			const bool canConfirm = (flag_ & DS_VALIDBUTTON) != 0;
-			if (Headless()) {
-				if (framesRun_ >= HEADLESS_ANSWER_UPDATES) {
-					LOGI("UTIL", "MsgDialog: answering by itself (headless)");
-					Choose(!canConfirm && canCancel);
-				}
-			} else {
-				if (!prompt_) {
-					prompt::Buttons b = (flag_ & DS_YESNO) ? prompt::Buttons::YesNo
-					                    : canConfirm && canCancel ? prompt::Buttons::OkCancel
-					                                              : prompt::Buttons::Ok;
-					prompt_ = prompt::ShowMessage("PSP", msgText_, b);
-				}
-				int a = prompt_->answer.load();
-				if (a == prompt::YES || a == prompt::OK) {
-					yesnoChoice_ = 1;
-					Choose(!canConfirm && canCancel);
-				} else if (a == prompt::NO) {
-					yesnoChoice_ = 0;
-					Choose(false);
-				} else if (a == prompt::CANCEL) {
-					Choose(canCancel || !canConfirm);
-				} else if (IsButtonPressed(cancelButtonFlag_) && canCancel) {
-					// The PSP buttons work too.
+		const bool canCancel = (flag_ & DS_CANCELBUTTON) != 0;
+		const bool canConfirm = (flag_ & DS_VALIDBUTTON) != 0;
+		if (Headless()) {
+			if (!wasFadingOut && !IsFadingOut() && framesRun_ >= HEADLESS_ANSWER_UPDATES) {
+				LOGI("UTIL", "MsgDialog: answering by itself (headless)");
+				Choose(!canConfirm && canCancel);
+			}
+		} else {
+			// As the PSP shows it (PPSSPP's layout): the message between two lines over a tinted
+			// screen, the Yes/No or OK choice, and the button guide.
+			StartDraw();
+			ppge::DrawRect(0, 0, 480, 272, CalcFadedColor(0xC0C8B2AC));
+			if ((flag_ & DS_MSG) || (flag_ & DS_ERRORMSG)) DisplayMessage(msgText_, (flag_ & DS_YESNO) != 0, (flag_ & DS_OK) != 0);
+			const bool v3 = params_.common.size == SIZE_V3;
+			if (flag_ & (DS_OK | DS_VALIDBUTTON))
+				DisplayButtons(DS_BUTTON_OK, v3 ? FixedField(params_.okayButton, sizeof(params_.okayButton)) : std::string_view());
+			if (flag_ & DS_CANCELBUTTON)
+				DisplayButtons(DS_BUTTON_CANCEL, v3 ? FixedField(params_.cancelButton, sizeof(params_.cancelButton)) : std::string_view());
+			if (!wasFadingOut && !IsFadingOut()) {
+				if (IsButtonPressed(cancelButtonFlag_) && canCancel) {
 					Choose(true);
 				} else if (IsButtonPressed(okButtonFlag_) && canConfirm) {
 					Choose(false);
 				}
 			}
+			EndDraw();
 		}
 		params_.result = 0;
 	}
@@ -219,7 +307,6 @@ int MsgDialog::Shutdown(bool force) {
 	if (GetStatus() != STATUS_FINISHED && !force) return (int)SCE_ERROR_UTILITY_INVALID_STATUS;
 	Dialog::Shutdown(force);
 	if (!force) ChangeStatusShutdown(MSG_SHUTDOWN_DELAY_US);
-	prompt_.reset();
 	return 0;
 }
 

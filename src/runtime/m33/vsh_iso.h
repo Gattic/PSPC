@@ -5,6 +5,8 @@
 // memory stick's file system gets an overlay: listing ms0:/PSP/GAME adds one folder per image,
 // "MMMMMISO<n>" (vshctrl's names), holding a virtual EBOOT.PBP made of the image's PARAM.SFO
 // (as a memory stick game), ICON0/ICON1/PIC0/PIC1/SND0. Launching that EBOOT.PBP boots the image.
+// The listing also has vshctrl's GAME150 / GAME4XX entries, and pspc's Games folder: its UMD
+// images and its EBOOT.PBP game folders (read-only, launched from where they are).
 #pragma once
 
 #include <string>
@@ -17,5 +19,9 @@ namespace m33 {
 void InstallIsoBrowser(const std::vector<std::string> &extraDirs = {});
 // The host path of the UMD image a virtual "ms0:/PSP/GAME/MMMMMISO<n>/..." path stands for.
 bool IsoForVirtualGamePath(const std::string &pspPath, std::string *hostPath);
+// The host file behind a game path the overlay adds: "ms0:/PSP/GAME/<name>__150/..." and
+// "<name>__4XX/..." (vshctrl's GAME150 / GAME4XX folders), and the EBOOT.PBP game folders of
+// pspc's Games folder, which appear in ms0:/PSP/GAME under their own names.
+bool HostPathForVirtualGame(const std::string &pspPath, std::string *hostPath);
 
 }  // namespace m33

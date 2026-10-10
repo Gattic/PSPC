@@ -97,4 +97,34 @@ bool DecodeJpegRgb(const u8 *data, size_t size, int *width, int *height, std::ve
 	return ok;
 }
 
+bool DecodeImageRgba(const u8 *data, size_t size, int *width, int *height, std::vector<u32> *rgba) {
+	IWICImagingFactory *factory = Factory();
+	if (!factory || size == 0 || size > 0x7FFFFFFF) return false;
+	IWICStream *stream = nullptr;
+	IWICBitmapDecoder *decoder = nullptr;
+	IWICBitmapFrameDecode *frame = nullptr;
+	IWICBitmapSource *converted = nullptr;
+	bool ok = false;
+	if (SUCCEEDED(factory->CreateStream(&stream)) &&
+	    SUCCEEDED(stream->InitializeFromMemory(const_cast<BYTE *>(data), (DWORD)size)) &&
+	    SUCCEEDED(factory->CreateDecoderFromStream(stream, nullptr, WICDecodeMetadataCacheOnDemand, &decoder)) &&
+	    SUCCEEDED(decoder->GetFrame(0, &frame)) &&
+	    SUCCEEDED(WICConvertBitmapSource(GUID_WICPixelFormat32bppRGBA, frame, &converted))) {
+		UINT w = 0, h = 0;
+		if (SUCCEEDED(converted->GetSize(&w, &h)) && w > 0 && h > 0 && w <= 0x1000 && h <= 0x1000) {
+			rgba->resize((size_t)w * h);
+			if (SUCCEEDED(converted->CopyPixels(nullptr, w * 4, (UINT)(rgba->size() * 4), (BYTE *)rgba->data()))) {
+				*width = (int)w;
+				*height = (int)h;
+				ok = true;
+			}
+		}
+	}
+	if (converted) converted->Release();
+	if (frame) frame->Release();
+	if (decoder) decoder->Release();
+	if (stream) stream->Release();
+	return ok;
+}
+
 }  // namespace media

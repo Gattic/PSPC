@@ -19,6 +19,7 @@
 #include "common/log.h"
 #include "loader/elf.h"
 #include "runtime/core/memory.h"
+#include "runtime/dialogs/save_crypto.h"
 #include "runtime/io/io.h"
 #include "runtime/kernel/module.h"
 #include "runtime/kernel/scheduler.h"
@@ -26,15 +27,11 @@
 #include "runtime/kernel/threads.h"
 #include "runtime/boot.h"
 #include "runtime/kernel/callbacks.h"
-#include "runtime/dialogs/host_prompt.h"
 #include "runtime/host/host.h"
 #include "runtime/m33/m33.h"
 
 namespace modulemgr {
 bool IsNativeModuleName(const std::string &name);
-}
-namespace ctrl {
-void SetHomeHandler(void (*fn)());
 }
 
 namespace vsh {
@@ -43,42 +40,7 @@ namespace {
 
 bool g_active = false;
 bool g_returnToXmb = false;
-
-// Quitting a game the XMB launched: the game's exit callback runs (as after "Quit game" on a
-// PSP), and its sceKernelExitGame comes back here; a game without one quits at once.
-void QuitGame() {
-	SceUID cb = boot::ExitCallback();
-	if (cb > 0 && kernel::NotifyCallback(cb, 0) >= 0) {
-		LOGI("VSH", "Quit game: running the game's exit callback");
-		return;
-	}
-	LOGI("VSH", "Quit game: back to the XMB");
-	m33::ExitToVsh();
-}
-
-// HOME asks first, as the PSP's HOME screen does (a host message box; headless runs quit at once).
-std::shared_ptr<utility::prompt::State> g_quitPrompt;
-void PollQuitPrompt() {
-	sched::ScheduleEvent(sched::NowUs() + 20000, []() {
-		if (!g_quitPrompt) return;
-		int a = g_quitPrompt->answer.load();
-		if (a == utility::prompt::PENDING) {
-			PollQuitPrompt();
-			return;
-		}
-		g_quitPrompt.reset();
-		if (a == utility::prompt::YES) QuitGame();
-	});
-}
-void OnHome() {
-	if (g_quitPrompt) return;
-	if (host::IsHeadless()) {
-		QuitGame();
-		return;
-	}
-	g_quitPrompt = utility::prompt::ShowMessage("PSPC", "Quit the game and return to the XMB?", utility::prompt::Buttons::YesNo);
-	PollQuitPrompt();
-}
+std::vector<u8> g_vshmainArgs;
 
 constexpr u32 kBtcnfMagic = 0x0F803001;
 constexpr u32 kBootModeVsh = 0x0001;  // BootLoadFlags VSH (systemctrl_se.h)
@@ -182,10 +144,22 @@ void InitThread(bool recovery) {
 			continue;
 		}
 		kernel::PspModule *m = kernel::Get<kernel::PspModule>(id);
-		// argp: the module's path, as init.prx passes it.
-		u32 argSize = (u32)path.size() + 1;
+		// argp: the module's path, as init.prx passes it - except for vshmain coming back from a
+		// game, which gets the vshmain_args block LoadExec kept (0x20 or 0x400 bytes, starting
+		// with its size and 0x20).
+		const std::vector<u8> &va = g_vshmainArgs;
+		const bool useVshArgs = rel == "/vsh/module/vshmain.prx" && (va.size() == 0x20 || va.size() == 0x400) &&
+		                        Rd32(va, 0) == va.size() && Rd32(va, 4) == 0x20;
+		u32 argSize = useVshArgs ? (u32)va.size() : (u32)path.size() + 1;
 		u32 argp = kernel::AllocKernelMemory(AlignUp(argSize, 16), "vsh module args");
-		mem::WriteBytes(argp, path.c_str(), argSize);
+		if (useVshArgs) {
+			mem::WriteBytes(argp, va.data(), argSize);
+			LOGI("VSH", "vshmain gets the XMB's state back from the game (%u bytes)", argSize);
+		} else {
+			if (rel == "/vsh/module/vshmain.prx" && !va.empty())
+				LOGW("VSH", "vshmain_args not usable: %zu bytes, %08x %08x", va.size(), Rd32(va, 0), Rd32(va, 4));
+			mem::WriteBytes(argp, path.c_str(), argSize);
+		}
 		s32 status = 0;
 		u32 statusPtr = kernel::AllocKernelMemory(16, "vsh module status");
 		int r = kernel::StartModule(m, argSize, argp, statusPtr, true);
@@ -201,10 +175,9 @@ bool Active() { return g_active; }
 void SetActive(bool active) { g_active = active; }
 
 bool ReturnToXmb() { return g_returnToXmb; }
-void SetReturnToXmb(bool enable) {
-	g_returnToXmb = enable;
-	ctrl::SetHomeHandler(enable ? &OnHome : nullptr);
-}
+void SetVshmainArgs(std::vector<u8> args) { g_vshmainArgs = std::move(args); }
+// HOME in such a game: the HOME menu (dialogs/home_menu.cpp) quits back to the XMB.
+void SetReturnToXmb(bool enable) { g_returnToXmb = enable; }
 
 bool FirmwareMissing(std::string *why) {
 	std::vector<u8> d;
@@ -236,6 +209,8 @@ int Boot(bool recovery) {
 			return -1;
 		}
 	}
+	// Saves without the PARAM.SFO hashes the Saved Data Utility checks would list as corrupted.
+	if (!recovery) savecrypto::AddMissingSfoHashes();
 	// A kernel thread whose entry just returns; the work happens on it before the entry runs.
 	u32 entry = kernel::AllocKernelMemory(16, "vsh init entry");
 	GWrite32(entry, 0x03E00008);      // jr ra

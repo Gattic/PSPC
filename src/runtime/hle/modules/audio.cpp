@@ -854,6 +854,12 @@ u32 sceVaudioOutputBlocking(int vol, u32 buffer) {
 	return r;
 }
 
+// vaudio.prx 4.01 (user library only): the buffered reserve, the same internal call
+// sceVaudioChReserveBuffering makes with a 2048-sample buffer (msvideo_main_plugin uses it for
+// MP4 audio); and a level in 0x400..0x1000 kept for the channel (it sets it for every frame).
+u32 sceVaudio_E8E78DC8(int sampleCount, int freq, int format) { return sceVaudioChReserve(sampleCount, freq, format); }
+u32 sceVaudio_504E4745(int level) { return level >= 0x400 && level <= 0x1000 ? 0 : SCE_KERNEL_ERROR_INVALID_VALUE; }
+
 u32 sceVaudioSetEffectType(int effectType, int vol) { return 0; }
 u32 sceVaudioSetAlcMode(int alcMode) { return 0; }
 
@@ -980,9 +986,9 @@ void audiohle::Register_sceVaudio() {
 		HLEFN(0x67585DFD, sceVaudioChRelease),
 		HLEFN(0x346FBE94, sceVaudioSetEffectType),
 		HLEFN(0xCBD4AC51, sceVaudioSetAlcMode),
-		HLESTUB(0x504E4745, "sceVaudio_504E4745"),
+		HLEFN(0x504E4745, sceVaudio_504E4745),
 		HLESTUB(0x27ACC20B, "sceVaudioChReserveBuffering"),
-		HLESTUB(0xE8E78DC8, "sceVaudio_E8E78DC8"),
+		HLEFN(0xE8E78DC8, sceVaudio_E8E78DC8),
 	};
 	hle::RegisterModule("sceVaudio", funcs);
 	hle::RegisterModule("sceVaudio_driver", funcs);

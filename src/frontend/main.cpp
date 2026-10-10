@@ -13,6 +13,7 @@
 #include "common/fileutil.h"
 #include "common/log.h"
 #include "common/settings.h"
+#include "net/adhoc_server.h"
 #include "runtime/runtime.h"
 
 // "<vblank>:<BUTTON[+BUTTON...]>[:<frames>]", e.g. "600:START" or "900:CROSS+UP:4".
@@ -23,7 +24,8 @@ static bool ParsePress(const std::string &spec, runtime::Options::Press &out) {
 	} kButtons[] = {{"SELECT", 0x1},     {"START", 0x8},     {"UP", 0x10},       {"RIGHT", 0x20},
 	                {"DOWN", 0x40},      {"LEFT", 0x80},     {"L", 0x100},       {"R", 0x200},
 	                {"TRIANGLE", 0x1000}, {"CIRCLE", 0x2000}, {"CROSS", 0x4000}, {"SQUARE", 0x8000},
-	                {"HOME", 0x10000}};
+	                {"HOME", 0x10000},   {"NOTE", 0x800000}, {"SCREEN", 0x400000}, {"VOLUP", 0x100000},
+	                {"VOLDOWN", 0x200000}};
 	size_t c1 = spec.find(':');
 	if (c1 == std::string::npos) return false;
 	size_t c2 = spec.find(':', c1 + 1);
@@ -58,9 +60,12 @@ static void Usage() {
 	        "  --fast-time          skip idle time instead of sleeping\n"
 	        "  --timeout <sec>      stop after this many seconds\n"
 	        "  --ram <32|64>        guest RAM size in MB (default 64)\n"
-	        "  --large-mem          let user code use RAM beyond 24 MB\n"
+	        "  --large-mem          let user code use RAM beyond 24 MB (default: only for the XMB)\n"
+	        "  --no-large-mem       keep user memory at 24 MB, also for the XMB\n"
 	        "  --strict-mem         treat bad guest memory accesses as fatal\n"
 	        "  --memstick <dir>     memory stick root (default: <exe>/ms0)\n"
+	        "  --plugins <dir>      M33 plugins folder laid over ms0: (default: the nearest plugins\\)\n"
+	        "  --no-plugins         don't load M33 plugins\n"
 	        "  --flash0 <dir>       flash0 root (default: <exe>/flash0)\n"
 	        "  --host0 <dir>        host0: root (default: the program's folder)\n"
 	        "  --umd <image>        insert a disc image while running a .prx/.elf/.pbp\n"
@@ -77,7 +82,29 @@ static void Usage() {
 	        "  --render-scale <n>   d3d11 internal resolution, 1-4 times the PSP's (default 1)\n"
 	        "  --press <v>:<B>[:n]  hold buttons B (e.g. START, CROSS+UP) for n VBlanks (6) from VBlank v\n"
 	        "  --vsh                boot the firmware's XMB (tools/pspc_install_fw.py) instead of a file\n"
-	        "  --recovery           boot M33's recovery menu (also: hold R while the XMB boots)\n");
+	        "  --recovery           boot M33's recovery menu (also: hold R while the XMB boots)\n"
+	        "  --net-selftest <s>   run network test scenario <s> instead of a file (tools/net_selftest.py)\n"
+	        "  --adhoc-server       run an ad hoc server (PPSSPP-compatible) until Ctrl+C instead of a game;\n"
+	        "                       --adhoc-port <n> (default 27312), --adhoc-bind <addr> (default 0.0.0.0)\n");
+}
+
+// pspc --adhoc-server [--adhoc-port <n>] [--adhoc-bind <addr>]: serves until Ctrl+C, boots nothing.
+static int RunAdhocServer(int argc, char **argv) {
+	adhocserver::Options so;
+	for (int i = 1; i < argc; i++) {
+		std::string a = argv[i];
+		if (a == "--adhoc-port" && i + 1 < argc) {
+			int p = atoi(argv[++i]);
+			if (p < 0 || p > 65535) {
+				fprintf(stderr, "bad --adhoc-port %s\n", argv[i]);
+				return 1;
+			}
+			so.port = (u16)p;
+		} else if (a == "--adhoc-bind" && i + 1 < argc) {
+			so.bindAddress = argv[++i];
+		}
+	}
+	return adhocserver::RunCommandLine(so);
 }
 
 static u32 ParseFw(const std::string &s) {
@@ -100,13 +127,18 @@ static void ApplySettings(const settings::Settings &s, runtime::Options &o) {
 	o.padBindings = s.pads;
 	o.padStick = s.padStick;
 	o.gamesDir = s.gamesDir;
+	o.plugins = s.plugins;
+	o.pluginsDir = s.pluginsDir;
+	o.network = s.network;
+	o.adhocServer = s.adhocServer;
 }
 
 // The effective settings (after command-line overrides), at info level.
 static void LogSettings(const runtime::Options &o) {
 	u32 fw = o.firmwareVersion;
-	LOGI("CONFIG", "scale=%d fullscreen=%d vsync=%d aot=%d fw=%u.%u%u volume=%d", o.windowScale, o.fullscreen,
-	     o.vsync, o.aot, fw >> 24, (fw >> 16) & 0xFF, (fw >> 8) & 0xFF, o.volume);
+	LOGI("CONFIG", "scale=%d fullscreen=%d vsync=%d aot=%d fw=%u.%u%u volume=%d network=%d adhoc_server=%s",
+	     o.windowScale, o.fullscreen, o.vsync, o.aot, fw >> 24, (fw >> 16) & 0xFF, (fw >> 8) & 0xFF, o.volume,
+	     o.network, o.adhocServer.c_str());
 	auto quoted = [](const std::string &v) { return v.find(' ') == std::string::npos ? v : "\"" + v + "\""; };
 	std::string keys, pads;
 	for (size_t i = 0; i < settings::kNumControls; i++) {
@@ -118,6 +150,8 @@ static void LogSettings(const runtime::Options &o) {
 }
 
 int main(int argc, char **argv) {
+	for (int i = 1; i < argc; i++)
+		if (!strcmp(argv[i], "--adhoc-server")) return RunAdhocServer(argc, argv);
 	runtime::Options o;
 	fs::path exeDir = ExecutableDir();
 	o.aotDir = (exeDir / "cache" / "aot").string();
@@ -169,19 +203,23 @@ int main(int argc, char **argv) {
 		else if (a == "--vsh") o.vsh = true;
 		else if (a == "--return-to-vsh") o.returnToVsh = true;
 		else if (a == "--recovery") o.vsh = o.recovery = true;
+		else if (a == "--net-selftest") o.netSelftest = next();
 		else if (a == "--interp") o.aot = false;
 		else if (a == "--aot-dir") o.aotDir = next();
 		else if (a == "--fast-time") o.fastTime = true;
 		else if (a == "--timeout") o.timeoutSec = atoi(next().c_str());
 		else if (a == "--ram") o.ramMB = atoi(next().c_str()) == 32 ? 32 : 64;
-		else if (a == "--large-mem") o.largeUserMemory = true;
+		else if (a == "--large-mem") o.largeUserMemory = 1;
+		else if (a == "--no-large-mem") o.largeUserMemory = 0;
 		else if (a == "--strict-mem") o.strictMemory = true;
 		else if (a == "--memstick") o.memstickDir = next();
 		else if (a == "--flash0") o.flash0Dir = next();
 		else if (a == "--flash1") o.flash1Dir = next();
 		else if (a == "--no-plugins") o.plugins = false;
+		else if (a == "--plugins") o.pluginsDir = next();
 		else if (a == "--host0") o.host0Dir = next();
 		else if (a == "--umd") o.umdImage = next();
+		else if (a == "--vsh-args") o.vshArgsFile = next();
 		else if (a == "--osk-text") o.oskText = next();
 		else if (a == "--boot-path") o.bootPath = next();
 		else if (a == "--boot-args") o.bootArgsFile = next();
@@ -220,7 +258,7 @@ int main(int argc, char **argv) {
 			o.file = a;
 		}
 	}
-	if (o.file.empty() && !o.vsh) {
+	if (o.file.empty() && !o.vsh && o.netSelftest.empty()) {
 		Usage();
 		return 1;
 	}
@@ -239,6 +277,18 @@ int main(int argc, char **argv) {
 			if (fs::is_directory(p / "Games")) {
 				o.gamesDir = (p / "Games").string();
 				break;
+			}
+		}
+	}
+	if (o.pluginsDir.empty()) {
+		// The plugins folder (seplugins\game.txt and the plugins' files), found like Games: the
+		// nearest one with a seplugins folder, else the nearest one.
+		for (int pass = 0; pass < 2 && o.pluginsDir.empty(); pass++) {
+			for (fs::path p = exeDir; !p.empty() && p != p.root_path(); p = p.parent_path()) {
+				if (fs::is_directory(pass == 0 ? p / "plugins" / "seplugins" : p / "plugins")) {
+					o.pluginsDir = (p / "plugins").string();
+					break;
+				}
 			}
 		}
 	}
@@ -267,8 +317,14 @@ int main(int argc, char **argv) {
 				continue;
 			}
 			if (a == "--vsh" || a == "--return-to-vsh" || a == "--recovery") continue;
-			if (a == "--umd" && i + 1 < argc && (o.vsh || toVsh)) {
-				i++;
+			if (a == "--umd" && i + 1 < argc) {
+				// The disc stays in the drive: through the game the XMB launched and back to the
+				// XMB (an image from ms0:/ISO only stands in for it while its game runs).
+				cmd += L" \"--umd\" \"" + fs::u8path(argv[++i]).wstring() + L"\"";
+				continue;
+			}
+			if (a == "--vsh-args" && i + 1 < argc && m33) {
+				i++;  // replaced by the XMB state of this launch (below)
 				continue;
 			}
 			std::wstring arg = fs::u8path(a).wstring();
@@ -282,6 +338,8 @@ int main(int argc, char **argv) {
 		if (toVsh) cmd += L" --vsh";
 		else if (m33 && !fileSeen) cmd += L" \"" + fs::u8path(next).wstring() + L"\"";
 		if ((m33 || loadExec) && (o.vsh || o.returnToVsh)) cmd += L" --return-to-vsh";
+		std::string vshArgs;
+		if (m33 && runtime::TakeVshArgsFile(vshArgs)) cmd += L" --vsh-args \"" + fs::u8path(vshArgs).wstring() + L"\"";
 		if (loadExec) {
 			cmd += L" --boot-path \"" + fs::u8path(bootPath).wstring() + L"\"";
 			if (!bootArgs.empty()) cmd += L" --boot-args \"" + fs::u8path(bootArgs).wstring() + L"\"";

@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // sceUtilitySavedata. Ported from PPSSPP (Core/Dialog/PSPSaveDialog.cpp), Copyright (c) 2012-
 // PPSSPP Project, GPL-2.0-or-later. The IO runs synchronously (PPSSPP uses a host thread) but keeps
-// PPSSPP's Update timing: the first Update starts it, the next one takes the results. Nothing is
-// drawn; the visible modes answer by themselves (headless) or through host prompts (windowed).
+// PPSSPP's Update timing: the first Update starts it, the next one takes the results.
+//
+// With overlays the visible modes are PPSSPP's screens: the save list with icons and details, the
+// save/load/delete confirmations, progress and done screens, answered with the PSP buttons.
+// Without (headless) they draw nothing and answer by themselves.
 #pragma once
 
+#include <map>
 #include <memory>
 #include <string>
 
 #include "runtime/dialogs/dialog.h"
-#include "runtime/dialogs/host_prompt.h"
 #include "runtime/dialogs/savedata.h"
 
 namespace utility {
@@ -49,15 +52,28 @@ private:
 		DS_DELETE_FAILED,
 	};
 	enum IoStatus { IO_NONE, IO_PENDING, IO_DONE, IO_READY };
+	enum Banner { DB_NONE, DB_SAVE, DB_LOAD, DB_DELETE };
 
 	std::string GetSelectedSaveDirName() const;
 	void StartIO();
 	bool FinishIO();
 	void ExecuteIOAction();
-	void ExecuteNotVisibleIOAction();
-	// For the visible modes: the player's answer, if there is one yet. 1 = yes/OK, 0 = no/back.
-	int Ask(const std::string &text, bool yesNo, bool defaultYes);
-	void ResetAsk() { prompt_.reset(), askFrames_ = 0; }
+	// Headless: the visible modes answer by themselves. 1 = yes/OK, 0 = no/back, -1 = not yet.
+	int Ask(const std::string &text, bool defaultYes);
+	void ResetAsk() { askFrames_ = 0; }
+	void UpdateAuto();
+	// With overlays: PPSSPP's screens and the player's answers.
+	void UpdateInteractive();
+
+	// Drawing (PPSSPP's PSPSaveDialog).
+	void DisplayBanner(Banner which);
+	void DisplaySaveList(bool canMove = true);
+	void DisplaySaveIcon(bool checkExists);
+	void DisplaySaveDataInfo1();
+	void DisplaySaveDataInfo2(bool showNewData = false);
+	void DisplayMessage(std::string_view text, bool hasYesNo = false);
+	std::shared_ptr<const ppge::Texture> SaveIcon(int idx);
+	void Finish(s32 result);
 
 	DisplayState display_ = DS_NONE;
 	Savedata param_;
@@ -73,11 +89,14 @@ private:
 	SavedataRequest ioResult_{};
 	int ioSaveId_ = 0;
 	std::string ioSaveDirName_, ioListSaveDirName_, ioDeleteDir_;
+	int ioShownUpdates_ = 0;  // how long the progress screen has been up
 
-	std::shared_ptr<prompt::State> prompt_;
 	int askFrames_ = 0;
 	// A visible mode has done its save/load/delete (headless then backs out of any list).
 	bool actionDone_ = false;
+
+	int upFramesHeld_ = 0, downFramesHeld_ = 0;
+	std::map<std::string, std::shared_ptr<const ppge::Texture>> icons_;
 };
 
 }  // namespace utility

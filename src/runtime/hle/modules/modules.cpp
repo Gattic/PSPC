@@ -27,6 +27,7 @@ void RegisterAllModules() {
 	Register_sceUtility();
 	Register_Misc();
 	Register_M33();
+	Register_KernelClib();
 	Register_VshLibraries();
 }
 

@@ -6,16 +6,21 @@
 // measured them.
 #include "runtime/hle/modules/rtc.h"
 
+#include <windows.h>
+
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <string>
 
+#include "common/log.h"
 #include "runtime/hle/hle_wrap.h"
 #include "runtime/hle/modules/modules.h"
 #include "runtime/kernel/errors.h"
+#include "runtime/io/io.h"
 #include "runtime/kernel/scheduler.h"
+#include "runtime/vsh.h"
 
 namespace {
 
@@ -43,6 +48,54 @@ static_assert(sizeof(PspDateTime) == 16, "ScePspDateTime");
 
 bool g_baseSet = false;
 u64 g_baseUnixUs = 0;  // host time at boot, whole seconds
+
+// The PSP's own clock, as System Settings > Date & Time set it: an offset from the host clock and
+// the time zone (sceRtcSetConf), kept in flash1:/pspc_rtc.txt. Like the XMB's registry
+// (flash1:/registry/pspc.reg) they apply to the XMB and the games it launches; a game started on
+// its own runs on the host clock, so test results don't depend on XMB use.
+constexpr const char *kClockFile = "flash1:/pspc_rtc.txt";
+bool g_clockLoaded = false;
+s64 g_clockOffsetUs = 0;
+bool g_zoneSet = false;
+s32 g_zoneMinutes = 0;  // time zone + daylight saving, minutes east of UTC
+
+void LoadClock() {
+	if (g_clockLoaded) return;
+	g_clockLoaded = true;
+	if (!vsh::Active() && !vsh::ReturnToXmb()) return;
+	std::vector<u8> data;
+	if (!io::ReadFile(kClockFile, data)) return;
+	const std::string text(data.begin(), data.end());
+	size_t pos = 0;
+	while (pos < text.size()) {
+		size_t end = text.find('\n', pos);
+		if (end == std::string::npos) end = text.size();
+		const std::string line = text.substr(pos, end - pos);
+		pos = end + 1;
+		if (line.rfind("offset_us=", 0) == 0) g_clockOffsetUs = strtoll(line.c_str() + 10, nullptr, 10);
+		if (line.rfind("zone_minutes=", 0) == 0) {
+			g_zoneMinutes = (s32)strtol(line.c_str() + 13, nullptr, 10);
+			g_zoneSet = true;
+		}
+	}
+}
+
+void SaveClock() {
+	char text[256];
+	int n = snprintf(text, sizeof(text),
+	                 "# The PSP clock set in the XMB (System Settings > Date & Time): microseconds ahead of\n"
+	                 "# the host clock, and the time zone in minutes east of UTC. Delete to follow the host.\n"
+	                 "offset_us=%lld\n", (long long)g_clockOffsetUs);
+	if (g_zoneSet) snprintf(text + n, sizeof(text) - n, "zone_minutes=%d\n", g_zoneMinutes);
+	std::shared_ptr<io::Device> dev = io::MountedDevice("flash1");
+	int h = dev ? dev->Open("/pspc_rtc.txt", io::PSP_O_WRONLY | io::PSP_O_CREAT | io::PSP_O_TRUNC, 0777) : -1;
+	if (h < 0) {
+		LOGW("RTC", "Cannot write %s", kClockFile);
+		return;
+	}
+	dev->Write(h, text, (s64)strlen(text));
+	dev->Close(h);
+}
 
 u64 BaseUnixUs() {
 	if (!g_baseSet) {
@@ -184,6 +237,8 @@ u32 sceRtcGetCurrentClock(u32 ptr, int tz) {
 }
 
 u32 sceRtcGetCurrentClockLocalTime(u32 ptr) {
+	LoadClock();
+	if (g_zoneSet) return sceRtcGetCurrentClock(ptr, g_zoneMinutes);
 	const u64 unixUs = rtc::NowUnixUs();
 	const time_t sec = (time_t)(unixUs / 1000000ULL);
 	tm local{};
@@ -240,16 +295,64 @@ u32 sceRtcGetDaysInMonth(u32 year, u32 month) {
 
 u32 sceRtcIsLeapYear(u32 year) { return IsLeapYear(year) ? 1 : 0; }
 
+// The local time's offset from UTC: the time zone the XMB set (sceRtcSetConf), else the host's.
+s64 LocalOffsetUs() {
+	LoadClock();
+	return g_zoneSet ? (s64)g_zoneMinutes * 60000000LL : rtc::StandardOffsetUs();
+}
+
 int sceRtcConvertLocalTimeToUTC(u32 localPtr, u32 utcPtr) {
 	if (!Valid(localPtr, 8) || !Valid(utcPtr, 8)) return 1;
-	Write64(utcPtr, Read64(localPtr) - (u64)rtc::StandardOffsetUs());
+	Write64(utcPtr, Read64(localPtr) - (u64)LocalOffsetUs());
 	return 0;
 }
 
 int sceRtcConvertUtcToLocalTime(u32 utcPtr, u32 localPtr) {
 	if (!Valid(localPtr, 8) || !Valid(utcPtr, 8)) return 1;
-	Write64(localPtr, Read64(utcPtr) + (u64)rtc::StandardOffsetUs());
+	Write64(localPtr, Read64(utcPtr) + (u64)LocalOffsetUs());
 	return 0;
+}
+
+// sceRtcSetCurrentTick (kernel; System Settings > Date & Time through sceVshBridge): the clock
+// becomes `tick` (UTC); PSPC keeps the difference from the host clock.
+int sceRtcSetCurrentTick(u32 tickPtr) {
+	if (!tickPtr) return (int)0x80000103;
+	if (!Valid(tickPtr, 8)) return (int)0x80000023;
+	LoadClock();
+	const s64 want = (s64)(Read64(tickPtr) - kMagicOffset);
+	g_clockOffsetUs += want - (s64)rtc::NowUnixUs();
+	LOGI("RTC", "Clock set: %+lld s from the host clock", (long long)(g_clockOffsetUs / 1000000));
+	SaveClock();
+	return 0;
+}
+
+// sceRtcSetConf (kernel): the date and time formats, and the time zone and daylight saving
+// offsets (minutes) that local time adds to UTC.
+int sceRtcSetConf(int dateFormat, int timeFormat, int zoneMinutes, int dstMinutes) {
+	(void)dateFormat;
+	(void)timeFormat;
+	LoadClock();
+	// The XMB's default zone is the host's (reg.cpp): then local time keeps following the host
+	// (daylight saving changes included); another zone the user picked takes over.
+	TIME_ZONE_INFORMATION tzi{};
+	const DWORD r = GetTimeZoneInformation(&tzi);
+	const s32 host = -(s32)(tzi.Bias + (r == TIME_ZONE_ID_DAYLIGHT ? tzi.DaylightBias : tzi.StandardBias));
+	const s32 zone = zoneMinutes + dstMinutes;
+	const bool set = zone != host;
+	if (set != g_zoneSet || (set && g_zoneMinutes != zone)) {
+		g_zoneSet = set;
+		g_zoneMinutes = zone;
+		SaveClock();
+		LOGI("RTC", set ? "Time zone set: UTC%+d min" : "Time zone: the host's (UTC%+d min)", zone);
+	}
+	return 0;
+}
+
+// sceRtcGetCurrentSecureTick (kernel): no secure (network) time was ever set.
+int sceRtcGetCurrentSecureTick(u32 tickPtr) {
+	if (!Valid(tickPtr, 8)) return (int)0x80000023;
+	Write64(tickPtr, 0x00DDDEF8B3A14000ULL);
+	return (int)0x80000001;
 }
 
 int sceRtcCheckValid(u32 ptr) {
@@ -588,10 +691,10 @@ bool FormatArgsValid(u32 outPtr, u32 srcTickPtr) { return Valid(outPtr, 32) && V
 int sceRtcFormatRFC2822(u32 o, u32 t, int tz) { return FormatArgsValid(o, t) ? FormatRFC2822(o, t, tz) : -1; }
 int sceRtcFormatRFC3339(u32 o, u32 t, int tz) { return FormatArgsValid(o, t) ? FormatRFC3339(o, t, tz) : -1; }
 int sceRtcFormatRFC2822LocalTime(u32 o, u32 t) {
-	return FormatArgsValid(o, t) ? FormatRFC2822(o, t, (int)(rtc::StandardOffsetUs() / 60000000)) : -1;
+	return FormatArgsValid(o, t) ? FormatRFC2822(o, t, (int)(LocalOffsetUs() / 60000000)) : -1;
 }
 int sceRtcFormatRFC3339LocalTime(u32 o, u32 t) {
-	return FormatArgsValid(o, t) ? FormatRFC3339(o, t, (int)(rtc::StandardOffsetUs() / 60000000)) : -1;
+	return FormatArgsValid(o, t) ? FormatRFC3339(o, t, (int)(LocalOffsetUs() / 60000000)) : -1;
 }
 
 // ---------------------------------------------------------------- fixed times and the alarm
@@ -628,7 +731,10 @@ int sceRtcUnregisterCallback(SceUID cb) {
 
 namespace rtc {
 
-u64 NowUnixUs() { return BaseUnixUs() + sched::NowUs(); }
+u64 NowUnixUs() {
+	LoadClock();
+	return (u64)((s64)BaseUnixUs() + g_clockOffsetUs) + sched::NowUs();
+}
 
 s64 StandardOffsetUs() {
 	_tzset();
@@ -694,6 +800,10 @@ void Register_sceRtc() {
 		HLEFN(0x68AED59A, sceRtcSetAlarmTick), HLEFN(0xADAF231F, sceRtcSetAlarmTick),
 		HLEFN(0x55AC1C23, sceRtcSetAlarmTick), HLEFN(0x827BCB3F, sceRtcSetAlarmTick),
 		HLEFN(0x329E8E3A, sceRtcSetAlarmTick),
+		// 4.01's kernel exports (rtc.prx), reached by the XMB through sceVshBridge.
+		HLEFN(0x38D062F0, sceRtcSetCurrentTick), HLEFN(0x9763C138, sceRtcSetCurrentTick),
+		HLEFN(0x8EB1DEAC, sceRtcSetConf),
+		HLEFN(0x8D9645A2, sceRtcGetCurrentSecureTick), HLEFN(0xB44BDAED, sceRtcGetCurrentSecureTick),
 	};
 	hle::RegisterModule("sceRtc_driver", funcs);
 	hle::RegisterModule("sceRtc_driver", driver);

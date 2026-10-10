@@ -5,6 +5,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "common/common.h"
 
@@ -20,6 +21,11 @@ void SetActive(bool active);
 // `recovery` (or R held at boot, as M33 checks it): M33's recovery menu
 // (flash0:/vsh/module/recovery.prx) boots instead of the XMB.
 int Boot(bool recovery = false);
+
+// The vshmain_args block the XMB passed to the game it launched (LoadExecVSH*), handed back to
+// vshmain's module_start when the game exits to the XMB, as LoadExec does: the XMB then knows it
+// isn't a cold boot (no UMD auto-start) and returns to the item it launched.
+void SetVshmainArgs(std::vector<u8> args);
 
 // The firmware's VSH modules aren't installed (no flash0:/vsh/module/vshmain.prx).
 bool FirmwareMissing(std::string *why);

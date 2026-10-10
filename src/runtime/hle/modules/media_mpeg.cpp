@@ -149,8 +149,34 @@ const u8 defaultMpegheader[2048] = {
     0x01, 0x00, 0x00, 0x00, 0x22, 0x00, 0x02, 0xe0, 0x00, 0x20, 0xfb, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1e,
     0x11, 0x00, 0x00, 0xbd, 0x00, 0x20, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02};
 
+// Memory Stick Video (sceMpegCreate modes 4 to 6, see sceMpegGetAvcNalAu below): the access unit
+// sceMpegGetAvcNalAu built and the decoder it goes to. The pictures are left in Media Engine
+// memory, a few frame buffer sets in turn, as the ME's decoded picture buffer would.
+constexpr int kNalFrameSets = 4;
+struct NalState {
+	std::vector<u8> au;  // Annex B
+	media::H264Decoder decoder;
+	bool decoderFailed = false;
+	u32 frames[kNalFrameSets] = {};
+	int framesW = 0, framesH = 0;
+	int nextSet = 0;
+	int decoded = 0;
+
+	NalState() = default;
+	NalState(const NalState &) = delete;
+	NalState &operator=(const NalState &) = delete;
+	~NalState() {
+		for (u32 f : frames)
+			if (f) MERelease(f);
+	}
+};
+
 struct MpegContext {
 	MpegContext() { memcpy(mpegheader, defaultMpegheader, 2048); }
+
+	u32 workArea = 0;    // the memory given to sceMpegCreate
+	int createMode = 0;  // its mode argument
+	std::unique_ptr<NalState> nal;
 
 	u8 mpegheader[2048];
 	u32 defaultFrameWidth = 0;
@@ -331,7 +357,6 @@ u32 sceMpegRingbufferConstruct(u32 ringbufferAddr, u32 numPackets, u32 data, u32
 u32 MpegRequiredMem() { return g_mpegLibVersion < 0x0105 ? MPEG_MEMSIZE_0104 : MPEG_MEMSIZE_0105; }
 
 u32 sceMpegCreate(u32 mpegAddr, u32 dataPtr, u32 size, u32 ringbufferAddr, u32 frameWidth, u32 mode, u32 ddrTop) {
-	(void)mode;
 	(void)ddrTop;
 	EnsureInit();
 	// pspautotests intr/delays.
@@ -374,6 +399,8 @@ u32 sceMpegCreate(u32 mpegAddr, u32 dataPtr, u32 size, u32 ringbufferAddr, u32 f
 
 	ctx->mpegRingbufferAddr = ringbufferAddr;
 	ctx->handle = mpegHandle;
+	ctx->workArea = dataPtr;
+	ctx->createMode = (int)mode;
 	ctx->videoPixelMode = GE_CMODE_32BIT_ABGR8888;
 	ctx->defaultFrameWidth = frameWidth;
 	// Detailed "analysis" is done later in Query* for some reason.
@@ -506,9 +533,253 @@ void UpdateAvail(MpegContext *ctx, SceMpegRingBuffer *ring, s32 beforeAvail) {
 	}
 }
 
+// ---- Memory Stick Video: AVC out of MP4 files ----
+//
+// msvideo_main_plugin demuxes MP4 files itself (sceMpegCreate mode 4 or 5) and hands the decoder
+// one access unit at a time as length-prefixed NAL units, with the SPS and PPS from the avcC box
+// (sceMpegGetAvcNalAu). The picture comes back through the structure sceMpegAvcDecodeDetail2
+// points at: msvideo copies it out of the ME's frame buffers with sceMpegBaseYCrCbCopy and
+// converts it with sceMpegBaseCscAvc. Layouts as mpeg_vsh.prx 4.01 builds them and
+// msvideo_main_plugin reads them.
+
+bool IsNalMode(const MpegContext *ctx) { return ctx->createMode >= 4 && ctx->createMode <= 6; }
+
+NalState &Nal(MpegContext *ctx) {
+	if (!ctx->nal) ctx->nal = std::make_unique<NalState>();
+	return *ctx->nal;
+}
+
+// What sceMpegGetAvcNalAu reads.
+struct SceMpegAvcNal {
+	u32 sps, spsSize;
+	u32 pps, ppsSize;
+	u32 prefixSize;  // 1, 2 or 4: the big-endian length in front of every NAL unit
+	u32 nal, nalSize;
+	u32 mode;        // bit 0: put the SPS in front, bit 1: the PPS
+};
+static_assert(sizeof(SceMpegAvcNal) == 32, "SceMpegAvcNal layout");
+
+// The structure sceMpegAvcDecodeDetail2 hands out, kept in the work area given to sceMpegCreate.
+constexpr u32 kNalDetailOffset = 0x1000;
+enum : u32 {
+	NAL_DETAIL = 0x00,   // +0x10 picture info, +0x2c frame buffers, +0x30 VUI (pointers to the below)
+	NAL_INFO = 0x40,     // as sceMpegAvcDecodeDetail: result, count, width, height (pixels), crop
+	                     // left/right/top/bottom, pictures this decode
+	NAL_BUFFERS = 0x80,  // the eight frame buffers (as SceMp4AvcCscStruct's), pts, two SEI pointers
+	NAL_VUI = 0xC0,      // [0] aspect_ratio_info_present, [1] aspect_ratio_idc, +4/+8 SAR, ...
+	NAL_AREA_SIZE = 0x124,
+};
+
+u32 NalDetailAddr(const MpegContext *ctx) { return ctx->workArea + kNalDetailOffset; }
+
+void NalWriteDetail(MpegContext *ctx, const u32 *buffers, int width, int height, int cropRight, int cropBottom,
+                    int pictures, s64 pts) {
+	const u32 base = NalDetailAddr(ctx);
+	u8 *p = mem::GetPointer(base, NAL_AREA_SIZE);
+	if (!p) return;
+	memset(p + NAL_DETAIL, 0, NAL_INFO - NAL_DETAIL);
+	GWrite32(base + NAL_DETAIL + 0x10, base + NAL_INFO);
+	GWrite32(base + NAL_DETAIL + 0x2c, base + NAL_BUFFERS);
+	GWrite32(base + NAL_DETAIL + 0x30, base + NAL_VUI);
+	GWrite32(base + NAL_INFO + 0x00, MPEG_AVC_DECODE_SUCCESS);
+	GWrite32(base + NAL_INFO + 0x04, (u32)ctx->videoFrameCount);
+	GWrite32(base + NAL_INFO + 0x20, (u32)pictures);
+	GWrite32(base + NAL_INFO + 0x24, 0);
+	if (!buffers) return;  // no new picture: the last one stays described
+	GWrite32(base + NAL_INFO + 0x08, (u32)width);
+	GWrite32(base + NAL_INFO + 0x0c, (u32)height);
+	GWrite32(base + NAL_INFO + 0x10, 0);
+	GWrite32(base + NAL_INFO + 0x14, (u32)cropRight);
+	GWrite32(base + NAL_INFO + 0x18, 0);
+	GWrite32(base + NAL_INFO + 0x1c, (u32)cropBottom);
+	for (int i = 0; i < 8; i++) GWrite32(base + NAL_BUFFERS + i * 4, buffers[i]);
+	GWrite32(base + NAL_BUFFERS + 0x20, (u32)pts);
+	GWrite32(base + NAL_BUFFERS + 0x24, 0);
+	GWrite32(base + NAL_BUFFERS + 0x28, 0);
+	memset(p + NAL_VUI, 0, NAL_AREA_SIZE - NAL_VUI);  // no aspect ratio information: square pixels
+}
+
+// Puts a decoded picture into the next frame buffer set and describes it. False if there is no
+// room in ME memory.
+bool NalPublish(MpegContext *ctx, const media::YuvFrame &f) {
+	NalState &st = Nal(ctx);
+	const int w = (f.width + 15) & ~15, h = (f.height + 15) & ~15;
+	u32 offsets[8];
+	int sizes[8];
+	const u32 total = media::FrameBufferLayout(w, h, sizes, offsets);
+	if (total == 0) return false;
+	if (w != st.framesW || h != st.framesH) {
+		for (u32 &set : st.frames) {
+			if (set) MERelease(set);
+			set = 0;
+		}
+		st.framesW = w;
+		st.framesH = h;
+	}
+	u32 &set = st.frames[st.nextSet];
+	st.nextSet = (st.nextSet + 1) % kNalFrameSets;
+	if (!set) set = MEAllocate(total);
+	if (!set) {
+		LOGE("MPEG", "No room in ME memory for a %dx%d picture", w, h);
+		return false;
+	}
+	u32 buffers[8];
+	u8 *dst[8];
+	for (int i = 0; i < 8; i++) {
+		buffers[i] = set + offsets[i];
+		dst[i] = sizes[i] > 0 ? MEGetPointerRange(buffers[i], (u32)sizes[i]) : nullptr;
+	}
+	if (w == f.width && h == f.height) {
+		media::TileYCbCr(dst, sizes, f.y.data(), f.cb.data(), f.cr.data(), f.width, f.width / 2, w, h);
+	} else {
+		// Pad to whole macroblocks by repeating the last row and column, as the cropped-off part.
+		std::vector<u8> y((size_t)w * h), cb((size_t)(w / 2) * (h / 2)), cr(cb.size());
+		for (int row = 0; row < h; row++) {
+			const u8 *src = f.y.data() + (size_t)std::min(row, f.height - 1) * f.width;
+			u8 *out = y.data() + (size_t)row * w;
+			memcpy(out, src, f.width);
+			memset(out + f.width, src[f.width - 1], w - f.width);
+		}
+		const int cw = f.width / 2, ch = f.height / 2;
+		for (int row = 0; row < h / 2; row++) {
+			const size_t from = (size_t)std::min(row, ch - 1) * cw;
+			u8 *ob = cb.data() + (size_t)row * (w / 2), *orr = cr.data() + (size_t)row * (w / 2);
+			memcpy(ob, f.cb.data() + from, cw);
+			memcpy(orr, f.cr.data() + from, cw);
+			memset(ob + cw, f.cb[from + cw - 1], w / 2 - cw);
+			memset(orr + cw, f.cr[from + cw - 1], w / 2 - cw);
+		}
+		media::TileYCbCr(dst, sizes, y.data(), cb.data(), cr.data(), w, w / 2, w, h);
+	}
+	NalWriteDetail(ctx, buffers, w, h, w - f.width, h - f.height, 1, f.pts);
+	return true;
+}
+
+// The next picture the decoder has ready, if any, published. Returns the frame status.
+int NalTakePicture(MpegContext *ctx) {
+	NalState &st = Nal(ctx);
+	media::YuvFrame f;
+	int status = 0;
+	if (st.decoder.IsOpen() && st.decoder.PopFrame(&f) && f.Valid() && NalPublish(ctx, f)) status = 1;
+	if (status) {
+		ctx->videoFrameCount++;
+	} else {
+		NalWriteDetail(ctx, nullptr, 0, 0, 0, 0, 0, 0);
+	}
+	ctx->avc.avcFrameStatus = status;
+	ctx->avc.avcDecodeResult = MPEG_AVC_DECODE_SUCCESS;
+	return status;
+}
+
+u32 sceMpegGetAvcNalAu(u32 mpeg, u32 nalAddr, u32 auAddr) {
+	MpegContext *ctx = getMpegCtx(mpeg);
+	if (!ctx) return (u32)-1;
+	if (!mem::IsValidRange(nalAddr, sizeof(SceMpegAvcNal)) || !mem::IsValidRange(auAddr, sizeof(SceMpegAu)))
+		return SCE_MPEG_ERROR_INVALID_VALUE;
+	SceMpegAvcNal n;
+	memcpy(&n, GPtr(nalAddr), sizeof(n));
+	GWrite32(auAddr + 0x14, 0);  // esSize
+	if (n.prefixSize == 0 || (n.prefixSize > 2 && n.prefixSize != 4)) return SCE_MPEG_ERROR_INVALID_VALUE;
+	NalState &st = Nal(ctx);
+	st.au.clear();
+	static const u8 kStartCode[4] = {0, 0, 0, 1};
+	auto put = [&](const u8 *p, u32 n) { st.au.insert(st.au.end(), p, p + n); };
+	bool started = false;
+	if ((n.mode & 1) && n.sps) {
+		const u8 *sps = mem::GetPointer(n.sps, n.spsSize);
+		if (!sps) return SCE_MPEG_ERROR_INVALID_VALUE;
+		put(kStartCode, 4);
+		put(sps, n.spsSize);
+		started = true;
+	}
+	if ((n.mode & 2) && n.pps) {
+		const u8 *pps = mem::GetPointer(n.pps, n.ppsSize);
+		if (!pps) return SCE_MPEG_ERROR_INVALID_VALUE;
+		put(kStartCode, 4);
+		put(pps, n.ppsSize);
+		started = true;
+	}
+	int left = (int)n.nalSize;
+	const u8 *p = left > 0 ? mem::GetPointer(n.nal, n.nalSize) : nullptr;
+	if (left > 0 && !p) return SCE_MPEG_ERROR_INVALID_VALUE;
+	while (left > 0) {
+		u32 len = 0;
+		for (u32 i = 0; i < n.prefixSize; i++) len = len << 8 | p[i];
+		left -= (int)(n.prefixSize + len);
+		if (left < 0 || len == 0) {
+			st.au.clear();
+			return 0x80618007;
+		}
+		const u8 *unit = p + n.prefixSize;
+		// A four byte start code at the front and before parameter sets, three elsewhere.
+		const int skip = started && (unsigned)((unit[0] & 0x1f) - 7) >= 2 ? 1 : 0;
+		put(kStartCode + skip, 4 - skip);
+		put(unit, len);
+		started = true;
+		p = unit + len;
+	}
+	GWrite32(auAddr + 0x14, (u32)st.au.size());
+	return 0;
+}
+
+u32 NalDecode(MpegContext *ctx, u32 initAddr) {
+	NalState &st = Nal(ctx);
+	if (!st.au.empty() && !st.decoderFailed) {
+		if (!st.decoder.IsOpen() && !st.decoder.Open()) {
+			LOGE("MPEG", "No H.264 decoder for Memory Stick Video");
+			st.decoderFailed = true;
+		} else {
+			// msvideo leaves the AU's timestamps alone: number the access units instead.
+			st.decoder.Decode(st.au.data(), (int)st.au.size(), (s64)st.decoded * videoTimestampStep);
+			st.decoded++;
+		}
+	}
+	st.au.clear();
+	const int status = NalTakePicture(ctx);
+	W32(initAddr, (u32)status);
+	return MEDelay(0, st.decoded <= 1 ? avcFirstDelayUs : avcDecodeDelayUs);
+}
+
+int sceMpegAvcDecodeDetail2(u32 mpeg, u32 detailPtrAddr) {
+	MpegContext *ctx = getMpegCtx(mpeg);
+	if (!ctx) return -1;
+	if (!IsValid4Aligned(detailPtrAddr)) return (int)SCE_MPEG_ERROR_INVALID_VALUE;
+	if (!mem::IsValidRange(NalDetailAddr(ctx), NAL_AREA_SIZE)) return -1;
+	if (!IsNalMode(ctx)) LOGW("MPEG", "sceMpegAvcDecodeDetail2 outside MP4 mode (%d): picture not described", ctx->createMode);
+	if (GRead32(NalDetailAddr(ctx) + NAL_DETAIL + 0x10) == 0) NalWriteDetail(ctx, nullptr, 0, 0, 0, 0, 0, 0);
+	GWrite32(detailPtrAddr, NalDetailAddr(ctx));
+	return 0;
+}
+
+// One picture of the last decode: result, pts, width, height, crop left/right/top/bottom, pictures.
+int sceMpegAvcDecodeDetailIndex(u32 mpeg, int index, u32 outAddr) {
+	MpegContext *ctx = getMpegCtx(mpeg);
+	if (!ctx) return -1;
+	const u32 base = NalDetailAddr(ctx);
+	if (!mem::IsValidRange(base, NAL_AREA_SIZE) || !mem::IsValidRange(outAddr, 9 * 4)) return (int)SCE_MPEG_ERROR_INVALID_VALUE;
+	if (GRead32(base + NAL_DETAIL + 0x10) == 0) NalWriteDetail(ctx, nullptr, 0, 0, 0, 0, 0, 0);
+	if (index < 0 || index >= (int)GRead32(base + NAL_INFO + 0x20)) return (int)SCE_MPEG_ERROR_INVALID_VALUE;
+	GWrite32(outAddr, GRead32(base + NAL_DETAIL + 8));
+	GWrite32(outAddr + 4, GRead32(base + NAL_BUFFERS + 0x20));
+	for (int i = 0; i < 7; i++) GWrite32(outAddr + 8 + i * 4, GRead32(base + NAL_INFO + 8 + i * 4));
+	return 0;
+}
+
+// Which of the described pictures the last decode produced (mpeg_vsh takes it from its state for
+// modes 3 to 6); always the first here.
+int sceMpeg_6F314410(u32 mpeg, u32 outAddr) {
+	MpegContext *ctx = getMpegCtx(mpeg);
+	if (!ctx) return -1;
+	if (ctx->createMode < 3 || ctx->createMode > 6) return (int)SCE_MPEG_ERROR_INVALID_VALUE;
+	if (!IsValid4Aligned(outAddr)) return (int)SCE_MPEG_ERROR_INVALID_VALUE;
+	GWrite32(outAddr, 0);
+	return 0;
+}
+
 u32 sceMpegAvcDecode(u32 mpeg, u32 auAddr, u32 frameWidth, u32 bufferAddr, u32 initAddr) {
 	MpegContext *ctx = getMpegCtx(mpeg);
 	if (!ctx) return (u32)-1;
+	if (IsNalMode(ctx)) return NalDecode(ctx, initAddr);
 	if (frameWidth == 0) {  // Go Sudoku passes 0xcccccccc
 		frameWidth = ctx->defaultFrameWidth ? ctx->defaultFrameWidth : (u32)ctx->avc.avcDetailFrameWidth;
 	}
@@ -552,8 +823,15 @@ u32 sceMpegAvcDecode(u32 mpeg, u32 auAddr, u32 frameWidth, u32 bufferAddr, u32 i
 
 u32 sceMpegAvcDecodeStop(u32 mpeg, u32 frameWidth, u32 bufferAddr, u32 statusAddr) {
 	(void)frameWidth;
-	if (!mem::IsValidAddress(bufferAddr) || !mem::IsValidAddress(statusAddr)) return (u32)-1;
 	MpegContext *ctx = getMpegCtx(mpeg);
+	if (ctx && IsNalMode(ctx) && IsValid4Aligned(statusAddr)) {
+		// The pictures held back for reordering, one per call.
+		NalState &st = Nal(ctx);
+		if (st.decoder.IsOpen() && st.decoder.PendingFrames() == 0) st.decoder.Drain();
+		W32(statusAddr, (u32)NalTakePicture(ctx));
+		return 0;
+	}
+	if (!mem::IsValidAddress(bufferAddr) || !mem::IsValidAddress(statusAddr)) return (u32)-1;
 	if (!ctx) return (u32)-1;
 	// No last frame generated.
 	W32(statusAddr, 0);
@@ -648,6 +926,18 @@ int sceMpegAvcDecodeYCbCr(u32 mpeg, u32 auAddr, u32 bufferAddr, u32 initAddr) {
 u32 sceMpegAvcDecodeFlush(u32 mpeg) {
 	MpegContext *ctx = getMpegCtx(mpeg);
 	if (!ctx) return (u32)-1;
+	if (ctx->nal && ctx->nal->decoder.IsOpen()) ctx->nal->decoder.Flush();
+	return 0;
+}
+
+// Seeking in MP4 mode: what was fed in and not yet shown is dropped.
+u32 sceMpegFlushAu(u32 mpeg) {
+	MpegContext *ctx = getMpegCtx(mpeg);
+	if (!ctx) return (u32)-1;
+	if (ctx->nal) {
+		ctx->nal->au.clear();
+		if (ctx->nal->decoder.IsOpen()) ctx->nal->decoder.Flush();
+	}
 	return 0;
 }
 
@@ -1286,8 +1576,15 @@ int sceMpegBaseYCrCbCopy(u32 dstAddr, u32 srcAddr, int flags) {
 	SceMp4AvcCscStruct dst, src;
 	memcpy(&dst, GPtr(dstAddr), sizeof(dst));
 	memcpy(&src, GPtr(srcAddr), sizeof(src));
-	const int width = dst.width << 4;
-	const int height = dst.height << 4;
+	// The callers build the source descriptor on the stack with the size in pixels; the
+	// destination states it in macroblocks, when at all (msvideo_main_plugin leaves it unset).
+	int width = src.width, height = src.height;
+	if (width <= 0 || height <= 0 || width > 1024 || height > 1024) {
+		width = dst.width << 4;
+		height = dst.height << 4;
+	}
+	width = (width + 15) & ~15;
+	height = (height + 15) & ~15;
 	if (width <= 0 || height <= 0 || width > 1024 || height > 1024) return -1;
 	int sizes[8];
 	media::FrameBufferLayout(width, height, sizes, nullptr);
@@ -1364,13 +1661,14 @@ void Register_sceMpeg() {
 	    HLEFN(0xF5E7EA31, sceMpegAvcConvertToYuv420),
 	    HLEFN(0x01977054, sceMpegGetUserdataAu),
 	    HLEFN(0x3C37A7A6, sceMpegNextAvcRpAu),
-	    hle::HleFunction{0x11F95CF1, &hle::Wrap<&sceMpegCtxOnlyStub>, "sceMpegGetAvcNalAu", 0},
-	    hle::HleFunction{0xAB0E9556, &hle::Wrap<&sceMpegCtxOnlyStub>, "sceMpegAvcDecodeDetailIndex", 0},
-	    hle::HleFunction{0xCF3547A2, &hle::Wrap<&sceMpegCtxOnlyStub>, "sceMpegAvcDecodeDetail2", 0},
+	    HLEFN(0x11F95CF1, sceMpegGetAvcNalAu),
+	    HLEFN(0xAB0E9556, sceMpegAvcDecodeDetailIndex),
+	    HLEFN(0xCF3547A2, sceMpegAvcDecodeDetail2),
+	    HLEFN(0x6F314410, sceMpeg_6F314410),
 	    hle::HleFunction{0x921FCCCF, &hle::Wrap<&sceMpegCtxOnlyStub>, "sceMpegGetAvcEsAu", 0},
 	    hle::HleFunction{0xE95838F6, &hle::Wrap<&sceMpegCtxOnlyStub>, "sceMpegAvcCscInfo", 0},
 	    hle::HleFunction{0xD1CE4950, &hle::Wrap<&sceMpegCtxOnlyStub>, "sceMpegAvcCscMode", 0},
-	    hle::HleFunction{0xDBB60658, &hle::Wrap<&sceMpegCtxOnlyStub>, "sceMpegFlushAu", 0},
+	    HLEFN(0xDBB60658, sceMpegFlushAu),
 	    HLESTUB(0xD4DD6E75, "sceMpeg_D4DD6E75"),
 	    HLESTUB(0x11CAB459, "sceMpeg_11CAB459"),
 	    HLESTUB(0xC345DED2, "sceMpeg_C345DED2"),

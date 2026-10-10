@@ -8,9 +8,13 @@
 #include "allegrex/guestmem.h"
 #include "common/log.h"
 #include "runtime/core/memory.h"
-#include "runtime/host/host.h"
+#include "runtime/dialogs/home_menu.h"
 #include "runtime/kernel/errors.h"
 #include "runtime/kernel/scheduler.h"
+
+namespace ctrl {
+u32 RawButtons();
+}
 
 namespace utility {
 
@@ -155,6 +159,7 @@ void Dialog::ChangeStatusShutdown(int delayUs) {
 
 int Dialog::Shutdown(bool force) {
 	ChangeStatus(force ? STATUS_NONE : STATUS_SHUTDOWN, 0);
+	ppge::Clear(ppge::Layer::Dialog);
 	return 0;
 }
 
@@ -189,12 +194,76 @@ void Dialog::UpdateFade(int animSpeed) {
 void Dialog::FinishFadeOut() { ChangeStatus(STATUS_FINISHED, 0); }
 
 void Dialog::UpdateButtons() {
-	u32 now = host::IsHeadless() ? 0 : host::GetCtrl().buttons;
+	// Not while the HOME menu is up.
+	u32 now = Headless() ? 0 : homemenu::FilterButtons(ctrl::RawButtons());
 	buttons_ = now & ~lastButtons_;  // newly pressed since the last Update
 	lastButtons_ = now;
 }
 
 bool Dialog::IsButtonPressed(u32 button) const { return !IsFadingOut() && (buttons_ & button) != 0; }
+
+bool Dialog::IsButtonHeld(u32 button, int &framesHeld, int threshold, int repeatRate) const {
+	// Held since the last Update too (not just pressed).
+	if (!IsFadingOut() && (lastButtons_ & button) && !(buttons_ & button)) {
+		framesHeld++;
+	} else {
+		framesHeld = 0;
+		return false;
+	}
+	return framesHeld >= threshold && (framesHeld % repeatRate) == 0;
+}
+
+// ---- drawing
+
+void Dialog::StartDraw() {
+	ppge::Begin(ppge::Layer::Dialog);
+	ppge::DrawRect(0, 0, 480, 272, CalcFadedColor(0x20000000));
+}
+
+void Dialog::EndDraw() { ppge::End(); }
+
+u32 Dialog::CalcFadedColor(u32 color) const {
+	u32 alpha = (color >> 24) * fadeValue_ / 255;
+	return (color & 0x00FFFFFF) | (alpha << 24);
+}
+
+ppge::Style Dialog::FadedStyle(ppge::Align align, float scale) const {
+	ppge::Style s;
+	s.align = align;
+	s.scale = scale;
+	s.color = CalcFadedColor(s.color);
+	s.hasShadow = true;
+	s.shadowColor = CalcFadedColor(s.shadowColor);
+	return s;
+}
+
+ppge::Style Dialog::FadedImageStyle() const {
+	ppge::Style s;
+	s.color = CalcFadedColor(s.color);
+	return s;
+}
+
+void Dialog::DisplayButtons(int flags, std::string_view caption) {
+	char safeCaption[65] = {0};
+	const bool useCaption = !caption.empty();
+	if (useCaption) memcpy(safeCaption, caption.data(), std::min<size_t>(caption.size(), 64));
+	ppge::Style textStyle = FadedStyle(ppge::BOX_LEFT, 0.55f);
+	const DialogCommon *common = const_cast<Dialog *>(this)->GetCommonParam();
+	if (!common) return;
+	float x1 = 183.5f, x2 = 261.5f;
+	if (common->buttonSwap == 1) {
+		x1 = 261.5f;
+		x2 = 183.5f;
+	}
+	if (flags & DS_BUTTON_OK) {
+		ppge::DrawIcon(OkIcon(), x2, 256, 11.5f, 11.5f, textStyle);
+		ppge::DrawString(useCaption ? safeCaption : "Enter", x2 + 14.5f, 252, textStyle);
+	}
+	if (flags & DS_BUTTON_CANCEL) {
+		ppge::DrawIcon(CancelIcon(), x1, 256, 11.5f, 11.5f, textStyle);
+		ppge::DrawString(useCaption ? safeCaption : "Back", x1 + 14.5f, 252, textStyle);
+	}
+}
 
 int Dialog::CheckRequest(u32 addr, std::initializer_list<u32> sizes) {
 	if (!mem::IsValidRange(addr, sizeof(DialogCommon))) return (int)SCE_ERROR_UTILITY_INVALID_ADDRESS;
@@ -206,5 +275,24 @@ int Dialog::CheckRequest(u32 addr, std::initializer_list<u32> sizes) {
 
 u32 Dialog::GetConfirmButton() { return SystemButtonPreference() == 1 ? CTRL_CROSS : CTRL_CIRCLE; }
 u32 Dialog::GetCancelButton() { return SystemButtonPreference() == 1 ? CTRL_CIRCLE : CTRL_CROSS; }
+
+// The layout of PPSSPP's network dialog (Core/Dialog/PSPNetconfDialog.cpp).
+void Dialog::DisplayStatusScreen(std::string_view title, std::string_view message, int buttons, float progress) {
+	StartDraw();
+	ppge::DrawRect(0, 0, 480, 272, CalcFadedColor(0xC0C8B2AC));
+	ppge::DrawRect(0, 0, 480, 22, CalcFadedColor(0x65636358));
+	ppge::Style bannerStyle = FadedStyle(ppge::BOX_VCENTER, 0.6f);
+	bannerStyle.hasShadow = false;
+	ppge::DrawIcon(ppge::Icon::Hexagon, 10, 5, 11.0f, 11.0f, FadedImageStyle());
+	ppge::DrawString(title, 31, 10, bannerStyle);
+	ppge::DrawStringWrapped(message, 241, 132, 360.0f, 0, FadedStyle(ppge::BOX_CENTER, 0.55f));
+	if (progress >= 0.0f) {
+		const float x1 = 140, x2 = 340, y = 175;
+		ppge::DrawRect(x1, y, x2, y + 6, CalcFadedColor(0x60000000));
+		ppge::DrawRect(x1, y, x1 + (x2 - x1) * std::min(progress, 1.0f), y + 6, CalcFadedColor(0xFFFFFFFF));
+	}
+	if (buttons) DisplayButtons(buttons);
+	EndDraw();
+}
 
 }  // namespace utility

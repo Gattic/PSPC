@@ -80,7 +80,8 @@ SceUID LoadFromBytes(const std::vector<u8> &data, const std::string &path, u32 o
 	}
 	if (IsFirmwareKernelModule(data, path)) return MakePlaceholderModule(name.empty() ? path : name, path);
 	LoadOptions opts;
-	(void)optPtr;
+	// SceKernelLMOption: u32 size, mpidtext, mpiddata, flags; u8 position, access; u8 reserved[2].
+	if (optPtr && mem::IsValidRange(optPtr, 12) && GRead32(optPtr) >= 12) opts.partition = (int)GRead32(optPtr + 4);
 	return LoadModuleFromMemory(data, path, opts);
 }
 
@@ -405,4 +406,9 @@ void Register_LoadExecForUser() {
 	};
 	hle::RegisterModule("LoadExecForUser", funcs);
 	hle::RegisterModule("LoadExecForKernel", funcs);
+	// Kernel plugins quit the game to the XMB with it (DarkFrost's "exit game").
+	static const hle::HleFunction kfuncs[] = {
+		HLEFN(0xA3D5E142, sceKernelExitGame),  // sceKernelExitVSHVSH(param)
+	};
+	hle::RegisterModule("LoadExecForKernel", kfuncs);
 }

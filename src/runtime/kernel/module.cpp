@@ -22,6 +22,7 @@
 #include "runtime/kernel/scheduler.h"
 #include "runtime/kernel/sysmem.h"
 #include "runtime/kernel/threads.h"
+#include "runtime/kernel/callbacks.h"
 
 namespace kernel {
 
@@ -252,6 +253,7 @@ void RegisterAotFunctions(PspModule *m) {
 void SetAotCacheDir(const std::string &dir) { g_aotDir = dir; }
 void SetAotEnabled(bool enabled) { g_aotEnabled = enabled; }
 void SetDecryptTool(const std::string &exe) { g_decryptTool = exe; }
+const std::string &DecryptToolPath() { return g_decryptTool; }
 bool DecryptWithTool(const std::vector<u8> &in, std::vector<u8> &out, std::string *err) { return RunDecryptTool(in, out, err); }
 void SetDecryptCacheDir(const std::string &dir) { g_decryptCache = dir; }
 const std::vector<SceUID> &LoadedModules() { return g_modules; }
@@ -289,10 +291,15 @@ SceUID LoadModuleFromMemory(const std::vector<u8> &input, const std::string &pat
 	u32 aotBase = 0;
 	bool aot = TryLoadAot(m, elf, &aotBase);
 
+	BlockAllocator *userAlloc = &g_userMem;
+	if (opts.partition && elf.Relocatable()) {
+		// The partition the load option asks for (the XMB's browser loads into volatile memory).
+		if (BlockAllocator *a = AllocatorForPartitionId(opts.partition, m->kernelMode)) userAlloc = a;
+	}
 	BlockAllocator &alloc = (m->kernelMode && elf.TotalStart() < 0x08800000 && !elf.Relocatable()) ||
 	                                (m->kernelMode && elf.Relocatable())
 	                            ? g_kernelMem
-	                            : g_userMem;
+	                            : *userAlloc;
 	u32 size = elf.TotalSize();
 	u32 base = 0;
 	if (!elf.Relocatable()) {
@@ -449,14 +456,29 @@ int RunModuleThread(PspModule *m, u32 entry, const ModuleThreadParams &p, u32 ar
 	                          nullptr, p.stackAlloc);
 	if (tid < 0) return tid;
 	PspThread *t = Get<PspThread>(tid);
-	t->deleteOnReturn = true;
-	t->onFirstRun = std::move(onFirstRun);
 	PspThread *caller = sched::Current();
-	if (wait && caller) t->endWaiters.push_back(caller->uid);
+	// A waiting caller collects the exit status and then deletes the thread itself: a start thread
+	// better than the caller runs inside StartThread, and if module_start returns at once (the
+	// XMB's netfront.prx) it has ended before the caller waits.
+	const bool collect = wait && caller;
+	t->deleteOnReturn = !collect;
+	t->onFirstRun = std::move(onFirstRun);
+	if (collect) t->endWaiters.push_back(caller->uid);
 	StartThread(t, argSize, argPtr);
-	if (wait && caller) {
-		s32 r = sched::Wait(WAITTYPE_THREADEND, tid, 0, false);
+	if (collect) {
+		PspThread *st = Get<PspThread>(tid);
+		s32 r = 0;
+		if (st && !(st->status & (THREADSTATUS_DORMANT | THREADSTATUS_DEAD))) r = sched::Wait(WAITTYPE_THREADEND, tid, 0, false);
+		else if (st) r = st->exitStatus;
 		if (exitStatus) *exitStatus = r;
+		st = Get<PspThread>(tid);
+		if (st && (st->status & THREADSTATUS_DORMANT)) {
+			DeleteThreadCallbacks(st);
+			FreeThreadStack(st);
+			sched::DeleteThread(st);
+		} else if (st) {
+			st->deleteOnReturn = true;  // the wait was cut short: it cleans up after itself
+		}
 	}
 	return 0;
 }
@@ -566,6 +588,63 @@ PspModule *ModuleByAddress(u32 addr) {
 		if (m && addr >= m->memAddr && addr < m->memAddr + m->memSize) return m;
 	}
 	return nullptr;
+}
+
+SceUID RegisterFirmwareModule(const std::string &name, u16 attr, u16 version, const std::vector<FirmwareExport> &libs) {
+	if (PspModule *m = ModuleByName(name)) return m->uid;
+	auto *m = new PspModule();
+	// One block: the entry table (syslib first, unnamed, as in every module), library names, each
+	// library's NIDs followed by its function addresses, then an 8-byte stub per function.
+	u32 entries = 16 * (u32)(libs.size() + 1), names = 0, tables = 0, stubs = 0;
+	for (const FirmwareExport &l : libs) {
+		names += ((u32)l.library.size() + 4) & ~3u;
+		tables += 8 * (u32)l.nids.size();
+		stubs += 8 * (u32)l.nids.size();
+	}
+	const u32 size = entries + names + tables + stubs;
+	const u32 base = AllocKernelMemory(size, name.c_str());
+	if (base) {
+		mem::Memset(base, 0, size);
+		u32 entry = base, name_ = base + entries, table = name_ + names, stub = table + tables;
+		GWrite16(entry + 6, 0x8000);  // syslib: no name, no functions
+		GWrite8(entry + 8, 4);
+		entry += 16;
+		for (const FirmwareExport &l : libs) {
+			const u32 n = (u32)l.nids.size();
+			mem::WriteBytes(name_, l.library.c_str(), (u32)l.library.size() + 1);
+			GWrite32(entry + 0, name_);
+			GWrite16(entry + 4, l.version);
+			GWrite16(entry + 6, l.attr);
+			GWrite8(entry + 8, 4);
+			GWrite8(entry + 9, 0);
+			GWrite16(entry + 10, (u16)n);
+			GWrite32(entry + 12, table);
+			for (u32 i = 0; i < n; i++) {
+				GWrite32(table + 4 * i, l.nids[i]);
+				GWrite32(table + 4 * (n + i), stub);
+				hle::PatchImportStub(stub, l.library, l.nids[i]);
+				stub += 8;
+			}
+			entry += 16;
+			name_ += ((u32)l.library.size() + 4) & ~3u;
+			table += 8 * n;
+		}
+		m->memAddr = base;
+		m->memSize = size;
+		m->image.modInfo.libent = base;
+		m->image.modInfo.libentEnd = base + entries;
+	}
+	m->name = name;
+	m->path = "flash0:/kd/" + name;
+	m->image.modInfo.attr = attr;
+	m->image.modInfo.version[0] = (u8)(version >> 8);
+	m->image.modInfo.version[1] = (u8)version;
+	memcpy(m->image.modInfo.name, name.c_str(), std::min<size_t>(name.size(), 27));
+	m->kernelMode = (attr & 0x1000) != 0;
+	m->status = MODULE_STATUS_STARTED;
+	SceUID id = Register(m);
+	g_modules.push_back(id);
+	return id;
 }
 
 PspModule *ModuleByName(const std::string &name) {

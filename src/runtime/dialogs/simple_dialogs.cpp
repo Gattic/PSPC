@@ -12,6 +12,7 @@
 #include "fs/param_sfo.h"
 #include "runtime/core/memory.h"
 #include "runtime/dialogs/save_fs.h"
+#include "runtime/hle/modules/net_hle.h"
 #include "runtime/kernel/errors.h"
 #include "runtime/kernel/sysmem.h"
 
@@ -42,6 +43,20 @@ constexpr int HEADLESS_ANSWER_UPDATES = 30;
 namespace {
 constexpr int NET_INIT_DELAY_US = 200000;
 constexpr int NET_SHUTDOWN_DELAY_US = 200000;
+
+// netAction values.
+constexpr s32 NETCONF_CONNECT_APNET = 0, NETCONF_STATUS_APNET = 1, NETCONF_CONNECT_ADHOC = 2,
+              NETCONF_CONNECT_APNET_LAST = 3, NETCONF_CREATE_ADHOC = 4, NETCONF_JOIN_ADHOC = 5;
+// Give up on a connection that isn't up after this many updates (about 30 s at 60 per second).
+constexpr int NETCONF_TIMEOUT_UPDATES = 1800;
+
+// The connection the dialog is making (one Netconf dialog runs at a time). connResult: 1 = not
+// asked yet, else what sceNetApctlConnect / sceNetAdhocctl* returned.
+struct NetconfFlow {
+	int connResult = 1;
+	std::string error;
+};
+NetconfFlow g_netconfFlow;
 }  // namespace
 
 int NetconfDialog::Init(u32 paramAddr) {
@@ -50,13 +65,13 @@ int NetconfDialog::Init(u32 paramAddr) {
 	if (check < 0) return check;
 	if (!ReadRequest(paramAddr, &request_)) return (int)SCE_KERNEL_ERROR_BAD_ARGUMENT;
 	requestAddr_ = paramAddr;
-	LOGI("UTIL", "Netconf dialog (action %d): offline, the WLAN switch is off", request_.netAction);
+	LOGI("UTIL", "Netconf dialog (action %d)%s", request_.netAction, net::Enabled() ? "" : ": offline, the WLAN switch is off");
+	g_netconfFlow = NetconfFlow{};
 	request_.common.result = 0;
 	ChangeStatusInit(NET_INIT_DELAY_US);
 	InitCommon();
 	UpdateButtons();
 	framesRun_ = 0;
-	prompt_.reset();
 	StartFade(true);
 	return 0;
 }
@@ -68,22 +83,93 @@ int NetconfDialog::Update(int animSpeed) {
 	UpdateFade(animSpeed);
 	framesRun_++;
 	if (pendingStatus_ != STATUS_FINISHED) {
-		// "The WLAN switch is off": the player can only back out.
+		// Bring the connection up (the virtual access point, or an ad hoc group through the ad hoc
+		// server) and finish once it is; on an error the player can only back out.
+		NetconfFlow &flow = g_netconfFlow;
+		const s32 action = request_.netAction;
+		const bool infra = action == NETCONF_CONNECT_APNET || action == NETCONF_STATUS_APNET || action == NETCONF_CONNECT_APNET_LAST;
+		const bool adhoc = action == NETCONF_CONNECT_ADHOC || action == NETCONF_CREATE_ADHOC || action == NETCONF_JOIN_ADHOC;
+		bool connected = false;
+		if (flow.error.empty()) {
+			char msg[160];
+			if (!net::Enabled()) {
+				flow.error = "The WLAN switch is off (network=0 in pspc.ini).";
+			} else if (infra) {
+				int state = net::ApctlGetState();
+				if (state == net::APCTL_STATE_GOT_IP) {
+					connected = true;
+				} else if (state == net::APCTL_STATE_DISCONNECTED) {
+					if (flow.connResult > 0) {
+						flow.connResult = net::ApctlConnect(1);
+						if (flow.connResult < 0) {
+							snprintf(msg, sizeof(msg), "Could not connect to the access point (%08X).", (u32)flow.connResult);
+							flow.error = msg;
+						}
+					} else if (flow.connResult == 0) {
+						flow.error = "The connection to the access point was lost.";
+					}
+				}
+			} else if (adhoc) {
+				if (net::AdhocctlGetState() == net::ADHOCCTL_STATE_CONNECTED) {
+					connected = true;
+				} else if (flow.connResult > 0) {
+					// netconfData -> SceUtilityNetconfData { char groupName[8]; u32 timeout; }.
+					u32 group = request_.netconfData;
+					flow.connResult = action == NETCONF_CREATE_ADHOC ? net::AdhocctlCreate(group) : net::AdhocctlConnect(group);
+					if (flow.connResult < 0) {
+						snprintf(msg, sizeof(msg), "Could not connect to the ad hoc network (%08X).", (u32)flow.connResult);
+						flow.error = msg;
+					}
+				}
+			} else {
+				snprintf(msg, sizeof(msg), "Unknown network action %d.", action);
+				flow.error = msg;
+			}
+			if (!connected && flow.error.empty() && framesRun_ > NETCONF_TIMEOUT_UPDATES)
+				flow.error = "The connection timed out.";
+			if (!flow.error.empty()) {
+				LOGI("UTIL", "Netconf dialog: %s", flow.error.c_str());
+				// Don't leave a half-made connection behind.
+				if (flow.connResult == 0) {
+					if (infra) net::ApctlDisconnect();
+					else if (adhoc) net::AdhocctlDisconnect();
+				}
+			}
+		}
 		bool done = false;
-		if (Headless()) {
-			done = framesRun_ >= HEADLESS_ANSWER_UPDATES;
-		} else {
-			if (!prompt_)
-				prompt_ = prompt::ShowMessage("Network connection",
-				                              "A connection error has occurred.\nThe WLAN switch is off (PSPC runs offline).",
-				                              prompt::Buttons::Ok);
-			done = prompt_->answer.load() != prompt::PENDING || IsButtonPressed(cancelButtonFlag_);
+		bool cancelled = false;
+		if (connected) {
+			LOGI("UTIL", "Netconf dialog: connected");
+			done = true;
+		} else if (!flow.error.empty()) {
+			if (Headless()) {
+				done = framesRun_ >= HEADLESS_ANSWER_UPDATES;
+			} else {
+				done = IsButtonPressed(cancelButtonFlag_);
+			}
+			cancelled = done;
+		} else if (!Headless() && IsButtonPressed(cancelButtonFlag_)) {
+			// Backing out while the connection is being made.
+			if (infra) net::ApctlDisconnect();
+			else if (adhoc) net::AdhocctlDisconnect();
+			done = cancelled = true;
 		}
 		if (done) {
 			StartFade(false);
 			ChangeStatus(STATUS_FINISHED, NET_SHUTDOWN_DELAY_US);
-			request_.common.result = SCE_UTILITY_DIALOG_RESULT_ABORT;
+			request_.common.result = cancelled ? SCE_UTILITY_DIALOG_RESULT_ABORT : 0;
 		}
+	}
+	if (!Headless()) {
+		// What the connection is doing, or what went wrong (the player backs out with the back button).
+		const s32 action = request_.netAction;
+		const bool adhocAction = action == NETCONF_CONNECT_ADHOC || action == NETCONF_CREATE_ADHOC || action == NETCONF_JOIN_ADHOC;
+		if (!g_netconfFlow.error.empty())
+			DisplayStatusScreen("Network Connection", "A connection error has occurred.\n" + g_netconfFlow.error, DS_BUTTON_CANCEL);
+		else
+			DisplayStatusScreen("Network Connection",
+			                    adhocAction ? "Connecting.\nPlease wait..." : "Connecting to the access point.\nPlease wait...",
+			                    DS_BUTTON_CANCEL);
 	}
 	if (ReadStatus() == STATUS_FINISHED || pendingStatus_ == STATUS_FINISHED)
 		mem::WriteBytes(requestAddr_, &request_, std::min<u32>(request_.common.size, sizeof(request_)));
@@ -94,7 +180,6 @@ int NetconfDialog::Shutdown(bool force) {
 	if (ReadStatus() != STATUS_FINISHED && !force) return (int)SCE_ERROR_UTILITY_INVALID_STATUS;
 	Dialog::Shutdown(force);
 	if (!force) ChangeStatusShutdown(NET_SHUTDOWN_DELAY_US);
-	prompt_.reset();
 	return 0;
 }
 
@@ -135,6 +220,7 @@ int NpSigninDialog::Update(int animSpeed) {
 		request_.common.result = SCE_UTILITY_DIALOG_RESULT_ABORT;
 		request_.npSigninStatus = NP_SIGNIN_STATUS_CANCELED;
 	}
+	if (!Headless()) DisplayStatusScreen("PlayStation Network", "Could not sign in to PlayStation Network.", DS_BUTTON_NONE);
 	return 0;
 }
 
@@ -222,6 +308,7 @@ int GamedataInstallDialog::Init(u32 paramAddr) {
 	ReadRequest(paramAddr, &request_);
 	InitCommon();
 	ChangeStatusInit(GAMEDATA_INIT_DELAY_US);
+	if (!Headless()) StartFade(true);
 	return 0;
 }
 
@@ -282,6 +369,11 @@ int GamedataInstallDialog::Update(int animSpeed) {
 		GWrite32(paramAddr_ + offsetof(GamedataInstallParams, unknownResult1), (u32)files_.size());
 		GWrite32(paramAddr_ + offsetof(GamedataInstallParams, unknownResult2), (u32)files_.size());
 		ChangeStatus(STATUS_FINISHED, 0);
+	}
+	if (!Headless()) {
+		UpdateFade(animSpeed);
+		DisplayStatusScreen("Game Data Installation", "Installing game data.\nPlease wait...", DS_BUTTON_NONE,
+		                    totalSize_ ? (float)copiedSize_ / (float)totalSize_ : 1.0f);
 	}
 	(void)GAMEDATA_BYTES_PER_UPDATE;
 	return 0;
@@ -354,6 +446,7 @@ int HtmlViewerDialog::Update(int animSpeed) {
 		if (DialogCommon *c = GetCommonParam()) c->result = 0;
 		StartFade(false);
 	}
+	if (!Headless()) DisplayStatusScreen("Internet Browser", "The Internet browser is not available.", DS_BUTTON_NONE);
 	return 0;
 }
 

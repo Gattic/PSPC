@@ -44,6 +44,11 @@ u64 ScheduleEvent(u64 atUs, std::function<void()> fn);
 void CancelEvent(u64 id);
 // Run fn on the emulation thread as soon as possible (thread-safe; for host threads).
 void PostFromHost(std::function<void()> fn);
+// Fast-time mode only: while at least one hold is in place, idle time passes in real time
+// instead of being skipped, so time-outs that the outside world measures too (network peers,
+// servers) stay meaningful. The network libraries hold it while host sockets are open. Counted;
+// emulation thread only.
+void HoldRealTime(bool hold);
 
 // ---- Threads ----
 PspThread *Current();

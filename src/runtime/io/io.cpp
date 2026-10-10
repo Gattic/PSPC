@@ -32,6 +32,17 @@ std::vector<SceUID> g_msCallbacks, g_msFatCallbacks;
 u32 g_msFatState = 1;
 // A constant capacity keeps results reproducible (PPSSPP does the same).
 constexpr u64 kFakeFreeSpace = 1536ull << 20;
+// Four words the memory stick driver keeps per inserted stick (mscmhc0: devctl 0x0201580B sets
+// them, 0x0202580A reads them back) and forgets when the stick is changed. The XMB's Saved Data
+// Utility sets them before it asks for another stick (to copy a save), and reads them back to
+// tell whether the stick was really swapped (savedata_plugin.prx 4.01, module offset 0x11220).
+u32 g_msStickWords[4] = {};
+// The other memory stick (a host folder): when the XMB asks for another stick, PSPC swaps them
+// as a user would (ChangeMemoryStick, defined after HostDevice).
+std::string g_otherStick;
+bool g_msChangeArmed = false;  // a copy between sticks is under way
+bool g_otherStickIn = false;   // the second stick is in ms0:
+void ChangeMemoryStick();
 
 bool IsCallback(u32 uid) { return kernel::Get<kernel::Callback>((SceUID)uid) != nullptr; }
 
@@ -109,6 +120,18 @@ int MemoryStickDevctl(const std::string &name, u32 cmd, u32 inAddr, u32 inLen, u
 		if (!mem::IsValidRange(outAddr, 4) || outLen < 4) return (int)SCE_ERROR_MEMSTICK_DEVCTL_BAD_PARAMS;
 		GWrite32(outAddr, kMsInserted);
 		return 0;
+	case 0x0201580B:  // set the stick's four words (plus a flags word)
+		if (!mem::IsValidRange(inAddr, 16) || inLen < 16) return (int)SCE_ERROR_MEMSTICK_DEVCTL_BAD_PARAMS;
+		for (int i = 0; i < 4; i++) g_msStickWords[i] = GRead32(inAddr + 4 * i);
+		// The Saved Data Utility marks the stick it copies from (see ChangeMemoryStick).
+		if (!g_otherStick.empty()) g_msChangeArmed = true;
+		return 0;
+	case 0x0202580A:  // read them back
+		if (!mem::IsValidRange(outAddr, 16) || outLen < 16) return (int)SCE_ERROR_MEMSTICK_DEVCTL_BAD_PARAMS;
+		// The utility only asks after "insert the other Memory Stick and press X".
+		if (g_msChangeArmed) ChangeMemoryStick();
+		for (int i = 0; i < 4; i++) GWrite32(outAddr + 4 * i, g_msStickWords[i]);
+		return 0;
 	case 0x02425818:
 		return WriteMsCapacity(inAddr, inLen);
 	case 0x02425824:
@@ -131,10 +154,24 @@ public:
 		return overlay_ ? overlay_.get() : fs_.get();
 	}
 	void OnMount(const std::string &name) override {
+		name_ = name;
 		Configure(name);
 		overlay_.reset();
 	}
 	void SetOverlay(std::shared_ptr<vfs::FileSystem> fs) { overlay_ = std::move(fs); }
+	// What SetFsOverlay / AddHostFallback set up, so a memory stick change can redo it.
+	void SetOverlayMaker(std::function<std::shared_ptr<vfs::FileSystem>(vfs::HostFileSystem *)> make) {
+		overlayMake_ = std::move(make);
+	}
+	void RememberFallback(const std::filesystem::path &dir) { fallbacks_.push_back(dir); }
+	const std::string &RootDir() const { return root_; }
+	// Another host folder behind the device (a memory stick change).
+	void Reroot(const std::string &root) {
+		root_ = root;
+		Configure(name_);
+		for (const auto &d : fallbacks_) fs_->AddFallbackRoot(d);
+		overlay_ = overlayMake_ ? overlayMake_(fs_.get()) : nullptr;
+	}
 	int Devctl(const std::string &devName, u32 cmd, u32 inAddr, u32 inLen, u32 outAddr, u32 outLen, u32 *delayUs) override {
 		if (cls_ == DevClass::MemoryStick) return MemoryStickDevctl(devName, cmd, inAddr, inLen, outAddr, outLen, delayUs);
 		return Device::Devctl(devName, cmd, inAddr, inLen, outAddr, outLen, delayUs);
@@ -172,10 +209,38 @@ private:
 
 	std::string root_;
 	bool readOnly_;
+	std::string name_ = "host0";
 	DevClass cls_ = DevClass::Host;
 	std::shared_ptr<vfs::HostFileSystem> fs_;
 	std::shared_ptr<vfs::FileSystem> overlay_;  // in front of fs_ (see SetFsOverlay)
+	std::function<std::shared_ptr<vfs::FileSystem>(vfs::HostFileSystem *)> overlayMake_;
+	std::vector<std::filesystem::path> fallbacks_;
 };
+
+// The XMB's Saved Data Utility copies a save from one memory stick to another: it marks the stick
+// it copies from (devctl 0x0201580B), reads the save, says "Insert the destination Memory Stick
+// and press the X button", then reads the marks back (0x0202580A): a stick that still has them
+// wasn't changed ("This is not the correct Memory Stick"). Then it writes the save, and for a big
+// one asks for the source again, and so on (savedata_plugin.prx 4.01, module offsets 0x10050-
+// 0x11220). PSPC has a second stick, a host folder (SetOtherMemoryStick; ms1 next to ms0 by
+// default), and changes sticks for the user when the utility checks after such a request: the
+// other stick goes into ms0: and the driver forgets the marks, as for any newly inserted stick.
+// No insert/eject callbacks: the change happens between two of the utility's own calls, while
+// its page waits for exactly that. "Copy completed. Insert the source Memory Stick": when the
+// utility lists the saves again, the first stick goes back in (OnDirectoryOpen).
+void ChangeMemoryStick() {
+	auto *h = dynamic_cast<HostDevice *>(MountedDevice("ms0").get());
+	if (!h || g_otherStick.empty()) return;
+	std::error_code ec;
+	std::filesystem::create_directories(std::filesystem::u8path(g_otherStick), ec);
+	const std::string previous = h->RootDir();
+	h->Reroot(g_otherStick);
+	LOGI("IO", "Memory stick changed for the Saved Data Utility: ms0: is now %s (was %s)", g_otherStick.c_str(),
+	     previous.c_str());
+	g_otherStick = previous;
+	g_otherStickIn = !g_otherStickIn;
+	for (u32 &w : g_msStickWords) w = 0;
+}
 
 class VfsDevice : public Device {
 public:
@@ -435,7 +500,30 @@ bool SetFsOverlay(const std::string &device, const std::function<std::shared_ptr
 	auto *h = dynamic_cast<HostDevice *>(MountedDevice(device).get());
 	if (!h) return false;
 	h->SetOverlay(make(h->Host()));
+	h->SetOverlayMaker(make);
 	return true;
+}
+
+bool AddHostFallback(const std::string &device, const std::string &dir) {
+	auto *h = dynamic_cast<HostDevice *>(MountedDevice(device).get());
+	std::error_code ec;
+	if (!h || dir.empty() || !std::filesystem::is_directory(fs::u8path(dir), ec)) return false;
+	h->Host()->AddFallbackRoot(fs::u8path(dir));
+	h->RememberFallback(fs::u8path(dir));
+	return true;
+}
+
+void SetOtherMemoryStick(const std::string &hostDir) { g_otherStick = hostDir; }
+
+void OnDirectoryOpen(const std::string &device, const std::string &path) {
+	if (!g_msChangeArmed || device != "ms0") return;
+	std::string p = ToLower(path);
+	std::replace(p.begin(), p.end(), '\\', '/');
+	while (p.size() > 1 && p.back() == '/') p.pop_back();
+	if (p != "/psp/savedata") return;
+	// The copy is over (or was cancelled): the source stick goes back in, as the XMB asks.
+	g_msChangeArmed = false;
+	if (g_otherStickIn) ChangeMemoryStick();
 }
 
 std::shared_ptr<Device> MakeVfsDevice(std::shared_ptr<vfs::FileSystem> fs, DevClass cls) {

@@ -256,6 +256,8 @@ void RunThread(PspThread *t) {
 	FreeDeadFibers();
 }
 
+int g_realTimeHolds = 0;
+
 void IdleUntil(u64 next) {
 	u64 now = NowUs();
 	if (next == UINT64_MAX) {
@@ -264,6 +266,15 @@ void IdleUntil(u64 next) {
 	}
 	if (next <= now) return;
 	u64 delta = next - now;
+	if (g_fastTime && g_realTimeHolds > 0 && delta >= 1000) {
+		// Host-paced: sleep (until a host post at the latest) and let the virtual clock follow.
+		u64 start = RealUs();
+		WaitForSingleObject(g_wakeEvent, (DWORD)std::min<u64>(delta / 1000, 50));
+		u64 slept = std::max<u64>(RealUs() - start, 1);
+		g_vcycles = (now + std::min(delta, slept)) * kCyclesPerUs;
+		g_vcyclesPublished.store(g_vcycles, std::memory_order_relaxed);
+		return;
+	}
 	if (g_fastTime) {
 		g_vcycles = next * kCyclesPerUs;
 		g_vcyclesPublished.store(g_vcycles, std::memory_order_relaxed);
@@ -646,6 +657,11 @@ void PostFromHost(std::function<void()> fn) {
 		g_hostPending = true;
 	}
 	SetEvent(g_wakeEvent);
+}
+
+void HoldRealTime(bool hold) {
+	g_realTimeHolds += hold ? 1 : -1;
+	if (g_realTimeHolds < 0) g_realTimeHolds = 0;
 }
 
 int Run() {

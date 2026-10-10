@@ -13,6 +13,7 @@
 
 #include "common/fileutil.h"
 #include "common/log.h"
+#include "common/seplugins.h"
 #include "runtime/core/cpu.h"
 #include "runtime/hle/hle_wrap.h"
 #include "runtime/hle/modules/modules.h"
@@ -38,6 +39,7 @@ u32 g_startModuleHandler = 0;
 u32 g_vshMenuCallback = 0;
 std::string g_relaunch;
 bool g_relaunchPending = false;
+std::vector<u8> g_vshmainArgs;  // the XMB's vshmain_args for the game it launches
 bool g_exitToVshPending = false;
 
 constexpr u32 SE_MAGIC = 0x47434553;
@@ -66,6 +68,9 @@ u32 Module2For(kernel::PspModule *m) {
 	g_module2[m->uid] = a;
 	mem::Memset(a, 0, 0xA0);
 	const loader::PspModuleInfoRaw &mi = m->image.modInfo;
+	// Kernel modules' addresses are in the kernel segment (0x88...), as plugins check.
+	const u32 kseg = m->kernelMode ? 0x80000000 : 0;
+	auto k = [kseg](u32 addr) { return addr ? addr | kseg : 0; };
 	GWrite32(a + 0x00, 0);  // next
 	GWrite16(a + 0x04, mi.attr);
 	GWrite8(a + 0x06, mi.version[0]);
@@ -73,22 +78,24 @@ u32 Module2For(kernel::PspModule *m) {
 	mem::WriteBytes(a + 0x08, m->name.c_str(), (u32)std::min<size_t>(m->name.size(), 27));
 	GWrite8(a + 0x24, (u8)m->status);
 	GWrite32(a + 0x2C, (u32)m->uid);
-	GWrite32(a + 0x40, mi.libent);
+	GWrite32(a + 0x40, k(mi.libent));
 	GWrite32(a + 0x44, mi.libentEnd - mi.libent);
-	GWrite32(a + 0x48, mi.libstub);
+	// The stub table follows the entry table in every module; plugins measure the entry table
+	// as stub_top - ent_top.
+	GWrite32(a + 0x48, k(mi.libstub ? mi.libstub : mi.libentEnd));
 	GWrite32(a + 0x4C, mi.libstubEnd - mi.libstub);
-	GWrite32(a + 0x50, m->moduleStart);
-	GWrite32(a + 0x64, m->moduleStart);
+	GWrite32(a + 0x50, k(m->moduleStart));
+	GWrite32(a + 0x64, k(m->moduleStart));
 	GWrite32(a + 0x68, m->gp);
 	u32 textEnd = m->memAddr;
 	for (const auto &r : m->image.codeRanges) textEnd = std::max(textEnd, r.second);
-	GWrite32(a + 0x6C, m->memAddr);
+	GWrite32(a + 0x6C, k(m->memAddr));
 	GWrite32(a + 0x70, textEnd - m->memAddr);
 	GWrite32(a + 0x74, m->memAddr + m->memSize - textEnd);
 	u32 nseg = 0;
 	for (const auto &seg : m->image.segments) {
 		if (!seg.loadAddr || nseg == 4) continue;
-		GWrite32(a + 0x80 + 4 * nseg, seg.loadAddr);
+		GWrite32(a + 0x80 + 4 * nseg, k(seg.loadAddr));
 		GWrite32(a + 0x90 + 4 * nseg, seg.memsz);
 		nseg++;
 	}
@@ -105,10 +112,16 @@ void OnModuleStart(SceUID id) {
 	u32 mod2 = Module2For(m);
 	if (!mod2) return;
 	LOGD("M33", "start-module handler %08x for %s", g_startModuleHandler, m->name.c_str());
-	cpu::CallGuest(&t->ctx, g_startModuleHandler, {mod2});
+	cpu::CallGuest(&t->ctx, g_startModuleHandler, {mod2 | 0x80000000});
 }
 
 }  // namespace
+
+u32 ModuleDescriptor(int uid) {
+	kernel::PspModule *m = kernel::Get<kernel::PspModule>(uid);
+	const u32 a = m ? Module2For(m) : 0;
+	return a ? a | 0x80000000 : 0;  // kernel memory, seen through the kernel segment
+}
 
 void Init(const std::string &flash1HostDir, const BootInfo &boot) {
 	g_boot = boot;
@@ -151,34 +164,76 @@ int ExitToVsh() {
 	return 0;
 }
 
-// seplugins/<list>.txt with enable bytes in seplugins/conf.bin (5 slots per list:
-// vsh 0-4, game 5-9, pops 10-14). A second token ("path 1"/"path 0") overrides the byte.
-void LoadPlugins() {
-	const char *list = g_boot.apitype == APITYPE_VSH ? "vsh.txt" : g_boot.apitype == APITYPE_POPS ? "pops.txt" : "game.txt";
-	int base = g_boot.apitype == APITYPE_VSH ? 0 : g_boot.apitype == APITYPE_POPS ? 10 : 5;
-	std::vector<u8> txt, conf;
-	if (!io::ReadFile(std::string("ms0:/seplugins/") + list, txt)) return;
-	io::ReadFile("ms0:/seplugins/conf.bin", conf);
-	std::istringstream in(std::string(txt.begin(), txt.end()));
+// The modules 4.01 and M33 have loaded when a game's plugins start, from data/fw_boot_modules.csv
+// (tools/gen_fw_modules.py): pspc implements them natively; plugins find them by name and walk
+// their export tables.
+struct BootModule {
+	std::string name;
+	u16 attr = 0, version = 0;
+	std::vector<kernel::FirmwareExport> libs;
+};
+
+std::vector<BootModule> ReadBootModules(const std::string &csvPath) {
+	std::vector<BootModule> mods;
+	std::ifstream in(fs::u8path(csvPath));
 	std::string line;
-	int index = 0;
 	while (std::getline(in, line)) {
-		while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
-		if (line.empty()) continue;
-		std::string path = line;
-		bool enabled = (size_t)(base + index) < conf.size() ? conf[base + index] != 0 : true;
-		size_t sp = line.find_first_of(" \t");
-		if (sp != std::string::npos) {
-			path = line.substr(0, sp);
-			std::string flag = line.substr(line.find_first_not_of(" \t", sp));
-			enabled = flag != "0";
+		if (!line.empty() && line.back() == '\r') line.pop_back();
+		std::vector<std::string> f;
+		std::stringstream ss(line);
+		for (std::string t; std::getline(ss, t, ',');) f.push_back(t);
+		if (f.size() >= 4 && f[0] == "module") {
+			BootModule m;
+			m.name = f[1];
+			m.attr = (u16)strtoul(f[2].c_str(), nullptr, 16);
+			m.version = (u16)strtoul(f[3].c_str(), nullptr, 16);
+			mods.push_back(std::move(m));
+		} else if (f.size() >= 5 && f[0] == "lib" && !mods.empty()) {
+			kernel::FirmwareExport e;
+			e.library = f[1];
+			e.version = (u16)strtoul(f[2].c_str(), nullptr, 16);
+			e.attr = (u16)strtoul(f[3].c_str(), nullptr, 16);
+			std::stringstream ns(f[4]);
+			for (std::string n; ns >> n;) e.nids.push_back((u32)strtoul(n.c_str(), nullptr, 16));
+			mods.back().libs.push_back(std::move(e));
 		}
-		index++;
-		if (!enabled) continue;
+	}
+	return mods;
+}
+
+// The user-mode kernel library: the last module before the game, registered after the plugins.
+constexpr const char *kUserKernelLibrary = "sceKernelLibrary";
+
+// The list for the boot type (common/seplugins.h has the format), read through ms0: so that
+// pspc's plugins folder counts.
+void LoadPlugins(const std::string &bootModulesCsv) {
+	const seplugins::List which = g_boot.apitype == APITYPE_VSH    ? seplugins::List::Vsh
+	                              : g_boot.apitype == APITYPE_POPS ? seplugins::List::Pops
+	                                                               : seplugins::List::Game;
+	std::vector<u8> txt, conf;
+	if (!io::ReadFile(std::string("ms0:/seplugins/") + seplugins::FileName(which), txt)) return;
+	io::ReadFile("ms0:/seplugins/conf.bin", conf);
+	int loaded = 0;
+	bool registered = false;
+	std::vector<BootModule> boot;
+	for (const seplugins::Entry &e : seplugins::Parse(std::string(txt.begin(), txt.end()), which, conf)) {
+		const std::string &path = e.path;
+		if (!e.enabled) {
+			LOGI("M33", "Plugin %s is disabled", path.c_str());
+			continue;
+		}
 		std::vector<u8> data;
 		if (!io::ReadFile(path, data)) {
 			LOGW("M33", "Plugin %s not found", path.c_str());
 			continue;
+		}
+		// Before the first plugin: the firmware modules a real boot has loaded by now.
+		if (!registered) {
+			registered = true;
+			boot = ReadBootModules(bootModulesCsv);
+			if (boot.empty()) LOGW("M33", "No firmware module list (%s): plugins won't find system modules", bootModulesCsv.c_str());
+			for (const BootModule &b : boot)
+				if (b.name != kUserKernelLibrary) kernel::RegisterFirmwareModule(b.name, b.attr, b.version, b.libs);
 		}
 		kernel::LoadOptions opts;
 		SceUID id = kernel::LoadModuleFromMemory(data, path, opts);
@@ -187,8 +242,17 @@ void LoadPlugins() {
 			continue;
 		}
 		LOGI("M33", "Plugin %s loaded", path.c_str());
+		loaded++;
 		if (auto *m = kernel::Get<kernel::PspModule>(id)) kernel::StartModule(m, 0, 0, 0, false);
 	}
+	if (!loaded) return;
+	bool userLib = false;
+	for (const BootModule &b : boot) {
+		if (b.name != kUserKernelLibrary) continue;
+		kernel::RegisterFirmwareModule(b.name, b.attr, b.version, b.libs);
+		userLib = true;
+	}
+	if (!userLib) kernel::RegisterFirmwareModule(kUserKernelLibrary, 0x0007, 0x0103);
 }
 
 void RegisterNidResolver(const std::string &csvPath) {
@@ -449,14 +513,45 @@ void OnVshCtrlRead(u32 padPtr, int count) {
 	}
 }
 
+bool TakeVshmainArgs(std::vector<u8> &out) {
+	if (g_vshmainArgs.empty()) return false;
+	out = std::move(g_vshmainArgs);
+	g_vshmainArgs.clear();
+	return true;
+}
+
 int LoadExecFromVsh(const char *file, u32 apitype, u32 paramPtr) {
-	(void)paramPtr;
+	// SceKernelLoadExecVSHParam: size, args, argp, key, vshmain_args_size, vshmain_args, ... The
+	// vshmain_args block is the XMB's own state (which item was selected, that it has booted
+	// before, the launch result); LoadExec keeps it through the game and gives it back to vshmain
+	// when the game exits.
+	g_vshmainArgs.clear();
+	if (mem::IsValidRange(paramPtr, 0x18)) {
+		const u32 size = GRead32(paramPtr + 0x10), args = GRead32(paramPtr + 0x14);
+		LOGD("M33", "LoadExecVSH param %08x: size %u, vshmain_args %u bytes at %08x", paramPtr, GRead32(paramPtr), size, args);
+		if ((size == 0x20 || size == 0x400) && mem::IsValidRange(args, size)) {
+			g_vshmainArgs.resize(size);
+			mem::ReadBytes(g_vshmainArgs.data(), args, size);
+			// LoadExec frames the block for vshmain's module_start: its size, then 0x20.
+			const u32 frame[2] = {size, 0x20};
+			memcpy(g_vshmainArgs.data(), frame, sizeof(frame));
+		}
+	}
 	// A UMD image the Game menu shows as a memory stick game (vshctrl): boot the image.
 	std::string iso;
 	if (file && IsoForVirtualGamePath(file, &iso)) {
 		LOGI("M33", "LoadExec %s: the UMD image %s", file, iso.c_str());
 		g_umdFile = file;
 		g_relaunch = iso;
+		g_relaunchPending = true;
+		sched::RequestStop(0x4D33);
+		return 0;
+	}
+	// A game of GAME150/GAME4XX or of pspc's Games folder (vsh_iso.h): its EBOOT.PBP where it is.
+	std::string host;
+	if (file && HostPathForVirtualGame(file, &host)) {
+		LOGI("M33", "LoadExec %s: %s", file, host.c_str());
+		g_relaunch = host;
 		g_relaunchPending = true;
 		sched::RequestStop(0x4D33);
 		return 0;

@@ -13,3 +13,6 @@ void Register_RegAndSystemLibraries();
 void Register_FontLibraries();
 // media_*.cpp: sceMpeg, sceMpegbase, scePsmf, scePsmfPlayer, sceVideocodec, sceJpeg, sceMp4.
 void Register_MediaLibraries();
+// chnnlsv.cpp: sceChnnlsv (savedata MAC/cipher) and the kernel "semaphore" library (KIRK), through
+// the pspc-decrypt KIRK service.
+void Register_ChnnlsvLibraries();

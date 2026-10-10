@@ -195,7 +195,12 @@ int AudioCodecInitCommon(u32 ctxPtr, int codec, bool mono) {
 	case PSP_CODEC_AAC:
 		// A rate not in the list is refused at once; the flag bytes only by the ME.
 		if (mono || !AacSampleRateFromContext(ctx)) return (int)SCE_AVCODEC_ERROR_UNSUPPORTED;
-		if (ctx->fmt.aac.unk2c || ctx->fmt.aac.unk2d) return MECall(SCE_AVCODEC_ERROR_UNSUPPORTED, InitUs(codec, ctx));
+		// Either flag byte makes the ME refuse 44100 Hz (hardware). msvideo_main_plugin sets 0x2d on
+		// every model but the PSP-1000 and plays 48 kHz MP4s with it, and its other AAC path only
+		// initialises such a context at 24000 or 48000 Hz (the Memory Stick Video rates), so those
+		// two are taken here.
+		if ((ctx->fmt.aac.unk2c || ctx->fmt.aac.unk2d) && ctx->fmt.aac.sampleRate != 24000 && ctx->fmt.aac.sampleRate != 48000)
+			return MECall(SCE_AVCODEC_ERROR_UNSUPPORTED, InitUs(codec, ctx));
 		primingFrames = 2;
 		break;
 	case PSP_CODEC_AT3PLUS: {

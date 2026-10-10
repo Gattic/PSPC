@@ -42,7 +42,7 @@ def normalize(text):
 
 
 def run_one(args, rel, prx, exp):
-    cmd = [args.pspc, '--config', 'none', '--headless', '--fast-time', '--timeout', str(args.timeout), '--log', 'warn']
+    cmd = [args.pspc, '--config', 'none', '--no-plugins', '--headless', '--fast-time', '--timeout', str(args.timeout), '--log', 'warn']
     if not args.aot:
         cmd.append('--interp')
     # Tests address their data as host0:/tests/..., i.e. host0: is the pspautotests root.

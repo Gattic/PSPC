@@ -50,6 +50,7 @@ struct PspModule : KObject {
 struct LoadOptions {
 	bool kernel = false;   // load into the kernel partition
 	u32 fixedBase = 0;     // force a load address for relocatable modules (0 = allocate)
+	int partition = 0;     // SceKernelLMOption mpidtext for a relocatable user module (5 = volatile); 0 = default
 };
 
 // Loads an executable image (ELF/PRX, possibly ~PSP packed). `path` is the PSP path it came
@@ -73,6 +74,19 @@ int InvalidateNativeCode(u32 addr, u32 size);
 // one is started): M33's start-module handler hooks in here.
 void SetModuleStartHook(void (*hook)(SceUID module));
 PspModule *ModuleByName(const std::string &name);
+// A library a firmware module exports, as RegisterFirmwareModule publishes it.
+struct FirmwareExport {
+	std::string library;
+	u16 version = 0, attr = 0;
+	std::vector<u32> nids;
+};
+// A record for a firmware module the HLE kernel implements natively, started. M33 plugins look
+// modules up by name to see how far boot has got (DarkFrost waits for "sceKernelLibrary") and
+// walk their export tables to call functions directly: the module gets a real export table in
+// kernel memory whose functions are stubs into the HLE implementations (or logged as
+// unimplemented). Returns the UID, an existing module's if one has the name.
+SceUID RegisterFirmwareModule(const std::string &name, u16 attr, u16 version,
+	const std::vector<FirmwareExport> &libs = {});
 const std::vector<SceUID> &LoadedModules();
 
 // Directory for AOT-compiled module DLLs (searched by SHA-1).
@@ -81,6 +95,7 @@ void SetAotCacheDir(const std::string &dir);
 void SetAotEnabled(bool enabled);
 // Path of the pspc-decrypt helper, used for encrypted modules.
 void SetDecryptTool(const std::string &exe);
+const std::string &DecryptToolPath();
 // Runs pspc-decrypt on an encrypted module or system file (results are cached by SHA-1).
 bool DecryptWithTool(const std::vector<u8> &in, std::vector<u8> &out, std::string *err);
 // Directory where decrypted copies of encrypted modules are cached.

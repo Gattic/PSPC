@@ -13,7 +13,6 @@
 #include <vector>
 
 #include "runtime/dialogs/dialog.h"
-#include "runtime/dialogs/host_prompt.h"
 #include "runtime/dialogs/savedata.h"
 
 namespace utility {
@@ -63,7 +62,6 @@ private:
 	NetconfParams request_{};
 	u32 requestAddr_ = 0;
 	int framesRun_ = 0;
-	std::shared_ptr<prompt::State> prompt_;
 };
 
 class NpSigninDialog : public Dialog {

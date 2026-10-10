@@ -26,6 +26,9 @@ void PsmfPlayerNotifyLoadModule(int devkitVersion);
 u8 *MEGetPointerRange(u32 addr, u32 size);
 // Media Engine address, or failing that guest memory.
 const u8 *MEOrGuestPointer(u32 addr, u32 size);
+// A block of Media Engine memory (64-byte aligned), 0 if there is no room; and freeing one.
+u32 MEAllocate(u32 size);
+void MERelease(u32 addr);
 
 void Register_sceMpeg();
 void Register_sceMpegbase();

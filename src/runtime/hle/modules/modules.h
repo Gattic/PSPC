@@ -25,6 +25,8 @@ void Register_sceUtility();
 void Register_sceHprm();
 void Register_Misc();
 void Register_M33();
+// kernel_clib.cpp: SysclibForKernel, StdioForKernel, LoadCoreForKernel (for kernel plugins).
+void Register_KernelClib();
 // vsh_bridge.cpp: sceVshBridge and sceResmgr (the XMB's kernel bridge). Registered last: it
 // forwards to functions of the other libraries.
 void Register_VshLibraries();

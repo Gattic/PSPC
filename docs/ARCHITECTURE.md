@@ -41,12 +41,13 @@ flowchart TB
 | `src/runtime/m33/` | The M33 CFW behaviours (SystemCtrl, KUBridge, VshCtrl, config.se, plugins, NID resolver, vshctrl's ISO browsing and VSH menu). |
 | `src/runtime/vsh.cpp` | `pspc --vsh`: boots the firmware's XMB modules as guest code, as init.prx does ([vsh-boot.md](vsh-boot.md)). |
 | `src/fs/` | Disc images (ISO/CSO/ZSO/DAX), ISO9660, host file system, PBP, PARAM.SFO. |
+| `src/net/` | Host networking for the network libraries (`hle/modules/net*.cpp`): non-blocking Winsock sockets with readiness events and a poller thread, the host's network configuration, WinHTTP requests, and the PPSSPP-compatible ad hoc server (`pspc --adhoc-server`). [networking.md](networking.md) |
 | `src/gpu/` | GE display-list processing, timing and the multithreaded software rasterizer (the default renderer and the accuracy reference). `backend.h` is the renderer seam at the post-transform level. |
 | `src/gpu/hw/` | Optional Direct3D 11 renderer (`--renderer d3d11`, `--render-scale 1-4`): the GE pixel pipeline in a shader over rasterizer-ordered views, surfaces mirroring VRAM framebuffers, written back to guest memory when guest code touches it. |
 | `src/audio/` | Audio decoders and mixers (ATRAC3/3+, SAS, MP3/AAC through Media Foundation). |
 | `src/media/` | The Media Engine's video side: PSMF program stream demuxing, H.264 through the Media Foundation decoder, JPEG through WIC, YCbCr conversion. Used by the `media_*.cpp` HLE libraries (sceMpeg, scePsmfPlayer, sceVideocodec, sceJpeg). |
 | `src/media/` | Video and image decoding for sceMpeg/PSMF/sceJpeg (PS demux, H.264 through Media Foundation, WIC). |
-| `src/runtime/dialogs/` | sceUtility dialogs (message, OSK, save data...) and their host-side prompts. |
+| `src/runtime/dialogs/` | sceUtility dialogs (message, OSK, save data...), the HOME menu, and `ppge`, which draws them over every presented frame (PPSSPP's PPGe: system PGF fonts, button symbols, images) without touching guest memory, so both renderers show them. Headless runs draw nothing and the dialogs answer by themselves (`PSPC_HEADLESS_OVERLAYS=1` draws them anyway, for frame dumps driven by `--press`). |
 | `src/frontend/` | `pspc.exe` (command line, LoadExec relaunch), `pspc-launcher.exe` (game library), `pspc-iso.exe`. |
 | `tools/pspc-decrypt/` | Separate GPL-3.0 executable (uses libkirk). Never linked into `src/`. |
 | `tools/*.py` | AOT build driver, autotest runner, firmware/M33 extraction and analysis, NID database generation, Ghidra pipeline. |
@@ -105,6 +106,13 @@ natively instead of being loaded. A second copy of a module that already runs na
 interpreted (one DLL instance holds one relocation delta). Before a module's `module_start` runs,
 M33's start-module handler (if a plugin set one) is called with the module's `SceModule2`.
 
+**Plugins.** M33 plugins load from `seplugins/*.txt` before the game starts; pspc's `plugins`
+folder is laid over ms0: (a fallback root of its host file system). The firmware modules a real
+boot has loaded by then are published as module records with export tables leading to the native
+implementations (`data/fw_boot_modules.csv`), the HOME screen has a real framebuffer at display
+priority 0, and the kernel-only libraries plugins call are native too. See
+[plugins.md](plugins.md).
+
 **LoadExec.** `sceKernelLoadExec` (and M33's LoadExec family) restart the runtime in a fresh process
 that boots the requested executable with the same devices mounted, like the PSP's reboot.
 
@@ -121,7 +129,7 @@ the decrypted ELF, sets its relocation delta and registers its functions in the 
 | Native (HLE) | Runs as guest code (recompiled or interpreted) |
 |---|---|
 | kernel (threads, sync, memory, modules, interrupts), I/O, display, controller, power, RTC, UMD | games, homebrew, game-shipped libraries (sceDeflt, sceMd5, sceHeap, sceCcc...) |
-| GE graphics, audio output, SAS, ATRAC/MP3/MPEG codecs, network (offline) | M33 user-level UI (VSH menu, recovery) once firmware is present |
+| GE graphics, audio output, SAS, ATRAC/MP3/MPEG codecs, network (over Winsock / WinHTTP) | M33 user-level UI (VSH menu, recovery) once firmware is present |
 | sceUtility dialogs and save data | the 4.01 XMB (vshmain, paf, plugins): `pspc --vsh` |
 | every Sony kernel module, `vshbridge` included (`sceVshBridge` in hle/modules/vsh_bridge.cpp) | |
 | M33 SystemCtrl/KUBridge/VshCtrl behaviours | M33 game plugins (`seplugins/game.txt`) |

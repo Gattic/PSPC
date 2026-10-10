@@ -14,6 +14,10 @@
 *.dll
 *.exe
 
+# M33 plugins: user-supplied PRX files and the data they write; only the README is tracked.
+/plugins/*
+!/plugins/README.md
+
 # Runtime data written by pspc
 /ms0/
 /cache/

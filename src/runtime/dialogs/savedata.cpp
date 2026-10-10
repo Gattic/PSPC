@@ -11,6 +11,7 @@
 #include "common/sha1.h"
 #include "fs/param_sfo.h"
 #include "runtime/core/memory.h"
+#include "runtime/dialogs/save_crypto.h"
 #include "runtime/dialogs/save_fs.h"
 #include "runtime/kernel/errors.h"
 
@@ -131,8 +132,9 @@ bool HasAnyKey(const SavedataRequest *param) {
 	return false;
 }
 
-// Stands in for a PSP's file hash, which depends on the game key: lets a load with the wrong key
-// fail like decryption would.
+// Stands in for a PSP's file hash in saves PSPC stored in the clear (before it had the KIRK
+// service, or without it): depends on the game key, so a load with the wrong key fails like
+// decryption would.
 void KeyHash(const SavedataRequest *param, int mode, u8 out[16]) {
 	memset(out, 0, 16);
 	if (mode <= 1 || !HasAnyKey(param)) return;
@@ -141,6 +143,37 @@ void KeyHash(const SavedataRequest *param, int mode, u8 out[16]) {
 	h.Update("PSPC", 4);
 	auto d = h.Final();
 	memcpy(out, d.data(), 16);
+}
+
+// The SAVEDATA_FILE_LIST entry of `filename`: false if the file isn't a secure one.
+bool SecureFileHash(const vfs::ParamSfo &sfo, const std::string &filename, u8 out[16]) {
+	std::vector<u8> list;
+	if (!sfo.GetBinary("SAVEDATA_FILE_LIST", list)) return false;
+	const auto *entries = (const SfoFileListEntry *)list.data();
+	for (size_t i = 0; i < std::min<size_t>(FILE_LIST_COUNT_MAX, list.size() / sizeof(SfoFileListEntry)); i++) {
+		if (entries[i].filename[0] != '\0' &&
+		    strncmp(entries[i].filename, filename.c_str(), sizeof(entries[i].filename)) == 0) {
+			memcpy(out, entries[i].hash, 16);
+			return true;
+		}
+	}
+	return false;
+}
+
+bool IsZero16(const u8 *p) {
+	for (int i = 0; i < 16; i++)
+		if (p[i]) return false;
+	return true;
+}
+
+// A secure file PSPC stored in the clear: the save has the marker, or the file's hash is one PSPC
+// made up (KeyHash) rather than a MAC. (The XMB's copy rewrites SAVEDATA_PARAMS without the
+// marker, so the hash is checked too.)
+bool IsPlainSecureFile(const SavedataRequest *param, int mode, const std::vector<u8> &params, const u8 stored[16]) {
+	if (HasPlainMarker(params) || IsZero16(stored)) return true;
+	u8 legacy[16];
+	KeyHash(param, mode, legacy);
+	return memcmp(legacy, stored, 16) == 0;
 }
 bool LoadSfoFile(const std::string &path, vfs::ParamSfo &sfo) {
 	std::vector<u8> data;
@@ -334,12 +367,15 @@ int Savedata::Save(SavedataRequest *param, const std::string &saveDirName, bool 
 		sfo.SetString("SAVEDATA_DIRECTORY", GetSaveDir(param, saveDirName), 64);
 	}
 
-	// What a PSP would encrypt: the data file of a secure write. A sub-write (WRITEDATA) into an
+	// What a PSP encrypts: the data file of a secure write. A sub-write (WRITEDATA) into an
 	// encrypted save keeps its mode.
 	const bool encrypt = secureMode && ValidBuf(param->dataBuf);
 	const bool subWrite = param->mode == SAVEDATA_WRITEDATASECURE || param->mode == SAVEDATA_WRITEDATA;
 	std::vector<u8> oldParams;
 	const bool wasCrypted = sfo.GetBinary("SAVEDATA_PARAMS", oldParams) && !oldParams.empty() && oldParams[0] != 0;
+	const bool wasPlain = HasPlainMarker(oldParams);
+	const bool haveCrypto = savecrypto::Available();
+	const std::string saveFilename = GetFileName(param);
 
 	// The list of secure files: 13 bytes of name, 16 of hash, 3 of padding.
 	std::vector<u8> list(FILE_LIST_TOTAL_SIZE, 0);
@@ -347,44 +383,76 @@ int Savedata::Save(SavedataRequest *param, const std::string &saveDirName, bool 
 		std::vector<u8> old;
 		if (sfo.GetBinary("SAVEDATA_FILE_LIST", old)) memcpy(list.data(), old.data(), std::min<size_t>(old.size(), list.size()));
 	}
+	auto *entries = (SfoFileListEntry *)list.data();
+	bool otherSecureFiles = false, thisListed = false;
+	for (int i = 0; i < FILE_LIST_COUNT_MAX; ++i) {
+		if (entries[i].filename[0] == '\0') continue;
+		if (strncmp(entries[i].filename, saveFilename.c_str(), sizeof(entries[i].filename)) != 0)
+			otherSecureFiles = true;
+		else
+			thisListed = true;
+	}
 	const int cryptMode = DetermineCryptMode(param);
+
+	// The data file as it goes on the memory stick: encrypted like a PSP does, with the KIRK service.
+	// Without it, or in a save PSPC keeps in the clear that has other secure files, it stays plain.
+	u32 saveSize = 0;
+	const u8 *saveBytes = nullptr;
+	if (ValidBuf(param->dataBuf)) {
+		saveSize = param->dataSize;
+		if (saveSize == 0 || saveSize > param->dataBufSize) saveSize = param->dataBufSize;
+		saveBytes = mem::GetPointer(param->dataBuf, saveSize);
+		if (!saveBytes && saveSize && !saveFilename.empty()) return (int)SCE_UTILITY_SAVEDATA_ERROR_RW_BAD_PARAMS;
+	}
+	std::vector<u8> cryptedData;
+	u8 fileHash[16]{};
+	bool crypted = false;
+	if (encrypt && haveCrypto && !(wasPlain && otherSecureFiles) && !saveFilename.empty()) {
+		crypted = savecrypto::Encrypt(cryptMode, cryptMode > 1 ? param->key : nullptr, saveBytes, saveSize, cryptedData, fileHash);
+		if (!crypted) LOGW("UTIL", "Savedata encryption failed; %s stays unencrypted", saveFilename.c_str());
+	}
 	if (encrypt) {
-		const std::string saveFilename = GetFileName(param);
-		auto *entries = (SfoFileListEntry *)list.data();
 		for (int i = 0; i < FILE_LIST_COUNT_MAX; ++i) {
 			SfoFileListEntry &e = entries[i];
 			if (e.filename[0] != '\0' && strncmp(e.filename, saveFilename.c_str(), sizeof(e.filename)) != 0) continue;
 			memset(e.filename, 0, sizeof(e.filename));
 			memcpy(e.filename, saveFilename.data(), std::min<size_t>(saveFilename.size(), sizeof(e.filename) - 1));
-			KeyHash(param, cryptMode, e.hash);
+			if (crypted)
+				memcpy(e.hash, fileHash, 16);
+			else
+				KeyHash(param, cryptMode, e.hash);
 			break;
 		}
 	}
 	sfo.SetBinary("SAVEDATA_FILE_LIST", list.data(), list.size(), FILE_LIST_TOTAL_SIZE);
-	// SAVEDATA_PARAMS: byte 0 is the encryption mode a PSP would have used; the PSPC marker says the
-	// data is stored in the clear (see savedata.h).
+	// SAVEDATA_PARAMS: byte 0 is the hash mode, then the PARAM.SFO hashes (save_crypto.h), which
+	// the XMB checks. The PSPC marker says the secure files are stored in the clear (savedata.h).
+	const bool markPlain = encrypt ? !crypted && !(haveCrypto && saveFilename.empty())
+	                               : (wasPlain && (otherSecureFiles || thisListed));
 	u8 params[128]{};
-	if (encrypt) {
+	if (markPlain) {
 		params[0] = CryptModeFlag(cryptMode);
 		memcpy(params + kPlainMarkerOffset, kPlainMarker, sizeof(kPlainMarker));
-	} else if (subWrite && wasCrypted) {
+	} else if (!haveCrypto && subWrite && wasCrypted) {
 		memcpy(params, oldParams.data(), std::min<size_t>(oldParams.size(), sizeof(params)));
 	}
 	sfo.SetBinary("SAVEDATA_PARAMS", params, sizeof(params), sizeof(params));
 	std::vector<u8> sfoData = sfo.Serialize();
+	if (haveCrypto) {
+		const size_t at = savecrypto::SfoValueOffset(sfoData, "SAVEDATA_PARAMS");
+		if (at != SIZE_MAX) savecrypto::UpdateHash(sfoData, at, cryptMode, markPlain);
+	}
 	savefs::WriteAll(sfoPath, sfoData.data(), sfoData.size());
 
 	// The data file. MAKEDATA may come without one.
 	if (ValidBuf(param->dataBuf)) {
-		std::string fileName = GetFileName(param);
-		u32 saveSize = param->dataSize;
-		if (saveSize == 0 || saveSize > param->dataBufSize) saveSize = param->dataBufSize;
+		const std::string &fileName = saveFilename;
 		StrNCopy(param->saveName, saveDirName, sizeof(param->saveName));
 		if (!fileName.empty()) {
-			const u8 *p = mem::GetPointer(param->dataBuf, saveSize);
-			if (!p && saveSize) return (int)SCE_UTILITY_SAVEDATA_ERROR_RW_BAD_PARAMS;
-			LOGI("UTIL", "Saving %u bytes to %s/%s", saveSize, dirPath.c_str(), fileName.c_str());
-			if (!savefs::WriteAll(dirPath + "/" + fileName, p, saveSize)) {
+			const u8 *p = crypted ? cryptedData.data() : saveBytes;
+			const u32 writeSize = crypted ? (u32)cryptedData.size() : saveSize;
+			LOGI("UTIL", "Saving %u bytes to %s/%s%s", saveSize, dirPath.c_str(), fileName.c_str(), crypted ? " (encrypted)" : "");
+			if (!savefs::WriteAll(dirPath + "/" + fileName, p, writeSize)) {
 				LOGE("UTIL", "Error writing %s/%s", dirPath.c_str(), fileName.c_str());
 				return (int)SCE_UTILITY_SAVEDATA_ERROR_SAVE_MS_NOSPACE;
 			}
@@ -475,27 +543,34 @@ int Savedata::LoadSaveData(SavedataRequest *param, const std::string &saveDirNam
 		std::vector<u8> params;
 		LoadSfoFile(dirPath + "/" + SFO_FILENAME, sfo);
 		sfo.GetBinary("SAVEDATA_PARAMS", params);
-		if (!HasPlainMarker(params)) {
-			// Encrypted by a PSP (or PPSSPP): there's no KIRK engine to decrypt it with.
-			LOGE("UTIL", "%s is encrypted (mode %d); PSPC can't decrypt saves made elsewhere", filePath.c_str(), prevCryptMode);
-			return (int)SCE_UTILITY_SAVEDATA_ERROR_LOAD_DATA_BROKEN;
-		}
-		// Decrypting with another mode or key would fail on a PSP.
-		u8 expected[16], stored[16]{};
-		KeyHash(param, mode, expected);
-		std::vector<u8> list;
-		if (sfo.GetBinary("SAVEDATA_FILE_LIST", list)) {
-			const auto *entries = (const SfoFileListEntry *)list.data();
-			for (size_t i = 0; i < list.size() / sizeof(SfoFileListEntry); i++) {
-				if (strncmp(entries[i].filename, filename.c_str(), sizeof(entries[i].filename)) == 0) {
-					memcpy(stored, entries[i].hash, sizeof(stored));
-					break;
+		// Only the files SAVEDATA_FILE_LIST names are encrypted.
+		u8 stored[16]{};
+		if (SecureFileHash(sfo, filename, stored)) {
+			if (IsPlainSecureFile(param, mode, params, stored)) {
+				// Stored in the clear by PSPC: loading with another mode or key would fail on a PSP.
+				u8 expected[16];
+				KeyHash(param, mode, expected);
+				const bool modeMismatch = HasPlainMarker(params) && mode != prevCryptMode;
+				if (modeMismatch || memcmp(expected, stored, sizeof(stored)) != 0) {
+					LOGW("UTIL", "%s: saved with mode %d, loading with mode %d or another key", filePath.c_str(), prevCryptMode, mode);
+					return (int)SCE_UTILITY_SAVEDATA_ERROR_LOAD_DATA_BROKEN;
 				}
+			} else {
+				// Encrypted (by PSPC, a PSP or PPSSPP): decrypted with the mode and key the game asks
+				// for, which must give the MAC the file list holds.
+				std::vector<u8> plain;
+				u8 hash[16];
+				if (!savecrypto::Available()) {
+					LOGE("UTIL", "%s is encrypted and the KIRK service (pspc-decrypt) isn't available", filePath.c_str());
+					return (int)SCE_UTILITY_SAVEDATA_ERROR_LOAD_DATA_BROKEN;
+				}
+				if (!savecrypto::Decrypt(mode, mode > 1 ? param->key : nullptr, saveData, plain, hash) ||
+				    memcmp(hash, stored, sizeof(hash)) != 0) {
+					LOGW("UTIL", "%s doesn't decrypt with mode %d and this key (saved with mode %d)", filePath.c_str(), mode, prevCryptMode);
+					return (int)SCE_UTILITY_SAVEDATA_ERROR_LOAD_DATA_BROKEN;
+				}
+				saveData = std::move(plain);
 			}
-		}
-		if (mode != prevCryptMode || memcmp(expected, stored, sizeof(stored)) != 0) {
-			LOGW("UTIL", "%s: saved with mode %d, loading with mode %d or another key", filePath.c_str(), prevCryptMode, mode);
-			return (int)SCE_UTILITY_SAVEDATA_ERROR_LOAD_DATA_BROKEN;
 		}
 	}
 

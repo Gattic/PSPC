@@ -15,7 +15,9 @@
 #include "common/log.h"
 #include "runtime/boot.h"
 #include "runtime/core/backtrace.h"
+#include "runtime/dialogs/home_menu.h"
 #include "runtime/dialogs/osk_dialog.h"
+#include "runtime/dialogs/ppge.h"
 #include "runtime/core/cpu.h"
 #include "runtime/core/dispatch.h"
 #include "runtime/core/interp.h"
@@ -23,6 +25,8 @@
 #include "runtime/hle/display.h"
 #include "runtime/hle/hle.h"
 #include "runtime/hle/modules/modules.h"
+#include "runtime/hle/modules/net_hle.h"
+#include "runtime/hle/modules/net_selftest.h"
 #include "runtime/host/host.h"
 #include "runtime/io/io.h"
 #include "runtime/kernel/module.h"
@@ -119,6 +123,12 @@ std::string Host0PathOf(const Options &o, const fs::path &file) {
 
 bool PrepareBoot(const Options &o, BootTarget &bt) {
 	io::Mount("host0", io::MakeHostDevice(Host0Root(o).string(), false));
+	if (!o.netSelftest.empty()) {
+		// A network test scenario runs instead of an executable (net::selftest::Start).
+		bt.pspPath = "host0:/net-selftest";
+		bt.cwd = "host0:/";
+		return true;
+	}
 	if (o.vsh) {
 		// The XMB: no executable of our own. A disc is in the drive only with --umd.
 		bt.pspPath = "flash0:/vsh/module/vshmain.prx";
@@ -215,10 +225,13 @@ void DumpFrame(const std::string &dir) {
 	int hw = 0, hh = 0;
 	if (gpu::GetBackendDisplayImage(addr, stride, format, 480, 272, px, &hw, &hh)) {
 		snprintf(name, sizeof(name), "hires_%06u.bmp", display::Vcount());
+		ppge::Composite(px.data(), hw, hh, display::ShowingGameScreen());
 		WriteBmp(fs::u8path(dir) / name, px, hw, hh);
 	}
 #endif
 	display::ConvertFramebuffer(addr, stride, format, 480, 272, px);
+	// What the dialogs and the HOME menu draw over it.
+	ppge::Composite(px.data(), 480, 272, display::ShowingGameScreen());
 	snprintf(name, sizeof(name), "frame_%06u.bmp", display::Vcount());
 	WriteBmp(fs::u8path(dir) / name, px, 480, 272);
 }
@@ -289,7 +302,8 @@ void SetUpRenderer(const Options &o) {
 int RunOnce(const Options &o, BootTarget bt) {
 	backtrace::InstallFatalHook();
 	if (!mem::Init((u32)o.ramMB << 20)) Fatal("Cannot reserve guest memory");
-	kernel::InitMemoryPartitions(mem::g_ramSize, o.largeUserMemory);
+	const bool xmb = o.vsh && o.bootPath.empty() && o.netSelftest.empty();
+	kernel::InitMemoryPartitions(mem::g_ramSize, o.largeUserMemory >= 0 ? o.largeUserMemory != 0 : xmb);
 	kernel::g_firmwareVersion = o.firmwareVersion;
 	cpu::Init();
 	cpu::SetStrictMemory(o.strictMemory);
@@ -303,6 +317,8 @@ int RunOnce(const Options &o, BootTarget bt) {
 	sched::Init(o.fastTime);
 	io::Init();
 	io::Mount("ms0", io::MakeHostDevice(o.memstickDir, false));
+	if (!o.pluginsDir.empty() && io::AddHostFallback("ms0", o.pluginsDir))
+		LOGI("M33", "Plugins folder %s overlays ms0:", o.pluginsDir.c_str());
 	io::Mount("flash0", io::MakeHostDevice(o.flash0Dir, true));
 	io::Mount("flash1", io::MakeHostDevice(o.flash1Dir, false));
 	io::Mount("emulator", io::MakeEmulatorDevice(o.hasDisplayForTests));
@@ -322,6 +338,7 @@ int RunOnce(const Options &o, BootTarget bt) {
 	display::Init();
 	for (const Options::Press &p : o.presses) ctrl::AddScriptedPress(p.vblank, p.buttons, p.frames);
 	utility::SetHeadlessOskText(o.oskText);
+	net::Configure(net::Config{o.network, o.adhocServer});
 	if (!o.dumpFramesDir.empty()) {
 		std::error_code ec;
 		fs::create_directories(fs::u8path(o.dumpFramesDir), ec);
@@ -358,21 +375,40 @@ int RunOnce(const Options &o, BootTarget bt) {
 	// The M33 layer: config.se, kernel NID resolver, plugins (docs/m33-behaviors.md).
 	vsh::SetActive(o.vsh && o.bootPath.empty());
 	vsh::SetReturnToXmb(!vsh::Active() && o.returnToVsh);
+	// HOME in a game: the HOME menu (the XMB handles HOME itself).
+	homemenu::Install(!vsh::Active());
 	m33::BootInfo bi;
 	bi.fromDisc = bt.pspPath.rfind("disc0:", 0) == 0;
 	bi.apitype = vsh::Active() ? m33::APITYPE_VSH : bi.fromDisc ? m33::APITYPE_GAME_UMD : m33::APITYPE_GAME_MS;
 	bi.initFileName = bt.pspPath;
 	m33::Init(o.flash1Dir, bi);
 	if (!o.dataDir.empty()) m33::RegisterNidResolver((fs::u8path(o.dataDir) / "m33_nid_resolver.csv").string());
-	if (o.plugins) m33::LoadPlugins();
+	if (o.plugins) m33::LoadPlugins(o.dataDir.empty() ? std::string() : (fs::u8path(o.dataDir) / "fw_boot_modules.csv").string());
 
-	if (vsh::Active()) {
+	if (!o.netSelftest.empty()) {
+		if (net::selftest::Start(o.netSelftest) < 0) return 2;
+	} else if (vsh::Active()) {
 		// No disc unless one was given: the XMB shows an empty drive. UMD images in ms0:/ISO and
 		// in pspc's Games folder show in the Game menu (M33 vshctrl).
 		umd::SetDriveEmpty(!media::HaveDisc());
 		m33::InstallIsoBrowser({o.gamesDir});
 		io::Mount("msstor0p1", io::MakeMsStorDevice());
 		io::Mount("msstor0", io::MakeMsStorDevice());
+		{
+			// The second memory stick the Saved Data Utility copies to: ms1 next to ms0.
+			fs::path ms = fs::u8path(o.memstickDir);
+			std::string name = PathToUtf8(ms.filename());
+			if (name.empty()) name = PathToUtf8(ms.parent_path().filename()), ms = ms.parent_path();
+			const std::string other = !name.empty() && name.back() == '0' ? name.substr(0, name.size() - 1) + "1" : name + "_2";
+			io::SetOtherMemoryStick(PathToUtf8(ms.parent_path() / fs::u8path(other)));
+		}
+		if (!o.vshArgsFile.empty()) {
+			// Back from a game the XMB launched: its vshmain_args, which LoadExec kept.
+			std::vector<u8> vshArgs;
+			if (ReadWholeFile(fs::u8path(o.vshArgsFile), vshArgs)) vsh::SetVshmainArgs(std::move(vshArgs));
+			std::error_code ec;
+			fs::remove(fs::u8path(o.vshArgsFile), ec);
+		}
 		if (vsh::Boot(o.recovery) < 0) return 2;
 	} else {
 		SceUID mod = boot::BootModule(bt.image, bt.pspPath, bootArgs);
@@ -392,6 +428,7 @@ int RunOnce(const Options &o, BootTarget bt) {
 std::string g_relaunchTarget;
 std::string g_loadExecPath, g_loadExecArgsFile;
 bool g_exitToVsh = false;
+std::string g_vshArgsFile;
 
 }  // namespace
 
@@ -399,6 +436,13 @@ bool TakeExitToVsh() {
 	bool r = g_exitToVsh;
 	g_exitToVsh = false;
 	return r;
+}
+
+bool TakeVshArgsFile(std::string &file) {
+	if (g_vshArgsFile.empty()) return false;
+	file = g_vshArgsFile;
+	g_vshArgsFile.clear();
+	return true;
 }
 
 bool TakeRelaunch(std::string &hostFile) {
@@ -485,6 +529,14 @@ int Run(const Options &o) {
 				LOGI("RUNTIME", "LoadExec %s: restarting", m33next.c_str());
 				g_relaunchTarget = m33next;
 				code = 0;
+				// The XMB's own state goes with the game and comes back to vshmain (--vsh-args).
+				std::vector<u8> vshArgs;
+				if (m33::TakeVshmainArgs(vshArgs)) {
+					wchar_t tmp[MAX_PATH];
+					GetTempPathW(MAX_PATH, tmp);
+					fs::path f = fs::path(tmp) / ("pspc_vshargs_" + std::to_string(GetCurrentProcessId()) + ".bin");
+					if (WriteWholeFile(f, vshArgs.data(), vshArgs.size())) g_vshArgsFile = PathToUtf8(f);
+				}
 			}
 			if (m33::TakeExitToVsh()) {
 				g_exitToVsh = true;

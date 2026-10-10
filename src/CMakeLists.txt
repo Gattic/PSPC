@@ -4,6 +4,7 @@
 add_library(pspc_common STATIC
 	common/log.cpp
 	common/fileutil.cpp
+	common/seplugins.cpp
 	common/settings.cpp
 	common/sha1.cpp
 )
@@ -36,7 +37,7 @@ target_include_directories(pspc_sem PUBLIC ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(pspc_sem PUBLIC pspc_common)
 
 # Each component directory owns its CMakeLists.txt; order matters only for dependencies.
-foreach(component fs loader gpu audio media hle runtime recomp tools)
+foreach(component fs loader gpu audio media net hle runtime recomp tools)
 	if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${component}/CMakeLists.txt)
 		add_subdirectory(${component})
 	endif()

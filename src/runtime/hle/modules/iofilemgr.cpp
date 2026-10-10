@@ -19,6 +19,7 @@
 #include "runtime/kernel/callbacks.h"
 #include "runtime/kernel/errors.h"
 #include "runtime/kernel/scheduler.h"
+#include "runtime/media/disc.h"
 
 using namespace kernel;
 
@@ -566,7 +567,7 @@ bool UmdDevctl(u32 cmd, u32 in, u32 inLen, u32 out, u32 outLen, int *result, u32
 		return true;
 	case 0x01F20001:  // disc type
 		if ((out & 3) == 0 && mem::IsValidRange(out, 8) && outLen >= 8) {
-			GWrite32(out + 4, 0x10);  // game disc
+			GWrite32(out + 4, media::DiscType());  // 0x10 game, 0x20 UMD Video, 0x40 UMD Audio
 			*result = 0;
 		} else {
 			badParams();
@@ -761,6 +762,7 @@ int sceIoDopen(const char *path) {
 	io::Resolved r;
 	int err = ResolveFs(path, &r);
 	if (err < 0) return err;
+	io::OnDirectoryOpen(r.device, r.path);
 	vfs::FileSystem *fs = r.dev->Fs();
 	s32 dd = fs->DOpen(r.path);
 	if (dd < 0) return dd;

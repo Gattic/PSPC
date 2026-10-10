@@ -396,6 +396,9 @@ const u8 *MEOrGuestPointer(u32 addr, u32 size) {
 	return mem::GetPointer(addr, size);
 }
 
+u32 MEAllocate(u32 size) { return MEAlloc(size); }
+void MERelease(u32 addr) { MEFree(addr); }
+
 void Register_sceVideocodec() {
 	static const hle::HleFunction funcs[] = {
 	    HLEFN(0xC01EC829, sceVideocodecOpen),

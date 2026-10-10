@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// sceHttp (libhttp.prx) and sceSsl (libssl.prx), offline. Templates, connections and requests are
-// created and configured as on hardware; sending a request fails the way it does with no network
-// (the host name doesn't resolve: no DNS server), after which the request is still "before send".
+// sceHttp (libhttp.prx) and sceSsl (libssl.prx). Templates, connections and requests are created
+// and configured as on hardware; sending a request makes it over WinHTTP (http and https, the
+// system's proxy settings, redirects, chunked bodies), on a worker thread while the calling guest
+// thread sleeps. The body is read as the game asks for it (sceHttpReadData).
+//
+// Like libhttp, a request needs the PSP to be on a network: without an access point (sceNetApctl not
+// at GOT_IP) a host name fails with the resolver's NO_DNS_SERVER and an address with
+// SCE_HTTP_ERROR_NETWORK, and the request stays "before send". network=0 always behaves that way.
 //
 // Function set, the template/connection/request model and argument checks ported from PPSSPP
 // (Core/HLE/sceHttp.cpp, sceHttp.h, sceSsl.cpp), Copyright (c) 2012- PPSSPP Project,
@@ -11,12 +16,19 @@
 #include <algorithm>
 #include <cctype>
 #include <map>
+#include <memory>
 #include <string>
+#include <vector>
 
 #include "common/log.h"
+#include "net/http_client.h"
 #include "runtime/hle/hle_wrap.h"
 #include "runtime/hle/modules/net_internal.h"
 #include "runtime/kernel/errors.h"
+#include "runtime/kernel/scheduler.h"
+#include "runtime/kernel/sysmem.h"
+
+#include <winhttp.h>  // after windows.h (via net_internal.h)
 
 namespace {
 
@@ -25,9 +37,16 @@ constexpr const char *LOG = "NET";
 // libhttp error codes (uOFW lib_http.h / vitasdk).
 constexpr u32 SCE_HTTP_ERROR_BEFORE_INIT = 0x80431001;
 constexpr u32 SCE_HTTP_ERROR_ALREADY_INITED = 0x80431020;
+constexpr u32 SCE_HTTP_ERROR_OUT_OF_MEMORY = 0x80431022;
 constexpr u32 SCE_HTTP_ERROR_UNKNOWN_SCHEME = 0x80431061;
 constexpr u32 SCE_HTTP_ERROR_NETWORK = 0x80431063;
+constexpr u32 SCE_HTTP_ERROR_BAD_RESPONSE = 0x80431064;
 constexpr u32 SCE_HTTP_ERROR_BEFORE_SEND = 0x80431065;
+constexpr u32 SCE_HTTP_ERROR_TIMEOUT = 0x80431068;
+constexpr u32 SCE_HTTP_ERROR_NO_CONTENT_LENGTH = 0x80431071;
+constexpr u32 SCE_HTTP_ERROR_SSL = 0x80431075;
+constexpr u32 SCE_HTTP_ERROR_ABORTED = 0x80431080;
+constexpr u32 SCE_HTTP_ERROR_UNKNOWN = 0x80431081;
 constexpr u32 SCE_HTTP_ERROR_UNKNOWN_METHOD = 0x8043106B;
 constexpr u32 SCE_HTTP_ERROR_INVALID_ID = 0x80431100;
 constexpr u32 SCE_HTTP_ERROR_INVALID_VALUE = 0x804311FE;
@@ -60,6 +79,16 @@ struct HttpConnection {
 	u16 port = 80;
 };
 
+// The host side of a request: shared with the worker thread doing its WinHTTP calls, which may
+// outlive the request (a deleted or aborted request's worker finishes on its own).
+struct HttpTransfer {
+	hostnet::HttpExchange exchange;
+	u32 error = 0;           // WinHTTP error of the last call
+	std::vector<u8> buffer;  // body bytes read ahead of the game
+	size_t pos = 0;
+	bool eof = false;
+};
+
 struct HttpRequest {
 	HttpSettings settings;
 	u32 connectionId = 0;
@@ -68,7 +97,20 @@ struct HttpRequest {
 	u64 contentLength = 0;
 	bool sent = false;
 	bool aborted = false;
+	std::shared_ptr<HttpTransfer> transfer;
+	u64 abortKey = 0;
+	int networkErrno = 0;  // sceHttpGetNetworkErrno
+	u32 headerAddr = 0;    // sceHttpGetAllHeader's copy (user memory)
 };
+u64 g_nextHttpAbortKey = 1;
+
+void ReleaseRequest(HttpRequest &r) {
+	if (r.transfer) r.transfer->exchange.Cancel();
+	r.transfer.reset();
+	if (r.abortKey) net::AbortWaits(r.abortKey);
+	if (r.headerAddr) kernel::g_userMem.Free(r.headerAddr);
+	r.headerAddr = 0;
+}
 
 bool g_httpInited = false;
 bool g_httpsInited = false;
@@ -172,6 +214,7 @@ int sceHttpInit(u32 poolSize) {
 
 int sceHttpEnd() {
 	HTTP_REQUIRE_INIT();
+	for (auto &r : g_requests) ReleaseRequest(r.second);
 	g_templates.clear();
 	g_connections.clear();
 	g_requests.clear();
@@ -247,6 +290,7 @@ int CreateRequest(u32 connectionId, int method, const std::string &url, u64 cont
 	r.method = method;
 	r.url = url;
 	r.contentLength = contentLength;
+	r.abortKey = (4ull << 40) | g_nextHttpAbortKey++;
 	g_requests[id] = r;
 	LOGD(LOG, "sceHttpCreateRequest(%08x, %d, %s) -> %08x", connectionId, method, url.c_str(), id);
 	return (int)id;
@@ -272,23 +316,115 @@ int sceHttpCreateRequestWithURL(u32 connectionId, int method, const char *url, u
 
 int sceHttpDeleteRequest(u32 id) {
 	HTTP_REQUIRE_INIT();
-	if (!g_requests.erase(id)) return (int)SCE_HTTP_ERROR_INVALID_ID;
+	auto it = g_requests.find(id);
+	if (it == g_requests.end()) return (int)SCE_HTTP_ERROR_INVALID_ID;
+	ReleaseRequest(it->second);
+	g_requests.erase(it);
 	return 0;
 }
 
-// Resolving the host is the first thing sending does, and with no DNS server it fails there.
+// libhttp result of a failed WinHTTP call, and the PSP errno sceHttpGetNetworkErrno reports.
+u32 HttpErrorFrom(u32 err, int *networkErrno) {
+	*networkErrno = 0;
+	switch (err) {
+	case ERROR_WINHTTP_NAME_NOT_RESOLVED: return SCE_NET_RESOLVER_ERROR_INVALID_HOST;
+	case ERROR_WINHTTP_CANNOT_CONNECT:
+		*networkErrno = net::INET_ECONNREFUSED;
+		return SCE_HTTP_ERROR_NETWORK;
+	case ERROR_WINHTTP_CONNECTION_ERROR:
+		*networkErrno = net::INET_ECONNRESET;
+		return SCE_HTTP_ERROR_NETWORK;
+	case ERROR_WINHTTP_TIMEOUT:
+		*networkErrno = net::INET_ETIMEDOUT;
+		return SCE_HTTP_ERROR_TIMEOUT;
+	case ERROR_WINHTTP_OPERATION_CANCELLED: return SCE_HTTP_ERROR_ABORTED;
+	case ERROR_WINHTTP_INVALID_SERVER_RESPONSE:
+	case ERROR_WINHTTP_REDIRECT_FAILED:
+	case ERROR_WINHTTP_HEADER_SIZE_OVERFLOW: return SCE_HTTP_ERROR_BAD_RESPONSE;
+	case ERROR_WINHTTP_INVALID_URL: return SCE_HTTP_ERROR_INVALID_URL;
+	case ERROR_WINHTTP_UNRECOGNIZED_SCHEME: return SCE_HTTP_ERROR_UNKNOWN_SCHEME;
+	case ERROR_WINHTTP_SECURE_FAILURE:
+	case ERROR_WINHTTP_SECURE_INVALID_CA:
+	case ERROR_WINHTTP_SECURE_CERT_DATE_INVALID:
+	case ERROR_WINHTTP_SECURE_CERT_CN_INVALID:
+	case ERROR_WINHTTP_SECURE_CERT_REV_FAILED:
+	case ERROR_WINHTTP_SECURE_INVALID_CERT:
+	case ERROR_WINHTTP_SECURE_CERT_REVOKED:
+	case ERROR_WINHTTP_SECURE_CERT_WRONG_USAGE:
+	case ERROR_WINHTTP_CLIENT_AUTH_CERT_NEEDED: return SCE_HTTP_ERROR_SSL;
+	default: return SCE_HTTP_ERROR_UNKNOWN;
+	}
+}
+
+// The absolute URL of a request: its own, or the connection's scheme, host and port + its path.
+std::string RequestUrl(const HttpRequest &r) {
+	if (r.url.find("://") != std::string::npos) return r.url;
+	auto it = g_connections.find(r.connectionId);
+	if (it == g_connections.end()) return r.url;
+	const HttpConnection &c = it->second;
+	bool https = EqualsNoCase(c.scheme, "https");
+	std::string url = (https ? "https://" : "http://") + c.host;
+	if (c.port != (https ? 443 : 80)) url += ":" + std::to_string(c.port);
+	if (r.url.empty() || r.url[0] != '/') url += "/";
+	return url + r.url;
+}
+
+u32 MsFromUs(u32 us) { return us ? std::max<u32>(us / 1000, 1) : 0; }
+
 int sceHttpSendRequest(u32 id, u32 dataAddr, u32 dataSize) {
 	HTTP_REQUIRE_INIT();
 	HttpRequest *r = RequestOf(id);
 	if (!r) return (int)SCE_HTTP_ERROR_INVALID_ID;
 	if (dataSize > 0 && !mem::IsValidRange(dataAddr, dataSize)) return (int)SCE_HTTP_ERROR_INVALID_VALUE;
-	std::string host = g_connections.count(r->connectionId) ? g_connections[r->connectionId].host : "";
-	std::string scheme;
-	u16 port;
-	if (r->url.find("://") != std::string::npos) SplitHttpUrl(r->url, &scheme, &host, &port);
-	LOGI(LOG, "sceHttpSendRequest(%08x): %s - no network", id, host.c_str());
-	if (IsDottedAddress(host)) return (int)SCE_HTTP_ERROR_NETWORK;
-	return (int)net::SCE_NET_RESOLVER_NO_DNS_SERVER;
+	std::string url = RequestUrl(*r);
+	std::string scheme, host;
+	u16 port = 0;
+	if (!SplitHttpUrl(url, &scheme, &host, &port)) return (int)SCE_HTTP_ERROR_INVALID_URL;
+	// Resolving the host is the first thing sending does, and with no DNS server it fails there.
+	if (!net::Enabled() || !net::HaveDnsServer()) {
+		LOGI(LOG, "sceHttpSendRequest(%08x): %s - not connected to a network", id, url.c_str());
+		if (IsDottedAddress(host)) return (int)SCE_HTTP_ERROR_NETWORK;
+		return (int)net::SCE_NET_RESOLVER_NO_DNS_SERVER;
+	}
+	hostnet::HttpRequestSpec spec;
+	spec.method = r->method == HTTP_METHOD_POST ? "POST" : r->method == HTTP_METHOD_HEAD ? "HEAD" : "GET";
+	spec.url = url;
+	spec.userAgent = r->settings.userAgent;
+	spec.http10 = r->settings.httpVersion == 0;
+	for (auto &h : r->settings.headers)
+		if (!EqualsNoCase(h.first, "user-agent")) spec.headers.push_back(h);
+	if (dataSize) spec.body.assign((const u8 *)GPtr(dataAddr), (const u8 *)GPtr(dataAddr) + dataSize);
+	spec.followRedirects = r->settings.redirect;
+	spec.cookies = r->settings.cookie;
+	spec.resolveTimeoutMs = MsFromUs(r->settings.resolveTimeout) * (u32)std::max(1, r->settings.resolveRetry);
+	spec.connectTimeoutMs = MsFromUs(r->settings.connectTimeout);
+	spec.sendTimeoutMs = MsFromUs(r->settings.sendTimeout);
+	spec.recvTimeoutMs = MsFromUs(r->settings.recvTimeout);
+
+	// A request can be sent again; the previous response goes.
+	if (r->transfer) r->transfer->exchange.Cancel();
+	auto xfer = std::make_shared<HttpTransfer>();
+	r->transfer = xfer;
+	r->sent = false;
+	r->aborted = false;
+	r->networkErrno = 0;
+	u64 key = r->abortKey;
+	LOGI(LOG, "sceHttpSendRequest(%08x): %s %s", id, spec.method.c_str(), url.c_str());
+	bool done = net::RunBlockingOnHost([xfer, spec] { xfer->error = xfer->exchange.Send(spec); }, 0, key);
+	r = RequestOf(id);
+	if (!r || r->transfer != xfer) return (int)SCE_HTTP_ERROR_ABORTED;  // deleted or re-sent meanwhile
+	if (!done || r->aborted) {
+		xfer->exchange.Cancel();
+		return (int)SCE_HTTP_ERROR_ABORTED;
+	}
+	if (xfer->error) {
+		u32 e = HttpErrorFrom(xfer->error, &r->networkErrno);
+		LOGI(LOG, "sceHttpSendRequest(%08x): %s -> %08x", id, hostnet::HttpExchange::ErrorName(xfer->error), e);
+		return (int)e;
+	}
+	r->sent = true;
+	LOGI(LOG, "sceHttpSendRequest(%08x): %s", id, xfer->exchange.statusLine.c_str());
+	return 0;
 }
 
 int sceHttpAbortRequest(u32 id) {
@@ -296,16 +432,20 @@ int sceHttpAbortRequest(u32 id) {
 	HttpRequest *r = RequestOf(id);
 	if (!r) return (int)SCE_HTTP_ERROR_INVALID_ID;
 	r->aborted = true;
+	if (r->transfer) r->transfer->exchange.Cancel();
+	net::AbortWaits(r->abortKey);
 	return 0;
 }
 
-// Everything about the response is unavailable until a send succeeds, which it never does.
+// The response is there once a send succeeded.
 int sceHttpGetStatusCode(u32 id, u32 statusCodeAddr) {
 	HTTP_REQUIRE_INIT();
 	HttpRequest *r = RequestOf(id);
 	if (!r) return (int)SCE_HTTP_ERROR_INVALID_ID;
 	if (!mem::IsValidRange(statusCodeAddr, 4)) return (int)SCE_HTTP_ERROR_INVALID_VALUE;
-	return (int)SCE_HTTP_ERROR_BEFORE_SEND;
+	if (!r->sent || !r->transfer) return (int)SCE_HTTP_ERROR_BEFORE_SEND;
+	GWrite32(statusCodeAddr, (u32)r->transfer->exchange.status);
+	return 0;
 }
 
 int sceHttpGetContentLength(u32 id, u32 contentLengthAddr) {
@@ -313,29 +453,75 @@ int sceHttpGetContentLength(u32 id, u32 contentLengthAddr) {
 	HttpRequest *r = RequestOf(id);
 	if (!r) return (int)SCE_HTTP_ERROR_INVALID_ID;
 	if (!mem::IsValidRange(contentLengthAddr, 8)) return (int)SCE_HTTP_ERROR_INVALID_VALUE;
-	return (int)SCE_HTTP_ERROR_BEFORE_SEND;
+	if (!r->sent || !r->transfer) return (int)SCE_HTTP_ERROR_BEFORE_SEND;
+	// A chunked (or connection-close) body has no length up front.
+	if (!r->transfer->exchange.haveContentLength) return (int)SCE_HTTP_ERROR_NO_CONTENT_LENGTH;
+	u64 len = r->transfer->exchange.contentLength;
+	GWrite32(contentLengthAddr, (u32)len);
+	GWrite32(contentLengthAddr + 4, (u32)(len >> 32));
+	return 0;
 }
 
+// The header block as received (status line, headers, blank line), NUL-terminated, in a buffer of
+// the library's; *headerSize counts the NUL (libhttp 6.60, as in PPSSPP).
 int sceHttpGetAllHeader(u32 id, u32 headerAddrPtr, u32 headerSizePtr) {
 	HTTP_REQUIRE_INIT();
 	HttpRequest *r = RequestOf(id);
 	if (!r) return (int)SCE_HTTP_ERROR_INVALID_ID;
 	if (!mem::IsValidRange(headerAddrPtr, 4) || !mem::IsValidRange(headerSizePtr, 4)) return (int)SCE_HTTP_ERROR_INVALID_VALUE;
-	return (int)SCE_HTTP_ERROR_BEFORE_SEND;
+	if (!r->sent || !r->transfer) return (int)SCE_HTTP_ERROR_BEFORE_SEND;
+	const std::string &h = r->transfer->exchange.rawHeaders;
+	u32 size = (u32)h.size() + 1;
+	if (r->headerAddr) kernel::g_userMem.Free(r->headerAddr);
+	r->headerAddr = kernel::g_userMem.Alloc(size, false, "sceHttp response headers");
+	if (!r->headerAddr) return (int)SCE_HTTP_ERROR_OUT_OF_MEMORY;
+	mem::WriteBytes(r->headerAddr, h.c_str(), size);
+	GWrite32(headerAddrPtr, r->headerAddr);
+	GWrite32(headerSizePtr, size);
+	return 0;
 }
 
+// Copies what the game asks for; the body is fetched from the host in pieces of at least 16 KB.
 int sceHttpReadData(u32 id, u32 dataAddr, u32 dataSize) {
 	HTTP_REQUIRE_INIT();
 	HttpRequest *r = RequestOf(id);
 	if (!r) return (int)SCE_HTTP_ERROR_INVALID_ID;
 	if (dataSize && !mem::IsValidRange(dataAddr, dataSize)) return (int)SCE_HTTP_ERROR_INVALID_VALUE;
-	return (int)SCE_HTTP_ERROR_BEFORE_SEND;
+	if (!r->sent || !r->transfer) return (int)SCE_HTTP_ERROR_BEFORE_SEND;
+	if (!dataSize || r->method == HTTP_METHOD_HEAD) return 0;
+	std::shared_ptr<HttpTransfer> xfer = r->transfer;
+	if (xfer->pos >= xfer->buffer.size() && !xfer->eof) {
+		u32 want = std::max<u32>(dataSize, 16 * 1024);
+		u64 key = r->abortKey;
+		bool done = net::RunBlockingOnHost(
+		    [xfer, want] {
+			    xfer->buffer.resize(want);
+			    xfer->pos = 0;
+			    u32 got = 0;
+			    xfer->error = xfer->exchange.Read(xfer->buffer.data(), want, &got);
+			    xfer->buffer.resize(xfer->error ? 0 : got);
+			    if (!xfer->error && got == 0) xfer->eof = true;
+		    },
+		    0, key);
+		r = RequestOf(id);
+		if (!r || r->transfer != xfer || !done || r->aborted) return (int)SCE_HTTP_ERROR_ABORTED;
+		if (xfer->error) {
+			u32 e = HttpErrorFrom(xfer->error, &r->networkErrno);
+			LOGI(LOG, "sceHttpReadData(%08x): %s -> %08x", id, hostnet::HttpExchange::ErrorName(xfer->error), e);
+			return (int)e;
+		}
+	}
+	u32 n = (u32)std::min<size_t>(dataSize, xfer->buffer.size() - xfer->pos);
+	if (n) mem::WriteBytes(dataAddr, xfer->buffer.data() + xfer->pos, n);
+	xfer->pos += n;
+	return (int)n;
 }
 
 int sceHttpGetNetworkErrno(u32 id, u32 errnoAddr) {
 	HTTP_REQUIRE_INIT();
-	if (!RequestOf(id)) return (int)SCE_HTTP_ERROR_INVALID_ID;
-	if (mem::IsValidRange(errnoAddr, 4)) GWrite32(errnoAddr, 0);
+	HttpRequest *r = RequestOf(id);
+	if (!r) return (int)SCE_HTTP_ERROR_INVALID_ID;
+	if (mem::IsValidRange(errnoAddr, 4)) GWrite32(errnoAddr, (u32)r->networkErrno);
 	return 0;
 }
 
@@ -460,6 +646,44 @@ int sceHttpNagle(u32 id) {
 	return 0;
 }
 
+// The browser (NetFront) sends through the cache: there is none, so it's a plain send.
+int sceHttpSendRequestInCacheFirstMode(u32 id, u32 dataAddr, u32 dataSize) { return sceHttpSendRequest(id, dataAddr, dataSize); }
+// Nothing is ever cached.
+int sceHttpIsRequestInCache(u32 id, u32, u32) {
+	HTTP_REQUIRE_INIT();
+	return RequestOf(id) ? 0 : (int)SCE_HTTP_ERROR_INVALID_ID;
+}
+int sceHttpGetNetworkPspError(u32 id, u32 errAddr) {
+	HTTP_REQUIRE_INIT();
+	HttpRequest *r = RequestOf(id);
+	if (!r) return (int)SCE_HTTP_ERROR_INVALID_ID;
+	if (mem::IsValidRange(errAddr, 4)) GWrite32(errAddr, r->networkErrno ? 0x80010000u | (u32)r->networkErrno : 0);
+	return 0;
+}
+int sceHttpChangeHttpVersion(u32 id, int version) {
+	HTTP_REQUIRE_INIT();
+	HttpSettings *s = SettingsOf(id);
+	if (!s) return (int)SCE_HTTP_ERROR_INVALID_ID;
+	s->httpVersion = version;
+	return 0;
+}
+int sceHttpCloneTemplate(u32 id) {
+	HTTP_REQUIRE_INIT();
+	auto it = g_templates.find(id);
+	if (it == g_templates.end()) return (int)SCE_HTTP_ERROR_INVALID_ID;
+	u32 clone = FreeId(g_templates, 0);
+	g_templates[clone] = it->second;
+	return (int)clone;
+}
+// Options with nothing behind them here (caches, auth lists, cookie callbacks, buffer sizes).
+int sceHttpAccepted() { return g_httpInited ? 0 : (int)SCE_HTTP_ERROR_BEFORE_INIT; }
+// Cookies live in the host's HTTP session; none is handed out to the guest.
+int sceHttpGetCookie(u32, u32, u32 lengthAddr, u32, u32) {
+	HTTP_REQUIRE_INIT();
+	if (mem::IsValidRange(lengthAddr, 4)) GWrite32(lengthAddr, 0);
+	return (int)0x80431025;  // SCE_HTTP_ERROR_NOT_FOUND
+}
+
 int sceHttpsInit(int, int, int, int) {
 	g_httpsInited = true;
 	return 0;
@@ -564,7 +788,29 @@ void RegisterHttpLibraries() {
 		HLEFN(0x68AB0F86, sceHttpsInitWithPath),
 		HLEFN(0xB3FAF831, sceHttpsOption),  // sceHttpsDisableOption
 		HLEFN(0xBAC31BF1, sceHttpsOption),  // sceHttpsEnableOption
-		HLESTUB(0x2255551E, "sceHttpGetNetworkPspError"),
+		HLEFN(0x2255551E, sceHttpGetNetworkPspError),
+		HLEFN(0x9AFC98B2, sceHttpSendRequestInCacheFirstMode),
+		HLEFN(0x54E7DF75, sceHttpIsRequestInCache),
+		HLEFN(0xC6330B0D, sceHttpChangeHttpVersion),
+		HLEFN(0x4E4A284A, sceHttpCloneTemplate),
+		HLEFN(0x739C2D79, sceHttpAccepted),  // sceHttpInitExternalCache
+		HLEFN(0x8046E250, sceHttpAccepted),  // sceHttpEnableExternalCache
+		HLEFN(0xA461A167, sceHttpAccepted),  // sceHttpEndExternalCache
+		HLEFN(0xB0257723, sceHttpAccepted),  // sceHttpFlushExternalCache
+		HLEFN(0x1CEDB9D4, sceHttpAccepted),  // sceHttpFlushCache
+		HLEFN(0x457D221D, sceHttpAccepted),  // sceHttpFlushCookie
+		HLEFN(0x2C3C82CF, sceHttpAccepted),  // sceHttpFlushAuthList
+		HLEFN(0x77EE5319, sceHttpAccepted),  // sceHttpLoadAuthList
+		HLEFN(0xDD6E7857, sceHttpAccepted),  // sceHttpSaveAuthList
+		HLEFN(0x951D310E, sceHttpAccepted),  // sceHttpDisableProxyAuth
+		HLEFN(0xCDB0DC58, sceHttpAccepted),  // sceHttpEnableProxyAuth
+		HLEFN(0x06488A1C, sceHttpAccepted),  // sceHttpSetCookieSendCallback
+		HLEFN(0x3A67F306, sceHttpAccepted),  // sceHttpSetCookieRecvCallback
+		HLEFN(0xC98CBBA7, sceHttpAccepted),  // sceHttpSetResHeaderMaxSize
+		HLEFN(0x9668864C, sceHttpAccepted),  // sceHttpSetRecvBlockSize
+		HLEFN(0xB0C34B1D, sceHttpAccepted),  // sceHttpSetCacheContentLengthMaxSize
+		HLEFN(0xA909F2AE, sceHttpAccepted),  // sceHttp_A909F2AE (htmlviewer)
+		HLEFN(0x96F16D3E, sceHttpGetCookie),
 		HLEFN(0xAB1540D5, sceHttpsGetSslError),
 		HLEFN(0xA4496DE5, sceHttpSetCallback),  // sceHttpSetRedirectCallback
 		HLEFN(0x267618F4, sceHttpSetCallback),  // sceHttpSetAuthInfoCallback

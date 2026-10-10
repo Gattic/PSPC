@@ -22,10 +22,19 @@ python -I tools\pspc_install_fw.py --build-dir build\RelWithDebInfo
 build\RelWithDebInfo\bin\pspc.exe --vsh
 ```
 
-UMD images (`.iso/.cso/.zso/.dax`) in `<pspc dir>\ms0\ISO` appear under Game > Memory Stick (a
-hard link works: `mklink /H ms0\ISO\game.iso Games\game.iso`). `--umd <image>` puts a disc in the
-drive instead. SELECT opens M33's VSH menu; `--recovery` (or R held while the XMB boots) starts
-M33's recovery menu.
+UMD images (`.iso/.cso/.zso/.dax`) in `<pspc dir>\ms0\ISO` or in pspc's Games folder
+(`games_dir` in pspc.ini; default the `Games` folder next to pspc.exe or in a parent) appear under
+Game > Memory Stick, and so do `EBOOT.PBP` game folders in the Games folder (`Games\<name>\EBOOT.PBP`,
+the PSN/homebrew layout), without being copied to the memory stick. `ms0:/PSP/GAME150` and
+`GAME4XX` are listed too. `--umd <image>` puts a disc in the drive instead; it stays there when a
+game launched from it returns to the XMB. SELECT opens M33's VSH menu (its ISO VIDEO MOUNT puts an
+image of `ms0:/ISO/VIDEO` in the drive as a UMD Video); `--recovery` (or R held while the XMB boots)
+starts M33's recovery menu.
+
+The XMB gets the user memory of a PSP-2000 (all of the 64 MB above the kernel, not 24 MB): its
+plugins, the browser's in particular, don't fit otherwise, since PSPC places firmware modules at
+their native-code addresses. `--no-large-mem` keeps it at 24 MB; games still get 24 MB unless
+`--large-mem` is given.
 
 Headless check, as used during development:
 
@@ -72,6 +81,12 @@ Waiting is what removes the investigation's scePaf heap-pool patch: `heaparea1`'
 exits. From there the VSH loads its plugins itself (`opening_plugin`, `impose_plugin`,
 `game_plugin`, `sysconf_plugin`...) through `vshKernelLoadModuleVSH`.
 
+When the XMB launches a game it passes its `vshmain_args` block (0x400 bytes: which column and
+item had the focus, "not a cold boot") through LoadExecVSH. PSPC keeps it across the restart
+(`--vsh-args <temp file>`, added by the frontend) and hands it back to `vshmain`'s `module_start`
+when the game exits, so the XMB comes back where it was, without the boot animation and without
+auto-booting the disc again.
+
 Module loading policy for what the VSH loads by path:
 
 | What | Result |
@@ -113,11 +128,47 @@ Module loading policy for what the VSH loads by path:
 * **Loader fixes** found on the way, both generic: a PRX with no entry point (e_entry 0xFFFFFFFF)
   is no longer "started" at base - 1; variable imports are bound when the exporting library loads
   after the importer (music_main_plugin uses variables of music_browser, loaded later).
+* **The registry is 4.01's** (`hle/modules/reg.cpp`): every directory and key of the default
+  table in 4.01 `vshmain.prx`, with its types and sizes, `category_version` 0x40 (an older value
+  makes the VSH "upgrade" the registry) and region values for a European PSP-2000. The date, time
+  and time zone keys follow the host unless the XMB has set them.
+* **sceChnnlsv** (`hle/modules/chnnlsv.cpp`, after PPSSPP's sceChnnlsv.cpp) and the save data
+  hashes and encryption. The KIRK commands run in `pspc-decrypt kirk-service`, a GPL-3 process
+  started on first use (`kirk_client.cpp`, see tools/pspc-decrypt/README.md); commands 5 and 8
+  use a key derived from this installation's fuse ID. Saves are now written as a PSP writes them
+  (encrypted data file, SAVEDATA_FILE_LIST MAC, the PARAM.SFO hashes in SAVEDATA_PARAMS), so the
+  Saved Data Utility lists them as intact and copies them; the older PSPC-PLAINTEXT saves still
+  load, and at XMB boot the hashes the utility checks are added to saves that lack them
+  (`save_crypto.cpp`, `dialogs/savedata.h`). Without pspc-decrypt.exe saves stay plaintext.
+* **Copy in the Saved Data Utility** copies between two memory sticks: `<pspc dir>\ms1` is the
+  second one. The utility asks the user to swap sticks and polls `mscmhc0:` devctl 0x0202580A for
+  the swap (after setting its four words with 0x0201580B); PSPC swaps `ms0:` to the other folder
+  at that read (the FAT/memory stick callbacks fire as for a real swap) and back when the
+  utility next lists `ms0:/PSP/SAVEDATA`.
+* **sceIdStorageLookup** (`console_id.cpp`): a MAC address and fuse ID made up once per
+  installation (`flash1:/pspc_idstorage.txt`, locally administered MAC); System Information shows
+  the MAC. Keys PSPC has no data for are reported missing, as before.
+* **Setting the clock**: `sceRtcSetCurrentTick`, `sceRtcSetConf` and `sceRtcGetCurrentSecureTick`
+  (the vshbridge entries System Settings uses). The difference from the host clock and the time
+  zone go to `flash1:/pspc_rtc.txt` and apply to sceRtc and the kernel's time functions in the
+  XMB and the games it launches; a game started on its own keeps the host clock.
+* **Memory Stick Video** (`ms0:/VIDEO`): msvideo_main_plugin demuxes MP4 itself and feeds
+  sceMpeg in mode 4/5 one access unit at a time as NAL units; `sceMpegGetAvcNalAu`,
+  `sceMpegAvcDecodeDetail2`, `sceMpegAvcDecodeDetailIndex`, `sceMpeg_6F314410` and
+  `sceMpegFlushAu` implement that path (Windows' H.264 decoder, pictures left in ME memory and
+  described as mpeg_vsh.prx describes them; `sceMpegBaseYCrCbCopy` takes the size from the
+  source descriptor). AAC goes through sceAudiocodec with the 0x2D flag msvideo sets on every
+  model but the PSP-1000, and out through vaudio (`sceVaudio_E8E78DC8` is 4.01's buffered
+  reserve, `sceVaudio_504E4745` a level setting).
+* **Disc type**: `sceUmdGetDiscInfo` and devctl 0x01F20001 report a UMD Video (0x20) or UMD
+  Audio (0x40) image as such, so the Video column offers it.
+* Smaller ones met on user-reachable paths: `scePowerIsRequest`; `sceUsbGetState` reports "no
+  connection" (0x001), which stops the camera plugin waiting for a USB camera.
 
-Deliberately left as they are: devctl 0x01F20001 answers "game disc" even with an empty drive
-(answering 0 made the 4.01 XMB show "The disc could not be read" at boot), and the registry keeps
-`category_version` 1 and `umd_autoboot` 1 (with a disc in the drive the XMB boots it at once, as a
-PSP with UMD auto-start does).
+Deliberately left as it is: devctl 0x01F20001 answers "game disc" even with an empty drive
+(answering 0 made the 4.01 XMB show "The disc could not be read" at boot). `umd_autoboot` is 1:
+with a disc in the drive at boot the XMB starts it at once, as a PSP with UMD auto-start does
+(not when coming back from a game, see above).
 
 ## M33 behaviours reproduced natively (`src/runtime/m33`)
 
@@ -125,7 +176,14 @@ PSP with UMD auto-start does).
   overlay: listing `ms0:/PSP/GAME` adds a folder `MMMMMISO<n>` per image in `ms0:/ISO`, holding a
   virtual `EBOOT.PBP` built from the image's PARAM.SFO (CATEGORY changed to "MG", a memory stick
   game), ICON0, ICON1.PMF, PIC0, PIC1 and SND0. The XMB shows icons, backgrounds and animated
-  icons for each image. Deleting such an entry is refused (it would delete the image).
+  icons for each image. Deleting such an entry is refused (it would delete the image). Images in
+  pspc's Games folder are added the same way (an image found both ways is listed once).
+* **GAME150 / GAME4XX**: their entries are listed in `ms0:/PSP/GAME` with `__150` / `__4XX`
+  appended and every path under such an entry is redirected to the real folder, as vshctrl does;
+  the 1.50-kernel homebrew of GAME150 then runs in PSPC's single kernel like any other.
+* **EBOOT.PBP folders in the Games folder** are listed in `ms0:/PSP/GAME` under their folder name
+  (up to the depth images are searched); reads go to the host folder, and launching one restarts
+  pspc with the host `EBOOT.PBP`. Deleting them from the XMB is refused.
 * **Launching**: the XMB calls `vshKernelLoadExecVSHMs2("ms0:/PSP/GAME/MMMMMISO<n>/EBOOT.PBP")`;
   `m33::LoadExecFromVsh` maps it to the image and the runtime restarts with it (a new pspc
   process, `--return-to-vsh` added). UMD launches (`vshKernelLoadExecVSHDisc`) restart with the
@@ -155,19 +213,30 @@ PSP with UMD auto-start does).
   their Options menu (Copy / Delete / Information).
 * The VSH menu opens on SELECT, moves, changes settings (UMD ISO MODE), closes on SELECT.
 * The recovery menu boots and navigates.
+* Saved Data Utility > Copy: the swap prompts, the copy to `ms1`, and the copied save listed on
+  the second stick; saves written by PSPC list as intact (sceChnnlsv hashes).
+* `--umd`: back from the game, the disc is still in the drive and the XMB returns to the item it
+  launched, without auto-booting it again.
+* System Settings > Date & Time Settings changes the clock; the XMB clock shows the new time
+  after a restart of pspc. System Information shows the installation's MAC address.
+* GAME150/GAME4XX entries and `Games\<name>\EBOOT.PBP` folders are listed and launch.
+* Video > Memory Stick plays an MP4 (H.264 Main, CABAC, 480x272, AAC 48 kHz) from `ms0:/VIDEO`
+  with sound, start to end in real time; the player pauses on the last picture.
+* A windowed run (`PSPC_HOST_SNAPSHOT=<file.bmp>`, the 600th presented frame) shows the XMB at
+  960x544.
 
 ## Remaining work
 
-* The HOME screen of a game is a host message box, not the PSP's overlay.
-* GAME150/GAME4XX folders and video ISOs (`ms0:/ISO/VIDEO`, VSH menu ISO VIDEO MOUNT) are not
-  browsed; vshctrl's `isocache.bin` isn't written (images are read on demand instead).
+* vshctrl's `isocache.bin` isn't written (images are read on demand instead).
+* UMD Video images are recognised and offered, but playback is untested: no real UMD Video image
+  was available (a synthetic one stops at its missing `UMD_VIDEO/PLAYLIST.UMD`). Protected
+  (MagicGate) memory stick video needs the 16 `sceMgVideo` vshbridge entries, which stay
+  unresolved.
+* MP4 with B-frames: Windows' decoder gives each picture one access unit late (as the ME would
+  with reordering), and msvideo never asks for the last one, so it ends on the second-to-last
+  picture. Whether the player should go back to the list at the end is unverified.
 * Unimplemented VSH-only libraries log once and return 0: `sceUtility_private` (the plugins'
-  dialogs), `sceChnnlsv` (savedata hashes in Saved Data Utility), `sceMgVideo_driver` (protected
-  video), network/adhoc/NP pieces (`sceNetAdhocDownload`, `sceNetApctl_lib`...), `sceUsbCam`,
-  `sceG729`, `sceAsfParser` exports, `sceMlnBridge`. None of them is on the boot path.
-* `sceIdStorageLookup` reports every key missing (System Information shows no MAC address).
-* System Settings > Date & Time can't change the clock (it follows the host's).
-* The registry dump is a 6.6x PSP's: some keys the 4.01 sysconf reads may be missing or have
-  6.6x values; STR keys the XMB rewrites keep the size it wrote.
-* A game launched with `--umd` from the XMB comes back to an XMB with an empty drive.
-* Windowed mode was only exercised through the same code paths as headless.
+  dialogs), network/adhoc/NP pieces (`sceNetAdhocDownload`, `sceNetApctl_lib`...), `sceUsbCam`,
+  `sceG729`, `sceAsfParser` exports, `sceMlnBridge`, `sceMpegbase_AC9E717E` (called once by
+  msvideo). None of them is on a path walked so far.
+* The net code uses its own MAC address (net.cpp) rather than the one sceIdStorage reports.

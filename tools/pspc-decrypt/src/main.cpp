@@ -20,6 +20,7 @@
 #include "common.h"
 #include "formats.h"
 #include "json.h"
+#include "kirk_service.h"
 #include "module.h"
 #include "psar.h"
 
@@ -48,13 +49,16 @@ const char *kUsage =
 	"                               manifest.json.\n"
 	"  carve <file> <outdir>        Find ~PSP modules embedded in any file and decode each one.\n"
 	"  batch <listfile>             One \"<in>\\t<out>\" per line, each done like prx.\n"
+	"  kirk-service                 Serve KIRK commands on stdin/stdout for the PSPC runtime\n"
+	"                               (a binary protocol, see src/kirk_service.h).\n"
 	"\n"
 	"Options:\n"
 	"  --json                 Print results as JSON on stdout.\n"
 	"  --seed <32 hex>        NPDRM seed (version key) for type 5 modules that need one.\n"
 	"  --licensee-key <32 hex>  Licensee key for PSPEDAT modules whose header asks for it.\n"
 	"  --model <any|01g..12g> psar: resolve names against one model's file lists (default any).\n"
-	"  --keep-encrypted       psar/carve: also keep the original encrypted modules.\n"
+	"  --fuse <16 hex>        kirk-service: the console's fuse ID (keys KIRK commands 5 and 8).\n"
+	"  --keep-encrypted      psar/carve: also keep the original encrypted modules.\n"
 	"  -v, --verbose          psar: one line per entry on stderr.\n"
 	"  -q, --quiet            No progress text on stdout.\n"
 	"\n"
@@ -72,6 +76,7 @@ struct Args {
 	u8 seed[16] = {};
 	bool haveLicensee = false;
 	u8 licensee[16] = {};
+	u64 fuseId = 0;
 
 	DecodeOptions Decode() const {
 		DecodeOptions o;
@@ -120,6 +125,15 @@ bool ParseArgs(const std::vector<std::string> &argv, Args *args, std::string *er
 				return false;
 			}
 			args->haveSeed = true;
+		} else if (a == "--fuse") {
+			if (!value(&v)) return false;
+			u8 fuse[8];
+			if (!ParseHex(v, fuse, 8)) {
+				*error = "--fuse wants 16 hex digits";
+				return false;
+			}
+			args->fuseId = 0;
+			for (u8 b : fuse) args->fuseId = (args->fuseId << 8) | b;
 		} else if (a == "--licensee-key") {
 			if (!value(&v)) return false;
 			if (!ParseHex(v, args->licensee, 16)) {
@@ -558,6 +572,13 @@ int CmdCarve(const Args &args) {
 	return failed ? EXIT_FAILED : needsKey ? EXIT_NEEDS_KEY : EXIT_OK;
 }
 
+int CmdKirkService(const Args &args) {
+	if (!args.positional.empty()) {
+		return Usage("kirk-service takes no files");
+	}
+	return RunKirkService(args.fuseId);
+}
+
 int Run(const std::vector<std::string> &argv) {
 	Args args;
 	std::string error;
@@ -582,6 +603,7 @@ int Run(const std::vector<std::string> &argv) {
 		{ "psar", CmdPsar },
 		{ "carve", CmdCarve },
 		{ "batch", CmdBatch },
+		{ "kirk-service", CmdKirkService },
 	};
 	const auto it = commands.find(args.command);
 	if (it == commands.end()) {

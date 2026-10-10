@@ -25,4 +25,8 @@ bool ParseJpegHeader(const u8 *data, size_t size, JpegInfo *info);
 // Decodes to packed 8-bit R,G,B. False if WIC can't decode it.
 bool DecodeJpegRgb(const u8 *data, size_t size, int *width, int *height, std::vector<u8> *rgb);
 
+// Any image WIC reads (PNG save data icons...) as RGBA8888 pixels, R in the low byte, straight
+// alpha. False if WIC can't decode it.
+bool DecodeImageRgba(const u8 *data, size_t size, int *width, int *height, std::vector<u32> *rgba);
+
 }  // namespace media

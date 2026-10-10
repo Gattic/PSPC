@@ -133,6 +133,15 @@ std::shared_ptr<Device> MakeHostDevice(const std::string &hostRoot, bool readOnl
 // answering for the host directory. Until the device is mounted again. False if `device` isn't a
 // host-directory device.
 bool SetFsOverlay(const std::string &device, const std::function<std::shared_ptr<vfs::FileSystem>(vfs::HostFileSystem *)> &make);
+// Overlays host directory `dir` onto host-directory device `device` (vfs::HostFileSystem::
+// AddFallbackRoot): pspc's plugins folder on ms0:. False if `device` isn't one or `dir` is missing.
+bool AddHostFallback(const std::string &device, const std::string &dir);
+// The host folder of a second memory stick, which goes into ms0: when the XMB asks for another
+// stick (copying a save in the Saved Data Utility); the first one is then the other.
+void SetOtherMemoryStick(const std::string &hostDir);
+// sceIoDopen calls this first: the Saved Data Utility listing the saves again ends a copy
+// between memory sticks ("Copy completed. Insert the source Memory Stick").
+void OnDirectoryOpen(const std::string &device, const std::string &path);
 std::shared_ptr<Device> MakeVfsDevice(std::shared_ptr<vfs::FileSystem> fs, DevClass cls);
 // "emulator:" device pspautotests send their output through.
 std::shared_ptr<Device> MakeEmulatorDevice(bool hasDisplay);

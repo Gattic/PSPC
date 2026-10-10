@@ -15,6 +15,7 @@
 
 #include "common/log.h"
 #include "runtime/hle/hle_wrap.h"
+#include "runtime/hle/modules/console_id.h"
 #include "runtime/hle/modules/modules.h"
 #include "runtime/kernel/errors.h"
 #include "runtime/kernel/kernel_hle.h"
@@ -67,12 +68,14 @@ int vshCtrlReadBufferPositive(u32 pad, int count) {
 	return r;
 }
 
-// sceIdStorageLookup(key, offset, buf, len): the console's factory data. PSPC has none; the leaves
-// read as zero and the call reports the key missing (idstorage's "not found").
+// sceIdStorageLookup(key, offset, buf, len): the console's factory data, PSPC's per-installation
+// identity (console_id.h): the MAC address and the few other leaves the XMB reads.
 int vshIdStorageLookup(u32 key, u32 offset, u32 buf, u32 len) {
-	if (mem::IsValidRange(buf, len)) mem::Memset(buf, 0, len);
-	LOGD(LOG, "sceIdStorageLookup(key %04x, offset %x, %u bytes): no ID storage", key, offset, len);
-	return (int)0x80000025;
+	if (!mem::IsValidRange(buf, len)) return (int)0x80000023;  // vshbridge: a bad user pointer
+	int r = console::IdStorageLookup((u16)key, offset, mem::GetPointer(buf, len), len);
+	if (r < 0) mem::Memset(buf, 0, len);
+	LOGD(LOG, "sceIdStorageLookup(key %04x, offset %x, %u bytes) -> %08x", key, offset, len, (u32)r);
+	return r;
 }
 
 // The GE's EDRAM: PSPC models the 2 MB of the PSP-1000 (sceGeEdramGetHwSize).
@@ -172,6 +175,10 @@ const Forward kForwards[] = {
 	{0x4D4CB4F3, "vshVaudioChReserve", "sceVaudio", 0x03B6807D},            // sceVaudio_driver 03B6807D
 	{0xB56B0B9A, "vshVaudioChRelease", "sceVaudio", 0x67585DFD},            // sceVaudio_driver 67585DFD
 	{0xE61AA670, "vshVaudioOutputBlocking", "sceVaudio", 0x8986295E},       // sceVaudio_driver 8986295E
+	// System Settings > Date & Time (rtc.cpp keeps the clock's offset from the host's).
+	{0x06559655, "vshRtcSetCurrentTick", "sceRtc_driver", 0x38D062F0},      // sceRtc_driver 38D062F0
+	{0xA0D8C9A9, "vshRtcSetConf", "sceRtc_driver", 0x8EB1DEAC},             // sceRtc_driver 8EB1DEAC
+	{0x5AD46F41, "vshRtcGetCurrentSecureTick", "sceRtc_driver", 0x8D9645A2}, // sceRtc_driver 8D9645A2
 };
 
 }  // namespace
@@ -223,10 +230,6 @@ void Register_VshLibraries() {
 		HLEFN(0x9DE0434C, vshBridgeNop),  // sceImpose_driver FDBE164F
 		HLEFN(0x6CF81E5F, vshBridgeNop),  // sceAudio_driver CD272A5D
 		HLEFN(0x1C022452, vshBridgeNop),  // scePower_driver 95204444
-		HLEFN(0x5AD46F41, vshBridgeNop),  // sceRtc_driver 8D9645A2
-		HLEFN(0xA0D8C9A9, vshBridgeNop),  // sceRtc_driver 8EB1DEAC sceRtcSetConf
-		// System Settings > Date & Time sets the clock: PSPC's clock is the host's, left alone.
-		HLEFN(0x06559655, vshBridgeNop),  // sceRtc_driver 38D062F0 sceRtcSetCurrentTick
 		HLEFN(0xEAED8B3A, vshBridgeNop),  // scePspNpDrm_driver 9A34AC9F sceNpDrmCheckRifTimeLimit
 		// USB mass storage mode (no cable): nothing to start.
 		HLEFN(0x0313836F, vshBridgeNop),  // sceUSB_Stor_Ms_driver 56AA41EA

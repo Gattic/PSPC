@@ -266,27 +266,49 @@ struct HostFileSystem::OpenDir {
 	size_t index = 0;
 };
 
-HostFileSystem::HostFileSystem(std::filesystem::path root, HostFsOptions options) : opt_(options) {
+namespace {
+
+// The "\\?\" form of a directory, no trailing separator; `canonical` receives the normalized path.
+std::wstring LongRoot(const std::filesystem::path &root, std::filesystem::path *canonical) {
 	std::error_code ec;
-	std::filesystem::create_directories(root, ec);
 	std::filesystem::path abs = std::filesystem::absolute(root, ec);
 	std::filesystem::path canon = std::filesystem::weakly_canonical(abs, ec);
-	root_ = ec ? abs : canon;
-	std::wstring w = root_.wstring();
+	if (canonical) *canonical = ec ? abs : canon;
+	std::wstring w = (ec ? abs : canon).wstring();
 	std::replace(w.begin(), w.end(), L'/', L'\\');
 	while (w.size() > 3 && w.back() == L'\\') {
 		w.pop_back();
 	}
+	std::wstring out;
 	if (w.rfind(L"\\\\?\\", 0) == 0) {
-		rootW_ = w;
+		out = w;
 	} else if (w.rfind(L"\\\\", 0) == 0) {
-		rootW_ = L"\\\\?\\UNC\\" + w.substr(2);
+		out = L"\\\\?\\UNC\\" + w.substr(2);
 	} else {
-		rootW_ = L"\\\\?\\" + w;
+		out = L"\\\\?\\" + w;
 	}
-	if (!rootW_.empty() && rootW_.back() == L'\\') {
-		rootW_.pop_back();  // drive root "C:\"
+	if (!out.empty() && out.back() == L'\\') {
+		out.pop_back();  // drive root "C:\"
 	}
+	return out;
+}
+
+}  // namespace
+
+HostFileSystem::HostFileSystem(std::filesystem::path root, HostFsOptions options) : opt_(options) {
+	std::error_code ec;
+	std::filesystem::create_directories(root, ec);
+	rootW_ = LongRoot(root, &root_);
+}
+
+void HostFileSystem::AddFallbackRoot(const std::filesystem::path &dir) {
+	std::error_code ec;
+	if (!std::filesystem::is_directory(dir, ec)) return;
+	std::wstring w = LongRoot(dir, nullptr);
+	if (_wcsicmp(w.c_str(), rootW_.c_str()) == 0) return;
+	for (const std::wstring &f : fallbackW_)
+		if (_wcsicmp(w.c_str(), f.c_str()) == 0) return;
+	fallbackW_.push_back(std::move(w));
 }
 
 HostFileSystem::~HostFileSystem() = default;
@@ -296,8 +318,42 @@ u32 HostFileSystem::Caps() const {
 }
 
 s32 HostFileSystem::Resolve(std::string_view path, bool allowMissingLast, std::wstring *hostPath, std::vector<std::string> *comps) {
+	s32 r = ResolveIn(rootW_, path, allowMissingLast, hostPath, comps);
+	if (r == 1 || fallbackW_.empty()) {
+		return r;
+	}
+	// Not in the volume itself: an existing path in a fallback root wins; a new name goes to the
+	// volume when its folder exists there, else to the fallback holding the folder.
+	std::wstring fbPath;
+	std::vector<std::string> fbComps;
+	s32 fbResult = SCE_ERRNO_ENOENT;
+	for (const std::wstring &fb : fallbackW_) {
+		std::wstring hp;
+		std::vector<std::string> cs;
+		s32 f = ResolveIn(fb, path, allowMissingLast, &hp, comps ? &cs : nullptr);
+		if (f == 1) {
+			*hostPath = std::move(hp);
+			if (comps) *comps = std::move(cs);
+			return 1;
+		}
+		if (f == 0 && fbResult < 0) {
+			fbResult = 0;
+			fbPath = std::move(hp);
+			fbComps = std::move(cs);
+		}
+	}
+	if (r == 0 || fbResult < 0) {
+		return r;
+	}
+	*hostPath = std::move(fbPath);
+	if (comps) *comps = std::move(fbComps);
+	return 0;
+}
+
+s32 HostFileSystem::ResolveIn(const std::wstring &rootW, std::string_view path, bool allowMissingLast,
+                              std::wstring *hostPath, std::vector<std::string> *comps) {
 	std::vector<std::string> parts = SplitPspPathComponents(path);
-	std::wstring cur = rootW_;
+	std::wstring cur = rootW;
 	s32 exists = 1;
 	for (size_t i = 0; i < parts.size(); i++) {
 		std::wstring w;
@@ -552,6 +608,11 @@ void HostFileSystem::FillStat(const EntryInfo &e, SceIoStat *out) const {
 	FileTimeToPsp(e.ctime, &out->st_ctime);
 	FileTimeToPsp(e.atime, &out->st_atime);
 	FileTimeToPsp(e.mtime, &out->st_mtime);
+	if (opt_.fat) {
+		// FAT keeps only the date of the last access.
+		out->st_atime.hour = out->st_atime.minute = out->st_atime.second = 0;
+		out->st_atime.microsecond = 0;
+	}
 }
 
 s32 HostFileSystem::GetStat(std::string_view path, SceIoStat *out) {
@@ -718,7 +779,7 @@ s32 HostFileSystem::Rename(std::string_view from, std::string_view to) {
 		// Names compare case-insensitively, so this includes renaming a file to itself.
 		return SCE_ERRNO_EEXIST;
 	}
-	if (!MoveFileExW(src.c_str(), dst.c_str(), 0)) {
+	if (!MoveFileExW(src.c_str(), dst.c_str(), MOVEFILE_COPY_ALLOWED)) {  // copy: roots may be on other volumes
 		return MapWin32Error(GetLastError());
 	}
 	return 0;
@@ -752,31 +813,80 @@ s32 HostFileSystem::DOpen(std::string_view path) {
 		dot.name = "..";
 		d->entries.push_back(dot);
 	}
-	WIN32_FIND_DATAW fd;
-	HANDLE h = FindFirstFileExW((hp + L"\\*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
-	if (h != INVALID_HANDLE_VALUE) {
-		do {
-			if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) {
-				continue;
+	if (fallbackW_.empty()) {
+		ListInto(hp, &d->entries);
+	} else {
+		// The same folder in every root, merged; a name already listed hides later copies.
+		std::vector<std::wstring> dirs;
+		std::wstring one;
+		if (ResolveIn(rootW_, path, false, &one, nullptr) == 1) {
+			dirs.push_back(std::move(one));
+		}
+		for (const std::wstring &fb : fallbackW_) {
+			if (ResolveIn(fb, path, false, &one, nullptr) == 1) {
+				DWORD a = GetFileAttributesW(one.c_str());
+				if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) {
+					dirs.push_back(std::move(one));
+				}
 			}
-			EntryInfo e;
-			e.name = WideToUtf8(fd.cFileName);
-			if (opt_.upperCase83) {
-				e.name = UpperCase83(e.name);
+		}
+		for (const std::wstring &dir : dirs) {
+			std::vector<EntryInfo> more;
+			ListInto(dir, &more);
+			for (EntryInfo &e : more) {
+				bool dup = false;
+				for (const EntryInfo &have : d->entries) {
+					if (_stricmp(have.name.c_str(), e.name.c_str()) == 0) {
+						dup = true;
+						break;
+					}
+				}
+				if (!dup) {
+					d->entries.push_back(std::move(e));
+				}
 			}
-			e.attrs = fd.dwFileAttributes;
-			e.size = ((u64)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
-			e.ctime = fd.ftCreationTime;
-			e.atime = fd.ftLastAccessTime;
-			e.mtime = fd.ftLastWriteTime;
-			d->entries.push_back(std::move(e));
-		} while (FindNextFileW(h, &fd));
-		FindClose(h);
+		}
 	}
 	std::lock_guard<std::mutex> lock(mutex_);
 	s32 dd = AllocHandle();
 	dirs_[dd] = std::move(d);
 	return dd;
+}
+
+void HostFileSystem::ListInto(const std::wstring &dir, std::vector<EntryInfo> *entries) const {
+	WIN32_FIND_DATAW fd;
+	HANDLE h = FindFirstFileExW((dir + L"\\*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+	if (h == INVALID_HANDLE_VALUE) {
+		return;
+	}
+	do {
+		if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) {
+			continue;
+		}
+		EntryInfo e;
+		e.name = WideToUtf8(fd.cFileName);
+		if (opt_.upperCase83) {
+			e.name = UpperCase83(e.name);
+		}
+		e.attrs = fd.dwFileAttributes;
+		e.size = ((u64)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+		e.ctime = fd.ftCreationTime;
+		e.atime = fd.ftLastAccessTime;
+		e.mtime = fd.ftLastWriteTime;
+		// NTFS updates the copy in the directory lazily (the access time, the size of a file being
+		// written): take the file's own record, as GetStat does, so a listing and a stat of the
+		// same file agree like on the PSP's FAT (the XMB compares them before copying a save).
+		WIN32_FILE_ATTRIBUTE_DATA a;
+		if (GetFileAttributesExW((dir + L"\\" + fd.cFileName).c_str(), GetFileExInfoStandard, &a)) {
+			e.attrs = a.dwFileAttributes;
+			e.size = ((u64)a.nFileSizeHigh << 32) | a.nFileSizeLow;
+			e.ctime = a.ftCreationTime;
+			e.atime = a.ftLastAccessTime;
+			e.mtime = a.ftLastWriteTime;
+		}
+		entries->push_back(std::move(e));
+	} while (FindNextFileW(h, &fd));
+	FindClose(h);
 }
 
 s32 HostFileSystem::DRead(s32 dd, SceIoDirent *out) {

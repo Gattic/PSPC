@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// sceUtilityOsk (on-screen keyboard). Ported in part from PPSSPP (Core/Dialog/PSPOskDialog.cpp),
-// Copyright (c) 2012- PPSSPP Project, GPL-2.0-or-later. Without a window the default text is
-// returned; with one, a host text input box replaces the PSP keyboard.
+// sceUtilityOsk (on-screen keyboard). Ported from PPSSPP (Core/Dialog/PSPOskDialog.cpp,
+// PSPOskConstants.cpp), Copyright (c) 2012- PPSSPP Project, GPL-2.0-or-later: with overlays, its
+// keyboard grid (Latin, kana, Hangul, Cyrillic, full-width Latin) driven by the d-pad; without
+// (headless), the --osk-text answer or the initial text.
 #pragma once
 
-#include <memory>
 #include <string>
 
 #include "runtime/dialogs/dialog.h"
-#include "runtime/dialogs/host_prompt.h"
 
 namespace utility {
 
@@ -53,13 +52,31 @@ protected:
 
 private:
 	u32 FieldMaxLength();
+	s32 FieldInputType();
 	void WriteOutput(s32 fieldResult);
+
+	// The keyboard (overlays).
+	void UpdateKeyboard();
+	void RenderKeyboard();
+	std::u16string CombinationString(bool isInput);  // Japanese, Korean
+	std::u16string CombinationKorean(bool isInput);
+	void RemoveKorean();
+	int Cols() const;
+	int Rows() const;
 
 	u32 paramsAddr_ = 0;
 	OskParams params_{};
 	std::u16string inputChars_;
+	std::string desc_;
 	int framesRun_ = 0;
-	std::shared_ptr<prompt::State> prompt_;
+
+	int selectedChar_ = 0;
+	int currentKeyboard_ = 0;          // OskKeyboardDisplay
+	int currentKeyboardLanguage_ = 0;  // OskKeyboardLanguage
+	bool isCombinated_ = false;
+	int iLevel_ = 0;        // Hangul composition state
+	int iValue_[3] = {};
+	int held_[6] = {};      // frames each repeating button has been held
 };
 
 // Headless runs have nobody to type: the on-screen keyboard returns this text (pspc --osk-text)

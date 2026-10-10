@@ -18,7 +18,9 @@ struct Options {
 	std::string aotDir;        // directory with <sha1>.dll module builds
 	bool fastTime = false;     // skip idle time (tests)
 	int ramMB = 64;
-	bool largeUserMemory = false;
+	// User memory beyond 24 MB: 1 (--large-mem) or 0 (--no-large-mem); -1 (default): only for the
+	// XMB on a 64 MB model, whose browser and other plugins use the PSP-2000's extra RAM.
+	int largeUserMemory = -1;
 	bool strictMemory = false;
 	int timeoutSec = 0;        // stop after this many wall-clock seconds (0 = never)
 	std::string memstickDir;
@@ -29,6 +31,7 @@ struct Options {
 	std::string bootPath;      // LoadExec relaunch: guest path to boot instead of the file's own
 	std::string bootArgsFile;  // LoadExec relaunch: argument block for the booted module
 	bool plugins = true;      // load ms0:/seplugins/game.txt (M33)
+	std::string pluginsDir;    // overlaid onto ms0: (seplugins/, the plugins' own folders); "" = none
 	std::string dataDir;       // contains nids.csv
 	std::string decryptTool;
 	std::string decryptCacheDir;
@@ -56,6 +59,14 @@ struct Options {
 	std::vector<Press> presses;
 	std::string oskText;  // headless: what the on-screen keyboard returns
 	std::string gamesDir;  // host folder whose UMD images the XMB lists besides ms0:/ISO
+	// --vsh-args: the XMB's vshmain_args, kept through a game it launched (deleted once read).
+	std::string vshArgsFile;
+	// Networking (pspc.ini network=, adhoc_server=): false = the WLAN switch reads off. The ad hoc
+	// server is a host name or address, optionally with :port (default 27312).
+	bool network = true;
+	std::string adhocServer = "localhost";
+	// Run a network selftest scenario ("name[:args]", hle/modules/net_selftest.h) instead of a file.
+	std::string netSelftest;
 };
 
 // Boots the program and runs until it exits. Returns the exit code.
@@ -67,5 +78,7 @@ bool TakeRelaunch(std::string &hostFile);
 bool TakeLoadExecRelaunch(std::string &pspPath, std::string &argsFile);
 // After Run(): the program asked to go back to the XMB (a game launched from it exited).
 bool TakeExitToVsh();
+// After Run() relaunched from the XMB: the file holding the XMB's vshmain_args (--vsh-args).
+bool TakeVshArgsFile(std::string &file);
 
 }  // namespace runtime

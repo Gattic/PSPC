@@ -142,7 +142,7 @@ u32 sceUmdGetDiscInfo(u32 infoAddr) {
 	if (!mem::IsValidRange(infoAddr, 8) || !IsUserAddress(infoAddr) || !IsUserAddress(infoAddr + 4))
 		return SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT;
 	if (GRead32(infoAddr) != 8) return SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT;
-	GWrite32(infoAddr + 4, PSP_UMD_TYPE_GAME);
+	GWrite32(infoAddr + 4, media::DiscType());  // PSP_UMD_TYPE_GAME / _VIDEO / _AUDIO
 	return 0;
 }
 

@@ -3,10 +3,9 @@
 // PPSSPP Project, GPL-2.0-or-later.
 #pragma once
 
-#include <memory>
+#include <string>
 
 #include "runtime/dialogs/dialog.h"
-#include "runtime/dialogs/host_prompt.h"
 
 namespace utility {
 
@@ -44,6 +43,7 @@ protected:
 private:
 	void FormatErrorCode(u32 code);
 	void Choose(bool cancel);
+	void DisplayMessage(const std::string &text, bool hasYesNo, bool hasOK);
 
 	enum Flags : u32 {
 		DS_MSG = 0x1,
@@ -63,7 +63,8 @@ private:
 	MsgDialogParams params_{};
 	u32 paramsAddr_ = 0;
 	char msgText_[512]{};
-	std::shared_ptr<prompt::State> prompt_;
+	float scrollPos_ = 0.0f;
+	int framesUpHeld_ = 0, framesDownHeld_ = 0;
 };
 
 }  // namespace utility

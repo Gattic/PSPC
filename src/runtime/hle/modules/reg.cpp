@@ -3,12 +3,12 @@
 // Small system libraries: sceReg (the system registry), sceOpenPSID, sceUsb / sceUsbstor /
 // sceUsbstorBoot / sceUsbAcc (no cable connected), sceChkreg.
 //
-// The registry is in memory: a dump of a real PSP's registry (minus account data) that guest writes
-// (sceRegCreateKey / sceRegSetKeyValue) are layered on, with /CONFIG/SYSTEM/XMB language and
-// button_assign following the system settings PSPC reports.
+// The registry is in memory: the default registry of firmware 4.01 (read from its vshmain.prx)
+// that guest writes (sceRegCreateKey / sceRegSetKeyValue) are layered on, with
+// /CONFIG/SYSTEM/XMB language and button_assign following the system settings PSPC reports.
 //
-// Ported from PPSSPP (Core/HLE/sceReg.cpp including its registry dump, sceOpenPSID.cpp, sceUsb.cpp,
-// sceUsbAcc.cpp, sceChkreg.cpp), Copyright (c) 2012- PPSSPP Project, GPL-2.0-or-later.
+// Ported from PPSSPP (Core/HLE/sceReg.cpp, sceOpenPSID.cpp, sceUsb.cpp, sceUsbAcc.cpp,
+// sceChkreg.cpp), Copyright (c) 2012- PPSSPP Project, GPL-2.0-or-later.
 #include <windows.h>
 
 #include <algorithm>
@@ -58,370 +58,440 @@ struct KeyValue {
 
 #define ARRAY_SIZE(a) ((int)(sizeof(a) / sizeof((a)[0])))
 
-// Partial dump of a PSP's registry made with tests/misc/reg.prx in pspautotests (from PPSSPP).
-// The owner name is PSPC's nickname.
+// The registry a 4.01 PSP starts with: vshmain.prx's own table of default keys (what it writes
+// when it creates the registry, flash1:/registry/init.dat), with the values it picks for the
+// region PSPC reports (sceChkregGetPsCode: product code 5, Europe), plus the nickname. Categories
+// and keys are in the table's order; the VSH upgrades a registry whose category_version is older
+// than 0x40 by adding keys, which this one never needs. Key names and values are facts read from
+// the 4.01 firmware (vshmain.prx module offsets 0x36E00 = the keys, 0x3FF38 = the categories,
+// 0xDE4 = the region-dependent defaults).
 
-// Dump of /DATA/FONT/PROPERTY/INFO0
+// /CONFIG/SYSTEM/XMB/THEME
+static const KeyValue tree_CONFIG_SYSTEM_XMB_THEME[] = {
+	{ "color_mode", ValueType::INT, "", (int)0x0 },
+	{ "wallpaper_mode", ValueType::INT, "", (int)0x0 },
+	{ "system_color", ValueType::INT, "", (int)0x0 },
+	{ "custom_theme_mode", ValueType::INT, "", (int)0x0 },
+};
+
+// /DATA/FONT/PROPERTY/INFO0
 static const KeyValue tree_DATA_FONT_PROPERTY_INFO0[] = {
-	{ "h_size", ValueType::INT, "", (int)0x288 },  // decimal: 648
-	{ "v_size", ValueType::INT, "", (int)0x288 },  // decimal: 648
-	{ "h_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "v_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "extra_attributes", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "weight", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "family_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "style", ValueType::INT, "", (int)0x67 },  // decimal: 103
-	{ "sub_style", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "language_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "region_code", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "country_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "font_name", ValueType::STR, "FTT-NewRodin Pro DB", 20 },
-	{ "file_name", ValueType::STR, "jpn0.pgf", 9 },
-	{ "expire_date", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "shadow_option", ValueType::INT, "", (int)0x0 },  // decimal: 0
+	{ "h_size", ValueType::INT, "", (int)0x288 },
+	{ "v_size", ValueType::INT, "", (int)0x288 },
+	{ "h_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "v_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "extra_attributes", ValueType::INT, "", (int)0x0 },
+	{ "weight", ValueType::INT, "", (int)0x0 },
+	{ "family_code", ValueType::INT, "", (int)0x1 },
+	{ "style", ValueType::INT, "", (int)0x67 },
+	{ "sub_style", ValueType::INT, "", (int)0x0 },
+	{ "language_code", ValueType::INT, "", (int)0x1 },
+	{ "region_code", ValueType::INT, "", (int)0x0 },
+	{ "country_code", ValueType::INT, "", (int)0x1 },
+	{ "font_name", ValueType::STR, "FTT-NewRodin Pro DB", 20 },  // created with room for 64 bytes
+	{ "file_name", ValueType::STR, "jpn0.pgf", 9 },  // created with room for 64 bytes
+	{ "expire_date", ValueType::INT, "", (int)0x0 },
+	{ "shadow_option", ValueType::INT, "", (int)0x0 },
 };
 
-// Dump of /DATA/FONT/PROPERTY/INFO1
+// /DATA/FONT/PROPERTY/INFO1
 static const KeyValue tree_DATA_FONT_PROPERTY_INFO1[] = {
-	{ "h_size", ValueType::INT, "", (int)0x288 },  // decimal: 648
-	{ "v_size", ValueType::INT, "", (int)0x288 },  // decimal: 648
-	{ "h_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "v_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "extra_attributes", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "weight", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "family_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "style", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "sub_style", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "language_code", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "region_code", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "country_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "font_name", ValueType::STR, "FTT-NewRodin Pro Latin", 23 },
-	{ "file_name", ValueType::STR, "ltn0.pgf", 9 },
-	{ "expire_date", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "shadow_option", ValueType::INT, "", (int)0x0 },  // decimal: 0
+	{ "h_size", ValueType::INT, "", (int)0x288 },
+	{ "v_size", ValueType::INT, "", (int)0x288 },
+	{ "h_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "v_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "extra_attributes", ValueType::INT, "", (int)0x0 },
+	{ "weight", ValueType::INT, "", (int)0x0 },
+	{ "family_code", ValueType::INT, "", (int)0x1 },
+	{ "style", ValueType::INT, "", (int)0x1 },
+	{ "sub_style", ValueType::INT, "", (int)0x0 },
+	{ "language_code", ValueType::INT, "", (int)0x2 },
+	{ "region_code", ValueType::INT, "", (int)0x0 },
+	{ "country_code", ValueType::INT, "", (int)0x1 },
+	{ "font_name", ValueType::STR, "FTT-NewRodin Pro Latin", 23 },  // created with room for 64 bytes
+	{ "file_name", ValueType::STR, "ltn0.pgf", 9 },  // created with room for 64 bytes
+	{ "expire_date", ValueType::INT, "", (int)0x0 },
+	{ "shadow_option", ValueType::INT, "", (int)0x0 },
 };
 
-// Dump of /DATA/FONT/PROPERTY/INFO2
+// /DATA/FONT/PROPERTY/INFO2
 static const KeyValue tree_DATA_FONT_PROPERTY_INFO2[] = {
-	{ "h_size", ValueType::INT, "", (int)0x288 },  // decimal: 648
-	{ "v_size", ValueType::INT, "", (int)0x288 },  // decimal: 648
-	{ "h_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "v_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "extra_attributes", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "weight", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "family_code", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "style", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "sub_style", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "language_code", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "region_code", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "country_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "font_name", ValueType::STR, "FTT-Matisse Pro Latin", 22 },
-	{ "file_name", ValueType::STR, "ltn1.pgf", 9 },
-	{ "expire_date", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "shadow_option", ValueType::INT, "", (int)0x0 },  // decimal: 0
+	{ "h_size", ValueType::INT, "", (int)0x288 },
+	{ "v_size", ValueType::INT, "", (int)0x288 },
+	{ "h_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "v_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "extra_attributes", ValueType::INT, "", (int)0x0 },
+	{ "weight", ValueType::INT, "", (int)0x0 },
+	{ "family_code", ValueType::INT, "", (int)0x2 },
+	{ "style", ValueType::INT, "", (int)0x1 },
+	{ "sub_style", ValueType::INT, "", (int)0x0 },
+	{ "language_code", ValueType::INT, "", (int)0x2 },
+	{ "region_code", ValueType::INT, "", (int)0x0 },
+	{ "country_code", ValueType::INT, "", (int)0x1 },
+	{ "font_name", ValueType::STR, "FTT-Matisse Pro Latin", 22 },  // created with room for 64 bytes
+	{ "file_name", ValueType::STR, "ltn1.pgf", 9 },  // created with room for 64 bytes
+	{ "expire_date", ValueType::INT, "", (int)0x0 },
+	{ "shadow_option", ValueType::INT, "", (int)0x0 },
 };
 
-// Dump of /DATA/FONT/PROPERTY/INFO3
+// /DATA/FONT/PROPERTY/INFO3
 static const KeyValue tree_DATA_FONT_PROPERTY_INFO3[] = {
-	{ "h_size", ValueType::INT, "", (int)0x288 },  // decimal: 648
-	{ "v_size", ValueType::INT, "", (int)0x288 },  // decimal: 648
-	{ "h_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "v_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "extra_attributes", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "weight", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "family_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "style", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "sub_style", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "language_code", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "region_code", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "country_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "font_name", ValueType::STR, "FTT-NewRodin Pro Latin", 23 },
-	{ "file_name", ValueType::STR, "ltn2.pgf", 9 },
-	{ "expire_date", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "shadow_option", ValueType::INT, "", (int)0x0 },  // decimal: 0
+	{ "h_size", ValueType::INT, "", (int)0x288 },
+	{ "v_size", ValueType::INT, "", (int)0x288 },
+	{ "h_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "v_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "extra_attributes", ValueType::INT, "", (int)0x0 },
+	{ "weight", ValueType::INT, "", (int)0x0 },
+	{ "family_code", ValueType::INT, "", (int)0x1 },
+	{ "style", ValueType::INT, "", (int)0x2 },
+	{ "sub_style", ValueType::INT, "", (int)0x0 },
+	{ "language_code", ValueType::INT, "", (int)0x2 },
+	{ "region_code", ValueType::INT, "", (int)0x0 },
+	{ "country_code", ValueType::INT, "", (int)0x1 },
+	{ "font_name", ValueType::STR, "FTT-NewRodin Pro Latin", 23 },  // created with room for 64 bytes
+	{ "file_name", ValueType::STR, "ltn2.pgf", 9 },  // created with room for 64 bytes
+	{ "expire_date", ValueType::INT, "", (int)0x0 },
+	{ "shadow_option", ValueType::INT, "", (int)0x0 },
 };
 
-// Dump of /DATA/FONT/PROPERTY/INFO4
+// /DATA/FONT/PROPERTY/INFO4
 static const KeyValue tree_DATA_FONT_PROPERTY_INFO4[] = {
-	{ "h_size", ValueType::INT, "", (int)0x288 },  // decimal: 648
-	{ "v_size", ValueType::INT, "", (int)0x288 },  // decimal: 648
-	{ "h_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "v_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "extra_attributes", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "weight", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "family_code", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "style", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "sub_style", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "language_code", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "region_code", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "country_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "font_name", ValueType::STR, "FTT-Matisse Pro Latin", 22 },
-	{ "file_name", ValueType::STR, "ltn3.pgf", 9 },
-	{ "expire_date", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "shadow_option", ValueType::INT, "", (int)0x0 },  // decimal: 0
+	{ "h_size", ValueType::INT, "", (int)0x288 },
+	{ "v_size", ValueType::INT, "", (int)0x288 },
+	{ "h_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "v_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "extra_attributes", ValueType::INT, "", (int)0x0 },
+	{ "weight", ValueType::INT, "", (int)0x0 },
+	{ "family_code", ValueType::INT, "", (int)0x2 },
+	{ "style", ValueType::INT, "", (int)0x2 },
+	{ "sub_style", ValueType::INT, "", (int)0x0 },
+	{ "language_code", ValueType::INT, "", (int)0x2 },
+	{ "region_code", ValueType::INT, "", (int)0x0 },
+	{ "country_code", ValueType::INT, "", (int)0x1 },
+	{ "font_name", ValueType::STR, "FTT-Matisse Pro Latin", 22 },  // created with room for 64 bytes
+	{ "file_name", ValueType::STR, "ltn3.pgf", 9 },  // created with room for 64 bytes
+	{ "expire_date", ValueType::INT, "", (int)0x0 },
+	{ "shadow_option", ValueType::INT, "", (int)0x0 },
 };
 
-// Dump of /DATA/FONT/PROPERTY/INFO5
+// /DATA/FONT/PROPERTY/INFO5
 static const KeyValue tree_DATA_FONT_PROPERTY_INFO5[] = {
-	{ "h_size", ValueType::INT, "", (int)0x288 },  // decimal: 648
-	{ "v_size", ValueType::INT, "", (int)0x288 },  // decimal: 648
-	{ "h_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "v_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "extra_attributes", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "weight", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "family_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "style", ValueType::INT, "", (int)0x5 },  // decimal: 5
-	{ "sub_style", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "language_code", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "region_code", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "country_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "font_name", ValueType::STR, "FTT-NewRodin Pro Latin", 23 },
-	{ "file_name", ValueType::STR, "ltn4.pgf", 9 },
-	{ "expire_date", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "shadow_option", ValueType::INT, "", (int)0x0 },  // decimal: 0
+	{ "h_size", ValueType::INT, "", (int)0x288 },
+	{ "v_size", ValueType::INT, "", (int)0x288 },
+	{ "h_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "v_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "extra_attributes", ValueType::INT, "", (int)0x0 },
+	{ "weight", ValueType::INT, "", (int)0x0 },
+	{ "family_code", ValueType::INT, "", (int)0x1 },
+	{ "style", ValueType::INT, "", (int)0x5 },
+	{ "sub_style", ValueType::INT, "", (int)0x0 },
+	{ "language_code", ValueType::INT, "", (int)0x2 },
+	{ "region_code", ValueType::INT, "", (int)0x0 },
+	{ "country_code", ValueType::INT, "", (int)0x1 },
+	{ "font_name", ValueType::STR, "FTT-NewRodin Pro Latin", 23 },  // created with room for 64 bytes
+	{ "file_name", ValueType::STR, "ltn4.pgf", 9 },  // created with room for 64 bytes
+	{ "expire_date", ValueType::INT, "", (int)0x0 },
+	{ "shadow_option", ValueType::INT, "", (int)0x0 },
 };
 
-// Dump of /DATA/FONT/PROPERTY/INFO6
+// /DATA/FONT/PROPERTY/INFO6
 static const KeyValue tree_DATA_FONT_PROPERTY_INFO6[] = {
-	{ "h_size", ValueType::INT, "", (int)0x288 },  // decimal: 648
-	{ "v_size", ValueType::INT, "", (int)0x288 },  // decimal: 648
-	{ "h_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "v_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "extra_attributes", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "weight", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "family_code", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "style", ValueType::INT, "", (int)0x5 },  // decimal: 5
-	{ "sub_style", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "language_code", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "region_code", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "country_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "font_name", ValueType::STR, "FTT-Matisse Pro Latin", 22 },
-	{ "file_name", ValueType::STR, "ltn5.pgf", 9 },
-	{ "expire_date", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "shadow_option", ValueType::INT, "", (int)0x0 },  // decimal: 0
+	{ "h_size", ValueType::INT, "", (int)0x288 },
+	{ "v_size", ValueType::INT, "", (int)0x288 },
+	{ "h_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "v_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "extra_attributes", ValueType::INT, "", (int)0x0 },
+	{ "weight", ValueType::INT, "", (int)0x0 },
+	{ "family_code", ValueType::INT, "", (int)0x2 },
+	{ "style", ValueType::INT, "", (int)0x5 },
+	{ "sub_style", ValueType::INT, "", (int)0x0 },
+	{ "language_code", ValueType::INT, "", (int)0x2 },
+	{ "region_code", ValueType::INT, "", (int)0x0 },
+	{ "country_code", ValueType::INT, "", (int)0x1 },
+	{ "font_name", ValueType::STR, "FTT-Matisse Pro Latin", 22 },  // created with room for 64 bytes
+	{ "file_name", ValueType::STR, "ltn5.pgf", 9 },  // created with room for 64 bytes
+	{ "expire_date", ValueType::INT, "", (int)0x0 },
+	{ "shadow_option", ValueType::INT, "", (int)0x0 },
 };
 
-// Dump of /DATA/FONT/PROPERTY/INFO7
+// /DATA/FONT/PROPERTY/INFO7
 static const KeyValue tree_DATA_FONT_PROPERTY_INFO7[] = {
-	{ "h_size", ValueType::INT, "", (int)0x288 },  // decimal: 648
-	{ "v_size", ValueType::INT, "", (int)0x288 },  // decimal: 648
-	{ "h_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "v_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "extra_attributes", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "weight", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "family_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "style", ValueType::INT, "", (int)0x6 },  // decimal: 6
-	{ "sub_style", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "language_code", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "region_code", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "country_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "font_name", ValueType::STR, "FTT-NewRodin Pro Latin", 23 },
-	{ "file_name", ValueType::STR, "ltn6.pgf", 9 },
-	{ "expire_date", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "shadow_option", ValueType::INT, "", (int)0x0 },  // decimal: 0
+	{ "h_size", ValueType::INT, "", (int)0x288 },
+	{ "v_size", ValueType::INT, "", (int)0x288 },
+	{ "h_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "v_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "extra_attributes", ValueType::INT, "", (int)0x0 },
+	{ "weight", ValueType::INT, "", (int)0x0 },
+	{ "family_code", ValueType::INT, "", (int)0x1 },
+	{ "style", ValueType::INT, "", (int)0x6 },
+	{ "sub_style", ValueType::INT, "", (int)0x0 },
+	{ "language_code", ValueType::INT, "", (int)0x2 },
+	{ "region_code", ValueType::INT, "", (int)0x0 },
+	{ "country_code", ValueType::INT, "", (int)0x1 },
+	{ "font_name", ValueType::STR, "FTT-NewRodin Pro Latin", 23 },  // created with room for 64 bytes
+	{ "file_name", ValueType::STR, "ltn6.pgf", 9 },  // created with room for 64 bytes
+	{ "expire_date", ValueType::INT, "", (int)0x0 },
+	{ "shadow_option", ValueType::INT, "", (int)0x0 },
 };
 
-// Dump of /DATA/FONT/PROPERTY/INFO8
+// /DATA/FONT/PROPERTY/INFO8
 static const KeyValue tree_DATA_FONT_PROPERTY_INFO8[] = {
-	{ "h_size", ValueType::INT, "", (int)0x288 },  // decimal: 648
-	{ "v_size", ValueType::INT, "", (int)0x288 },  // decimal: 648
-	{ "h_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "v_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "extra_attributes", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "weight", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "family_code", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "style", ValueType::INT, "", (int)0x6 },  // decimal: 6
-	{ "sub_style", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "language_code", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "region_code", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "country_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "font_name", ValueType::STR, "FTT-Matisse Pro Latin", 22 },
-	{ "file_name", ValueType::STR, "ltn7.pgf", 9 },
-	{ "expire_date", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "shadow_option", ValueType::INT, "", (int)0x0 },  // decimal: 0
+	{ "h_size", ValueType::INT, "", (int)0x288 },
+	{ "v_size", ValueType::INT, "", (int)0x288 },
+	{ "h_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "v_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "extra_attributes", ValueType::INT, "", (int)0x0 },
+	{ "weight", ValueType::INT, "", (int)0x0 },
+	{ "family_code", ValueType::INT, "", (int)0x2 },
+	{ "style", ValueType::INT, "", (int)0x6 },
+	{ "sub_style", ValueType::INT, "", (int)0x0 },
+	{ "language_code", ValueType::INT, "", (int)0x2 },
+	{ "region_code", ValueType::INT, "", (int)0x0 },
+	{ "country_code", ValueType::INT, "", (int)0x1 },
+	{ "font_name", ValueType::STR, "FTT-Matisse Pro Latin", 22 },  // created with room for 64 bytes
+	{ "file_name", ValueType::STR, "ltn7.pgf", 9 },  // created with room for 64 bytes
+	{ "expire_date", ValueType::INT, "", (int)0x0 },
+	{ "shadow_option", ValueType::INT, "", (int)0x0 },
 };
 
-// Dump of /DATA/FONT/PROPERTY/INFO9
+// /DATA/FONT/PROPERTY/INFO9
 static const KeyValue tree_DATA_FONT_PROPERTY_INFO9[] = {
-	{ "h_size", ValueType::INT, "", (int)0x1c0 },  // decimal: 448
-	{ "v_size", ValueType::INT, "", (int)0x1c0 },  // decimal: 448
-	{ "h_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "v_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "extra_attributes", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "weight", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "family_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "style", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "sub_style", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "language_code", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "region_code", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "country_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "font_name", ValueType::STR, "FTT-NewRodin Pro Latin", 23 },
-	{ "file_name", ValueType::STR, "ltn8.pgf", 9 },
-	{ "expire_date", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "shadow_option", ValueType::INT, "", (int)0x0 },  // decimal: 0
+	{ "h_size", ValueType::INT, "", (int)0x1c0 },
+	{ "v_size", ValueType::INT, "", (int)0x1c0 },
+	{ "h_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "v_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "extra_attributes", ValueType::INT, "", (int)0x0 },
+	{ "weight", ValueType::INT, "", (int)0x0 },
+	{ "family_code", ValueType::INT, "", (int)0x1 },
+	{ "style", ValueType::INT, "", (int)0x1 },
+	{ "sub_style", ValueType::INT, "", (int)0x0 },
+	{ "language_code", ValueType::INT, "", (int)0x2 },
+	{ "region_code", ValueType::INT, "", (int)0x0 },
+	{ "country_code", ValueType::INT, "", (int)0x1 },
+	{ "font_name", ValueType::STR, "FTT-NewRodin Pro Latin", 23 },  // created with room for 64 bytes
+	{ "file_name", ValueType::STR, "ltn8.pgf", 9 },  // created with room for 64 bytes
+	{ "expire_date", ValueType::INT, "", (int)0x0 },
+	{ "shadow_option", ValueType::INT, "", (int)0x0 },
 };
 
-// Dump of /DATA/FONT/PROPERTY/INFO10
+// /DATA/FONT/PROPERTY/INFO10
 static const KeyValue tree_DATA_FONT_PROPERTY_INFO10[] = {
-	{ "h_size", ValueType::INT, "", (int)0x1c0 },  // decimal: 448
-	{ "v_size", ValueType::INT, "", (int)0x1c0 },  // decimal: 448
-	{ "h_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "v_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "extra_attributes", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "weight", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "family_code", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "style", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "sub_style", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "language_code", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "region_code", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "country_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "font_name", ValueType::STR, "FTT-Matisse Pro Latin", 22 },
-	{ "file_name", ValueType::STR, "ltn9.pgf", 9 },
-	{ "expire_date", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "shadow_option", ValueType::INT, "", (int)0x0 },  // decimal: 0
+	{ "h_size", ValueType::INT, "", (int)0x1c0 },
+	{ "v_size", ValueType::INT, "", (int)0x1c0 },
+	{ "h_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "v_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "extra_attributes", ValueType::INT, "", (int)0x0 },
+	{ "weight", ValueType::INT, "", (int)0x0 },
+	{ "family_code", ValueType::INT, "", (int)0x2 },
+	{ "style", ValueType::INT, "", (int)0x1 },
+	{ "sub_style", ValueType::INT, "", (int)0x0 },
+	{ "language_code", ValueType::INT, "", (int)0x2 },
+	{ "region_code", ValueType::INT, "", (int)0x0 },
+	{ "country_code", ValueType::INT, "", (int)0x1 },
+	{ "font_name", ValueType::STR, "FTT-Matisse Pro Latin", 22 },  // created with room for 64 bytes
+	{ "file_name", ValueType::STR, "ltn9.pgf", 9 },  // created with room for 64 bytes
+	{ "expire_date", ValueType::INT, "", (int)0x0 },
+	{ "shadow_option", ValueType::INT, "", (int)0x0 },
 };
 
-// Dump of /DATA/FONT/PROPERTY/INFO11
+// /DATA/FONT/PROPERTY/INFO11
 static const KeyValue tree_DATA_FONT_PROPERTY_INFO11[] = {
-	{ "h_size", ValueType::INT, "", (int)0x1c0 },  // decimal: 448
-	{ "v_size", ValueType::INT, "", (int)0x1c0 },  // decimal: 448
-	{ "h_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "v_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "extra_attributes", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "weight", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "family_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "style", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "sub_style", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "language_code", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "region_code", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "country_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "font_name", ValueType::STR, "FTT-NewRodin Pro Latin", 23 },
-	{ "file_name", ValueType::STR, "ltn10.pgf", 10 },
-	{ "expire_date", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "shadow_option", ValueType::INT, "", (int)0x0 },  // decimal: 0
+	{ "h_size", ValueType::INT, "", (int)0x1c0 },
+	{ "v_size", ValueType::INT, "", (int)0x1c0 },
+	{ "h_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "v_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "extra_attributes", ValueType::INT, "", (int)0x0 },
+	{ "weight", ValueType::INT, "", (int)0x0 },
+	{ "family_code", ValueType::INT, "", (int)0x1 },
+	{ "style", ValueType::INT, "", (int)0x2 },
+	{ "sub_style", ValueType::INT, "", (int)0x0 },
+	{ "language_code", ValueType::INT, "", (int)0x2 },
+	{ "region_code", ValueType::INT, "", (int)0x0 },
+	{ "country_code", ValueType::INT, "", (int)0x1 },
+	{ "font_name", ValueType::STR, "FTT-NewRodin Pro Latin", 23 },  // created with room for 64 bytes
+	{ "file_name", ValueType::STR, "ltn10.pgf", 10 },  // created with room for 64 bytes
+	{ "expire_date", ValueType::INT, "", (int)0x0 },
+	{ "shadow_option", ValueType::INT, "", (int)0x0 },
 };
 
-// Dump of /DATA/FONT/PROPERTY/INFO12
+// /DATA/FONT/PROPERTY/INFO12
 static const KeyValue tree_DATA_FONT_PROPERTY_INFO12[] = {
-	{ "h_size", ValueType::INT, "", (int)0x1c0 },  // decimal: 448
-	{ "v_size", ValueType::INT, "", (int)0x1c0 },  // decimal: 448
-	{ "h_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "v_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "extra_attributes", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "weight", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "family_code", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "style", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "sub_style", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "language_code", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "region_code", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "country_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "font_name", ValueType::STR, "FTT-Matisse Pro Latin", 22 },
-	{ "file_name", ValueType::STR, "ltn11.pgf", 10 },
-	{ "expire_date", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "shadow_option", ValueType::INT, "", (int)0x0 },  // decimal: 0
+	{ "h_size", ValueType::INT, "", (int)0x1c0 },
+	{ "v_size", ValueType::INT, "", (int)0x1c0 },
+	{ "h_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "v_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "extra_attributes", ValueType::INT, "", (int)0x0 },
+	{ "weight", ValueType::INT, "", (int)0x0 },
+	{ "family_code", ValueType::INT, "", (int)0x2 },
+	{ "style", ValueType::INT, "", (int)0x2 },
+	{ "sub_style", ValueType::INT, "", (int)0x0 },
+	{ "language_code", ValueType::INT, "", (int)0x2 },
+	{ "region_code", ValueType::INT, "", (int)0x0 },
+	{ "country_code", ValueType::INT, "", (int)0x1 },
+	{ "font_name", ValueType::STR, "FTT-Matisse Pro Latin", 22 },  // created with room for 64 bytes
+	{ "file_name", ValueType::STR, "ltn11.pgf", 10 },  // created with room for 64 bytes
+	{ "expire_date", ValueType::INT, "", (int)0x0 },
+	{ "shadow_option", ValueType::INT, "", (int)0x0 },
 };
 
-// Dump of /DATA/FONT/PROPERTY/INFO13
+// /DATA/FONT/PROPERTY/INFO13
 static const KeyValue tree_DATA_FONT_PROPERTY_INFO13[] = {
-	{ "h_size", ValueType::INT, "", (int)0x1c0 },  // decimal: 448
-	{ "v_size", ValueType::INT, "", (int)0x1c0 },  // decimal: 448
-	{ "h_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "v_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "extra_attributes", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "weight", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "family_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "style", ValueType::INT, "", (int)0x5 },  // decimal: 5
-	{ "sub_style", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "language_code", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "region_code", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "country_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "font_name", ValueType::STR, "FTT-NewRodin Pro Latin", 23 },
-	{ "file_name", ValueType::STR, "ltn12.pgf", 10 },
-	{ "expire_date", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "shadow_option", ValueType::INT, "", (int)0x0 },  // decimal: 0
+	{ "h_size", ValueType::INT, "", (int)0x1c0 },
+	{ "v_size", ValueType::INT, "", (int)0x1c0 },
+	{ "h_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "v_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "extra_attributes", ValueType::INT, "", (int)0x0 },
+	{ "weight", ValueType::INT, "", (int)0x0 },
+	{ "family_code", ValueType::INT, "", (int)0x1 },
+	{ "style", ValueType::INT, "", (int)0x5 },
+	{ "sub_style", ValueType::INT, "", (int)0x0 },
+	{ "language_code", ValueType::INT, "", (int)0x2 },
+	{ "region_code", ValueType::INT, "", (int)0x0 },
+	{ "country_code", ValueType::INT, "", (int)0x1 },
+	{ "font_name", ValueType::STR, "FTT-NewRodin Pro Latin", 23 },  // created with room for 64 bytes
+	{ "file_name", ValueType::STR, "ltn12.pgf", 10 },  // created with room for 64 bytes
+	{ "expire_date", ValueType::INT, "", (int)0x0 },
+	{ "shadow_option", ValueType::INT, "", (int)0x0 },
 };
 
-// Dump of /DATA/FONT/PROPERTY/INFO14
+// /DATA/FONT/PROPERTY/INFO14
 static const KeyValue tree_DATA_FONT_PROPERTY_INFO14[] = {
-	{ "h_size", ValueType::INT, "", (int)0x1c0 },  // decimal: 448
-	{ "v_size", ValueType::INT, "", (int)0x1c0 },  // decimal: 448
-	{ "h_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "v_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "extra_attributes", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "weight", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "family_code", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "style", ValueType::INT, "", (int)0x5 },  // decimal: 5
-	{ "sub_style", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "language_code", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "region_code", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "country_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "font_name", ValueType::STR, "FTT-Matisse Pro Latin", 22 },
-	{ "file_name", ValueType::STR, "ltn13.pgf", 10 },
-	{ "expire_date", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "shadow_option", ValueType::INT, "", (int)0x0 },  // decimal: 0
+	{ "h_size", ValueType::INT, "", (int)0x1c0 },
+	{ "v_size", ValueType::INT, "", (int)0x1c0 },
+	{ "h_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "v_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "extra_attributes", ValueType::INT, "", (int)0x0 },
+	{ "weight", ValueType::INT, "", (int)0x0 },
+	{ "family_code", ValueType::INT, "", (int)0x2 },
+	{ "style", ValueType::INT, "", (int)0x5 },
+	{ "sub_style", ValueType::INT, "", (int)0x0 },
+	{ "language_code", ValueType::INT, "", (int)0x2 },
+	{ "region_code", ValueType::INT, "", (int)0x0 },
+	{ "country_code", ValueType::INT, "", (int)0x1 },
+	{ "font_name", ValueType::STR, "FTT-Matisse Pro Latin", 22 },  // created with room for 64 bytes
+	{ "file_name", ValueType::STR, "ltn13.pgf", 10 },  // created with room for 64 bytes
+	{ "expire_date", ValueType::INT, "", (int)0x0 },
+	{ "shadow_option", ValueType::INT, "", (int)0x0 },
 };
 
-// Dump of /DATA/FONT/PROPERTY/INFO15
+// /DATA/FONT/PROPERTY/INFO15
 static const KeyValue tree_DATA_FONT_PROPERTY_INFO15[] = {
-	{ "h_size", ValueType::INT, "", (int)0x1c0 },  // decimal: 448
-	{ "v_size", ValueType::INT, "", (int)0x1c0 },  // decimal: 448
-	{ "h_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "v_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "extra_attributes", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "weight", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "family_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "style", ValueType::INT, "", (int)0x6 },  // decimal: 6
-	{ "sub_style", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "language_code", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "region_code", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "country_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "font_name", ValueType::STR, "FTT-NewRodin Pro Latin", 23 },
-	{ "file_name", ValueType::STR, "ltn14.pgf", 10 },
-	{ "expire_date", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "shadow_option", ValueType::INT, "", (int)0x0 },  // decimal: 0
+	{ "h_size", ValueType::INT, "", (int)0x1c0 },
+	{ "v_size", ValueType::INT, "", (int)0x1c0 },
+	{ "h_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "v_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "extra_attributes", ValueType::INT, "", (int)0x0 },
+	{ "weight", ValueType::INT, "", (int)0x0 },
+	{ "family_code", ValueType::INT, "", (int)0x1 },
+	{ "style", ValueType::INT, "", (int)0x6 },
+	{ "sub_style", ValueType::INT, "", (int)0x0 },
+	{ "language_code", ValueType::INT, "", (int)0x2 },
+	{ "region_code", ValueType::INT, "", (int)0x0 },
+	{ "country_code", ValueType::INT, "", (int)0x1 },
+	{ "font_name", ValueType::STR, "FTT-NewRodin Pro Latin", 23 },  // created with room for 64 bytes
+	{ "file_name", ValueType::STR, "ltn14.pgf", 10 },  // created with room for 64 bytes
+	{ "expire_date", ValueType::INT, "", (int)0x0 },
+	{ "shadow_option", ValueType::INT, "", (int)0x0 },
 };
 
-// Dump of /DATA/FONT/PROPERTY/INFO16
+// /DATA/FONT/PROPERTY/INFO16
 static const KeyValue tree_DATA_FONT_PROPERTY_INFO16[] = {
-	{ "h_size", ValueType::INT, "", (int)0x1c0 },  // decimal: 448
-	{ "v_size", ValueType::INT, "", (int)0x1c0 },  // decimal: 448
-	{ "h_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "v_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "extra_attributes", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "weight", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "family_code", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "style", ValueType::INT, "", (int)0x6 },  // decimal: 6
-	{ "sub_style", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "language_code", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "region_code", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "country_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "font_name", ValueType::STR, "FTT-Matisse Pro Latin", 22 },
-	{ "file_name", ValueType::STR, "ltn15.pgf", 10 },
-	{ "expire_date", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "shadow_option", ValueType::INT, "", (int)0x0 },  // decimal: 0
+	{ "h_size", ValueType::INT, "", (int)0x1c0 },
+	{ "v_size", ValueType::INT, "", (int)0x1c0 },
+	{ "h_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "v_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "extra_attributes", ValueType::INT, "", (int)0x0 },
+	{ "weight", ValueType::INT, "", (int)0x0 },
+	{ "family_code", ValueType::INT, "", (int)0x2 },
+	{ "style", ValueType::INT, "", (int)0x6 },
+	{ "sub_style", ValueType::INT, "", (int)0x0 },
+	{ "language_code", ValueType::INT, "", (int)0x2 },
+	{ "region_code", ValueType::INT, "", (int)0x0 },
+	{ "country_code", ValueType::INT, "", (int)0x1 },
+	{ "font_name", ValueType::STR, "FTT-Matisse Pro Latin", 22 },  // created with room for 64 bytes
+	{ "file_name", ValueType::STR, "ltn15.pgf", 10 },  // created with room for 64 bytes
+	{ "expire_date", ValueType::INT, "", (int)0x0 },
+	{ "shadow_option", ValueType::INT, "", (int)0x0 },
 };
 
-// Dump of /DATA/FONT/PROPERTY/INFO17
+// /DATA/FONT/PROPERTY/INFO17
 static const KeyValue tree_DATA_FONT_PROPERTY_INFO17[] = {
-	{ "h_size", ValueType::INT, "", (int)0x288 },  // decimal: 648
-	{ "v_size", ValueType::INT, "", (int)0x288 },  // decimal: 648
-	{ "h_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "v_resolution", ValueType::INT, "", (int)0x2000 },  // decimal: 8192
-	{ "extra_attributes", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "weight", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "family_code", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "style", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "sub_style", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "language_code", ValueType::INT, "", (int)0x3 },  // decimal: 3
-	{ "region_code", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "country_code", ValueType::INT, "", (int)0x3 },  // decimal: 3
-	{ "font_name", ValueType::STR, "AsiaNHH(512Johab)", 18 },
-	{ "file_name", ValueType::STR, "kr0.pgf", 8 },
-	{ "expire_date", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "shadow_option", ValueType::INT, "", (int)0x0 },  // decimal: 0
+	{ "h_size", ValueType::INT, "", (int)0x288 },
+	{ "v_size", ValueType::INT, "", (int)0x288 },
+	{ "h_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "v_resolution", ValueType::INT, "", (int)0x2000 },
+	{ "extra_attributes", ValueType::INT, "", (int)0x0 },
+	{ "weight", ValueType::INT, "", (int)0x0 },
+	{ "family_code", ValueType::INT, "", (int)0x1 },
+	{ "style", ValueType::INT, "", (int)0x1 },
+	{ "sub_style", ValueType::INT, "", (int)0x0 },
+	{ "language_code", ValueType::INT, "", (int)0x3 },
+	{ "region_code", ValueType::INT, "", (int)0x0 },
+	{ "country_code", ValueType::INT, "", (int)0x3 },
+	{ "font_name", ValueType::STR, "AsiaNHH(512Johab)", 18 },  // created with room for 64 bytes
+	{ "file_name", ValueType::STR, "kr0.pgf", 8 },  // created with room for 64 bytes
+	{ "expire_date", ValueType::INT, "", (int)0x0 },
+	{ "shadow_option", ValueType::INT, "", (int)0x0 },
 };
 
-// Dump of /DATA/FONT/PROPERTY
+// /CONFIG/SYSTEM/XMB
+static const KeyValue tree_CONFIG_SYSTEM_XMB[] = {
+	{ "theme_type", ValueType::INT, "", (int)0x0 },
+	{ "language", ValueType::INT, "", (int)0x1 },
+	{ "button_assign", ValueType::INT, "", (int)0x1 },
+	{ "THEME", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_SYSTEM_XMB_THEME), tree_CONFIG_SYSTEM_XMB_THEME },
+};
+
+// /CONFIG/SYSTEM/SOUND
+static const KeyValue tree_CONFIG_SYSTEM_SOUND[] = {
+	{ "main_volume", ValueType::INT, "", (int)0x14 },
+	{ "mute", ValueType::INT, "", (int)0x0 },
+	{ "avls", ValueType::INT, "", (int)0x0 },
+	{ "equalizer_mode", ValueType::INT, "", (int)0x0 },
+	{ "operation_sound_mode", ValueType::INT, "", (int)0x1 },
+	{ "dynamic_normalizer", ValueType::INT, "", (int)0x0 },
+};
+
+// /CONFIG/SYSTEM/POWER_SAVING
+static const KeyValue tree_CONFIG_SYSTEM_POWER_SAVING[] = {
+	{ "suspend_interval", ValueType::INT, "", (int)0x258 },
+	{ "backlight_off_interval", ValueType::INT, "", (int)0x12c },
+	{ "wlan_mode", ValueType::INT, "", (int)0x0 },
+};
+
+// /CONFIG/SYSTEM/LOCK
+static const KeyValue tree_CONFIG_SYSTEM_LOCK[] = {
+	{ "password", ValueType::BIN, "0000", 4 },
+	{ "parental_level", ValueType::INT, "", (int)0x0 },
+	{ "browser_start", ValueType::INT, "", (int)0x0 },
+};
+
+// /CONFIG/SYSTEM/CHARACTER_SET
+static const KeyValue tree_CONFIG_SYSTEM_CHARACTER_SET[] = {
+	{ "oem", ValueType::INT, "", (int)0x5 },
+	{ "ansi", ValueType::INT, "", (int)0x13 },
+};
+
+// /CONFIG/NETWORK/ADHOC
+static const KeyValue tree_CONFIG_NETWORK_ADHOC[] = {
+	{ "channel", ValueType::INT, "", (int)0x0 },
+};
+
+// /CONFIG/NETWORK/INFRASTRUCTURE
+static const KeyValue tree_CONFIG_NETWORK_INFRASTRUCTURE[] = {
+	{ "latest_id", ValueType::INT, "", (int)0x0 },
+	{ "eap_md5", ValueType::INT, "", (int)0x0 },
+	{ "auto_setting", ValueType::INT, "", (int)0x0 },
+	{ "wifisvc_setting", ValueType::INT, "", (int)0x0 },
+};
+
+// /CONFIG/NETWORK/GO_MESSENGER
+static const KeyValue tree_CONFIG_NETWORK_GO_MESSENGER[] = {
+	{ "auth_name", ValueType::STR, "", 1 },  // created with room for 64 bytes
+	{ "auth_key", ValueType::STR, "", 1 },  // created with room for 64 bytes
+};
+
+// /DATA/FONT/PROPERTY
 static const KeyValue tree_DATA_FONT_PROPERTY[] = {
 	{ "INFO0", ValueType::DIR, "", ARRAY_SIZE(tree_DATA_FONT_PROPERTY_INFO0), tree_DATA_FONT_PROPERTY_INFO0 },
 	{ "INFO1", ValueType::DIR, "", ARRAY_SIZE(tree_DATA_FONT_PROPERTY_INFO1), tree_DATA_FONT_PROPERTY_INFO1 },
@@ -443,295 +513,154 @@ static const KeyValue tree_DATA_FONT_PROPERTY[] = {
 	{ "INFO17", ValueType::DIR, "", ARRAY_SIZE(tree_DATA_FONT_PROPERTY_INFO17), tree_DATA_FONT_PROPERTY_INFO17 },
 };
 
-// Dump of /DATA/FONT
-static const KeyValue tree_DATA_FONT[] = {
-	{ "path_name", ValueType::STR, "flash0:/font", 13 },
-	{ "num_fonts", ValueType::INT, "", (int)0x12 },  // decimal: 18
-	{ "PROPERTY", ValueType::DIR, "", ARRAY_SIZE(tree_DATA_FONT_PROPERTY), tree_DATA_FONT_PROPERTY },
-};
-
-// Dump of /DATA/COUNT
-static const KeyValue tree_DATA_COUNT[] = {
-	{ "boot_count", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "game_exec_count", ValueType::INT, "", (int)0x46 },  // decimal: 70
-	{ "slide_count", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "usb_connect_count", ValueType::INT, "", (int)0xec },  // decimal: 236
-	{ "wifi_connect_count", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "psn_access_count", ValueType::INT, "", (int)0x0 },  // decimal: 0
-};
-
-// Dump of /DATA
-static const KeyValue tree_DATA[] = {
-	{ "FONT", ValueType::DIR, "", ARRAY_SIZE(tree_DATA_FONT), tree_DATA_FONT },
-	{ "COUNT", ValueType::DIR, "", ARRAY_SIZE(tree_DATA_COUNT), tree_DATA_COUNT },
-};
-
-// Dump of /SYSPROFILE/RESOLUTION
-static const KeyValue tree_SYSPROFILE_RESOLUTION[] = {
-	{ "horizontal", ValueType::INT, "", (int)0x2012 },  // decimal: 8210
-	{ "vertical", ValueType::INT, "", (int)0x2012 },  // decimal: 8210
-};
-
-// Dump of /SYSPROFILE
-static const KeyValue tree_SYSPROFILE[] = {
-	{ "sound_reduction", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "RESOLUTION", ValueType::DIR, "", ARRAY_SIZE(tree_SYSPROFILE_RESOLUTION), tree_SYSPROFILE_RESOLUTION },
-};
-
-// Dump of /CONFIG/VIDEO
+// /CONFIG/VIDEO
 static const KeyValue tree_CONFIG_VIDEO[] = {
 	{ "menu_language", ValueType::BIN, "en", 2 },
 	{ "sound_language", ValueType::BIN, "00", 2 },
 	{ "subtitle_language", ValueType::BIN, "en", 2 },
-	{ "appended_volume", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "lr_button_enable", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "list_play_mode", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "title_display_mode", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "output_ext_menu", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "output_ext_func", ValueType::INT, "", (int)0x0 },  // decimal: 0
+	{ "appended_volume", ValueType::INT, "", (int)0x0 },
+	{ "lr_button_enable", ValueType::INT, "", (int)0x1 },
+	{ "list_play_mode", ValueType::INT, "", (int)0x1 },
 };
 
-// Dump of /CONFIG/PHOTO
+// /CONFIG/PHOTO
 static const KeyValue tree_CONFIG_PHOTO[] = {
-	{ "slideshow_speed", ValueType::INT, "", (int)0x1 },  // decimal: 1
+	{ "slideshow_speed", ValueType::INT, "", (int)0x1 },
 };
 
-// Dump of /CONFIG/MUSIC
+// /CONFIG/MUSIC
 static const KeyValue tree_CONFIG_MUSIC[] = {
-	{ "wma_play", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "visualizer_mode", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "track_info_mode", ValueType::INT, "", (int)0x1 },  // decimal: 1
+	{ "wma_play", ValueType::INT, "", (int)0x0 },
+	{ "visualizer_mode", ValueType::INT, "", (int)0x0 },
+	{ "track_info_mode", ValueType::INT, "", (int)0x1 },
 };
 
-// Dump of /CONFIG/BROWSER
+// /CONFIG/BROWSER
 static const KeyValue tree_CONFIG_BROWSER[] = {
-	{ "home_uri", ValueType::STR, "", 1 },
-	{ "cookie_mode", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "proxy_mode", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "proxy_address", ValueType::STR, "", 1 },
-	{ "proxy_port", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "picture", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "animation", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "javascript", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "cache_size", ValueType::INT, "", (int)0x200 },  // decimal: 512
-	{ "char_size", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "disp_mode", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "connect_mode", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "flash_activated", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "flash_play", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "proxy_protect", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "proxy_autoauth", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "proxy_user", ValueType::STR, "", 1 },
-	{ "proxy_password", ValueType::STR, "", 1 },
-	{ "webpage_quality", ValueType::INT, "", (int)0x0 },  // decimal: 0
+	{ "home_uri", ValueType::STR, "", 1 },  // created with room for 1024 bytes
+	{ "cookie_mode", ValueType::INT, "", (int)0x1 },
+	{ "proxy_mode", ValueType::INT, "", (int)0x2 },
+	{ "proxy_address", ValueType::STR, "", 1 },  // created with room for 128 bytes
+	{ "proxy_port", ValueType::INT, "", (int)0x0 },
+	{ "picture", ValueType::INT, "", (int)0x1 },
+	{ "animation", ValueType::INT, "", (int)0x1 },
+	{ "javascript", ValueType::INT, "", (int)0x1 },
+	{ "cache_size", ValueType::INT, "", (int)0x200 },
+	{ "char_size", ValueType::INT, "", (int)0x1 },
+	{ "disp_mode", ValueType::INT, "", (int)0x0 },
+	{ "connect_mode", ValueType::INT, "", (int)0x0 },
+	{ "flash_activated", ValueType::INT, "", (int)0x0 },
+	{ "flash_play", ValueType::INT, "", (int)0x0 },
+	{ "proxy_protect", ValueType::INT, "", (int)0x0 },
+	{ "proxy_autoauth", ValueType::INT, "", (int)0x0 },
+	{ "proxy_user", ValueType::STR, "", 1 },  // created with room for 128 bytes
+	{ "proxy_password", ValueType::STR, "", 1 },  // created with room for 128 bytes
+	{ "webpage_quality", ValueType::INT, "", (int)0x0 },
 };
 
-// Dump of /CONFIG/BROWSER2
-static const KeyValue tree_CONFIG_BROWSER2[] = {
-	{ "tm_service", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "tm_ec_ttl", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "tm_ec_ttl_update_time", ValueType::BIN, "", 8 },  // (all zero)
-	{ "tm_service_sub_status", ValueType::INT, "", (int)0x0 },  // decimal: 0
-};
-
-// Dump of /CONFIG/LFTV
+// /CONFIG/LFTV
 static const KeyValue tree_CONFIG_LFTV[] = {
-	{ "easy_reg_done", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "netav_domain_name", ValueType::STR, "", 1 },
-	{ "netav_ip_address", ValueType::STR, "172.29.71.1", 12 },
-	{ "netav_port_no_home", ValueType::INT, "", (int)0x139d },  // decimal: 5021
-	{ "netav_port_no_away", ValueType::INT, "", (int)0x139d },  // decimal: 5021
-	{ "netav_nonce", ValueType::STR, "", 1 },
-	{ "base_station_version", ValueType::STR, "0.000", 6 },
-	{ "base_station_region", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "tuner_type", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "input_line", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "tv_channel", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "bitrate_home", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "bitrate_away", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "channel_setting_jp", ValueType::BIN, "", 24 },  // (all zero)
-	{ "channel_setting_us", ValueType::BIN, "", 68 },  // (all zero)
-	{ "channel_setting_us_catv", ValueType::BIN, "", 125 },  // (all zero)
-	{ "overwrite_netav_setting", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "screen_mode", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "remocon_setting_region", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "remocon_setting", ValueType::BIN, "", 96 },  // (all zero)
-	{ "remocon_setting_revision", ValueType::STR, "0000.00", 8 },
-	{ "external_tuner_channel", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "ssid", ValueType::STR, "", 1 },
-	{ "audio_gain", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "broadcast_standard_video1", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "broadcast_standard_video2", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "version", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "tv_channel_range", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "tuner_type_no", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "input_line_no", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "audio_channel", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "shared_remocon_setting", ValueType::BIN, "", 96 },  // (all zero)
+	{ "easy_reg_done", ValueType::INT, "", (int)0x0 },
+	{ "netav_domain_name", ValueType::STR, "", 1 },  // created with room for 256 bytes
+	{ "netav_ip_address", ValueType::STR, "172.29.71.1", 12 },  // created with room for 16 bytes
+	{ "netav_port_no_home", ValueType::INT, "", (int)0x139d },
+	{ "netav_port_no_away", ValueType::INT, "", (int)0x139d },
+	{ "netav_nonce", ValueType::STR, "", 1 },  // created with room for 33 bytes
+	{ "base_station_version", ValueType::STR, "0.000", 6 },  // created with room for 7 bytes
+	{ "base_station_region", ValueType::INT, "", (int)0x0 },
+	{ "tuner_type", ValueType::INT, "", (int)0x0 },
+	{ "input_line", ValueType::INT, "", (int)0x0 },
+	{ "tv_channel", ValueType::INT, "", (int)0x0 },
+	{ "bitrate_home", ValueType::INT, "", (int)0x0 },
+	{ "bitrate_away", ValueType::INT, "", (int)0x0 },
+	{ "channel_setting_jp", ValueType::BIN, "", 24 },  // all zero
+	{ "channel_setting_us", ValueType::BIN, "", 68 },  // all zero
+	{ "channel_setting_us_catv", ValueType::BIN, "", 125 },  // all zero
+	{ "overwrite_netav_setting", ValueType::INT, "", (int)0x1 },
+	{ "screen_mode", ValueType::INT, "", (int)0x0 },
+	{ "remocon_setting_region", ValueType::INT, "", (int)0x0 },
+	{ "remocon_setting", ValueType::BIN, "", 96 },  // all zero
+	{ "remocon_setting_revision", ValueType::STR, "0000.00", 8 },  // created with room for 8 bytes
+	{ "external_tuner_channel", ValueType::INT, "", (int)0x0 },
+	{ "ssid", ValueType::STR, "", 1 },  // created with room for 33 bytes
+	{ "audio_gain", ValueType::INT, "", (int)0x0 },
+	{ "broadcast_standard_video1", ValueType::INT, "", (int)0x0 },
+	{ "broadcast_standard_video2", ValueType::INT, "", (int)0x0 },
+	{ "version", ValueType::INT, "", (int)0x0 },
+	{ "tv_channel_range", ValueType::INT, "", (int)0x0 },
+	{ "tuner_type_no", ValueType::INT, "", (int)0x0 },
+	{ "input_line_no", ValueType::INT, "", (int)0x0 },
+	{ "audio_channel", ValueType::INT, "", (int)0x0 },
+	{ "shared_remocon_setting", ValueType::BIN, "", 96 },  // all zero
 };
 
-// Dump of /CONFIG/RSS
+// /CONFIG/RSS
 static const KeyValue tree_CONFIG_RSS[] = {
-	{ "download_items", ValueType::INT, "", (int)0x5 },  // decimal: 5
+	{ "download_items", ValueType::INT, "", (int)0x5 },
 };
 
-// Dump of /CONFIG/ALARM
+// /CONFIG/ALARM
 static const KeyValue tree_CONFIG_ALARM[] = {
-	{ "alarm_0_time", ValueType::INT, "", (int)0xffffffff },  // decimal: -1
-	{ "alarm_1_time", ValueType::INT, "", (int)0xffffffff },  // decimal: -1
-	{ "alarm_2_time", ValueType::INT, "", (int)0xffffffff },  // decimal: -1
-	{ "alarm_3_time", ValueType::INT, "", (int)0xffffffff },  // decimal: -1
-	{ "alarm_4_time", ValueType::INT, "", (int)0xffffffff },  // decimal: -1
-	{ "alarm_5_time", ValueType::INT, "", (int)0xffffffff },  // decimal: -1
-	{ "alarm_6_time", ValueType::INT, "", (int)0xffffffff },  // decimal: -1
-	{ "alarm_7_time", ValueType::INT, "", (int)0xffffffff },  // decimal: -1
-	{ "alarm_8_time", ValueType::INT, "", (int)0xffffffff },  // decimal: -1
-	{ "alarm_9_time", ValueType::INT, "", (int)0xffffffff },  // decimal: -1
-	{ "alarm_0_property", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "alarm_1_property", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "alarm_2_property", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "alarm_3_property", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "alarm_4_property", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "alarm_5_property", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "alarm_6_property", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "alarm_7_property", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "alarm_8_property", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "alarm_9_property", ValueType::INT, "", (int)0x0 },  // decimal: 0
+	{ "alarm_0_time", ValueType::INT, "", (int)0xffffffff },
+	{ "alarm_1_time", ValueType::INT, "", (int)0xffffffff },
 };
 
-// Dump of /CONFIG/PREMO
+// /CONFIG/PREMO
 static const KeyValue tree_CONFIG_PREMO[] = {
-	{ "guide_page", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "response", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "ps3_name", ValueType::STR, "", 1 },
-	{ "ps3_mac", ValueType::BIN, "", 6 },  // (all zero)
-	{ "ps3_keytype", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "ps3_key", ValueType::BIN, "", 16 },  // (all zero)
-	{ "custom_video_bitrate1", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "custom_video_bitrate2", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "custom_video_buffer1", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "custom_video_buffer2", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "setting_internet", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "button_assign", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "flags", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "account_id", ValueType::BIN, "", 16 },  // (all zero)
-	{ "login_id", ValueType::STR, "", 1 },
-	{ "password", ValueType::STR, "", 1 },
+	{ "guide_page", ValueType::INT, "", (int)0x1 },
+	{ "response", ValueType::INT, "", (int)0x0 },
+	{ "ps3_name", ValueType::STR, "", 1 },  // created with room for 128 bytes
+	{ "ps3_mac", ValueType::BIN, "", 6 },  // all zero
+	{ "ps3_keytype", ValueType::INT, "", (int)0x0 },
+	{ "ps3_key", ValueType::BIN, "", 16 },  // all zero
+	{ "custom_video_bitrate1", ValueType::INT, "", (int)0x0 },
+	{ "custom_video_bitrate2", ValueType::INT, "", (int)0x0 },
+	{ "custom_video_buffer1", ValueType::INT, "", (int)0x0 },
+	{ "custom_video_buffer2", ValueType::INT, "", (int)0x0 },
+	{ "setting_internet", ValueType::INT, "", (int)0x0 },
+	{ "button_assign", ValueType::INT, "", (int)0x0 },
+	{ "flags", ValueType::INT, "", (int)0x0 },
 };
 
-// Dump of /CONFIG/CAMERA
+// /CONFIG/CAMERA
 static const KeyValue tree_CONFIG_CAMERA[] = {
-	{ "still_size", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "movie_size", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "still_quality", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "movie_quality", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "movie_fps", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "white_balance", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "exposure_bias", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "shutter_sound_mode", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "file_folder", ValueType::INT, "", (int)0x65 },  // decimal: 101
-	{ "file_number", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "msid", ValueType::BIN, "", 16 },  // (all zero)
-	{ "still_effect", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "medium_type", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "file_number_eflash", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "folder_number_eflash", ValueType::INT, "", (int)0x65 },  // decimal: 101
+	{ "still_size", ValueType::INT, "", (int)0x1 },
+	{ "movie_size", ValueType::INT, "", (int)0x1 },
+	{ "still_quality", ValueType::INT, "", (int)0x0 },
+	{ "movie_quality", ValueType::INT, "", (int)0x0 },
+	{ "movie_fps", ValueType::INT, "", (int)0x1 },
+	{ "white_balance", ValueType::INT, "", (int)0x0 },
+	{ "exposure_bias", ValueType::INT, "", (int)0x0 },
+	{ "shutter_sound_mode", ValueType::INT, "", (int)0x0 },
+	{ "file_folder", ValueType::INT, "", (int)0x65 },
+	{ "file_number", ValueType::INT, "", (int)0x1 },
+	{ "msid", ValueType::BIN, "", 16 },  // all zero
+	{ "still_effect", ValueType::INT, "", (int)0x0 },
 };
 
-// Dump of /CONFIG/DISPLAY
+// /CONFIG/DISPLAY
 static const KeyValue tree_CONFIG_DISPLAY[] = {
-	{ "aspect_ratio", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "scan_mode", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "screensaver_start_time", ValueType::INT, "", (int)0x258 },  // decimal: 600
-	{ "color_space_mode", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "pi_blending_mode", ValueType::INT, "", (int)0x1 },  // decimal: 1
+	{ "aspect_ratio", ValueType::INT, "", (int)0x0 },
+	{ "scan_mode", ValueType::INT, "", (int)0x0 },
+	{ "screensaver_start_time", ValueType::INT, "", (int)0x258 },
 };
 
-// Dump of /CONFIG/NP
+// /CONFIG/NP
 static const KeyValue tree_CONFIG_NP[] = {
-	{ "env", ValueType::STR, "np", 3 },
-	{ "account_id", ValueType::BIN, "", 16 },  // (all zero)
-	{ "login_id", ValueType::STR, "", 1 },
-	{ "password", ValueType::STR, "", 1 },
-	{ "auto_sign_in_enable", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "nav_only", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "np_ad_clock_diff", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "view_mode", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "np_geo_filtering", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "guest_country", ValueType::STR, "", 1 },
-	{ "guest_lang", ValueType::STR, "", 1 },
-	{ "guest_yob", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "guest_mob", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "guest_dob", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "check_drm", ValueType::INT, "", (int)0x0 },  // decimal: 0
+	{ "env", ValueType::STR, "np", 3 },  // created with room for 9 bytes
+	{ "account_id", ValueType::BIN, "", 16 },  // all zero
+	{ "login_id", ValueType::STR, "", 1 },  // created with room for 65 bytes
+	{ "password", ValueType::STR, "", 1 },  // created with room for 31 bytes
+	{ "auto_sign_in_enable", ValueType::INT, "", (int)0x0 },
 };
 
-// Dump of /CONFIG/ONESEG
-static const KeyValue tree_CONFIG_ONESEG[] = {
-	{ "schedule_data_key", ValueType::BIN, "", 16 },  // (all zero)
-};
-
-// Dump of /CONFIG/SYSTEM/XMB/THEME
-static const KeyValue tree_CONFIG_SYSTEM_XMB_THEME[] = {
-	{ "color_mode", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "wallpaper_mode", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "system_color", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "custom_theme_mode", ValueType::INT, "", (int)0x0 },  // decimal: 0
-};
-
-// Dump of /CONFIG/SYSTEM/XMB
-static const KeyValue tree_CONFIG_SYSTEM_XMB[] = {
-	{ "theme_type", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "language", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "button_assign", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "THEME", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_SYSTEM_XMB_THEME), tree_CONFIG_SYSTEM_XMB_THEME },
-};
-
-// Dump of /CONFIG/SYSTEM/SOUND
-static const KeyValue tree_CONFIG_SYSTEM_SOUND[] = {
-	{ "main_volume", ValueType::INT, "", (int)0x1b },  // decimal: 27
-	{ "mute", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "avls", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "equalizer_mode", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "operation_sound_mode", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "dynamic_normalizer", ValueType::INT, "", (int)0x0 },  // decimal: 0
-};
-
-// Dump of /CONFIG/SYSTEM/POWER_SAVING
-static const KeyValue tree_CONFIG_SYSTEM_POWER_SAVING[] = {
-	{ "suspend_interval", ValueType::INT, "", (int)0x258 },  // decimal: 600
-	{ "backlight_off_interval", ValueType::INT, "", (int)0x12c },  // decimal: 300
-	{ "wlan_mode", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "active_backlight_mode", ValueType::INT, "", (int)0x0 },  // decimal: 0
-};
-
-// Dump of /CONFIG/SYSTEM/LOCK
-static const KeyValue tree_CONFIG_SYSTEM_LOCK[] = {
-	{ "password", ValueType::BIN, "0000", 4 },
-	{ "parental_level", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "browser_start", ValueType::INT, "", (int)0x0 },  // decimal: 0
-};
-
-// Dump of /CONFIG/SYSTEM/CHARACTER_SET
-static const KeyValue tree_CONFIG_SYSTEM_CHARACTER_SET[] = {
-	{ "oem", ValueType::INT, "", (int)0x5 },  // decimal: 5
-	{ "ansi", ValueType::INT, "", (int)0x13 },  // decimal: 19
-};
-
-// Dump of /CONFIG/SYSTEM
+// /CONFIG/SYSTEM
 static const KeyValue tree_CONFIG_SYSTEM[] = {
-	{ "owner_name", ValueType::STR, "PSPC", 5 },  // nickname
-	{ "backlight_brightness", ValueType::INT, "", (int)0x3 },  // decimal: 3
-	{ "umd_autoboot", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "usb_charge", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "umd_cache", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "usb_auto_connect", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "slide_action", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "first_boot_tick", ValueType::BIN, "\307\216\216\266\023\074\341\000\000\000\000\000\377\377\377\377\377\377\377\377\000b\240\010p\262\241\010 \350\377\t\006\000\002\000\006\000\022\000\050\302\231\010\304\r\217\010\000\000\300\300\340\347\377\t\360\\\274\t6\077\034A", 64 },
-	{ "owner_mob", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "owner_dob", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "slide_welcome", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "exh_mode", ValueType::INT, "", (int)0x0 },  // decimal: 0
+	{ "owner_name", ValueType::STR, "PSPC", 5 },  // nickname (4.01 leaves it empty for the first-boot setup); created with room for 128 bytes
+	{ "backlight_brightness", ValueType::INT, "", (int)0x2 },
+	{ "umd_autoboot", ValueType::INT, "", (int)0x1 },
+	{ "usb_charge", ValueType::INT, "", (int)0x1 },
+	{ "umd_cache", ValueType::INT, "", (int)0x1 },
 	{ "XMB", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_SYSTEM_XMB), tree_CONFIG_SYSTEM_XMB },
 	{ "SOUND", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_SYSTEM_SOUND), tree_CONFIG_SYSTEM_SOUND },
 	{ "POWER_SAVING", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_SYSTEM_POWER_SAVING), tree_CONFIG_SYSTEM_POWER_SAVING },
@@ -739,183 +668,46 @@ static const KeyValue tree_CONFIG_SYSTEM[] = {
 	{ "CHARACTER_SET", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_SYSTEM_CHARACTER_SET), tree_CONFIG_SYSTEM_CHARACTER_SET },
 };
 
-// Dump of /CONFIG/DATE
+// /CONFIG/DATE
 static const KeyValue tree_CONFIG_DATE[] = {
-	{ "time_format", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "date_format", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "summer_time", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "time_zone_offset", ValueType::INT, "", (int)0x3c },  // decimal: 60
-	{ "time_zone_area", ValueType::STR, "sweden", 7 },
+	{ "time_format", ValueType::INT, "", (int)0x0 },
+	{ "date_format", ValueType::INT, "", (int)0x2 },
+	{ "summer_time", ValueType::INT, "", (int)0x0 },
+	{ "time_zone_offset", ValueType::INT, "", (int)0x3c },
+	{ "time_zone_area", ValueType::STR, "belgium", 8 },  // created with room for 48 bytes
 };
 
-// Dump of /CONFIG/NETWORK/ADHOC
-static const KeyValue tree_CONFIG_NETWORK_ADHOC[] = {
-	{ "channel", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "ssid_prefix", ValueType::STR, "PSP", 4 },
-};
-
-// Dump of /CONFIG/NETWORK/INFRASTRUCTURE/0/SUB1
-static const KeyValue tree_CONFIG_NETWORK_INFRASTRUCTURE_0_SUB1[] = {
-	{ "wifisvc_auth_name", ValueType::STR, "", 1 },
-	{ "wifisvc_auth_key", ValueType::STR, "", 1 },
-	{ "wifisvc_option", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "last_leased_dhcp_addr", ValueType::STR, "", 1 },
-	{ "bt_id", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "at_command", ValueType::STR, "", 1 },
-	{ "phone_number", ValueType::STR, "", 1 },
-};
-
-// Dump of /CONFIG/NETWORK/INFRASTRUCTURE/0
-static const KeyValue tree_CONFIG_NETWORK_INFRASTRUCTURE_0[] = {
-	{ "SUB1", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_NETWORK_INFRASTRUCTURE_0_SUB1), tree_CONFIG_NETWORK_INFRASTRUCTURE_0_SUB1 },
-	{ "version", ValueType::INT, "", (int)0x5 },  // decimal: 5
-	{ "device", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "cnf_name", ValueType::STR, "", 1 },
-	{ "ssid", ValueType::STR, "", 1 },
-	{ "auth_proto", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "wep_key", ValueType::BIN, "", 5 },  // (all zero)
-	{ "how_to_set_ip", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "ip_address", ValueType::STR, "", 1 },
-	{ "netmask", ValueType::STR, "", 1 },
-	{ "default_route", ValueType::STR, "", 1 },
-	{ "dns_flag", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "primary_dns", ValueType::STR, "", 1 },
-	{ "secondary_dns", ValueType::STR, "", 1 },
-	{ "auth_name", ValueType::STR, "", 1 },
-	{ "auth_key", ValueType::STR, "", 1 },
-	{ "http_proxy_flag", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "http_proxy_server", ValueType::STR, "", 1 },
-	{ "http_proxy_port", ValueType::INT, "", (int)0x1f90 },  // decimal: 8080
-	{ "auth_8021x_type", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "auth_8021x_auth_name", ValueType::STR, "", 1 },
-	{ "auth_8021x_auth_key", ValueType::STR, "", 1 },
-	{ "wpa_key_type", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "wpa_key", ValueType::BIN, "", 64 },  // (all zero)
-	{ "browser_flag", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "wifisvc_config", ValueType::INT, "", (int)0x0 },  // decimal: 0
-};
-
-// Dump of /CONFIG/NETWORK/INFRASTRUCTURE
-static const KeyValue tree_CONFIG_NETWORK_INFRASTRUCTURE[] = {
-	{ "latest_id", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "eap_md5", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "auto_setting", ValueType::INT, "", (int)0x2 },  // decimal: 2
-	{ "wifisvc_setting", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "btdun_warnings_check", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "0", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_NETWORK_INFRASTRUCTURE_0), tree_CONFIG_NETWORK_INFRASTRUCTURE_0 },
-};
-
-// Dump of /CONFIG/NETWORK/GO_MESSENGER
-static const KeyValue tree_CONFIG_NETWORK_GO_MESSENGER[] = {
-	{ "auth_name", ValueType::STR, "", 1 },
-	{ "auth_key", ValueType::STR, "", 1 },
-};
-
-// Dump of /CONFIG/NETWORK
+// /CONFIG/NETWORK
 static const KeyValue tree_CONFIG_NETWORK[] = {
 	{ "ADHOC", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_NETWORK_ADHOC), tree_CONFIG_NETWORK_ADHOC },
 	{ "INFRASTRUCTURE", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_NETWORK_INFRASTRUCTURE), tree_CONFIG_NETWORK_INFRASTRUCTURE },
 	{ "GO_MESSENGER", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_NETWORK_GO_MESSENGER), tree_CONFIG_NETWORK_GO_MESSENGER },
 };
 
-// Dump of /CONFIG/OSK
-static const KeyValue tree_CONFIG_OSK[] = {
-	{ "version_id", ValueType::INT, "", (int)0x226 },  // decimal: 550
-	{ "disp_locale", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "writing_locale", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "input_char_mask", ValueType::INT, "", (int)0xf },  // decimal: 15
-	{ "keytop_index", ValueType::INT, "", (int)0x5 },  // decimal: 5
+// /DATA/FONT
+static const KeyValue tree_DATA_FONT[] = {
+	{ "path_name", ValueType::STR, "flash0:/font", 13 },  // created with room for 64 bytes
+	{ "num_fonts", ValueType::INT, "", (int)0x12 },
+	{ "PROPERTY", ValueType::DIR, "", ARRAY_SIZE(tree_DATA_FONT_PROPERTY), tree_DATA_FONT_PROPERTY },
 };
 
-// Dump of /CONFIG/INFOBOARD
-static const KeyValue tree_CONFIG_INFOBOARD[] = {
-	{ "locale_lang", ValueType::STR, "", 1 },
-	{ "qa_server", ValueType::INT, "", (int)0x0 },  // decimal: 0
+// /SYSPROFILE/RESOLUTION
+static const KeyValue tree_SYSPROFILE_RESOLUTION[] = {
+	{ "horizontal", ValueType::INT, "", (int)0x2012 },
+	{ "vertical", ValueType::INT, "", (int)0x2012 },
 };
 
-// Dump of /CONFIG/BT/DEVICE0
-static const KeyValue tree_CONFIG_BT_DEVICE0[] = {
-	{ "audio_type", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "device_type", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "device_name", ValueType::BIN, "", 64 },  // (all zero)
+// /REGISTRY
+static const KeyValue tree_REGISTRY[] = {
+	{ "category_version", ValueType::INT, "", (int)0x40 },  // 4.01's schema: the VSH upgrades older registries to it
 };
 
-// Dump of /CONFIG/BT/DEVICE1
-static const KeyValue tree_CONFIG_BT_DEVICE1[] = {
-	{ "audio_type", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "device_type", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "device_name", ValueType::BIN, "", 64 },  // (all zero)
-};
-
-// Dump of /CONFIG/BT/DEVICE2
-static const KeyValue tree_CONFIG_BT_DEVICE2[] = {
-	{ "audio_type", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "device_type", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "device_name", ValueType::BIN, "", 64 },  // (all zero)
-};
-
-// Dump of /CONFIG/BT/DEVICE3
-static const KeyValue tree_CONFIG_BT_DEVICE3[] = {
-	{ "audio_type", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "device_type", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "device_name", ValueType::BIN, "", 64 },  // (all zero)
-};
-
-// Dump of /CONFIG/BT/DEVICE4
-static const KeyValue tree_CONFIG_BT_DEVICE4[] = {
-	{ "audio_type", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "device_type", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "device_name", ValueType::BIN, "", 64 },  // (all zero)
-};
-
-// Dump of /CONFIG/BT/DEVICE5
-static const KeyValue tree_CONFIG_BT_DEVICE5[] = {
-	{ "audio_type", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "device_type", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "device_name", ValueType::BIN, "", 64 },  // (all zero)
-};
-
-// Dump of /CONFIG/BT/DEVICE6
-static const KeyValue tree_CONFIG_BT_DEVICE6[] = {
-	{ "audio_type", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "device_type", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "device_name", ValueType::BIN, "", 64 },  // (all zero)
-};
-
-// Dump of /CONFIG/BT/DEVICE7
-static const KeyValue tree_CONFIG_BT_DEVICE7[] = {
-	{ "audio_type", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "device_type", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "device_name", ValueType::BIN, "", 64 },  // (all zero)
-};
-
-// Dump of /CONFIG/BT
-static const KeyValue tree_CONFIG_BT[] = {
-	{ "connect_mode", ValueType::INT, "", (int)0x0 },  // decimal: 0
-	{ "DEVICE0", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_BT_DEVICE0), tree_CONFIG_BT_DEVICE0 },
-	{ "DEVICE1", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_BT_DEVICE1), tree_CONFIG_BT_DEVICE1 },
-	{ "DEVICE2", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_BT_DEVICE2), tree_CONFIG_BT_DEVICE2 },
-	{ "DEVICE3", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_BT_DEVICE3), tree_CONFIG_BT_DEVICE3 },
-	{ "DEVICE4", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_BT_DEVICE4), tree_CONFIG_BT_DEVICE4 },
-	{ "DEVICE5", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_BT_DEVICE5), tree_CONFIG_BT_DEVICE5 },
-	{ "DEVICE6", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_BT_DEVICE6), tree_CONFIG_BT_DEVICE6 },
-	{ "DEVICE7", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_BT_DEVICE7), tree_CONFIG_BT_DEVICE7 },
-};
-
-// Dump of /CONFIG/GAME
-static const KeyValue tree_CONFIG_GAME[] = {
-	{ "hibernation_ow_guide", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "hibernation_op_guide", ValueType::INT, "", (int)0x1 },  // decimal: 1
-	{ "subs_expiration_guide", ValueType::INT, "", (int)0x1 },  // decimal: 1
-};
-
-// Dump of /CONFIG
+// /CONFIG
 static const KeyValue tree_CONFIG[] = {
 	{ "VIDEO", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_VIDEO), tree_CONFIG_VIDEO },
 	{ "PHOTO", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_PHOTO), tree_CONFIG_PHOTO },
 	{ "MUSIC", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_MUSIC), tree_CONFIG_MUSIC },
 	{ "BROWSER", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_BROWSER), tree_CONFIG_BROWSER },
-	{ "BROWSER2", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_BROWSER2), tree_CONFIG_BROWSER2 },
 	{ "LFTV", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_LFTV), tree_CONFIG_LFTV },
 	{ "RSS", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_RSS), tree_CONFIG_RSS },
 	{ "ALARM", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_ALARM), tree_CONFIG_ALARM },
@@ -923,25 +715,22 @@ static const KeyValue tree_CONFIG[] = {
 	{ "CAMERA", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_CAMERA), tree_CONFIG_CAMERA },
 	{ "DISPLAY", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_DISPLAY), tree_CONFIG_DISPLAY },
 	{ "NP", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_NP), tree_CONFIG_NP },
-	{ "ONESEG", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_ONESEG), tree_CONFIG_ONESEG },
 	{ "SYSTEM", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_SYSTEM), tree_CONFIG_SYSTEM },
 	{ "DATE", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_DATE), tree_CONFIG_DATE },
 	{ "NETWORK", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_NETWORK), tree_CONFIG_NETWORK },
-	{ "OSK", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_OSK), tree_CONFIG_OSK },
-	{ "INFOBOARD", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_INFOBOARD), tree_CONFIG_INFOBOARD },
-	{ "BT", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_BT), tree_CONFIG_BT },
-	{ "GAME", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG_GAME), tree_CONFIG_GAME },
 };
 
-// Dump of /REGISTRY
-static const KeyValue tree_REGISTRY[] = {
-	// A real 6.6x PSP has 0x66 here, which is what this tree was dumped from - but the VSH treats a
-	// category_version higher than the schema it knows as a corrupt registry and offers to reset your
-	// settings instead of booting. So we go very low.
-	{ "category_version", ValueType::INT, "", 1 },
+// /DATA
+static const KeyValue tree_DATA[] = {
+	{ "FONT", ValueType::DIR, "", ARRAY_SIZE(tree_DATA_FONT), tree_DATA_FONT },
 };
 
-// There might be more categories.
+// /SYSPROFILE
+static const KeyValue tree_SYSPROFILE[] = {
+	{ "sound_reduction", ValueType::INT, "", (int)0x0 },
+	{ "RESOLUTION", ValueType::DIR, "", ARRAY_SIZE(tree_SYSPROFILE_RESOLUTION), tree_SYSPROFILE_RESOLUTION },
+};
+
 static const KeyValue ROOT[] = {
 	{ "REGISTRY", ValueType::DIR, "", ARRAY_SIZE(tree_REGISTRY), tree_REGISTRY },
 	{ "CONFIG", ValueType::DIR, "", ARRAY_SIZE(tree_CONFIG), tree_CONFIG },
@@ -1031,6 +820,27 @@ const KeyValue *LookupStatic(const std::string &path, int *count) {
 	return dir;
 }
 
+// One of the XMB's time zone areas for each offset from UTC (sysconf_plugin.prx 4.01 lists 109
+// areas with their offsets in minutes), to pick the area matching the host's zone.
+const char *TimeZoneAreaFor(s32 minutes) {
+	static const struct {
+		s32 minutes;
+		const char *area;
+	} kAreas[] = {
+		{-660, "samoa"}, {-600, "united_states_hawaii"}, {-540, "united_states_alaska"},
+		{-480, "pacific_us_canada"}, {-420, "mountain_us_canada"}, {-360, "central_us_canada"},
+		{-300, "eastern_us_canada"}, {-240, "venezuela"}, {-210, "canada_newfoundland"},
+		{-180, "sao_paulo_brazil"}, {-60, "portugal_azores"}, {0, "united_kingdom"}, {60, "belgium"},
+		{120, "greece"}, {180, "kuwait"}, {210, "iran"}, {240, "united_arab_emirates"},
+		{270, "afghanistan"}, {300, "pakistan"}, {330, "india"}, {345, "nepal"},
+		{360, "astana_kazakstan"}, {420, "thailand"}, {480, "malaysia"}, {540, "japan"},
+		{570, "australia_adelaide"}, {600, "australia_sydney"}, {720, "new_zealand"},
+	};
+	for (const auto &a : kAreas)
+		if (a.minutes == minutes) return a.area;
+	return nullptr;
+}
+
 // The merged contents of one category (path normalized). Doesn't check that the path exists.
 std::vector<RegKey> MergedCategory(const std::string &path) {
 	std::vector<RegKey> keys;
@@ -1044,16 +854,19 @@ std::vector<RegKey> MergedCategory(const std::string &path) {
 			if (k.name == "button_assign") k.intValue = systemparam::ButtonMode();
 		}
 	}
-	// Like sceUtilityGetSystemParamInt: headless runs keep the settings of the console the test
-	// results come from (which the dump also is); with a window, the host's time zone and the
-	// default formats.
-	if (path == "CONFIG/DATE" && !host::IsHeadless()) {
+	// The host's time zone, so the XMB's Date & Time settings (which convert with the zone of
+	// time_zone_area) agree with the clock PSPC shows; with a window also the default formats
+	// (headless runs keep the region's, like sceUtilityGetSystemParamInt).
+	if (path == "CONFIG/DATE") {
 		TIME_ZONE_INFORMATION tzi{};
 		DWORD r = GetTimeZoneInformation(&tzi);
+		const s32 standard = -(s32)tzi.Bias;
+		const char *area = TimeZoneAreaFor(standard);
 		for (RegKey &k : keys) {
-			if (k.name == "time_zone_offset") k.intValue = -(s32)tzi.Bias;
+			if (k.name == "time_zone_offset") k.intValue = standard;
 			if (k.name == "summer_time") k.intValue = r == TIME_ZONE_ID_DAYLIGHT ? 1 : 0;
-			if (k.name == "date_format" || k.name == "time_format") k.intValue = 0;
+			if (k.name == "time_zone_area" && area) k.data = std::string(area) + '\0';
+			if ((k.name == "date_format" || k.name == "time_format") && !host::IsHeadless()) k.intValue = 0;
 		}
 	}
 	auto it = g_overlay.find(path);
@@ -1453,6 +1266,7 @@ enum UsbState : u32 {
 	USB_STATUS_CONNECTED = 0x020,
 	USB_STATUS_DEACTIVATED = 0x100,
 	USB_STATUS_ACTIVATED = 0x200,
+	USB_CONNECTION_NOT_ESTABLISHED = 0x001,  // sceUsbGetState (sceUsbGetDrvState uses 1 and 2 for stopped/started)
 };
 constexpr u32 SCE_USB_ERROR_DRIVER_NOT_STARTED = 0x80243007;
 constexpr SceUID USB_WAIT_ID = 0x55534200;  // wait id for WAITTYPE_HLE ("USB")
@@ -1460,9 +1274,13 @@ constexpr SceUID USB_WAIT_ID = 0x55534200;  // wait id for WAITTYPE_HLE ("USB")
 int g_usbStartedDrivers = 0;
 bool g_usbActivated = false;
 
+// sceUsbGetState's bits: 0x001 connection not established / 0x002 established, 0x010 cable
+// disconnected / 0x020 connected, 0x100 deactivated / 0x200 activated. With no cable (and no
+// accessory such as the camera, which the XMB's camera plugin waits for as an established
+// connection) the connection is never established.
 u32 UsbCurrentState() {
 	if (g_usbStartedDrivers == 0) return 0;
-	return USB_STATUS_STARTED | USB_STATUS_DISCONNECTED | (g_usbActivated ? USB_STATUS_ACTIVATED : USB_STATUS_DEACTIVATED);
+	return USB_CONNECTION_NOT_ESTABLISHED | USB_STATUS_DISCONNECTED | (g_usbActivated ? USB_STATUS_ACTIVATED : USB_STATUS_DEACTIVATED);
 }
 
 bool UsbMatches(u32 state, u32 mode) {

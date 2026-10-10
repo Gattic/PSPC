@@ -12,8 +12,12 @@
 #include <vector>
 
 #include "common/settings.h"
+#include "frontend/dialog_util.h"
 
 namespace {
+
+using dlgutil::Control;
+using dlgutil::Template;
 
 enum : int {
 	IDC_SCALE = 1001,
@@ -215,17 +219,6 @@ LRESULT CALLBACK ListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, D
 	return DefSubclassProc(hwnd, msg, wp, lp);
 }
 
-// A child control at a position in dialog units.
-HWND Control(HWND dlg, const wchar_t *cls, const wchar_t *text, DWORD style, int x, int y, int w, int h, int id,
-             DWORD exStyle = 0) {
-	RECT r{x, y, x + w, y + h};
-	MapDialogRect(dlg, &r);
-	HWND c = CreateWindowExW(exStyle, cls, text, WS_CHILD | WS_VISIBLE | style, r.left, r.top, r.right - r.left,
-	                         r.bottom - r.top, dlg, (HMENU)(INT_PTR)id, GetModuleHandleW(nullptr), nullptr);
-	SendMessageW(c, WM_SETFONT, (WPARAM)SendMessageW(dlg, WM_GETFONT, 0, 0), FALSE);
-	return c;
-}
-
 void SetVolumeLabel(HWND dlg) {
 	int v = (int)SendDlgItemMessageW(dlg, IDC_VOLUME, TBM_GETPOS, 0, 0);
 	SetDlgItemTextW(dlg, IDC_VOLUME_VALUE, (std::to_wstring(v) + L"%").c_str());
@@ -393,32 +386,6 @@ INT_PTR CALLBACK DialogProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
 		break;
 	}
 	return FALSE;
-}
-
-// An empty dialog template (DLGTEMPLATE + title + font); the controls come from Init().
-std::vector<WORD> Template(const wchar_t *title, short cx, short cy) {
-	std::vector<WORD> t;
-	auto dword = [&](DWORD v) {
-		t.push_back(LOWORD(v));
-		t.push_back(HIWORD(v));
-	};
-	auto str = [&](const wchar_t *s) {
-		for (; *s; s++) t.push_back(*s);
-		t.push_back(0);
-	};
-	dword(DS_MODALFRAME | DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU);
-	dword(0);  // extended style
-	t.push_back(0);  // no items
-	t.push_back(0);  // x
-	t.push_back(0);  // y
-	t.push_back((WORD)cx);
-	t.push_back((WORD)cy);
-	t.push_back(0);  // no menu
-	t.push_back(0);  // default class
-	str(title);
-	t.push_back(9);  // point size
-	str(L"Segoe UI");
-	return t;
 }
 
 }  // namespace

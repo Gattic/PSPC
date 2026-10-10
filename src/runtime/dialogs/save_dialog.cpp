@@ -4,11 +4,14 @@
 #include "runtime/dialogs/save_dialog.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <ctime>
 
 #include "allegrex/guestmem.h"
 #include "common/log.h"
 #include "runtime/core/memory.h"
+#include "runtime/dialogs/save_fs.h"
 #include "runtime/kernel/errors.h"
 
 namespace utility {
@@ -25,6 +28,12 @@ constexpr u32 SAVEDATA_DIALOG_SIZE_V3 = 1536;
 
 // Headless: how many Updates a visible step stays up before it answers by itself.
 constexpr int HEADLESS_ANSWER_UPDATES = 3;
+
+// With overlays: the IO is done at once, but "Saving / Please wait..." stays up at least this
+// many Updates, so the player sees it.
+constexpr int MIN_PROGRESS_UPDATES = 30;
+
+constexpr float FONT_SCALE = 0.55f;
 
 const char *const kModeNames[] = {
 	"AUTOLOAD", "AUTOSAVE", "LOAD", "SAVE", "LISTLOAD", "LISTSAVE", "LISTDELETE", "LISTALLDELETE",
@@ -165,6 +174,8 @@ int SaveDialog::Init(u32 paramAddr) {
 	StartFade(true);
 	ResetAsk();
 	actionDone_ = false;
+	upFramesHeld_ = downFramesHeld_ = 0;
+	icons_.clear();
 	return retval;
 }
 
@@ -191,18 +202,11 @@ std::string SaveDialog::GetSelectedSaveDirName() const {
 	}
 }
 
-int SaveDialog::Ask(const std::string &text, bool yesNo, bool defaultYes) {
-	if (Headless()) {
-		if (++askFrames_ < HEADLESS_ANSWER_UPDATES) return -1;
-		askFrames_ = 0;
-		LOGI("UTIL", "Savedata: \"%s\" -> %s (headless)", text.c_str(), defaultYes ? "yes" : "no");
-		return defaultYes ? 1 : 0;
-	}
-	if (!prompt_) prompt_ = prompt::ShowMessage("PSP savedata", text, yesNo ? prompt::Buttons::YesNo : prompt::Buttons::Ok);
-	int a = prompt_->answer.load();
-	if (a == prompt::PENDING) return -1;
-	prompt_.reset();
-	return (a == prompt::YES || a == prompt::OK) ? 1 : 0;
+int SaveDialog::Ask(const std::string &text, bool defaultYes) {
+	if (++askFrames_ < HEADLESS_ANSWER_UPDATES) return -1;
+	askFrames_ = 0;
+	LOGI("UTIL", "Savedata: \"%s\" -> %s (headless)", text.c_str(), defaultYes ? "yes" : "no");
+	return defaultYes ? 1 : 0;
 }
 
 int SaveDialog::Update(int animSpeed) {
@@ -229,6 +233,18 @@ int SaveDialog::Update(int animSpeed) {
 	UpdateFade(animSpeed);
 	UpdateCommon();
 
+	if (Headless()) {
+		UpdateAuto();
+	} else {
+		UpdateInteractive();
+	}
+
+	if (ReadStatus() == STATUS_FINISHED || pendingStatus_ == STATUS_FINISHED)
+		mem::WriteBytes(requestAddr_, &request_, request_.common.size);
+	return 0;
+}
+
+void SaveDialog::UpdateAuto() {
 	SavedataRequest *p = param_.GetPspParam();
 	const bool fading = IsFadingOut();
 	auto finish = [&](s32 result, bool setResult) {
@@ -242,7 +258,7 @@ int SaveDialog::Update(int animSpeed) {
 	switch (display_) {
 	case DS_SAVE_LIST_CHOICE:
 		if (fading) break;
-		a = Ask("Save to slot \"" + slot + "\"?", true, !actionDone_);
+		a = Ask("Save to slot \"" + slot + "\"?", !actionDone_);
 		if (a == 0) {
 			finish(SCE_UTILITY_DIALOG_RESULT_CANCEL, true);
 		} else if (a == 1) {
@@ -257,7 +273,7 @@ int SaveDialog::Update(int animSpeed) {
 		break;
 	case DS_SAVE_CONFIRM:
 		if (fading) break;
-		a = Ask("Do you want to save this data?", true, true);
+		a = Ask("Do you want to save this data?", true);
 		if (a == 0) {
 			finish(SCE_UTILITY_DIALOG_RESULT_CANCEL, true);
 		} else if (a == 1) {
@@ -267,7 +283,7 @@ int SaveDialog::Update(int animSpeed) {
 		break;
 	case DS_SAVE_CONFIRM_OVERWRITE:
 		if (fading) break;
-		a = Ask("Do you want to overwrite the data?", true, true);
+		a = Ask("Do you want to overwrite the data?", true);
 		if (a == 0) {
 			if (p->mode != SAVEDATA_SAVE) {
 				display_ = DS_SAVE_LIST_CHOICE;
@@ -295,7 +311,7 @@ int SaveDialog::Update(int animSpeed) {
 
 	case DS_LOAD_LIST_CHOICE:
 		if (fading) break;
-		a = Ask("Load save \"" + slot + "\"?", true, !actionDone_);
+		a = Ask("Load save \"" + slot + "\"?", !actionDone_);
 		if (a == 0) {
 			finish(SCE_UTILITY_DIALOG_RESULT_CANCEL, true);
 		} else if (a == 1) {
@@ -305,7 +321,7 @@ int SaveDialog::Update(int animSpeed) {
 		break;
 	case DS_LOAD_CONFIRM:
 		if (fading) break;
-		a = Ask("Load this data?", true, true);
+		a = Ask("Load this data?", true);
 		if (a == 0) {
 			finish(SCE_UTILITY_DIALOG_RESULT_CANCEL, true);
 		} else if (a == 1) {
@@ -328,17 +344,13 @@ int SaveDialog::Update(int animSpeed) {
 		break;
 	case DS_LOAD_NODATA:
 		if (fading) break;
-		if (Ask("There is no data.", false, true) >= 0) finish((s32)SCE_UTILITY_SAVEDATA_ERROR_LOAD_NO_DATA, true);
+		if (Ask("There is no data.", true) >= 0) finish((s32)SCE_UTILITY_SAVEDATA_ERROR_LOAD_NO_DATA, true);
 		break;
 
 	case DS_DELETE_LIST_CHOICE:
 		if (fading) break;
-		if (param_.GetFilenameCount() == 0 && !Headless()) {
-			display_ = DS_DELETE_NODATA;
-			break;
-		}
 		// Headless answers like the player who recorded pspautotests: yes once, then back out.
-		a = Ask("Delete save \"" + slot + "\"?", true, !actionDone_);
+		a = Ask("Delete save \"" + slot + "\"?", !actionDone_);
 		if (a == 0) {
 			finish(SCE_UTILITY_DIALOG_RESULT_CANCEL, true);
 		} else if (a == 1) {
@@ -348,7 +360,7 @@ int SaveDialog::Update(int animSpeed) {
 		break;
 	case DS_DELETE_CONFIRM:
 		if (fading) break;
-		a = Ask("This save data will be deleted.\nAre you sure you want to continue?", true, true);
+		a = Ask("This save data will be deleted.\nAre you sure you want to continue?", true);
 		if (a == 0) {
 			if (p->mode == SAVEDATA_LISTDELETE || p->mode == SAVEDATA_LISTALLDELETE) {
 				display_ = DS_DELETE_LIST_CHOICE;
@@ -387,7 +399,7 @@ int SaveDialog::Update(int animSpeed) {
 		break;
 	case DS_DELETE_NODATA:
 		if (fading) break;
-		if (Ask("There is no data.", false, true) >= 0) finish((s32)SCE_UTILITY_SAVEDATA_ERROR_DELETE_NO_DATA, true);
+		if (Ask("There is no data.", true) >= 0) finish((s32)SCE_UTILITY_SAVEDATA_ERROR_DELETE_NO_DATA, true);
 		break;
 
 	case DS_NONE:  // the modes that show nothing
@@ -401,10 +413,529 @@ int SaveDialog::Update(int animSpeed) {
 		ChangeStatus(STATUS_FINISHED, 0);
 		break;
 	}
+}
 
-	if (ReadStatus() == STATUS_FINISHED || pendingStatus_ == STATUS_FINISHED)
-		mem::WriteBytes(requestAddr_, &request_, request_.common.size);
-	return 0;
+// ---------------------------------------------------------------- with overlays
+
+namespace {
+
+std::string FixedString(const char *s, size_t maxLen) { return std::string(s, strnlen(s, maxLen)); }
+
+std::string FormatHourMin(int hour, int minute) {
+	char buf[32];
+	if (SystemTimeFormat() == 1) {
+		const char *amPm = hour >= 12 ? "PM" : "AM";
+		int h = hour % 12;
+		if (h == 0) h = 12;
+		snprintf(buf, sizeof(buf), "%02d:%02d %s", h, minute, amPm);
+	} else {
+		snprintf(buf, sizeof(buf), "%02d:%02d", hour, minute);
+	}
+	return buf;
+}
+
+std::string FormatDate(int year, int month, int day) {
+	char buf[32];
+	switch (SystemDateFormat()) {
+	case 1: snprintf(buf, sizeof(buf), "%02d/%02d/%04d", month, day, year); break;
+	case 2: snprintf(buf, sizeof(buf), "%02d/%02d/%04d", day, month, year); break;
+	default: snprintf(buf, sizeof(buf), "%04d/%02d/%02d", year, month, day); break;
+	}
+	return buf;
+}
+
+}  // namespace
+
+void SaveDialog::Finish(s32 result) {
+	param_.GetPspParam()->common.result = result;
+	StartFade(false);
+}
+
+std::shared_ptr<const ppge::Texture> SaveDialog::SaveIcon(int idx) {
+	const SaveFileInfo &info = param_.GetFileInfo(idx);
+	std::string key;
+	std::vector<u8> png;
+	if (info.size > 0 && !info.saveDir.empty()) {
+		key = std::string(Savedata::kSavePath) + info.saveDir + "/ICON0.PNG";
+		auto it = icons_.find(key);
+		if (it != icons_.end()) return it->second;
+		savefs::ReadAll(key, png);
+	} else {
+		// A slot without data shows the icon of the data the game wants to save.
+		const SavedataFileData &f = param_.GetPspParam()->icon0FileData;
+		const u32 size = f.size ? f.size : f.bufSize;
+		char buf[48];
+		snprintf(buf, sizeof(buf), "new:%08x:%08x", f.buf, size);
+		key = buf;
+		auto it = icons_.find(key);
+		if (it != icons_.end()) return it->second;
+		if (f.buf && size && size < 0x100000 && mem::IsValidRange(f.buf, size)) {
+			png.resize(size);
+			mem::ReadBytes(png.data(), f.buf, size);
+		}
+	}
+	auto tex = png.empty() ? nullptr : ppge::DecodeTexture(png.data(), png.size());
+	icons_[key] = tex;
+	return tex;
+}
+
+void SaveDialog::DisplayBanner(Banner which) {
+	ppge::DrawRect(0, 0, 480, 23, CalcFadedColor(0x65636358));
+	ppge::Style textStyle = FadedStyle(ppge::BOX_VCENTER, 0.6f);
+	textStyle.hasShadow = false;
+	const char *title = which == DB_SAVE ? "Save" : which == DB_LOAD ? "Load" : which == DB_DELETE ? "Delete" : "";
+	ppge::DrawIcon(ppge::Icon::Hexagon, 10, 6, 12.0f, 12.0f, FadedImageStyle());
+	ppge::DrawString(title, 30, 11, textStyle);
+}
+
+void SaveDialog::DisplaySaveList(bool canMove) {
+	for (int displayCount = 0; displayCount < param_.GetFilenameCount(); displayCount++) {
+		u32 color = CalcFadedColor(0xFFFFFFFF);
+		const SaveFileInfo &fileInfo = param_.GetFileInfo(displayCount);
+		auto texture = SaveIcon(displayCount);
+		if (fileInfo.size == 0 && texture) color = CalcFadedColor(0xFF777777);
+
+		// The save's place on screen.
+		float w, h, x;
+		float y = 97;
+		if (displayCount != currentSelectedSave_) {
+			w = 81;
+			h = 45;
+			x = 58.5f;
+		} else {
+			w = 144;
+			h = 80;
+			x = 27;
+		}
+		if (displayCount < currentSelectedSave_)
+			y -= 13 + 45 * (currentSelectedSave_ - displayCount);
+		else if (displayCount > currentSelectedSave_)
+			y += 48 + 45 * (displayCount - currentSelectedSave_);
+		// Skip if it's well outside the screen.
+		if (y > 472.0f || y < -200.0f) continue;
+
+		float pad = 0;
+		if (texture) {
+			const float scale = h / (float)texture->height;
+			const float scaledW = (float)(int)(texture->width * scale);
+			pad = (float)(int)((w - scaledW) / 2);
+			w = scaledW;
+			// The PSP draws save icons over black, so their transparent parts come out black.
+			ppge::DrawRect(x + pad, y, x + pad + w, y + h, CalcFadedColor(0xFF000000));
+			ppge::DrawTexture(texture, x + pad, y, w, h, color);
+		} else {
+			ppge::DrawRect(x, y, x + w, y + h, CalcFadedColor(0x88666666));
+		}
+		if (displayCount == currentSelectedSave_) {
+			const float b = 1.2f;
+			const u32 bc = CalcFadedColor(0xD0FFFFFF);
+			ppge::DrawRect(x + pad - b, y - b, x + pad + w + b, y, bc);      // top
+			ppge::DrawRect(x + pad - b, y, x + pad, y + h, bc);              // left
+			ppge::DrawRect(x + pad - b, y + h, x + pad + w + b, y + h + b, bc);  // bottom
+			ppge::DrawRect(x + pad + w, y, x + pad + w + b, y + h, bc);      // right
+		}
+	}
+
+	if (canMove) {
+		if ((IsButtonPressed(CTRL_UP) || IsButtonHeld(CTRL_UP, upFramesHeld_)) && currentSelectedSave_ > 0)
+			currentSelectedSave_--;
+		else if ((IsButtonPressed(CTRL_DOWN) || IsButtonHeld(CTRL_DOWN, downFramesHeld_)) &&
+		         currentSelectedSave_ < (param_.GetFilenameCount() - 1))
+			currentSelectedSave_++;
+	}
+}
+
+void SaveDialog::DisplaySaveIcon(bool checkExists) {
+	const SaveFileInfo &curSave = param_.GetFileInfo(currentSelectedSave_);
+	u32 color = CalcFadedColor(0xFFFFFFFF);
+	if (curSave.size == 0 && checkExists) color = CalcFadedColor(0xFF777777);
+
+	float w = 144, h = 80, x = 27, y = 97;
+	auto texture = SaveIcon(currentSelectedSave_);
+	if (texture) {
+		const float scale = h / (float)texture->height;
+		const float scaledW = (float)(int)(texture->width * scale);
+		x += (float)(int)((w - scaledW) / 2);
+		w = scaledW;
+		// Over black, as in DisplaySaveList.
+		ppge::DrawRect(x, y, x + w, y + h, CalcFadedColor(0xFF000000));
+		ppge::DrawTexture(texture, x, y, w, h, color);
+	} else {
+		// No icon: a plain box, as PPSSPP draws it.
+		ppge::DrawRect(x, y, x + w, y + h, color);
+	}
+}
+
+void SaveDialog::DisplaySaveDataInfo1() {
+	const SaveFileInfo &saveInfo = param_.GetFileInfo(currentSelectedSave_);
+	const ppge::Style saveTitleStyle = FadedStyle(ppge::BOX_LEFT, 0.55f);
+	if (saveInfo.broken) {
+		ppge::DrawString("Corrupted Data", 180, 136, FadedStyle(ppge::BOX_VCENTER, 0.6f));
+		ppge::DrawString(FixedString(saveInfo.title, sizeof(saveInfo.title)), 175, 159, saveTitleStyle);
+	} else if (saveInfo.size == 0) {
+		ppge::DrawString("NEW DATA", 180, 136, FadedStyle(ppge::BOX_VCENTER, 0.6f));
+	} else {
+		const vfs::ScePspDateTime &t = saveInfo.modifTime;
+		char timeTxt[96];
+		snprintf(timeTxt, sizeof(timeTxt), "%s   %s  %lld KB", FormatDate(t.year, t.month, t.day).c_str(),
+		         FormatHourMin(t.hour, t.minute).c_str(), (long long)(saveInfo.size / 1024));
+
+		ppge::DrawRect(180, 136, 480, 137, CalcFadedColor(0xFFFFFFFF));
+		ppge::Style titleStyle = FadedStyle(ppge::BOX_BOTTOM, 0.6f);
+		titleStyle.color = CalcFadedColor(0xFFC0C0C0);
+		const ppge::Style textStyle = FadedStyle(ppge::BOX_LEFT, 0.5f);
+
+		ppge::DrawString(FixedString(saveInfo.title, sizeof(saveInfo.title)), 180, 136, titleStyle);
+		ppge::DrawString(timeTxt, 180, 137, textStyle);
+		ppge::DrawString(FixedString(saveInfo.saveTitle, sizeof(saveInfo.saveTitle)), 175, 159, saveTitleStyle);
+		ppge::DrawStringWrapped(FixedString(saveInfo.saveDetail, sizeof(saveInfo.saveDetail)), 175, 181, 480 - 175, 250 - 181, textStyle);
+	}
+}
+
+void SaveDialog::DisplaySaveDataInfo2(bool showNewData) {
+	const SaveFileInfo &info = param_.GetFileInfo(currentSelectedSave_);
+	std::string saveTitle;
+	s64 dataSize;
+	int year, month, day, hour, minute;
+	if (showNewData || info.size == 0) {
+		time_t now = time(nullptr);
+		tm t{};
+		localtime_s(&t, &now);
+		year = t.tm_year + 1900, month = t.tm_mon + 1, day = t.tm_mday, hour = t.tm_hour, minute = t.tm_min;
+		saveTitle = FixedString(param_.GetPspParam()->sfoParam.savedataTitle, sizeof(param_.GetPspParam()->sfoParam.savedataTitle));
+		dataSize = param_.GetPspParam()->dataSize;
+	} else {
+		const vfs::ScePspDateTime &t = info.modifTime;
+		year = t.year, month = t.month, day = t.day, hour = t.hour, minute = t.minute;
+		saveTitle = FixedString(info.saveTitle, sizeof(info.saveTitle));
+		dataSize = info.size;
+	}
+	const std::string text = saveTitle + "\n" + FormatDate(year, month, day) + "  " + FormatHourMin(hour, minute) + "\n" +
+	                         std::to_string((long long)(dataSize / 1024)) + " KB";
+	ppge::DrawString(text, 8, 200, FadedStyle(ppge::BOX_LEFT, 0.5f));
+}
+
+void SaveDialog::DisplayMessage(std::string_view text, bool hasYesNo) {
+	const ppge::Style textStyle = FadedStyle(ppge::BOX_CENTER, FONT_SCALE);
+	const float WRAP_WIDTH = 254.0f;
+	float y = 136.0f, h;
+	ppge::MeasureString(nullptr, &h, text, FONT_SCALE, ppge::LINE_WRAP_WORD, WRAP_WIDTH);
+	float h2 = h / 2.0f;
+	if (hasYesNo) {
+		const char *choiceText;
+		float x, w;
+		if (yesnoChoice_ == 1) {
+			choiceText = "Yes";
+			x = 302.0f;
+		} else {
+			choiceText = "No";
+			x = 366.0f;
+		}
+		ppge::MeasureString(&w, &h, choiceText, FONT_SCALE);
+		w = w / 2.0f + 5.5f;
+		h /= 2.0f;
+		const float y2 = y + h2 + 4.0f;
+		h2 += h + 4.0f;
+		y = 132.0f - h;
+		ppge::DrawRect(x - w, y2 - h, x + w, y2 + h, CalcFadedColor(0x40C0C0C0));
+		ppge::DrawString("Yes", 302.0f, y2, textStyle);
+		ppge::DrawString("No", 366.0f, y2, textStyle);
+		if (IsButtonPressed(CTRL_LEFT) && yesnoChoice_ == 0) {
+			yesnoChoice_ = 1;
+		} else if (IsButtonPressed(CTRL_RIGHT) && yesnoChoice_ == 1) {
+			yesnoChoice_ = 0;
+		}
+	}
+	ppge::DrawStringWrapped(text, 334.0f, y, WRAP_WIDTH, 0, textStyle);
+	const float sy = 122.0f - h2, ey = 150.0f + h2;
+	ppge::DrawRect(202.0f, sy, 466.0f, sy + 1.0f, CalcFadedColor(0xFFFFFFFF));
+	ppge::DrawRect(202.0f, ey, 466.0f, ey + 1.0f, CalcFadedColor(0xFFFFFFFF));
+}
+
+void SaveDialog::UpdateInteractive() {
+	SavedataRequest *p = param_.GetPspParam();
+	// The IO is done by now; the progress screens stay up a moment before showing the result.
+	auto progress = [&]() {
+		if (++ioShownUpdates_ >= MIN_PROGRESS_UPDATES) FinishIO();
+	};
+	const bool okPressed = IsButtonPressed(okButtonFlag_), cancelPressed = IsButtonPressed(cancelButtonFlag_);
+	const bool listMode = p->mode == SAVEDATA_LISTDELETE || p->mode == SAVEDATA_LISTALLDELETE;
+
+	switch (display_) {
+	case DS_SAVE_LIST_CHOICE:
+		StartDraw();
+		DisplaySaveList();
+		DisplaySaveDataInfo1();
+		DisplayButtons(DS_BUTTON_OK | DS_BUTTON_CANCEL);
+		DisplayBanner(DB_SAVE);
+		if (cancelPressed) {
+			Finish(SCE_UTILITY_DIALOG_RESULT_CANCEL);
+		} else if (okPressed) {
+			// An existing save: ask first.
+			if (param_.GetFileInfo(currentSelectedSave_).size > 0) {
+				yesnoChoice_ = 0;
+				display_ = DS_SAVE_CONFIRM_OVERWRITE;
+			} else {
+				display_ = DS_SAVE_SAVING;
+				StartIO();
+			}
+		}
+		EndDraw();
+		break;
+	case DS_SAVE_CONFIRM:
+		StartDraw();
+		DisplaySaveIcon(false);
+		DisplaySaveDataInfo2(true);
+		DisplayMessage("Do you want to save this data?", true);
+		DisplayButtons(DS_BUTTON_OK | DS_BUTTON_CANCEL);
+		DisplayBanner(DB_SAVE);
+		if (cancelPressed || (okPressed && yesnoChoice_ == 0)) {
+			Finish(SCE_UTILITY_DIALOG_RESULT_CANCEL);
+		} else if (okPressed) {
+			display_ = DS_SAVE_SAVING;
+			StartIO();
+		}
+		EndDraw();
+		break;
+	case DS_SAVE_CONFIRM_OVERWRITE:
+		StartDraw();
+		DisplaySaveIcon(true);
+		DisplaySaveDataInfo2();
+		DisplayMessage("Do you want to overwrite the data?", true);
+		DisplayButtons(DS_BUTTON_OK | DS_BUTTON_CANCEL);
+		DisplayBanner(DB_SAVE);
+		if (cancelPressed || (okPressed && yesnoChoice_ == 0)) {
+			if (p->mode != SAVEDATA_SAVE) {
+				display_ = DS_SAVE_LIST_CHOICE;
+			} else {
+				Finish(SCE_UTILITY_DIALOG_RESULT_CANCEL);
+			}
+		} else if (okPressed) {
+			display_ = DS_SAVE_SAVING;
+			StartIO();
+		}
+		EndDraw();
+		break;
+	case DS_SAVE_SAVING:
+		progress();
+		StartDraw();
+		DisplaySaveIcon(true);
+		DisplaySaveDataInfo2(true);
+		DisplayMessage("Saving\nPlease Wait...");
+		DisplayBanner(DB_SAVE);
+		EndDraw();
+		break;
+	case DS_SAVE_FAILED:
+		StartDraw();
+		DisplaySaveIcon(true);
+		DisplaySaveDataInfo2(true);
+		DisplayMessage("Unable to save data.");
+		DisplayButtons(DS_BUTTON_CANCEL);
+		DisplayBanner(DB_SAVE);
+		if (cancelPressed) {
+			LOGE("UTIL", "Savedata: unable to save");
+			// Back to the list to try again.
+			if (p->mode != SAVEDATA_SAVE) {
+				display_ = DS_SAVE_LIST_CHOICE;
+			} else {
+				Finish(SCE_UTILITY_DIALOG_RESULT_CANCEL);
+			}
+		}
+		EndDraw();
+		break;
+	case DS_SAVE_DONE:
+		StartDraw();
+		DisplaySaveIcon(true);
+		DisplaySaveDataInfo2();
+		DisplayMessage("Save completed");
+		DisplayButtons(DS_BUTTON_CANCEL);
+		DisplayBanner(DB_SAVE);
+		if (cancelPressed) {
+			// The save autosave and autoload use.
+			param_.SetSelectedSave(param_.GetFileInfo(currentSelectedSave_).idx);
+			Finish(SCE_UTILITY_DIALOG_RESULT_SUCCESS);
+		}
+		EndDraw();
+		break;
+
+	case DS_LOAD_LIST_CHOICE:
+		StartDraw();
+		DisplaySaveList();
+		DisplaySaveDataInfo1();
+		DisplayButtons(DS_BUTTON_OK | DS_BUTTON_CANCEL);
+		DisplayBanner(DB_LOAD);
+		if (cancelPressed) {
+			Finish(SCE_UTILITY_DIALOG_RESULT_CANCEL);
+		} else if (okPressed) {
+			display_ = DS_LOAD_LOADING;
+			StartIO();
+		}
+		EndDraw();
+		break;
+	case DS_LOAD_CONFIRM:
+		StartDraw();
+		DisplaySaveIcon(true);
+		DisplaySaveDataInfo2();
+		DisplayMessage("Load this data?", true);
+		DisplayButtons(DS_BUTTON_OK | DS_BUTTON_CANCEL);
+		DisplayBanner(DB_LOAD);
+		if (cancelPressed || (okPressed && yesnoChoice_ == 0)) {
+			Finish(SCE_UTILITY_DIALOG_RESULT_CANCEL);
+		} else if (okPressed) {
+			display_ = DS_LOAD_LOADING;
+			StartIO();
+		}
+		EndDraw();
+		break;
+	case DS_LOAD_LOADING:
+		progress();
+		StartDraw();
+		DisplaySaveIcon(true);
+		DisplaySaveDataInfo2();
+		DisplayMessage("Loading\nPlease Wait...");
+		DisplayBanner(DB_LOAD);
+		EndDraw();
+		break;
+	case DS_LOAD_FAILED:
+		StartDraw();
+		DisplaySaveIcon(true);
+		DisplaySaveDataInfo2();
+		DisplayMessage("Load failed\nThe data is corrupted.");
+		DisplayButtons(DS_BUTTON_CANCEL);
+		DisplayBanner(DB_LOAD);
+		if (cancelPressed) {
+			LOGE("UTIL", "Savedata: load failed (%08x)", p->common.result);
+			// Back to the list to try again; the error stays the result otherwise.
+			if (p->mode != SAVEDATA_LOAD) {
+				display_ = DS_LOAD_LIST_CHOICE;
+			} else {
+				StartFade(false);
+			}
+		}
+		EndDraw();
+		break;
+	case DS_LOAD_DONE:
+		StartDraw();
+		DisplaySaveIcon(true);
+		DisplaySaveDataInfo2();
+		DisplayMessage("Load completed");
+		DisplayButtons(DS_BUTTON_CANCEL);
+		DisplayBanner(DB_LOAD);
+		// The PSP only takes back here; PPSSPP takes OK as well, which gets players into the game
+		// sooner.
+		if (cancelPressed || okPressed) {
+			param_.SetSelectedSave(param_.GetFileInfo(currentSelectedSave_).idx);
+			Finish(SCE_UTILITY_DIALOG_RESULT_SUCCESS);
+		}
+		EndDraw();
+		break;
+	case DS_LOAD_NODATA:
+		StartDraw();
+		DisplayMessage("There is no data");
+		DisplayButtons(DS_BUTTON_CANCEL);
+		DisplayBanner(DB_LOAD);
+		if (cancelPressed) Finish((s32)SCE_UTILITY_SAVEDATA_ERROR_LOAD_NO_DATA);
+		EndDraw();
+		break;
+
+	case DS_DELETE_LIST_CHOICE:
+		StartDraw();
+		DisplaySaveList();
+		DisplaySaveDataInfo1();
+		DisplayButtons(DS_BUTTON_OK | DS_BUTTON_CANCEL);
+		DisplayBanner(DB_DELETE);
+		if (cancelPressed) {
+			Finish(SCE_UTILITY_DIALOG_RESULT_CANCEL);
+		} else if (okPressed && param_.GetFilenameCount() > 0) {
+			yesnoChoice_ = 0;
+			display_ = DS_DELETE_CONFIRM;
+		}
+		EndDraw();
+		break;
+	case DS_DELETE_CONFIRM:
+		StartDraw();
+		DisplaySaveIcon(true);
+		DisplaySaveDataInfo2();
+		DisplayMessage("This save data will be deleted.\nAre you sure you want to continue?", true);
+		DisplayButtons(DS_BUTTON_OK | DS_BUTTON_CANCEL);
+		DisplayBanner(DB_DELETE);
+		if (cancelPressed || (okPressed && yesnoChoice_ == 0)) {
+			if (listMode) {
+				display_ = DS_DELETE_LIST_CHOICE;
+			} else {
+				Finish(SCE_UTILITY_DIALOG_RESULT_CANCEL);
+			}
+		} else if (okPressed) {
+			display_ = DS_DELETE_DELETING;
+			StartIO();
+		}
+		EndDraw();
+		break;
+	case DS_DELETE_DELETING:
+		progress();
+		StartDraw();
+		DisplayMessage("Deleting\nPlease Wait...");
+		DisplayBanner(DB_DELETE);
+		EndDraw();
+		break;
+	case DS_DELETE_FAILED:
+		StartDraw();
+		DisplayMessage("Unable to delete data.");
+		DisplayButtons(DS_BUTTON_CANCEL);
+		DisplayBanner(DB_DELETE);
+		if (cancelPressed) {
+			if (listMode) {
+				display_ = DS_DELETE_LIST_CHOICE;
+			} else {
+				StartFade(false);
+			}
+		}
+		EndDraw();
+		break;
+	case DS_DELETE_DONE:
+		StartDraw();
+		DisplayMessage("Delete completed");
+		DisplayButtons(DS_BUTTON_CANCEL);
+		DisplayBanner(DB_DELETE);
+		if (cancelPressed) {
+			if (p->mode == SAVEDATA_DELETE) {
+				// The single save is gone: success, not "no data" (utility/savedata/deletedata).
+				Finish(SCE_UTILITY_DIALOG_RESULT_SUCCESS);
+			} else if (p->mode == SAVEDATA_LISTALLDELETE) {
+				// Back to the list of every save on the memory stick.
+				currentSelectedSave_ = std::max(0, std::min(currentSelectedSave_, param_.GetFilenameCount() - 1));
+				display_ = DS_DELETE_LIST_CHOICE;
+			} else if (param_.GetFilenameCount() == 0) {
+				display_ = DS_DELETE_NODATA;
+			} else if (p->mode == SAVEDATA_LISTDELETE) {
+				currentSelectedSave_ = std::min(currentSelectedSave_, param_.GetFilenameCount() - 1);
+				display_ = DS_DELETE_LIST_CHOICE;
+			} else {
+				Finish(SCE_UTILITY_DIALOG_RESULT_SUCCESS);
+			}
+		}
+		EndDraw();
+		break;
+	case DS_DELETE_NODATA:
+		StartDraw();
+		DisplayMessage("There is no data");
+		DisplayButtons(DS_BUTTON_CANCEL);
+		DisplayBanner(DB_DELETE);
+		if (cancelPressed) Finish((s32)SCE_UTILITY_SAVEDATA_ERROR_DELETE_NO_DATA);
+		EndDraw();
+		break;
+
+	case DS_NONE:  // the modes that show nothing
+		if (ioStatus_ == IO_NONE) {
+			StartIO();
+		} else if (FinishIO()) {
+			ChangeStatus(STATUS_FINISHED, 0);
+		}
+		break;
+	default:
+		ChangeStatus(STATUS_FINISHED, 0);
+		break;
+	}
 }
 
 void SaveDialog::StartIO() {
@@ -422,6 +953,7 @@ void SaveDialog::StartIO() {
 		ioDeleteDir_ = param_.GetSaveDir(param_.GetSelectedSave());
 	}
 	ioStatus_ = IO_PENDING;
+	ioShownUpdates_ = 0;
 	// PPSSPP runs this on a host thread; doing it right away keeps the same Update timing (the
 	// results are taken by the next Update).
 	ExecuteIOAction();

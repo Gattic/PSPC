@@ -34,6 +34,7 @@ using std::min;
 
 #include "common/fileutil.h"
 #include "common/settings.h"
+#include "frontend/plugins_dialog.h"
 #include "frontend/settings_dialog.h"
 #include "fs/vfs.h"
 #include "pspc_sem_version.h"
@@ -56,6 +57,7 @@ enum : int {
 	ID_OPEN_FOLDER,
 	ID_SETTINGS,
 	ID_BOOT_XMB,
+	ID_PLUGINS,
 	ID_TIMER_JOBS = 300,
 };
 const COLORREF kBackground = RGB(24, 24, 30), kToolbar = RGB(34, 34, 43), kText = RGB(230, 230, 235);
@@ -660,7 +662,7 @@ void BootXmb() {
 	if (!XmbInstalled()) {
 		MessageBoxW(g_main,
 		            L"The PSP firmware isn't installed.\n\nDecrypt Sony's 4.01 update with pspc-decrypt psar, then run "
-		            L"tools\pspc_install_fw.py (see docs\vsh-boot.md).",
+		            L"tools\\pspc_install_fw.py (see docs\\vsh-boot.md).",
 		            L"PSPC", MB_ICONINFORMATION);
 		return;
 	}
@@ -701,6 +703,21 @@ void OpenSettings() {
 		ReloadSettings();
 		UpdateUi();
 	}
+	SetFocus(g_list);
+}
+
+// The M33 plugins folder pspc lays over ms0: (pspc.ini plugins_dir, else the nearest "plugins"
+// folder above the launcher, as pspc.exe finds it, else one next to it).
+fs::path PluginsDir() {
+	if (!g_settings.pluginsDir.empty()) return fs::u8path(g_settings.pluginsDir);
+	fs::path found = FindUp(g_exeDir, fs::path("plugins") / "seplugins");
+	if (!found.empty()) return found.parent_path();
+	found = FindUp(g_exeDir, "plugins");
+	return found.empty() ? g_exeDir / "plugins" : found;
+}
+
+void OpenPlugins() {
+	if (ShowPluginsDialog(g_main, settings::DefaultPath(), PluginsDir())) ReloadSettings();
 	SetFocus(g_list);
 }
 
@@ -890,6 +907,7 @@ void ContextMenu(HWND hwnd, LPARAM lp) {
 	AppendMenuW(m, 0, ID_OPEN_FOLDER, L"&Open Games folder");
 	AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
 	AppendMenuW(m, XmbInstalled() ? 0 : MF_GRAYED, ID_BOOT_XMB, L"Boot &XMB (PSP firmware)");
+	AppendMenuW(m, 0, ID_PLUGINS, L"P&lugins (M33)...");
 	AppendMenuW(m, 0, ID_SETTINGS, L"&Settings...");
 	POINT pt{(short)LOWORD(lp), (short)HIWORD(lp)};
 	if (lp == -1) {  // from the keyboard: at the selected item
@@ -915,7 +933,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		g_uiFont = CreateFontIndirectW(&ncm.lfMessageFont);
 		const std::pair<int, const wchar_t *> tools[] = {
 			{ID_PLAY, L"Play"}, {ID_BUILD, L"Build native code"}, {ID_BOOT_XMB, L"Boot XMB"},
-			{ID_SETTINGS, L"Settings"}, {ID_REFRESH, L"Refresh"}, {ID_OPEN_FOLDER, L"Games folder"}};
+			{ID_PLUGINS, L"Plugins"}, {ID_SETTINGS, L"Settings"}, {ID_REFRESH, L"Refresh"},
+			{ID_OPEN_FOLDER, L"Games folder"}};
 		for (const auto &t : tools)
 			g_tools.push_back(CreateWindowExW(0, L"BUTTON", t.second, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0,
 			                                  0, hwnd, (HMENU)(INT_PTR)t.first, nullptr, nullptr));
@@ -981,6 +1000,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		case ID_REFRESH: Rescan(); break;
 		case ID_OPEN_FOLDER: ShellExecuteW(nullptr, L"open", g_gamesDir.wstring().c_str(), nullptr, nullptr, SW_SHOW); break;
 		case ID_SETTINGS: OpenSettings(); break;
+		case ID_PLUGINS: OpenPlugins(); break;
 		case ID_BOOT_XMB: BootXmb(); break;
 		}
 		// Toolbar buttons hand the keyboard back to the list.

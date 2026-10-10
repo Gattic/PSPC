@@ -2,7 +2,7 @@
 // Portions derived from PPSSPP (https://github.com/hrydgard/ppsspp), Copyright (c) 2012- PPSSPP Project, GPL-2.0-or-later.
 //
 // sceDisplay: framebuffer selection, VBlank timing and presentation of the selected framebuffer to the
-// host window at each VBlank. Timing as PPSSPP measured it: a frame is 1001/60 ms, starting when the
+// host window at each VBlank, with the sceUtility dialogs and the HOME menu drawn over it (ppge). Timing as PPSSPP measured it: a frame is 1001/60 ms, starting when the
 // vblank does; the vblank lasts 0.77 ms and the hcount counts 286 lines a frame from 1.
 #include <algorithm>
 #include <cmath>
@@ -12,6 +12,8 @@
 #if PSPC_HAVE_GPU
 #include "gpu/backend.h"
 #endif
+#include "runtime/dialogs/home_menu.h"
+#include "runtime/dialogs/ppge.h"
 #include "runtime/hle/display.h"
 #include "runtime/hle/hle_wrap.h"
 #include "runtime/hle/modules/modules.h"
@@ -20,6 +22,7 @@
 #include "runtime/kernel/errors.h"
 #include "runtime/kernel/interrupts.h"
 #include "runtime/kernel/scheduler.h"
+#include "runtime/kernel/sysmem.h"
 #include "runtime/kernel/waitqueue.h"
 
 using namespace kernel;
@@ -45,6 +48,29 @@ struct FrameBuf {
 };
 
 FrameBuf g_current, g_latched;
+// The display driver keeps four framebuffers by priority and shows the most urgent one set (0
+// first). Games set priority 2 (sceDisplaySetFrameBuf, held in g_current/g_latched above); the
+// system's own screens (the HOME screen) use priority 0, and kernel plugins draw over the game
+// by setting 0 or 1 through sceDisplaySetFrameBufferInternal and give the screen back with a
+// null address.
+constexpr int kGamePri = 2;
+FrameBuf g_pri[4];
+bool g_priSet[4];
+// As sceDisplayInit leaves an unused priority: no address or width, format 8888.
+constexpr FrameBuf kNoFrameBuf{0, 0, 3};
+// The HOME screen's framebuffer (512x272, 5650) in kernel memory, allocated the first time it
+// opens and kept: DarkFrost and other cheat menus find it at priority 0 while the HOME screen is
+// up and draw their own menus into it later.
+u32 g_systemScreen = 0;
+constexpr int kSystemScreenFormat = 0;
+
+// What the screen shows: an override above the game's framebuffer if one is set, else the game's.
+const FrameBuf &Shown() {
+	for (int p = 0; p < kGamePri; p++)
+		if (g_priSet[p] && g_pri[p].addr) return g_pri[p];
+	if (!g_current.addr && g_priSet[3] && g_pri[3].addr) return g_pri[3];
+	return g_current;
+}
 bool g_latchPending = false;
 bool g_fbSet = false;  // the game has chosen a framebuffer
 bool g_hasSetMode = false;
@@ -64,16 +90,19 @@ std::function<void()> g_vblankHook;
 u64 EnterUs(u64 frame) { return (u64)std::llround(g_bootUs + kFrameUs - kVblankUs + (double)frame * kFrameUs); }
 
 void Present() {
-	if (host::IsHeadless() || !g_current.addr) return;
+	const FrameBuf &fb = Shown();
+	if (host::IsHeadless() || !fb.addr) return;
 #if PSPC_HAVE_GPU
 	// A GPU renderer: its own (upscaled) image of the framebuffer, or guest memory made current.
 	int w = 0, h = 0;
-	if (gpu::GetBackendDisplayImage(g_current.addr, g_current.stride, g_current.format, 480, 272, g_rgba, &w, &h)) {
+	if (gpu::GetBackendDisplayImage(fb.addr, fb.stride, fb.format, 480, 272, g_rgba, &w, &h)) {
+		ppge::Composite(g_rgba.data(), w, h, &fb == &g_current);
 		host::PresentFrame(g_rgba.data(), w, h, w);
 		return;
 	}
 #endif
-	ConvertFramebuffer(g_current.addr, g_current.stride, g_current.format, 480, 272, g_rgba);
+	ConvertFramebuffer(fb.addr, fb.stride, fb.format, 480, 272, g_rgba);
+	ppge::Composite(g_rgba.data(), 480, 272, &fb == &g_current);
 	host::PresentFrame(g_rgba.data(), 480, 272, 480);
 }
 
@@ -94,6 +123,7 @@ void OnEnterVblank() {
 		g_current = g_latched;
 		g_latchPending = false;
 	}
+	homemenu::OnVblank();
 	Present();
 	if (g_vblankHook) g_vblankHook();
 
@@ -130,6 +160,11 @@ void OnEnterVblank() {
 
 void Init() {
 	g_current = g_latched = FrameBuf{};
+	for (int p = 0; p < 4; p++) {
+		g_pri[p] = kNoFrameBuf;
+		g_priSet[p] = false;
+	}
+	g_systemScreen = 0;
 	g_latchPending = false;
 	g_fbSet = false;
 	g_hasSetMode = false;
@@ -148,10 +183,48 @@ void Init() {
 
 void SetVblankHook(std::function<void()> fn) { g_vblankHook = std::move(fn); }
 
+void ShowSystemScreen(bool on) {
+	if (!on) {
+		// Only if it is still ours: a plugin may have put its own screen there meanwhile.
+		if (g_priSet[0] && g_pri[0].addr == g_systemScreen) {
+			g_pri[0] = kNoFrameBuf;
+			g_priSet[0] = false;
+		}
+		return;
+	}
+	constexpr int kStride = 512, kW = 480, kH = 272;
+	if (!g_systemScreen) g_systemScreen = kernel::AllocKernelMemory(kStride * kH * 2, "system screen");
+	// It starts as a still of the game's screen; the HOME menu is drawn over it.
+	const FrameBuf &game = Shown();
+	std::vector<u32> rgba;
+	if (game.addr) ConvertFramebuffer(game.addr, game.stride, game.format, kW, kH, rgba);
+	else rgba.assign((size_t)kW * kH, 0xFF000000u);
+	// A sceUtility dialog on screen is part of the game's image on a PSP.
+	ppge::Composite(rgba.data(), kW, kH, &game == &g_current);
+	u16 *dst = (u16 *)mem::GetPointer(g_systemScreen, kStride * kH * 2);
+	if (dst) {
+		for (int y = 0; y < kH; y++) {
+			for (int x = 0; x < kStride; x++) {
+				u16 p = 0;
+				if (x < kW) {
+					const u32 c = rgba[(size_t)y * kW + x];
+					p = (u16)(((c >> 3) & 0x1F) | (((c >> 10) & 0x3F) << 5) | (((c >> 19) & 0x1F) << 11));
+				}
+				dst[(size_t)y * kStride + x] = p;
+			}
+		}
+	}
+	g_pri[0] = FrameBuf{g_systemScreen, kStride, kSystemScreenFormat};
+	g_priSet[0] = true;
+}
+
+bool ShowingGameScreen() { return &Shown() == &g_current; }
+
 void CurrentFramebuffer(u32 &addr, int &stride, int &format) {
-	addr = g_fbSet ? g_current.addr : 0;
-	stride = g_current.stride;
-	format = g_current.format;
+	const FrameBuf &fb = Shown();
+	addr = g_fbSet || &fb != &g_current ? fb.addr : 0;
+	stride = fb.stride;
+	format = fb.format;
 }
 
 u32 Vcount() { return g_vcount; }
@@ -296,6 +369,31 @@ u32 sceDisplayGetFrameBuf(u32 topPtr, u32 linePtr, u32 fmtPtr, int sync) {
 	return 0;
 }
 
+// The driver's framebuffer at a priority (0-3; 2 is the game's, as sceDisplaySetFrameBuf and
+// sceDisplayGetFrameBuf use it). From display.prx 4.01 (390C7E0E / A1BEF1F6; 63E22A26 / 5B5AEFAD
+// before M33's NID resolver).
+u32 sceDisplaySetFrameBufferInternal(u32 pri, u32 topaddr, int linesize, int pixelformat, int sync) {
+	if (pri >= 4) return SCE_KERNEL_ERROR_INVALID_VALUE;
+	if (pri == kGamePri) return sceDisplaySetFrameBuf(topaddr, linesize, pixelformat, sync);
+	if (sync != 0 && sync != 1) return SCE_KERNEL_ERROR_INVALID_MODE;
+	if (topaddr & 0xF) return SCE_KERNEL_ERROR_INVALID_POINTER;
+	if (pixelformat < 0 || pixelformat > 3) return SCE_KERNEL_ERROR_INVALID_FORMAT;
+	g_pri[pri].addr = topaddr;
+	g_pri[pri].stride = linesize;
+	g_pri[pri].format = pixelformat;
+	g_priSet[pri] = topaddr != 0;
+	return 0;
+}
+u32 sceDisplayGetFrameBufferInternal(u32 pri, u32 topPtr, u32 linePtr, u32 fmtPtr, int sync) {
+	if (pri >= 4) return SCE_KERNEL_ERROR_INVALID_VALUE;
+	if (pri == kGamePri) return sceDisplayGetFrameBuf(topPtr, linePtr, fmtPtr, sync);
+	const FrameBuf &fb = g_priSet[pri] ? g_pri[pri] : kNoFrameBuf;
+	if (mem::IsValidRange(topPtr, 4)) GWrite32(topPtr, fb.addr);
+	if (mem::IsValidRange(linePtr, 4)) GWrite32(linePtr, (u32)fb.stride);
+	if (mem::IsValidRange(fmtPtr, 4)) GWrite32(fmtPtr, (u32)fb.format);
+	return 0;
+}
+
 int sceDisplayWaitVblankStart() {
 	if (int err = CheckCanWait()) return err;
 	return WaitVblankStart(1, false);
@@ -410,4 +508,11 @@ void Register_sceDisplay() {
 	};
 	hle::RegisterModule("sceDisplay", funcs);
 	hle::RegisterModule("sceDisplay_driver", funcs);
+	static const hle::HleFunction driverFuncs[] = {
+		HLEFN(0x390C7E0E, sceDisplaySetFrameBufferInternal),
+		HLEFN(0xA1BEF1F6, sceDisplayGetFrameBufferInternal),
+		HLEFN(0x63E22A26, sceDisplaySetFrameBufferInternal),
+		HLEFN(0x5B5AEFAD, sceDisplayGetFrameBufferInternal),
+	};
+	hle::RegisterModule("sceDisplay_driver", driverFuncs);
 }

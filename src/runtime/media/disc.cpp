@@ -19,6 +19,7 @@ namespace {
 std::shared_ptr<vfs::IsoFileSystem> g_iso;
 std::string g_discId;
 std::string g_discPath;
+unsigned g_discType = 0x10;
 
 }  // namespace
 
@@ -37,7 +38,24 @@ bool MountDisc(const std::string &hostPath) {
 	g_iso = iso;
 	g_discId.clear();
 	g_discPath = hostPath;
+	g_discType = 0;
+	static const struct {
+		const char *dir;
+		unsigned type;
+	} kKinds[] = {{"/PSP_GAME", 0x10}, {"/UMD_VIDEO", 0x20}, {"/UMD_AUDIO", 0x40}};
+	for (const auto &k : kKinds) {
+		vfs::SceIoStat st{};
+		if (iso->GetStat(k.dir, &st) >= 0) g_discType |= k.type;
+	}
+	if (!g_discType) g_discType = 0x10;
 	std::vector<u8> sfo;
+	if (iso->ReadWholeFile("/UMD_VIDEO/PARAM.SFO", sfo) == 0 && !(g_discType & 0x10)) {
+		vfs::ParamSfo p;
+		if (p.Parse(sfo.data(), sfo.size())) {
+			g_discId = p.GetString("DISC_ID");
+			LOGI("UMD", "UMD Video %s: %s", g_discId.c_str(), p.GetString("TITLE").c_str());
+		}
+	}
 	if (iso->ReadWholeFile("/PSP_GAME/PARAM.SFO", sfo) == 0) {
 		vfs::ParamSfo p;
 		if (p.Parse(sfo.data(), sfo.size())) {
@@ -56,6 +74,7 @@ void UnmountDisc() {
 	g_iso.reset();
 	g_discId.clear();
 	g_discPath.clear();
+	g_discType = 0x10;
 	umd::NotifyDiscChanged();
 }
 
@@ -68,6 +87,7 @@ void RemountDiscIfAny() {
 bool HaveDisc() { return g_iso != nullptr; }
 std::string DiscId() { return g_discId; }
 std::string DiscPath() { return g_discPath; }
+unsigned DiscType() { return g_iso ? g_discType : 0x10; }
 std::shared_ptr<vfs::IsoFileSystem> Disc() { return g_iso; }
 
 }  // namespace media

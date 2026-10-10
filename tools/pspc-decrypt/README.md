@@ -37,6 +37,7 @@ pspc-decrypt pbp   <in.pbp> <outdir>      [--json] [--seed HEX32]
 pspc-decrypt psar  <updater> <outdir>     [--json] [--model any|01g..12g] [--keep-encrypted] [-v]
 pspc-decrypt carve <file> <outdir>        [--json] [--keep-encrypted]
 pspc-decrypt batch <listfile>             [--json] [--seed HEX32]
+pspc-decrypt kirk-service                 [--fuse HEX16]
 pspc-decrypt version | help
 ```
 
@@ -66,6 +67,12 @@ pspc-decrypt version | help
 - **batch** reads lines of `<in>\t<out>` (UTF-8, CRLF or LF, `#` comments and blank lines
   skipped) and does each like `prx`, carrying on past failures. Relative paths are relative to
   the current directory.
+
+- **kirk-service** serves KIRK commands on stdin/stdout until stdin closes (a binary protocol,
+  described in `src/kirk_service.h`). The PSPC runtime starts it the first time a game or the XMB
+  needs KIRK at run time (sceChnnlsv for save data hashes and encryption, the "semaphore"
+  library), see below. Commands 5 and 8 (the console-bound key, which libkirk doesn't have) use a
+  key derived from `--fuse`, the installation's fuse ID.
 
 Options: `--seed` supplies the 16-byte NPDRM seed (version key) a type 5 module may need;
 `--licensee-key` the game's licensee key for a `.sprx` whose EDAT header asks for it.
@@ -161,10 +168,21 @@ with one `<input>\t<output>` per line (absolute paths, UTF-8). stdout is one JSO
 single file, `pspc-decrypt.exe prx --json <in> <out>` prints one such result object. For a
 firmware, run `psar` once into `private/fw/<version>/` and read `manifest.json`.
 
+## Use from the runtime (`kirk-service`)
+
+`src/runtime/hle/modules/kirk_client.cpp` starts `pspc-decrypt.exe kirk-service --fuse <id>`
+lazily, keeps it running for the session and sends it one request per KIRK call over its pipes;
+`kirk::Available()` is false when the executable is missing, and the save data code then falls
+back to plaintext saves. The fuse ID comes from `flash1:/pspc_idstorage.txt` (generated once per
+installation, like the MAC address the XMB shows), so saves encrypted with the console key stay
+readable by the same installation.
+
 ## Tests
 
 `pspc_decrypt_tests` (registered with CTest as `pspc_decrypt_tests`) needs no Sony data:
 
+- The kirk-service command set: CMD4/7 and CMD5/8 round trips, the fuse ID's effect on 5/8,
+  refused sizes and commands (`tests/test_kirk_service.cpp`).
 - AES (FIPS-197), AES-CMAC (RFC 4493), SHA-1, DES known answers; KIRK CMD1/4/7/10/11/12/13/16/17,
   including a real KIRK CMD1 ECDSA block and a real NPUMDIMG signature from pspautotests.
 - `~PSP` decryption for types 0 and 2 across many tags, using modules built by running each

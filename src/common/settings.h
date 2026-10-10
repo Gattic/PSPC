@@ -41,9 +41,13 @@ struct Settings {
 	std::string renderer;           // "software", "d3d11", "d3d11-warp"; "" = $PSPC_RENDERER or software
 	int renderScale = 0;            // d3d11 internal resolution 1-4; 0 = default (1)
 	std::string gamesDir;           // folder of game images the XMB lists ("" = the Games folder)
+	bool plugins = true;            // load M33 plugins (seplugins/game.txt, vsh.txt, pops.txt)
+	std::string pluginsDir;         // overlaid onto ms0: ("" = the plugins folder)
 	int volume = 100;               // 0-100
 	bool mute = false;
 	std::string padStick = "both";  // stick(s) driving the PSP analog: both, left, right, none
+	bool network = true;            // false: the WLAN switch reads off (no infrastructure or ad hoc)
+	std::string adhocServer = "localhost";  // ad hoc server (PPSSPP's "pro adhoc server" protocol)
 	// One comma-separated binding list per kControls entry ("" = unbound).
 	std::vector<std::string> keys, pads;
 	Settings();

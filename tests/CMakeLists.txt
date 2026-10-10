@@ -3,7 +3,7 @@
 file(GLOB PSPC_UNIT_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/unit/*.cpp)
 add_executable(pspc_unittests ${PSPC_UNIT_SOURCES})
 target_link_libraries(pspc_unittests PRIVATE pspc_sem)
-foreach(lib pspc_fs pspc_gpu pspc_loader pspc_audio)
+foreach(lib pspc_fs pspc_gpu pspc_loader pspc_audio pspc_net)
 	if(TARGET ${lib})
 		target_link_libraries(pspc_unittests PRIVATE ${lib})
 	endif()

@@ -146,6 +146,17 @@ public:
 	void Draw(const GlyphImage &img, int clipX, int clipY, int clipW, int clipH, int code, int altCode,
 	          GlyphKind kind) const;
 
+	// A character's image for drawing on the host (the sceUtility dialog overlays): one byte per
+	// pixel holding the 4-bit ink (0-15), rows top to bottom; the bitmap goes `left` pixels right
+	// of the pen and its top `top` pixels above the baseline, and the pen then moves `advH`
+	// (26.6). False when the font has no glyph for `code` (blank fonts have none).
+	struct HostGlyph {
+		int w = 0, h = 0, left = 0, top = 0;
+		s32 advH = 0;
+		std::vector<u8> ink;
+	};
+	bool RenderHostGlyph(int code, HostGlyph &out) const;
+
 private:
 	bool GlyphIndex(int code, u32 &index) const;
 	bool DecodeRecord(u32 index, Glyph &g) const;

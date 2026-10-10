@@ -10,4 +10,5 @@ void Register_Misc() {
 	Register_RegAndSystemLibraries();
 	Register_FontLibraries();
 	Register_MediaLibraries();
+	Register_ChnnlsvLibraries();
 }
