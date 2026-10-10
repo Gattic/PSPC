@@ -6,6 +6,8 @@
 // folder holds a virtual EBOOT.PBP. Our own code, written from the behaviour description.
 #include "runtime/m33/vsh_iso.h"
 
+#include <windows.h>
+
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
@@ -62,7 +64,8 @@ void PutU32(std::vector<u8> &v, size_t at, u32 x) { memcpy(&v[at], &x, 4); }
 
 // The images the Game menu shows, by index (n of MMMMMISO<n>).
 struct Image {
-	std::string name;     // file name in /ISO
+	std::string name;     // file name (in /ISO, or in a games folder)
+	std::filesystem::path host;  // the image on the host
 	vfs::SceIoStat stat;  // of the image file
 	bool built = false;
 	bool ok = false;
@@ -71,6 +74,33 @@ struct Image {
 
 class IsoBrowserFs;
 IsoBrowserFs *g_browser = nullptr;
+// Host folders listed besides ms0:/ISO (pspc's Games folder), searched a few levels deep.
+std::vector<std::filesystem::path> g_extraDirs;
+
+vfs::SceIoStat HostFileStat(const std::filesystem::path &p) {
+	vfs::SceIoStat st{};
+	WIN32_FILE_ATTRIBUTE_DATA d;
+	if (!GetFileAttributesExW(p.wstring().c_str(), GetFileExInfoStandard, &d)) return st;
+	st.st_mode = (s32)(vfs::FIO_S_IFREG | 0777);
+	st.st_attr = vfs::FIO_SO_IFREG;
+	st.st_size = (s64)(((u64)d.nFileSizeHigh << 32) | d.nFileSizeLow);
+	auto conv = [](const FILETIME &ft, vfs::ScePspDateTime *out) {
+		SYSTEMTIME t;
+		FILETIME local;
+		if (!FileTimeToLocalFileTime(&ft, &local) || !FileTimeToSystemTime(&local, &t)) return;
+		out->year = t.wYear;
+		out->month = t.wMonth;
+		out->day = t.wDay;
+		out->hour = t.wHour;
+		out->minute = t.wMinute;
+		out->second = t.wSecond;
+		out->microsecond = (u32)t.wMilliseconds * 1000;
+	};
+	conv(d.ftCreationTime, &st.st_ctime);
+	conv(d.ftLastAccessTime, &st.st_atime);
+	conv(d.ftLastWriteTime, &st.st_mtime);
+	return st;
+}
 
 class IsoBrowserFs : public vfs::FileSystem {
 public:
@@ -83,9 +113,7 @@ public:
 	std::string HostPathOf(int n) {
 		std::lock_guard<std::mutex> lock(mu_);
 		if (n < 0 || n >= (int)images_.size()) return "";
-		std::filesystem::path p;
-		if (inner_->HostPath("/ISO/" + images_[n].name, &p) < 0) return "";
-		return PathToUtf8(p);
+		return PathToUtf8(images_[n].host);
 	}
 
 	u32 Caps() const override { return inner_->Caps(); }
@@ -303,13 +331,34 @@ private:
 				Image img;
 				img.name = e.d_name;
 				img.stat = e.d_stat;
+				if (inner_->HostPath("/ISO/" + img.name, &img.host) < 0) continue;
 				found.push_back(std::move(img));
 			}
 			inner_->DClose(d);
 		}
+		// pspc's Games folder too, so the XMB shows what the launcher shows without copying.
+		for (const std::filesystem::path &dir : g_extraDirs) {
+			std::error_code ec;
+			auto opts = std::filesystem::directory_options::skip_permission_denied;
+			for (auto it = std::filesystem::recursive_directory_iterator(dir, opts, ec);
+			     !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec)) {
+				if (it.depth() > 3 || !it->is_regular_file(ec)) continue;
+				std::string name = PathToUtf8(it->path().filename());
+				if (!IsImageName(name)) continue;
+				bool dup = false;
+				for (const Image &f : found)
+					dup |= std::filesystem::equivalent(f.host, it->path(), ec) && !ec;
+				if (dup) continue;
+				Image img;
+				img.name = name;
+				img.host = it->path();
+				img.stat = HostFileStat(img.host);
+				found.push_back(std::move(img));
+			}
+		}
 		for (Image &f : found) {
 			for (Image &old : images_) {
-				if (old.name == f.name && old.stat.st_size == f.stat.st_size && old.built) {
+				if (old.host == f.host && old.stat.st_size == f.stat.st_size && old.built) {
 					f.built = true;
 					f.ok = old.ok;
 					f.pbp = std::move(old.pbp);
@@ -333,8 +382,7 @@ private:
 	// The virtual EBOOT.PBP: the image's PARAM.SFO as a memory stick game (CATEGORY "MG", as
 	// vshctrl's template), its icons, pictures and sound; no DATA.PSP (launching it boots the image).
 	bool BuildPbp(Image &img) {
-		std::filesystem::path host;
-		if (inner_->HostPath("/ISO/" + img.name, &host) < 0) return false;
+		const std::filesystem::path &host = img.host;
 		std::string err;
 		std::unique_ptr<vfs::BlockDevice> bd = vfs::OpenBlockDevice(host, &err);
 		if (!bd) {
@@ -378,7 +426,10 @@ private:
 
 }  // namespace
 
-void InstallIsoBrowser() {
+void InstallIsoBrowser(const std::vector<std::string> &extraDirs) {
+	g_extraDirs.clear();
+	for (const std::string &d : extraDirs)
+		if (!d.empty()) g_extraDirs.push_back(fs::u8path(d));
 	io::SetFsOverlay("ms0", [](vfs::HostFileSystem *host) {
 		auto fs = std::make_shared<IsoBrowserFs>(host);
 		g_browser = fs.get();

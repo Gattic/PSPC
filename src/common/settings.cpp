@@ -113,8 +113,8 @@ std::string JoinList(const std::vector<std::string> &names) {
 }
 
 std::vector<std::string> Keys() {
-	std::vector<std::string> k = {"scale", "fullscreen", "vsync", "aot", "fw", "renderer", "render_scale", "volume",
-	                              "mute"};
+	std::vector<std::string> k = {"scale",  "fullscreen", "vsync",  "aot",  "fw",
+	                              "renderer", "render_scale", "games_dir", "volume", "mute"};
 	for (size_t i = 0; i < kNumControls; i++) k.push_back(std::string("key.") + kControls[i].name);
 	k.push_back("pad.stick");
 	for (size_t i = 0; i < kNumControls; i++) k.push_back(std::string("pad.") + kControls[i].name);
@@ -143,6 +143,8 @@ bool Set(Settings &s, const std::string &rawKey, const std::string &rawValue, st
 		if (!l.empty() && l != "software" && l != "d3d11" && l != "d3d11-warp")
 			return fail("want software, d3d11 or d3d11-warp");
 		s.renderer = l;
+	} else if (key == "games_dir") {
+		s.gamesDir = v;
 	} else if (key == "render_scale") {
 		if (v.empty()) s.renderScale = 0;
 		else if (ParseInt(v, 1, 4, n)) s.renderScale = n;
@@ -153,7 +155,7 @@ bool Set(Settings &s, const std::string &rawKey, const std::string &rawValue, st
 		else return fail("want 0-100 or mute");
 	} else if (key == "pad.stick") {
 		std::string l = ToLower(v);
-		if (l != "left" && l != "right" && l != "none") return fail("want left, right or none");
+		if (l != "both" && l != "left" && l != "right" && l != "none") return fail("want both, left, right or none");
 		s.padStick = l;
 	} else if (key.rfind("key.", 0) == 0 && ControlIndex(key.substr(4)) >= 0) {
 		// Key names are checked by the host, which knows SDL's spellings.
@@ -181,6 +183,7 @@ std::string Get(const Settings &s, const std::string &key) {
 	if (key == "aot") return B(s.aot);
 	if (key == "fw") return s.fw;
 	if (key == "renderer") return s.renderer;
+	if (key == "games_dir") return s.gamesDir;
 	if (key == "render_scale") return s.renderScale ? std::to_string(s.renderScale) : "";
 	if (key == "volume") return std::to_string(s.volume);
 	if (key == "mute") return B(s.mute);
@@ -232,6 +235,8 @@ std::string Template(const Settings &s) {
 	     "# render_scale 1-4 renders at that many times the PSP's resolution).\n";
 	put("renderer");
 	put("render_scale");
+	t += "\n# Folder of game images (ISO/CSO) the XMB lists besides ms0:/ISO; empty = pspc's Games folder.\n";
+	put("games_dir");
 	t += "\n# Audio: volume 0-100; mute=1 silences the output.\n";
 	put("volume");
 	put("mute");
@@ -242,8 +247,8 @@ std::string Template(const Settings &s) {
 	for (size_t i = 0; i < kNumControls; i++) put(std::string("key.") + kControls[i].name);
 	t += "\n# Controller: pad.<control>=<button>[,<another>] with SDL's names: a b x y back guide start\n"
 	     "# leftstick rightstick leftshoulder rightshoulder dpup dpdown dpleft dpright misc1 paddle1-4\n"
-	     "# touchpad lefttrigger righttrigger. pad.stick: the stick that drives the PSP analog stick\n"
-	     "# (left, right or none).\n";
+	     "# touchpad lefttrigger righttrigger. pad.stick: the stick(s) that drive the PSP analog stick\n"
+	     "# (both = whichever is pushed further, left, right or none).\n";
 	put("pad.stick");
 	for (size_t i = 0; i < kNumControls; i++) put(std::string("pad.") + kControls[i].name);
 	return t;

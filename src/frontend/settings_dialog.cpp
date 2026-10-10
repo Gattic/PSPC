@@ -119,7 +119,7 @@ void UpdateRow(Dialog &d, int i) {
 	std::wstring keys = d.capturing == i ? L"Press a key..." : Pretty(d.s.keys[i]);
 	std::wstring pads = Pretty(d.s.pads[i]);
 	if (d.s.pads[i].empty() && settings::kControls[i].button == 0 && d.s.padStick != "none")
-		pads = Widen(d.s.padStick) + L" stick";
+		pads = d.s.padStick == "both" ? std::wstring(L"either stick") : Widen(d.s.padStick) + L" stick";
 	ListView_SetItemText(d.list, i, 1, keys.data());
 	ListView_SetItemText(d.list, i, 2, pads.data());
 }

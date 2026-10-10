@@ -40,9 +40,10 @@ struct Settings {
 	std::string fw = "6.60";        // firmware version reported to games
 	std::string renderer;           // "software", "d3d11", "d3d11-warp"; "" = $PSPC_RENDERER or software
 	int renderScale = 0;            // d3d11 internal resolution 1-4; 0 = default (1)
+	std::string gamesDir;           // folder of game images the XMB lists ("" = the Games folder)
 	int volume = 100;               // 0-100
 	bool mute = false;
-	std::string padStick = "left";  // controller stick that drives the PSP analog: left, right, none
+	std::string padStick = "both";  // stick(s) driving the PSP analog: both, left, right, none
 	// One comma-separated binding list per kControls entry ("" = unbound).
 	std::vector<std::string> keys, pads;
 	Settings();

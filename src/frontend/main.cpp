@@ -99,6 +99,7 @@ static void ApplySettings(const settings::Settings &s, runtime::Options &o) {
 	o.keyBindings = s.keys;
 	o.padBindings = s.pads;
 	o.padStick = s.padStick;
+	o.gamesDir = s.gamesDir;
 }
 
 // The effective settings (after command-line overrides), at info level.
@@ -228,6 +229,15 @@ int main(int argc, char **argv) {
 		for (fs::path p = exeDir; !p.empty() && p != p.root_path(); p = p.parent_path()) {
 			if (fs::exists(p / "data" / "nids.csv")) {
 				o.dataDir = (p / "data").string();
+				break;
+			}
+		}
+	}
+	if (o.gamesDir.empty()) {
+		// The launcher's Games folder: next to pspc.exe or in a parent (the repository's).
+		for (fs::path p = exeDir; !p.empty() && p != p.root_path(); p = p.parent_path()) {
+			if (fs::is_directory(p / "Games")) {
+				o.gamesDir = (p / "Games").string();
 				break;
 			}
 		}

@@ -55,6 +55,7 @@ struct Options {
 	};
 	std::vector<Press> presses;
 	std::string oskText;  // headless: what the on-screen keyboard returns
+	std::string gamesDir;  // host folder whose UMD images the XMB lists besides ms0:/ISO
 };
 
 // Boots the program and runs until it exits. Returns the exit code.

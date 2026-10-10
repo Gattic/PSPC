@@ -367,10 +367,10 @@ int RunOnce(const Options &o, BootTarget bt) {
 	if (o.plugins) m33::LoadPlugins();
 
 	if (vsh::Active()) {
-		// No disc unless one was given: the XMB shows an empty drive. UMD images in ms0:/ISO show
-		// in the Game menu (M33 vshctrl).
+		// No disc unless one was given: the XMB shows an empty drive. UMD images in ms0:/ISO and
+		// in pspc's Games folder show in the Game menu (M33 vshctrl).
 		umd::SetDriveEmpty(!media::HaveDisc());
-		m33::InstallIsoBrowser();
+		m33::InstallIsoBrowser({o.gamesDir});
 		io::Mount("msstor0p1", io::MakeMsStorDevice());
 		io::Mount("msstor0", io::MakeMsStorDevice());
 		if (vsh::Boot(o.recovery) < 0) return 2;

@@ -8,11 +8,13 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace m33 {
 
 // Installs the overlay on the mounted ms0: (call after io::Init and the mounts).
-void InstallIsoBrowser();
+// extraDirs: host folders whose UMD images are listed too (pspc's Games folder).
+void InstallIsoBrowser(const std::vector<std::string> &extraDirs = {});
 // The host path of the UMD image a virtual "ms0:/PSP/GAME/MMMMMISO<n>/..." path stands for.
 bool IsoForVirtualGamePath(const std::string &pspPath, std::string *hostPath);
 

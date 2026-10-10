@@ -31,7 +31,12 @@ bool g_frameDirty = false;
 // Input state read by the emulation thread: buttons from keys and controller buttons, the
 // analog stick from bound keys/buttons ("digital", 128 = centred) or the controller stick.
 std::atomic<u32> g_buttons{0};
-std::atomic<int> g_digitalLx{128}, g_digitalLy{128}, g_padLx{128}, g_padLy{128};
+std::atomic<int> g_digitalLx{128}, g_digitalLy{128};
+// Controller sticks (0 = left, 1 = right), 0-255 with 128 centred.
+std::atomic<int> g_stickPos[2][2] = {{128, 128}, {128, 128}};
+// Which stick drives the PSP analog stick: both (the one pushed further), left, right or none.
+enum class StickMode { Both, Left, Right, None };
+std::atomic<StickMode> g_stickMode{StickMode::Both};
 SDL_AudioDeviceID g_audio = 0;
 std::atomic<int> g_volume{100};
 
@@ -42,7 +47,6 @@ struct Binding {
 	std::vector<SDL_GameControllerAxis> triggers;
 };
 std::vector<Binding> g_bind;
-SDL_GameControllerAxis g_stickX = SDL_CONTROLLER_AXIS_LEFTX, g_stickY = SDL_CONTROLLER_AXIS_LEFTY;
 
 // What is held right now (host thread only).
 std::vector<SDL_Keycode> g_heldKeys;
@@ -69,14 +73,10 @@ void ResolveBindings(const Config &cfg) {
 			else LOGW("HOST", "pad.%s: unknown controller button \"%s\"", control, name.c_str());
 		}
 	}
-	g_stickX = SDL_CONTROLLER_AXIS_LEFTX;
-	g_stickY = SDL_CONTROLLER_AXIS_LEFTY;
-	if (cfg.padStick == "right") {
-		g_stickX = SDL_CONTROLLER_AXIS_RIGHTX;
-		g_stickY = SDL_CONTROLLER_AXIS_RIGHTY;
-	} else if (cfg.padStick == "none") {
-		g_stickX = g_stickY = SDL_CONTROLLER_AXIS_INVALID;
-	}
+	g_stickMode = cfg.padStick == "left"    ? StickMode::Left
+	              : cfg.padStick == "right" ? StickMode::Right
+	              : cfg.padStick == "none"  ? StickMode::None
+	                                        : StickMode::Both;
 }
 
 // Recomputes the PSP buttons and the digital analog directions from what is held. For opposite
@@ -217,7 +217,7 @@ int Run(const Config &cfg, const std::function<int()> &emulation, const std::fun
 					}
 				memset(g_heldButtons, 0, sizeof(g_heldButtons));
 				memset(g_heldTriggers, 0, sizeof(g_heldTriggers));
-				g_padLx = g_padLy = 128;
+				for (auto &s : g_stickPos) s[0] = s[1] = 128;
 				UpdateInput();
 				break;
 			case SDL_CONTROLLERBUTTONDOWN:
@@ -232,8 +232,10 @@ int Run(const Config &cfg, const std::function<int()> &emulation, const std::fun
 				int m = (v + 32768) >> 8;
 				if (m < 0) m = 0;
 				if (m > 255) m = 255;
-				if (ev.caxis.axis == g_stickX) g_padLx = m;
-				if (ev.caxis.axis == g_stickY) g_padLy = m;
+				if (ev.caxis.axis == SDL_CONTROLLER_AXIS_LEFTX) g_stickPos[0][0] = m;
+				if (ev.caxis.axis == SDL_CONTROLLER_AXIS_LEFTY) g_stickPos[0][1] = m;
+				if (ev.caxis.axis == SDL_CONTROLLER_AXIS_RIGHTX) g_stickPos[1][0] = m;
+				if (ev.caxis.axis == SDL_CONTROLLER_AXIS_RIGHTY) g_stickPos[1][1] = m;
 				if (ev.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERLEFT || ev.caxis.axis == SDL_CONTROLLER_AXIS_TRIGGERRIGHT) {
 					bool on = v > 16000;
 					if (g_heldTriggers[ev.caxis.axis] != on) {
@@ -311,7 +313,22 @@ void PresentFrame(const u32 *rgba, int width, int height, int stride) {
 CtrlState GetCtrl() {
 	CtrlState s;
 	s.buttons = g_buttons;
-	int lx = g_padLx, ly = g_padLy;
+	int lx = 128, ly = 128;
+	auto deflection = [](int s) {
+		int dx = std::abs(g_stickPos[s][0] - 128), dy = std::abs(g_stickPos[s][1] - 128);
+		return std::max(dx, dy);
+	};
+	int stick = -1;
+	switch (g_stickMode.load()) {
+	case StickMode::Left: stick = 0; break;
+	case StickMode::Right: stick = 1; break;
+	case StickMode::Both: stick = deflection(1) > deflection(0) ? 1 : 0; break;
+	case StickMode::None: break;
+	}
+	if (stick >= 0) {
+		lx = g_stickPos[stick][0];
+		ly = g_stickPos[stick][1];
+	}
 	if (g_digitalLx != 128) lx = g_digitalLx;
 	if (g_digitalLy != 128) ly = g_digitalLy;
 	s.lx = (u8)lx;
