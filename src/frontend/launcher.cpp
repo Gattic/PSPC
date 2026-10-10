@@ -34,6 +34,7 @@ using std::min;
 
 #include "common/fileutil.h"
 #include "common/settings.h"
+#include "frontend/network_dialog.h"
 #include "frontend/plugins_dialog.h"
 #include "frontend/settings_dialog.h"
 #include "fs/vfs.h"
@@ -58,6 +59,7 @@ enum : int {
 	ID_SETTINGS,
 	ID_BOOT_XMB,
 	ID_PLUGINS,
+	ID_NETWORK,
 	ID_TIMER_JOBS = 300,
 };
 const COLORREF kBackground = RGB(24, 24, 30), kToolbar = RGB(34, 34, 43), kText = RGB(230, 230, 235);
@@ -721,6 +723,11 @@ void OpenPlugins() {
 	SetFocus(g_list);
 }
 
+void OpenNetwork() {
+	if (ShowNetworkDialog(g_main, settings::DefaultPath())) ReloadSettings();
+	SetFocus(g_list);
+}
+
 // The panel for the selected game: PIC1 as the backdrop, ICON0, title, disc ID, native code status.
 void PaintDetail(HDC hdc, int w, int h) {
 	using namespace Gdiplus;
@@ -908,6 +915,7 @@ void ContextMenu(HWND hwnd, LPARAM lp) {
 	AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
 	AppendMenuW(m, XmbInstalled() ? 0 : MF_GRAYED, ID_BOOT_XMB, L"Boot &XMB (PSP firmware)");
 	AppendMenuW(m, 0, ID_PLUGINS, L"P&lugins (M33)...");
+	AppendMenuW(m, 0, ID_NETWORK, L"&Network (PSPC Network account)...");
 	AppendMenuW(m, 0, ID_SETTINGS, L"&Settings...");
 	POINT pt{(short)LOWORD(lp), (short)HIWORD(lp)};
 	if (lp == -1) {  // from the keyboard: at the selected item
@@ -933,7 +941,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		g_uiFont = CreateFontIndirectW(&ncm.lfMessageFont);
 		const std::pair<int, const wchar_t *> tools[] = {
 			{ID_PLAY, L"Play"}, {ID_BUILD, L"Build native code"}, {ID_BOOT_XMB, L"Boot XMB"},
-			{ID_PLUGINS, L"Plugins"}, {ID_SETTINGS, L"Settings"}, {ID_REFRESH, L"Refresh"},
+			{ID_PLUGINS, L"Plugins"}, {ID_NETWORK, L"Network"}, {ID_SETTINGS, L"Settings"}, {ID_REFRESH, L"Refresh"},
 			{ID_OPEN_FOLDER, L"Games folder"}};
 		for (const auto &t : tools)
 			g_tools.push_back(CreateWindowExW(0, L"BUTTON", t.second, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0,
@@ -1001,6 +1009,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		case ID_OPEN_FOLDER: ShellExecuteW(nullptr, L"open", g_gamesDir.wstring().c_str(), nullptr, nullptr, SW_SHOW); break;
 		case ID_SETTINGS: OpenSettings(); break;
 		case ID_PLUGINS: OpenPlugins(); break;
+		case ID_NETWORK: OpenNetwork(); break;
 		case ID_BOOT_XMB: BootXmb(); break;
 		}
 		// Toolbar buttons hand the keyboard back to the list.

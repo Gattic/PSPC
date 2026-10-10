@@ -65,6 +65,9 @@ struct Options {
 	// server is a host name or address, optionally with :port (default 27312).
 	bool network = true;
 	std::string adhocServer = "localhost";
+	// PSPC Network (pspc.ini np_server=, np_online_id=, np_token=) and online-service redirects
+	// (infra_dns=, data/infrastructure.json).
+	std::string npServer, npOnlineId, npToken, infraDns;
 	// Run a network selftest scenario ("name[:args]", hle/modules/net_selftest.h) instead of a file.
 	std::string netSelftest;
 };

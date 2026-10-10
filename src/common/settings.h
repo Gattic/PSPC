@@ -48,6 +48,11 @@ struct Settings {
 	std::string padStick = "both";  // stick(s) driving the PSP analog: both, left, right, none
 	bool network = true;            // false: the WLAN switch reads off (no infrastructure or ad hoc)
 	std::string adhocServer = "localhost";  // ad hoc server (PPSSPP's "pro adhoc server" protocol)
+	// PSPC Network, the stand-in for the PlayStation Network (net/np_client.h, docs/pspc-network.md).
+	std::string npServer;    // server URL; "" = sign in locally as npOnlineId, with no server
+	std::string npOnlineId;  // the online ID: the account's (set by the launcher) or the local one
+	std::string npToken;     // the server's sign-in token for that account (the launcher's Network dialog)
+	std::string infraDns;    // DNS server for every game's online services ("" = per-game table)
 	// One comma-separated binding list per kControls entry ("" = unbound).
 	std::vector<std::string> keys, pads;
 	Settings();

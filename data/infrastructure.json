@@ -1,0 +1,46 @@
+{
+  "comment": "Online-service redirects for PSPC (src/runtime/hle/modules/net_infra.cpp, docs/pspc-network.md). Same format as PPSSPP's infra-dns.json: per game, the disc IDs it covers, 'domains' (host name -> address of a revival server) and/or 'dns' (a revival DNS server that answers for all of the game's names). An infrastructure.json next to pspc.exe takes precedence over this file. 'hosts' lists the servers each game was seen to use, for revival server authors; it isn't used for redirecting.",
+  "games": [
+    {
+      "name": "Syphon Filter: Combat Ops",
+      "ids": ["NPUG80114"],
+      "hosts": [
+        "combatops.psp.online.scea.com:10071 (SCE-RT Medius lobby, TCP; resolved by the game's own DNS queries)",
+        "combatopspsp.online.scee.com:10070 (SVML over HTTP: /SPYWARSGPS_SVML/)",
+        "blob160.scea.com:10070 (SVML over HTTP: /SPYWARSGPS_SVML/)"
+      ],
+      "domains": {}
+    },
+    {
+      "name": "Syphon Filter: Logan's Shadow",
+      "ids": ["UCUS98606"],
+      "hosts": [
+        "combatopspsp.online.scee.com:10070 (SVML over HTTP: /SPYWARSGPS_SVML/)",
+        "blob160.scea.com:10070 (SVML over HTTP: /SPYWARSGPS_SVML/)"
+      ],
+      "domains": {}
+    },
+    {
+      "name": "Star Wars Battlefront: Renegade Squadron",
+      "ids": ["ULUS10292"],
+      "hosts": [
+        "gpcm.gamespy.com, gpsp.gamespy.com (GameSpy Presence)",
+        "swbfffpsp.available.gamespy.com, swbfffpsp.master.gamespy.com, swbfffpsp.ms<n>.gamespy.com (GameSpy master server)",
+        "natneg1.gamespy.com, natneg2.gamespy.com (NAT negotiation)",
+        "gamestats.gamespy.com (/swbfffpsp), motd.gamespy.com"
+      ],
+      "domains": {}
+    },
+    {
+      "name": "Star Wars Battlefront: Elite Squadron",
+      "ids": ["ULUS10390"],
+      "hosts": [
+        "gpcm.gamespy.com, gpsp.gamespy.com (GameSpy Presence)",
+        "swbfespsp.available.gamespy.com, swbfespsp.master.gamespy.com, swbfespsp.ms<n>.gamespy.com (GameSpy master server)",
+        "natneg1.gamespy.com, natneg2.gamespy.com, natneg3.gamespy.com (NAT negotiation)",
+        "gamestats.gamespy.com (/swbfespsp), motd.gamespy.com"
+      ],
+      "domains": {}
+    }
+  ]
+}

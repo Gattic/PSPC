@@ -29,6 +29,9 @@ struct HttpRequestSpec {
 	u32 connectTimeoutMs = 0;
 	u32 sendTimeoutMs = 0;
 	u32 recvTimeoutMs = 0;
+	// A revival server standing in for the URL's host (net_infra.cpp): connect here instead,
+	// keep the original Host header, and accept its certificate (it can't be the original's).
+	std::string connectAddress;
 };
 
 class HttpExchange {

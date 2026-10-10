@@ -189,7 +189,9 @@ namespace {
 constexpr int NP_INIT_DELAY_US = 200000;
 constexpr int NP_SHUTDOWN_DELAY_US = 501000;
 constexpr s32 NP_SIGNIN_STATUS_NONE = 0;
-constexpr s32 NP_SIGNIN_STATUS_CANCELED = 3;
+constexpr s32 NP_SIGNIN_STATUS_SUCCESS = 1;
+constexpr s32 NP_SIGNIN_STATUS_CANCELED = 2;
+constexpr s32 NP_SIGNIN_STATUS_FAILED = 3;
 }  // namespace
 
 int NpSigninDialog::Init(u32 paramAddr) {
@@ -200,6 +202,7 @@ int NpSigninDialog::Init(u32 paramAddr) {
 	requestAddr_ = paramAddr;
 	// An output; Update only acts while it's NONE.
 	request_.npSigninStatus = NP_SIGNIN_STATUS_NONE;
+	framesRun_ = 0;
 	ChangeStatusInit(NP_INIT_DELAY_US);
 	UpdateButtons();
 	InitCommon();
@@ -212,15 +215,49 @@ int NpSigninDialog::Update(int animSpeed) {
 	UpdateButtons();
 	UpdateCommon();
 	UpdateFade(animSpeed);
-	if (request_.npSigninStatus == NP_SIGNIN_STATUS_NONE) {
-		// Offline: signing in to the PlayStation Network can't succeed.
-		LOGI("UTIL", "NP sign-in: offline, cancelled");
-		StartFade(false);
-		ChangeStatus(STATUS_FINISHED, NP_SHUTDOWN_DELAY_US);
-		request_.common.result = SCE_UTILITY_DIALOG_RESULT_ABORT;
-		request_.npSigninStatus = NP_SIGNIN_STATUS_CANCELED;
+	framesRun_++;
+	// PSN sign-in goes to PSPC Network (net::NpStartSignIn): the server checks the account the
+	// launcher signed in, or with no server set the player signs in locally.
+	std::string message;
+	net::NpSigninState state = net::NpGetSignInState(&message);
+	if (pendingStatus_ != STATUS_FINISHED && request_.npSigninStatus == NP_SIGNIN_STATUS_NONE) {
+		if (state == net::NpSigninState::Idle) {
+			net::NpStartSignIn();
+			state = net::NpGetSignInState(&message);
+		}
+		bool done = false;
+		s32 status = NP_SIGNIN_STATUS_NONE;
+		if (state == net::NpSigninState::SignedIn) {
+			LOGI("UTIL", "NP sign-in: signed in as %s", net::NpOnlineId().c_str());
+			done = true;
+			status = NP_SIGNIN_STATUS_SUCCESS;
+		} else if (state == net::NpSigninState::Failed) {
+			done = Headless() ? framesRun_ >= HEADLESS_ANSWER_UPDATES : IsButtonPressed(cancelButtonFlag_);
+			status = NP_SIGNIN_STATUS_FAILED;
+			if (done) {
+				LOGI("UTIL", "NP sign-in failed: %s", message.c_str());
+				net::NpResetSignIn();
+			}
+		} else if (!Headless() && IsButtonPressed(cancelButtonFlag_)) {
+			done = true;
+			status = NP_SIGNIN_STATUS_CANCELED;
+		}
+		if (done) {
+			StartFade(false);
+			ChangeStatus(STATUS_FINISHED, NP_SHUTDOWN_DELAY_US);
+			request_.common.result = status == NP_SIGNIN_STATUS_SUCCESS ? 0 : SCE_UTILITY_DIALOG_RESULT_ABORT;
+			request_.npSigninStatus = status;
+			mem::WriteBytes(requestAddr_, &request_, std::min<u32>(request_.common.size, sizeof(request_)));
+		}
 	}
-	if (!Headless()) DisplayStatusScreen("PlayStation Network", "Could not sign in to PlayStation Network.", DS_BUTTON_NONE);
+	if (!Headless()) {
+		if (state == net::NpSigninState::Failed)
+			DisplayStatusScreen("PSPC Network", "Could not sign in.\n" + message, DS_BUTTON_CANCEL);
+		else if (state == net::NpSigninState::SignedIn)
+			DisplayStatusScreen("PSPC Network", "Signed in as " + net::NpOnlineId() + ".", DS_BUTTON_NONE);
+		else
+			DisplayStatusScreen("PSPC Network", "Signing in.\nPlease wait...", DS_BUTTON_CANCEL);
+	}
 	return 0;
 }
 

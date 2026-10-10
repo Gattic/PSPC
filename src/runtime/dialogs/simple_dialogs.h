@@ -78,6 +78,7 @@ protected:
 private:
 	NpSigninParams request_{};
 	u32 requestAddr_ = 0;
+	int framesRun_ = 0;
 };
 
 class ScreenshotDialog : public Dialog {

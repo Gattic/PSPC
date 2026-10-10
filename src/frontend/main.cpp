@@ -14,6 +14,7 @@
 #include "common/log.h"
 #include "common/settings.h"
 #include "net/adhoc_server.h"
+#include "net/np_client.h"
 #include "runtime/runtime.h"
 
 // "<vblank>:<BUTTON[+BUTTON...]>[:<frames>]", e.g. "600:START" or "900:CROSS+UP:4".
@@ -85,7 +86,10 @@ static void Usage() {
 	        "  --recovery           boot M33's recovery menu (also: hold R while the XMB boots)\n"
 	        "  --net-selftest <s>   run network test scenario <s> instead of a file (tools/net_selftest.py)\n"
 	        "  --adhoc-server       run an ad hoc server (PPSSPP-compatible) until Ctrl+C instead of a game;\n"
-	        "                       --adhoc-port <n> (default 27312), --adhoc-bind <addr> (default 0.0.0.0)\n");
+	        "                       --adhoc-port <n> (default 27312), --adhoc-bind <addr> (default 0.0.0.0)\n"
+	        "  --np <command>       PSPC Network account: register|signin --server <url> --id <online ID>,\n"
+	        "                       signout, status, local [--id <name>] (sign in without a server),\n"
+	        "                       friends, friend-add --id <online ID>, friend-remove --id <online ID>\n");
 }
 
 // pspc --adhoc-server [--adhoc-port <n>] [--adhoc-bind <addr>]: serves until Ctrl+C, boots nothing.
@@ -131,6 +135,10 @@ static void ApplySettings(const settings::Settings &s, runtime::Options &o) {
 	o.pluginsDir = s.pluginsDir;
 	o.network = s.network;
 	o.adhocServer = s.adhocServer;
+	o.npServer = s.npServer;
+	o.npOnlineId = s.npOnlineId;
+	o.npToken = s.npToken;
+	o.infraDns = s.infraDns;
 }
 
 // The effective settings (after command-line overrides), at info level.
@@ -149,9 +157,152 @@ static void LogSettings(const runtime::Options &o) {
 	LOGI("CONFIG", "pad: stick=%s%s", o.padStick.c_str(), pads.c_str());
 }
 
+// A password from the console without echo, or a line of stdin when it isn't a console (scripts).
+static std::string ReadPassword(const char *prompt) {
+	HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
+	DWORD mode = 0;
+	const bool console = GetConsoleMode(in, &mode) != 0;
+	if (console) {
+		fprintf(stderr, "%s", prompt);
+		SetConsoleMode(in, mode & ~(DWORD)ENABLE_ECHO_INPUT);
+	}
+	char buf[256] = {};
+	if (!fgets(buf, sizeof(buf), stdin)) buf[0] = 0;
+	if (console) {
+		SetConsoleMode(in, mode);
+		fprintf(stderr, "\n");
+	}
+	std::string s = buf;
+	while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+	return s;
+}
+
+// pspc --np register|signin|signout|status|local [--server <url>] [--id <online ID>] [--country <cc>]
+// [--config <file>]: PSPC Network account (the launcher's Network dialog does the same).
+static int RunNpCommand(int argc, char **argv) {
+	std::string command, server, onlineId, country = "us";
+	std::string cfgPath = PathToUtf8(settings::DefaultPath());
+	for (int i = 1; i < argc; i++) {
+		std::string a = argv[i];
+		auto next = [&]() { return i + 1 < argc ? std::string(argv[++i]) : std::string(); };
+		if (a == "--np") command = next();
+		else if (a == "--server") server = next();
+		else if (a == "--id") onlineId = next();
+		else if (a == "--country") country = next();
+		else if (a == "--config") cfgPath = next();
+	}
+	settings::Settings s;
+	settings::Load(fs::u8path(cfgPath), s);
+	if (server.empty()) server = s.npServer;
+	auto save = [&]() {
+		if (!settings::Save(fs::u8path(cfgPath), s)) {
+			fprintf(stderr, "Could not write %s\n", cfgPath.c_str());
+			return false;
+		}
+		return true;
+	};
+	if (command == "local") {
+		if (onlineId.empty()) onlineId = s.npOnlineId;
+		s.npServer.clear();
+		s.npToken.clear();
+		s.npOnlineId = onlineId;
+		if (!save()) return 1;
+		printf("Games sign in locally as %s (no PSPC Network server).\n", onlineId.empty() ? "PSPCPlayer" : onlineId.c_str());
+		return 0;
+	}
+	if (command == "register" || command == "signin") {
+		if (server.empty() || onlineId.empty()) {
+			fprintf(stderr, "usage: pspc --np %s --server <url> --id <online ID>\n", command.c_str());
+			return 1;
+		}
+		const std::string password = ReadPassword("Password: ");
+		if (command == "register" && ReadPassword("Again: ") != password) {
+			fprintf(stderr, "The passwords don't match.\n");
+			return 1;
+		}
+		np::NetworkClient client(server);
+		np::Profile profile;
+		std::string token;
+		const np::Result r = command == "register" ? client.Register(onlineId, password, country, &profile, &token)
+		                                           : client.SignIn(onlineId, password, &profile, &token);
+		if (!r) {
+			fprintf(stderr, "%s\n", r.message.c_str());
+			return 1;
+		}
+		s.npServer = client.Server();
+		s.npOnlineId = profile.onlineId;
+		s.npToken = token;
+		if (!save()) return 1;
+		printf("%s %s on %s.\n", command == "register" ? "Created and signed in as" : "Signed in as", profile.onlineId.c_str(),
+		       client.Server().c_str());
+		return 0;
+	}
+	if (command == "signout") {
+		if (!s.npToken.empty() && !server.empty()) np::NetworkClient(server, s.npToken).SignOut();
+		s.npToken.clear();
+		if (!save()) return 1;
+		printf("Signed out.\n");
+		return 0;
+	}
+	if (command == "status") {
+		if (server.empty()) {
+			printf("No PSPC Network server: games sign in locally as %s.\n", s.npOnlineId.empty() ? "PSPCPlayer" : s.npOnlineId.c_str());
+			return 0;
+		}
+		if (s.npToken.empty()) {
+			printf("Server %s; not signed in.\n", np::NormalizeServerUrl(server).c_str());
+			return 1;
+		}
+		np::Profile profile;
+		const np::Result r = np::NetworkClient(server, s.npToken).Me(&profile);
+		if (!r) {
+			printf("Server %s: %s\n", np::NormalizeServerUrl(server).c_str(), r.message.c_str());
+			return 1;
+		}
+		printf("Signed in to %s as %s (country %s).\n", np::NormalizeServerUrl(server).c_str(), profile.onlineId.c_str(),
+		       profile.country.c_str());
+		return 0;
+	}
+	if (command == "friends" || command == "friend-add" || command == "friend-remove") {
+		if (server.empty() || s.npToken.empty()) {
+			fprintf(stderr, "Not signed in to a PSPC Network server (pspc --np signin).\n");
+			return 1;
+		}
+		np::NetworkClient client(server, s.npToken);
+		np::Result r;
+		if (command != "friends") {
+			if (onlineId.empty()) {
+				fprintf(stderr, "usage: pspc --np %s --id <online ID>\n", command.c_str());
+				return 1;
+			}
+			np::Friend f;
+			r = command == "friend-add" ? client.AddFriend(onlineId, &f) : client.RemoveFriend(onlineId);
+			if (!r) {
+				fprintf(stderr, "%s\n", r.message.c_str());
+				return 1;
+			}
+		}
+		std::vector<np::Friend> list;
+		r = client.Friends(&list);
+		if (!r) {
+			fprintf(stderr, "%s\n", r.message.c_str());
+			return 1;
+		}
+		if (list.empty()) printf("No friends yet.\n");
+		for (const np::Friend &f : list)
+			printf("%-16s %s\n", f.onlineId.c_str(),
+			       f.status == "friend" ? "friends" : f.status == "sent" ? "request sent" : "wants to be friends (friend-add to accept)");
+		return 0;
+	}
+	fprintf(stderr, "usage: pspc --np register|signin|signout|status|local|friends|friend-add|friend-remove [--server <url>] [--id <online ID>]\n");
+	return 1;
+}
+
 int main(int argc, char **argv) {
-	for (int i = 1; i < argc; i++)
+	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--adhoc-server")) return RunAdhocServer(argc, argv);
+		if (!strcmp(argv[i], "--np")) return RunNpCommand(argc, argv);
+	}
 	runtime::Options o;
 	fs::path exeDir = ExecutableDir();
 	o.aotDir = (exeDir / "cache" / "aot").string();

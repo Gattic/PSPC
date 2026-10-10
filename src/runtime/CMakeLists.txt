@@ -53,10 +53,11 @@ target_link_libraries(pspc-iso PRIVATE pspc_fs pspc_common)
 
 add_executable(pspc-launcher WIN32
 	${CMAKE_SOURCE_DIR}/src/frontend/launcher.cpp
+	${CMAKE_SOURCE_DIR}/src/frontend/network_dialog.cpp
 	${CMAKE_SOURCE_DIR}/src/frontend/plugins_dialog.cpp
 	${CMAKE_SOURCE_DIR}/src/frontend/settings_dialog.cpp
 )
-target_link_libraries(pspc-launcher PRIVATE pspc_fs pspc_common comctl32 gdiplus)
+target_link_libraries(pspc-launcher PRIVATE pspc_fs pspc_net pspc_common comctl32 gdiplus)
 # Wide-character Win32 macros (ListView_InsertItem & co. take LVITEMW).
 target_compile_definitions(pspc-launcher PRIVATE UNICODE _UNICODE)
 # PSPC_SEM_VERSION: the launcher tells current AOT DLLs from stale ones.

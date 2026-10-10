@@ -14,10 +14,24 @@ namespace net {
 struct Config {
 	bool enabled = true;                  // false: the WLAN switch reads off (PSPC's offline mode)
 	std::string adhocServer = "localhost";  // host[:port] of the ad hoc server
+	std::string npServer, npOnlineId, npToken;  // PSPC Network (net_np.cpp)
+	std::string infraDns;                       // online-service redirects (net_infra.cpp)
+	std::string dataDir;                        // data/: infrastructure.json
 };
 // Called once per run, before the program boots (runtime.cpp).
 void Configure(const Config &config);
 bool Enabled();
+
+// ---------------------------------------------------------------- PSPC Network sign-in (net_np.cpp)
+
+// The PSN sign-in the NP sign-in dialog performs: against the PSPC Network server (np_server, with
+// the launcher's token), or locally as np_online_id when no server is set. Staying signed in for
+// the rest of the run, as the PSP's NP manager does.
+enum class NpSigninState { Idle, Working, SignedIn, Failed };
+void NpStartSignIn();  // no-op while working or signed in
+NpSigninState NpGetSignInState(std::string *message = nullptr);
+void NpResetSignIn();  // after a failure: the next NpStartSignIn tries again
+std::string NpOnlineId();
 
 // ---------------------------------------------------------------- infrastructure (sceNetApctl)
 

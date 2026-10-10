@@ -26,6 +26,7 @@ results in the interpreter and as native code.
 | I/O, UMD, memory stick, ISO/CSO/ZSO/DAX | Working |
 | sceUtility (save data, dialogs, OSK), fonts (PGF) | Working |
 | Network: infrastructure (virtual access point on the host's network, BSD sockets, DNS, HTTP/HTTPS) and ad hoc play (PPSSPP-compatible ad hoc server, `pspc --adhoc-server`) | Working. [docs/networking.md](docs/networking.md) |
+| PlayStation Network stand-in (PSPC Network: accounts, signed NP tickets, friend lists; redirects to revival servers, PPSSPP infra-dns.json compatible) | Working: Combat Ops signs in and reaches its lobby server lookup. [docs/pspc-network.md](docs/pspc-network.md), server in [server/](server/README.md) |
 | M33 layer (SystemCtrl, KUBridge, VshCtrl, config.se, plugins, NID resolver) | Working |
 | Video (sceMpeg, PSMF, psmfplayer, videocodec), JPEG | Working. H.264 via Media Foundation; `video/` 24/30, `jpeg/` 8/11; game movies play with sound |
 | Firmware tooling (M33 extraction, inventory, NID database, Ghidra pipeline, pspc-decrypt) | Working |
@@ -83,6 +84,7 @@ Useful options (`pspc --help` lists them all):
 | `--osk-text <text>` | headless: what the on-screen keyboard returns (e.g. a character name) |
 | `--config <file\|none>`, `--set key=value` | settings file to use (default `pspc.ini`), or override one entry |
 | `--fw 6.60` | firmware version reported to games |
+| `--np register\|signin\|status\|friends\|...` | PSPC Network account (see Network below) |
 | `--vsh`, `--recovery` | boot the installed firmware's XMB, or M33's recovery menu, instead of a file |
 | `--timeout <s>`, `--log <level>`, `--log-file <path>` | |
 
@@ -108,6 +110,9 @@ plugins=1          # load M33 plugins (see Plugins below)
 plugins_dir=       # folder laid over the memory stick; empty = the plugins folder
 network=1          # 0 = offline: the WLAN switch reads off
 adhoc_server=localhost  # ad hoc server (host or host:port) to meet other players through
+np_server=         # PSPC Network server (PSN stand-in); empty = games sign in locally as np_online_id
+np_online_id=      # your online ID; np_token= is written when you sign in (keep it private)
+infra_dns=         # optional revival DNS server for every game's online services
 ```
 
 Inputs: up down left right cross circle square triangle l r start select home vol_up vol_down note screen analog_up
@@ -135,6 +140,19 @@ build\RelWithDebInfo\bin\pspc.exe --adhoc-server                          :: LAN
 
 It speaks PPSSPP's protocol, so PPSSPP players and public PPSSPP servers work too. See
 [docs/networking.md](docs/networking.md) (LAN setup, the XMB's browser and Network Update, limits).
+
+**PlayStation Network.** Games that sign in to PSN (Syphon Filter: Combat Ops) sign in to
+*PSPC Network* instead: accounts, signed tickets and friend lists on a server anyone can run
+([server/README.md](server/README.md)). Press the launcher's **Network** button, enter the server's
+address, and create an account or sign in; the same dialog manages friends. Without a server,
+games sign in locally under the name you choose. Games' old server names can be pointed at
+community revival servers with an `infrastructure.json` (PPSSPP's `infra-dns.json` format works
+too). See [docs/pspc-network.md](docs/pspc-network.md).
+
+```bat
+build\RelWithDebInfo\bin\pspc.exe --np register --server https://np.example.org --id Gabe_Logan
+build\RelWithDebInfo\bin\pspc.exe --np friend-add --id Lian_Xing
+```
 
 ### Plugins
 

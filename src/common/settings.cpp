@@ -121,7 +121,7 @@ std::string JoinList(const std::vector<std::string> &names) {
 std::vector<std::string> Keys() {
 	std::vector<std::string> k = {"scale",  "fullscreen", "vsync",  "aot",  "fw",
 	                              "renderer", "render_scale", "games_dir", "plugins", "plugins_dir", "volume", "mute",
-	                              "network", "adhoc_server"};
+	                              "network", "adhoc_server", "np_server", "np_online_id", "np_token", "infra_dns"};
 	for (size_t i = 0; i < kNumControls; i++) k.push_back(std::string("key.") + kControls[i].name);
 	k.push_back("pad.stick");
 	for (size_t i = 0; i < kNumControls; i++) k.push_back(std::string("pad.") + kControls[i].name);
@@ -159,6 +159,14 @@ bool Set(Settings &s, const std::string &rawKey, const std::string &rawValue, st
 		s.renderer = l;
 	} else if (key == "games_dir") {
 		s.gamesDir = v;
+	} else if (key == "np_server") {
+		s.npServer = v;
+	} else if (key == "np_online_id") {
+		s.npOnlineId = v;
+	} else if (key == "np_token") {
+		s.npToken = v;
+	} else if (key == "infra_dns") {
+		s.infraDns = v;
 	} else if (key == "plugins_dir") {
 		s.pluginsDir = v;
 	} else if (key == "plugins") {
@@ -209,6 +217,10 @@ std::string Get(const Settings &s, const std::string &key) {
 	if (key == "mute") return B(s.mute);
 	if (key == "network") return B(s.network);
 	if (key == "adhoc_server") return s.adhocServer;
+	if (key == "np_server") return s.npServer;
+	if (key == "np_online_id") return s.npOnlineId;
+	if (key == "np_token") return s.npToken;
+	if (key == "infra_dns") return s.infraDns;
 	if (key == "pad.stick") return s.padStick;
 	if (key.size() > 4) {
 		int i = ControlIndex(key.substr(4));
@@ -273,6 +285,15 @@ std::string Template(const Settings &s) {
 	     "# with pspc --adhoc-server). localhost when playing two pspc instances on one PC.\n";
 	put("network");
 	put("adhoc_server");
+	t += "\n# PSPC Network, the PlayStation Network stand-in: np_server is the server (https://...); the\n"
+	     "# launcher's Network button signs in and stores np_online_id and np_token (keep the token private).\n"
+	     "# Without a server, games sign in locally as np_online_id. infra_dns: a DNS server that sends\n"
+	     "# every game's online services to revival servers (empty = the per-game table in\n"
+	     "# data/infrastructure.json).\n";
+	put("np_server");
+	put("np_online_id");
+	put("np_token");
+	put("infra_dns");
 	t += "\n# Keyboard: key.<control>=<SDL key name>[,<another>]. Names as SDL spells them: A-Z, 0-9,\n"
 	     "# F1-F10, Up, Down, Left, Right, Return, Space, Escape, Tab, Backspace, Left Shift, Right Shift,\n"
 	     "# Left Ctrl, Right Ctrl, Left Alt, Right Alt, Keypad 0-9, Keypad Enter, Comma, ... (empty =\n"

@@ -20,6 +20,7 @@
 // as measured on hardware (pspautotests net/primary/ether).
 #include <algorithm>
 #include <cstdio>
+#include <deque>
 #include <map>
 #include <memory>
 #include <string>
@@ -367,6 +368,8 @@ void ApctlGotIp() {
 	g_apctlLease.gateway = cfg.gateway;
 	g_apctlLease.dns1 = cfg.dns[0];
 	g_apctlLease.dns2 = cfg.dns[1];
+	// A revival DNS server answers for the game's servers (net_infra.cpp).
+	if (const u32 revival = net::InfraDnsServer()) g_apctlLease.dns1 = revival;
 	LOGI(LOG, "sceNetApctl: connected to \"%s\" through %s: IP %s, netmask %s, gateway %s, DNS %s", APCTL_SSID,
 	     cfg.adapter.c_str(), hostnet::Ipv4ToString(cfg.ip).c_str(), hostnet::Ipv4ToString(cfg.netmask).c_str(),
 	     hostnet::Ipv4ToString(cfg.gateway).c_str(), hostnet::Ipv4ToString(cfg.dns[0]).c_str());
@@ -588,6 +591,9 @@ struct InetSocket {
 	u64 abortKey = 0;
 	std::map<u64, u32> options;  // (level << 32 | name) -> value, for getsockopt
 	u8 localAddr[16] = {};       // offline: the sockaddr given to bind
+	// Datagrams pspc answered itself (DNS for redirected names, net_infra.cpp), received before
+	// anything from the host.
+	std::deque<std::pair<std::vector<u8>, sockaddr_in>> injected;
 };
 
 bool g_inetInited = false;
@@ -790,6 +796,12 @@ int BindHost(InetSocket *sock, sockaddr_in a) {
 	if (a.sin_addr.s_addr == htonl(INADDR_ANY)) a.sin_addr.s_addr = InterfaceAddress();
 	if (bind(sock->host.s, (const sockaddr *)&a, sizeof(a)) != 0) return SetErrnoFromWsa(WSAGetLastError());
 	sock->bound = true;
+	if (logging::g_level <= LogLevel::Debug) {
+		sockaddr_in got{};
+		int len = sizeof(got);
+		getsockname(sock->host.s, (sockaddr *)&got, &len);
+		LOGD(LOG, "  bound to %s:%u on the host", hostnet::Ipv4ToString(got.sin_addr.s_addr).c_str(), ntohs(got.sin_port));
+	}
 	return 0;
 }
 
@@ -988,6 +1000,15 @@ int RecvCommon(int s, u32 buf, u32 len, u32 flags, u32 fromPtr, u32 fromLenPtr) 
 	u64 deadline = Deadline(sock->rcvTimeoutUs);
 	u32 got = 0;
 	for (;;) {
+		// Checked on every pass: a thread already waiting here picks it up at its next recheck.
+		if (!sock->injected.empty() && sock->type != INET_SOCK_STREAM) {
+			const auto &d = sock->injected.front();
+			const u32 n = std::min<u32>(len, (u32)d.first.size());
+			if (n) mem::WriteBytes(buf, d.first.data(), n);
+			if (fromPtr) WriteSockaddr(fromPtr, fromLenPtr, d.second);
+			if (!(flags & hostnet::PSP_MSG_PEEK)) sock->injected.pop_front();
+			return (int)n;
+		}
 		char *p = (char *)GPtr(buf) + got;
 		sockaddr_in from{};
 		int fromLen = sizeof(from);
@@ -1015,10 +1036,45 @@ int RecvCommon(int s, u32 buf, u32 len, u32 flags, u32 fromPtr, u32 fromLenPtr) 
 	}
 }
 
+// The DNS server the access point told the game about (the host's, or a revival server).
+bool IsDnsServer(const sockaddr_in &to) {
+	return ntohs(to.sin_port) == 53 && to.sin_addr.s_addr != 0 &&
+	       (to.sin_addr.s_addr == g_apctlLease.dns1 || to.sin_addr.s_addr == g_apctlLease.dns2);
+}
+
+// A DNS query the game sends itself (SCE-RT games resolve their servers this way): answered here
+// when the name is redirected to a revival server (net_infra.cpp). Returns the bytes "sent", or -1
+// to send the query on to the real server.
+int TryAnswerDns(int s, u32 buf, u32 len, const sockaddr_in &to) {
+	if (len < 12 || len > 512 || !mem::IsValidRange(buf, len) || !net::InfraHasRedirects()) return -1;
+	struct Out {
+		std::vector<u8> query, response;
+		bool answered = false;
+	};
+	auto out = std::make_shared<Out>();
+	out->query.resize(len);
+	mem::ReadBytes(out->query.data(), buf, len);
+	const bool done = net::RunBlockingOnHost(
+		[out] { out->answered = net::InfraAnswerDnsQuery(out->query.data(), out->query.size(), &out->response); },
+		sched::NowUs() + 5000000);
+	InetSocket *sock = GetSocket(s);
+	if (!done || !out->answered || !sock) return -1;
+	sock->injected.push_back({out->response, to});
+	return (int)len;
+}
+
 int sceNetInetSend(int s, u32 buf, u32 len, u32 flags) {
 	InetSocket *sock = GetSocket(s);
 	if (!sock) return SetErrno(net::INET_EBADF);
 	if (!sock->host.Valid()) return SetErrno(sock->type == INET_SOCK_STREAM ? net::INET_ENOTCONN : net::INET_EDESTADDRREQ);
+	if (sock->type == INET_SOCK_DGRAM) {
+		sockaddr_in peer{};
+		int peerLen = sizeof(peer);
+		if (getpeername(sock->host.s, (sockaddr *)&peer, &peerLen) == 0 && IsDnsServer(peer)) {
+			const int r = TryAnswerDns(s, buf, len, peer);
+			if (r >= 0) return r;
+		}
+	}
 	return SendCommon(s, buf, len, flags, nullptr);
 }
 int sceNetInetSendto(int s, u32 buf, u32 len, u32 flags, u32 toPtr, u32 toLen) {
@@ -1032,6 +1088,10 @@ int sceNetInetSendto(int s, u32 buf, u32 len, u32 flags, u32 toPtr, u32 toLen) {
 	sockaddr_in to;
 	int err;
 	if (!ReadSockaddr(toPtr, (int)toLen, &to, &err)) return SetErrno(err);
+	if (sock->type == INET_SOCK_DGRAM && IsDnsServer(to)) {
+		const int r = TryAnswerDns(s, buf, len, to);
+		if (r >= 0) return r;
+	}
 	return SendCommon(s, buf, len, flags, &to);
 }
 
@@ -1309,6 +1369,7 @@ int sceNetInetGetpeername(int s, u32 namePtr, u32 nameLenPtr) {
 hostnet::Readiness SocketReadiness(InetSocket *sock) {
 	hostnet::Readiness r;
 	if (!sock->host.Valid() || !hostnet::CheckReady(sock->host.s, &r)) return hostnet::Readiness{};
+	if (!sock->injected.empty()) r.read = true;
 	if (sock->connecting && (r.write || r.except)) {
 		sock->connecting = false;
 		if (r.except) {
@@ -1560,8 +1621,9 @@ int sceNetResolverStartNtoA(int id, u32 hostnamePtr, u32 inAddrPtr, int timeout,
 		u32 addr = 0;
 	};
 	auto res = std::make_shared<Result>();
-	bool done = net::RunBlockingOnHost([res, host] { res->rc = hostnet::ResolveIpv4(host, &res->addr); },
-	                                   ResolverDeadline(timeout, retry), key);
+	bool done = net::RunBlockingOnHost(
+		[res, host] { res->rc = net::InfraRedirect(host, &res->addr) ? 0 : hostnet::ResolveIpv4(host, &res->addr); },
+		ResolverDeadline(timeout, retry), key);
 	it = g_resolvers.find(id);
 	bool stopped = it == g_resolvers.end() || !it->second.running;
 	if (it != g_resolvers.end()) it->second.running = false;

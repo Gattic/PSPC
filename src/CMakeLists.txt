@@ -4,6 +4,7 @@
 add_library(pspc_common STATIC
 	common/log.cpp
 	common/fileutil.cpp
+	common/json.cpp
 	common/seplugins.cpp
 	common/settings.cpp
 	common/sha1.cpp

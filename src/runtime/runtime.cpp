@@ -338,7 +338,15 @@ int RunOnce(const Options &o, BootTarget bt) {
 	display::Init();
 	for (const Options::Press &p : o.presses) ctrl::AddScriptedPress(p.vblank, p.buttons, p.frames);
 	utility::SetHeadlessOskText(o.oskText);
-	net::Configure(net::Config{o.network, o.adhocServer});
+	net::Config netConfig;
+	netConfig.enabled = o.network;
+	netConfig.adhocServer = o.adhocServer;
+	netConfig.npServer = o.npServer;
+	netConfig.npOnlineId = o.npOnlineId;
+	netConfig.npToken = o.npToken;
+	netConfig.infraDns = o.infraDns;
+	netConfig.dataDir = o.dataDir;
+	net::Configure(netConfig);
 	if (!o.dumpFramesDir.empty()) {
 		std::error_code ec;
 		fs::create_directories(fs::u8path(o.dumpFramesDir), ec);

@@ -17,6 +17,7 @@
 #include <initializer_list>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "common/common.h"
 #include "net/host_net.h"
@@ -99,6 +100,17 @@ enum InetErrno : int {
 
 // Error codes of the core / WLAN layers used by more than one file.
 constexpr u32 SCE_NET_RESOLVER_NO_DNS_SERVER = 0x80410402;
+
+// ---------------------------------------------------------------- online-service redirects (net_infra.cpp)
+
+// The running game's revival servers (data/infrastructure.json and friends, pspc.ini infra_dns).
+// InfraRedirect: true and the address (network order) when `host` goes to a revival server; may
+// block (asks a revival DNS server), so call it on a host worker. InfraAnswerDnsQuery answers a
+// DNS query (raw message) for a redirected name.
+u32 InfraDnsServer();  // a revival DNS server for every name (network order), 0 = none
+bool InfraHasRedirects();
+bool InfraRedirect(const std::string &host, u32 *addr);
+bool InfraAnswerDnsQuery(const u8 *query, size_t size, std::vector<u8> *response);
 
 // ---------------------------------------------------------------- guest <-> host glue (net_host.cpp)
 

@@ -410,7 +410,14 @@ int sceHttpSendRequest(u32 id, u32 dataAddr, u32 dataSize) {
 	r->networkErrno = 0;
 	u64 key = r->abortKey;
 	LOGI(LOG, "sceHttpSendRequest(%08x): %s %s", id, spec.method.c_str(), url.c_str());
-	bool done = net::RunBlockingOnHost([xfer, spec] { xfer->error = xfer->exchange.Send(spec); }, 0, key);
+	bool done = net::RunBlockingOnHost(
+		[xfer, spec, host]() mutable {
+			// The game's server may live on as a revival server (net_infra.cpp).
+			u32 revival = 0;
+			if (!IsDottedAddress(host) && net::InfraRedirect(host, &revival)) spec.connectAddress = hostnet::Ipv4ToString(revival);
+			xfer->error = xfer->exchange.Send(spec);
+		},
+		0, key);
 	r = RequestOf(id);
 	if (!r || r->transfer != xfer) return (int)SCE_HTTP_ERROR_ABORTED;  // deleted or re-sent meanwhile
 	if (!done || r->aborted) {

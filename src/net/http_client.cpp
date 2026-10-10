@@ -99,6 +99,8 @@ u32 HttpExchange::Send(const HttpRequestSpec &spec) {
 		int send = spec.sendTimeoutMs ? (int)spec.sendTimeoutMs : 30000;
 		int recv = spec.recvTimeoutMs ? (int)spec.recvTimeoutMs : 30000;
 		WinHttpSetTimeouts(session, resolve, conn, send, recv);
+		const std::wstring originalHost = host;
+		if (!spec.connectAddress.empty()) host = Widen(spec.connectAddress);
 		connect = WinHttpConnect(session, host.c_str(), uc.nPort, 0);
 		if (!connect) return GetLastError();
 		connect_ = connect;
@@ -112,6 +114,15 @@ u32 HttpExchange::Send(const HttpRequestSpec &spec) {
 		if (!spec.cookies) features |= WINHTTP_DISABLE_COOKIES;
 		if (features) WinHttpSetOption(request, WINHTTP_OPTION_DISABLE_FEATURE, &features, sizeof(features));
 		std::wstring headers;
+		if (!spec.connectAddress.empty()) {
+			const bool defaultPort = uc.nPort == (secure ? INTERNET_DEFAULT_HTTPS_PORT : INTERNET_DEFAULT_HTTP_PORT);
+			headers += L"Host: " + originalHost + (defaultPort ? L"" : L":" + std::to_wstring(uc.nPort)) + L"\r\n";
+			if (secure) {
+				DWORD flags = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID |
+				              SECURITY_FLAG_IGNORE_CERT_DATE_INVALID | SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+				WinHttpSetOption(request, WINHTTP_OPTION_SECURITY_FLAGS, &flags, sizeof(flags));
+			}
+		}
 		for (auto &h : spec.headers) headers += Widen(h.first) + L": " + Widen(h.second) + L"\r\n";
 		if (!headers.empty() &&
 		    !WinHttpAddRequestHeaders(request, headers.c_str(), (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE))
