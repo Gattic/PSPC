@@ -62,6 +62,8 @@ struct Settings {
 	bool hostSfco = false;          // the Syphon Filter: Combat Ops server
 	std::string hostSfcoAddress;    // the address players reach it at ("" = this PC's LAN address)
 	bool hostSfcoAllowLocal = true; // also let in players without a PSPC Network account
+	bool hostGameSpy = false;       // the GameSpy server (Star Wars Battlefront: Elite Squadron)
+	std::string hostGameSpyAddress; // the address players on other PCs reach it at ("" = this PC's LAN address)
 	bool hostAdhoc = false;         // the ad hoc server (pspc --adhoc-server)
 	// One comma-separated binding list per kControls entry ("" = unbound).
 	std::vector<std::string> keys, pads;

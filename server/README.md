@@ -133,6 +133,14 @@ leaderboards, cells, a message board), which checks players' tickets with this s
 python -m pspc_medius --db sfco.sqlite serve --public-host 203.0.113.7 --umd SFCO.iso --network https://np.example.org
 ```
 
+`pspc_gamespy` replaces GameSpy's servers for Star Wars Battlefront: Elite Squadron (accounts,
+friends, hosted games, NAT negotiation, stats, leaderboards); it has accounts of its own, made in
+the game: see [docs/gamespy-server.md](../docs/gamespy-server.md).
+
+```sh
+python -m pspc_gamespy --db gamespy.sqlite serve --public-host 203.0.113.7
+```
+
 ## Tests
 
 ```sh

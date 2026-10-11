@@ -35,10 +35,12 @@
       "name": "Star Wars Battlefront: Elite Squadron",
       "ids": ["ULUS10390"],
       "hosts": [
-        "gpcm.gamespy.com, gpsp.gamespy.com (GameSpy Presence)",
-        "swbfespsp.available.gamespy.com, swbfespsp.master.gamespy.com, swbfespsp.ms<n>.gamespy.com (GameSpy master server)",
-        "natneg1.gamespy.com, natneg2.gamespy.com, natneg3.gamespy.com (NAT negotiation)",
-        "gamestats.gamespy.com (/swbfespsp), motd.gamespy.com"
+        "gpcm.gamespy.com:29900, gpsp.gamespy.com:29901 (GameSpy Presence)",
+        "swbfespsp.available.gamespy.com, swbfespsp.master.gamespy.com (UDP 27900: QR2 master server)",
+        "swbfespsp.ms<n>.gamespy.com:28910 (server browser)",
+        "swbfespsp.natneg1.gamespy.com, swbfespsp.natneg2.gamespy.com, swbfespsp.natneg3.gamespy.com (UDP 27901: NAT negotiation)",
+        "swbfespsp.sdkdev.gamespy.com:29920 (stats), sdkdev.gamespy.com:80 (/games/swbfespsp/web/bfes_score.asp: leaderboards), motd.gamespy.com:80",
+        "A server for all of them: server/pspc_gamespy (docs/gamespy-server.md); redirect *.gamespy.com"
       ],
       "domains": {}
     }

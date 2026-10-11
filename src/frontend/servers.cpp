@@ -58,9 +58,12 @@ std::string Narrow(const std::wstring &w) {
 std::wstring Q(const std::wstring &s) { return L"\"" + s + L"\""; }
 std::wstring Q(const fs::path &p) { return Q(p.wstring()); }
 
-const wchar_t *FileName(Kind k) { return k == Kind::Network ? L"pspc_network" : k == Kind::Sfco ? L"sfco" : L"adhoc"; }
-const wchar_t *Module(Kind k) { return k == Kind::Network ? L"pspc_network" : L"pspc_medius"; }
+const wchar_t *FileName(Kind k) {
+	return k == Kind::Network ? L"pspc_network" : k == Kind::Sfco ? L"sfco" : k == Kind::GameSpy ? L"gamespy" : L"adhoc";
+}
+const wchar_t *Module(Kind k) { return k == Kind::Network ? L"pspc_network" : k == Kind::GameSpy ? L"pspc_gamespy" : L"pspc_medius"; }
 fs::path Database(Kind k) { return DataDir() / (std::wstring(FileName(k)) + L".sqlite"); }
+fs::path StatusPath(Kind k) { return DataDir() / (std::wstring(FileName(k)) + L".status.json"); }
 
 // The Python that comes with PSPC, else the newest Python 3.9+ installed for this user or for all,
 // else the py launcher, else python.exe on PATH (not the Microsoft Store's stand-in).
@@ -244,7 +247,13 @@ fs::path DataDir() { return g_exeDir / "servers"; }
 fs::path LogPath(Kind k) { return DataDir() / (std::wstring(FileName(k)) + L".log"); }
 
 int Port(Kind k, const settings::Settings &s) {
-	return k == Kind::Network ? s.hostNetworkPort : k == Kind::Sfco ? 10071 : kAdhocPort;
+	return k == Kind::Network ? s.hostNetworkPort : k == Kind::Sfco ? 10071 : k == Kind::GameSpy ? 29900 : kAdhocPort;
+}
+
+std::string Status(Kind k) {
+	const Proc &p = g_procs[Index(k)];
+	if (k != Kind::GameSpy || !p.process || p.state != State::Running) return "";
+	return ReadText(StatusPath(k));
 }
 
 bool Start(Kind k, const settings::Settings &s, const std::wstring &umd, std::wstring *error) {
@@ -274,6 +283,10 @@ bool Start(Kind k, const settings::Settings &s, const std::wstring &umd, std::ws
 		if (k == Kind::Network) {
 			cmd += L" --listen " + std::wstring(s.hostNetworkLan ? L"0.0.0.0:" : L"127.0.0.1:") + std::to_wstring(port) + L" --name " +
 			       Q(L"PSPC Network on " + ComputerName());
+		} else if (k == Kind::GameSpy) {
+			cmd += L" --public-host " + (s.hostGameSpyAddress.empty() ? LanAddress() : Widen(s.hostGameSpyAddress)) + L" --status-file " +
+			       Q(StatusPath(k));
+			fs::remove(StatusPath(k), ec);
 		} else {
 			cmd += L" --public-host " + (s.hostSfcoAddress.empty() ? LanAddress() : Widen(s.hostSfcoAddress));
 			if (!umd.empty()) cmd += L" --umd " + Q(umd);

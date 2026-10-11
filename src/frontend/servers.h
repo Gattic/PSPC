@@ -2,7 +2,8 @@
 //
 // The servers pspc-launcher runs on this PC (its Online page): the PSPC Network server
 // (server/pspc_network: accounts and sign-in, the PlayStation Network stand-in), game servers
-// (server/pspc_medius: Syphon Filter: Combat Ops) and the ad hoc server (pspc --adhoc-server).
+// (server/pspc_medius: Syphon Filter: Combat Ops; server/pspc_gamespy: GameSpy games) and the ad hoc
+// server (pspc --adhoc-server).
 // Each is a child process writing to a log file in the servers folder next to pspc.exe, with its
 // database there too; they stop when the launcher closes (a job object kills them).
 //
@@ -23,8 +24,8 @@
 
 namespace servers {
 
-enum class Kind { Network, Sfco, Adhoc };
-constexpr int kKinds = 3;
+enum class Kind { Network, Sfco, Adhoc, GameSpy };
+constexpr int kKinds = 4;
 inline int Index(Kind k) { return (int)k; }
 
 enum class State { Stopped, Starting, Running, Failed };
@@ -33,6 +34,15 @@ enum class State { Stopped, Starting, Running, Failed };
 constexpr const char *kSfcoDiscId = "NPUG80114";
 constexpr const char *kSfcoDomain = "combatops.psp.online.scea.com";
 constexpr int kAdhocPort = 27312;
+
+// The games Kind::GameSpy serves. Their redirect sends every GameSpy name (*.gamespy.com) to a
+// server; OpenSpy's public servers have the same names under openspy.net.
+struct GameSpyGame {
+	const char *discId, *name;
+};
+constexpr GameSpyGame kGameSpyGames[] = {{"ULUS10390", "Star Wars Battlefront: Elite Squadron"}};
+constexpr const char *kGameSpyDomain = "*.gamespy.com";
+constexpr const char *kOpenSpyTarget = "*.openspy.net";
 
 // exeDir: where pspc.exe is (the servers folder and an installed PSPC's python\ and server\ are
 // next to it).
@@ -46,6 +56,9 @@ std::wstring PythonCommand();
 std::wstring Missing(Kind k);
 fs::path DataDir();  // <exe dir>\servers
 fs::path LogPath(Kind k);
+// What a running server says about itself (Kind::GameSpy: who is online, the hosted games), as
+// JSON; "" if it doesn't say.
+std::string Status(Kind k);
 int Port(Kind k, const settings::Settings &s);
 
 // Starts a server with the settings (Kind::Sfco: umd is the game's disc image, for its official

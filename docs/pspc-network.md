@@ -71,7 +71,8 @@ PSPC can answer those lookups with a revival server's address. The table is read
 
 1. `infrastructure.json` next to pspc.exe (your own),
 2. `data/infrastructure.json` (shipped with PSPC: lists the servers each supported game uses,
-   no revival servers yet; for Combat Ops, run [its server](combat-ops-server.md)),
+   no revival servers yet; for Combat Ops and Elite Squadron, run their servers:
+   [combat-ops-server.md](combat-ops-server.md), [gamespy-server.md](gamespy-server.md)),
 3. PPSSPP's `infra-dns.json`, next to pspc.exe or in `data/`.
 
 The format is PPSSPP's, so community revival tables work unchanged:
@@ -90,7 +91,10 @@ The format is PPSSPP's, so community revival tables work unchanged:
 ```
 
 `ids` (or PPSSPP's `known_working_ids`, `other_ids`, `not_working_ids`) are disc IDs. `domains`
-maps a host name to an IPv4 address or another host name. `dns` is a revival DNS server that
+maps a host name to an IPv4 address or another host name. A name starting with `*.` covers every
+name under it (`"*.gamespy.com": "127.0.0.1"`; an exact name wins over it, a longer wildcard over a
+shorter one), and a target starting with `*.` keeps what the wildcard matched
+(`"*.gamespy.com": "*.openspy.net"` sends `gpcm.gamespy.com` to `gpcm.openspy.net`). `dns` is a revival DNS server that
 answers for all of the game's other names. pspc.ini `infra_dns=` is a revival DNS server for every
 game.
 

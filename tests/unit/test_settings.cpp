@@ -78,6 +78,9 @@ TEST(settings_set_validates) {
 	CHECK(!settings::Set(s, "host_network_port", "70000") && s.hostNetworkPort == 9000);
 	CHECK(settings::Set(s, "host_sfco_address", "203.0.113.7") && s.hostSfcoAddress == "203.0.113.7");
 	CHECK(!settings::Set(s, "host_sfco_address", "http://x/") && s.hostSfcoAddress == "203.0.113.7");
+	CHECK(!s.hostGameSpy && settings::Set(s, "host_gamespy", "1") && s.hostGameSpy);
+	CHECK(settings::Set(s, "host_gamespy_address", "gs.example.org") && s.hostGameSpyAddress == "gs.example.org" &&
+	      settings::Get(s, "host_gamespy_address") == "gs.example.org");
 	CHECK(settings::Set(s, "host_adhoc", "1") && settings::Get(s, "host_adhoc") == "1");
 }
 

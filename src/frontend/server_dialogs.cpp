@@ -40,6 +40,7 @@ enum : int {
 	IDC_FOLDER,
 	IDC_TEXT,
 	IDC_TEXT2,
+	IDC_PUBLIC,
 };
 
 std::wstring Widen(const std::string &s) {
@@ -156,6 +157,7 @@ struct ChooseState {
 	bool allowNone;
 	Target target;
 	std::wstring address;
+	const wchar_t *publicOption;
 };
 
 void SyncChoose(HWND dlg) { EnableWindow(GetDlgItem(dlg, IDC_ADDRESS), IsDlgButtonChecked(dlg, IDC_OTHER) == BST_CHECKED); }
@@ -169,16 +171,22 @@ INT_PTR CALLBACK ChooseProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
 		        IDC_THISPC);
 		Control(dlg, L"BUTTON", L"A server on another PC, or on the internet, at:", BS_AUTORADIOBUTTON, 14, 56, 246, 11, IDC_OTHER);
 		int y = 90;
+		if (st->publicOption) {
+			Control(dlg, L"BUTTON", st->publicOption, BS_AUTORADIOBUTTON, 14, y, 246, 11, IDC_PUBLIC);
+			y += 16;
+		}
 		if (st->allowNone) {
-			Control(dlg, L"BUTTON", L"Nowhere (the game's own servers, which Sony closed)", BS_AUTORADIOBUTTON, 14, 90, 246, 11, IDC_NONE);
-			y = 106;
+			Control(dlg, L"BUTTON", L"Nowhere (the game's own servers, which closed)", BS_AUTORADIOBUTTON, 14, y, 246, 11, IDC_NONE);
+			y += 16;
 		}
 		// (Created after the radio buttons, so they stay one group.)
 		Control(dlg, L"EDIT", st->address.c_str(), ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP | WS_GROUP, 26, 70, 234, 13, IDC_ADDRESS);
 		SendDlgItemMessageW(dlg, IDC_ADDRESS, EM_SETCUEBANNER, TRUE, (LPARAM)L"192.168.1.20, or a host name such as sfco.example.org");
 		Control(dlg, L"BUTTON", L"OK", BS_DEFPUSHBUTTON | WS_TABSTOP | WS_GROUP, 156, y + 8, 50, 14, IDOK);
 		Control(dlg, L"BUTTON", L"Cancel", BS_PUSHBUTTON | WS_TABSTOP, 210, y + 8, 50, 14, IDCANCEL);
-		CheckDlgButton(dlg, st->target == Target::ThisPc ? IDC_THISPC : st->target == Target::Other ? IDC_OTHER : IDC_NONE, BST_CHECKED);
+		CheckDlgButton(dlg,
+		               st->target == Target::ThisPc ? IDC_THISPC : st->target == Target::Other ? IDC_OTHER : st->target == Target::Public ? IDC_PUBLIC : IDC_NONE,
+		               BST_CHECKED);
 		SyncChoose(dlg);
 		ui::ThemeDialog(dlg);
 		return TRUE;
@@ -188,14 +196,16 @@ INT_PTR CALLBACK ChooseProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
 		case IDC_THISPC:
 		case IDC_OTHER:
 		case IDC_NONE:
+		case IDC_PUBLIC:
 			SyncChoose(dlg);
 			if (LOWORD(wp) == IDC_OTHER) SetFocus(GetDlgItem(dlg, IDC_ADDRESS));
 			return TRUE;
 		case IDOK: {
 			std::wstring address = ItemText(dlg, IDC_ADDRESS);
-			Target t = IsDlgButtonChecked(dlg, IDC_THISPC) == BST_CHECKED ? Target::ThisPc
-			           : IsDlgButtonChecked(dlg, IDC_OTHER) == BST_CHECKED ? Target::Other
-			                                                               : Target::None;
+			Target t = IsDlgButtonChecked(dlg, IDC_THISPC) == BST_CHECKED  ? Target::ThisPc
+			           : IsDlgButtonChecked(dlg, IDC_OTHER) == BST_CHECKED  ? Target::Other
+			           : IsDlgButtonChecked(dlg, IDC_PUBLIC) == BST_CHECKED ? Target::Public
+			                                                                : Target::None;
 			if (t == Target::Other) {
 				// Accept "http://host:port/..." pasted from somewhere: keep the host.
 				size_t scheme = address.find(L"://");
@@ -516,6 +526,147 @@ INT_PTR CALLBACK SfcoProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
 	return FALSE;
 }
 
+// ---- the GameSpy server
+
+enum GsView { kGsPlayers, kGsCareers, kGsGames };
+
+struct GameSpyState {
+	settings::Settings *s = nullptr;
+	HWND list = nullptr;
+	GsView view = kGsPlayers;
+	std::vector<std::wstring> ids;  // per player row: the name the actions take
+	bool changed = false;
+};
+
+std::wstring Num(double v) { return std::to_wstring((long long)(v + (v < 0 ? -0.5 : 0.5))); }
+
+std::wstring Hours(double seconds) {
+	wchar_t buf[32];
+	swprintf(buf, 32, L"%.1f h", seconds / 3600.0);
+	return buf;
+}
+
+void LoadGameSpy(HWND dlg, GameSpyState &st) {
+	ListView_DeleteAllItems(st.list);
+	st.ids.clear();
+	for (int id : {IDC_A, IDC_B, IDC_C}) ShowWindow(GetDlgItem(dlg, id), st.view == kGsPlayers ? SW_SHOW : SW_HIDE);
+	std::string out;
+	switch (st.view) {
+	case kGsPlayers:
+		Columns(st.list, {{L"Player", 30}, {L"E-mail", 32}, {L"Last seen", 22}, {L"Status", 16}});
+		if (!AdminOrSay(dlg, servers::Kind::GameSpy, {L"--json", L"accounts"}, &out)) return;
+		for (const json::Value &a : json::Value::Parse(out).Array()) {
+			std::wstring name = Widen(a["uniquenick"].String(""));
+			if (name.empty()) name = Widen(a["name"].String(""));
+			double seen = a["last_login"].Number();
+			Row(st.list, {name, Widen(a["email"].String("")), Date(seen > 0 ? seen : a["created"].Number()), a["banned"].Bool() ? L"Banned" : L""},
+			    (LPARAM)st.ids.size());
+			st.ids.push_back(name);
+		}
+		break;
+	case kGsCareers:
+		Columns(st.list, {{L"Player", 28}, {L"Games", 12}, {L"Kills", 12}, {L"Deaths", 12}, {L"Won", 12}, {L"Lost", 12}, {L"Online", 12}});
+		if (!AdminOrSay(dlg, servers::Kind::GameSpy, {L"--json", L"stats"}, &out)) return;
+		for (const json::Value &p : json::Value::Parse(out).Array()) {
+			const json::Value &t = p["stats"];
+			Row(st.list,
+			    {Widen(p["name"].String("")), Num(t["games"].Number()), Num(t["kills"].Number()), Num(t["deaths"].Number()), Num(t["wins"].Number()),
+			     Num(t["losses"].Number()), Hours(t["time"].Number())},
+			    0);
+		}
+		break;
+	case kGsGames:
+		Columns(st.list, {{L"Started", 22}, {L"Host", 24}, {L"Map", 36}, {L"", 18}});
+		if (!AdminOrSay(dlg, servers::Kind::GameSpy, {L"--json", L"games"}, &out)) return;
+		for (const json::Value &g : json::Value::Parse(out).Array())
+			Row(st.list, {Date(g["started"].Number()), Widen(g["host_name"].String("")), Widen(g["map"].String("")),
+			              g["finished"].Number() > 0 ? L"Finished" : L""},
+			    0);
+		break;
+	}
+}
+
+void GameSpyAction(HWND dlg, GameSpyState &st, int button) {
+	int sel = SelectedParam(st.list);
+	std::wstring id = st.view == kGsPlayers && sel >= 0 && (size_t)sel < st.ids.size() ? st.ids[sel] : L"";
+	if (id.empty()) return;
+	if (button == IDC_C) {
+		AskState ask;
+		ask.prompt = L"New password for " + id + L":";
+		ask.prompt2 = L"The same again:";
+		ask.password = true;
+		if (Ask(dlg, L"New password", ask) &&
+		    AdminOrSay(dlg, servers::Kind::GameSpy, {L"passwd", id, L"--password-stdin"}, nullptr, Narrow(ask.value)))
+			MessageBoxW(dlg, (L"The password of " + id + L" is changed; they log in to GameSpy again with it.").c_str(), L"PSPC",
+			            MB_ICONINFORMATION);
+		return;
+	}
+	if (AdminOrSay(dlg, servers::Kind::GameSpy, {button == IDC_A ? L"ban" : L"unban", id})) LoadGameSpy(dlg, st);
+}
+
+INT_PTR CALLBACK GameSpyProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
+	GameSpyState *st = State<GameSpyState>(dlg, msg, lp);
+	switch (msg) {
+	case WM_INITDIALOG: {
+		Control(dlg, L"BUTTON", L"Server", BS_GROUPBOX, 7, 5, 346, 78, -1);
+		Control(dlg, L"STATIC", L"Other PCs reach it at", SS_LEFT, 15, 21, 72, 10, -1);
+		Control(dlg, L"EDIT", L"", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP | WS_GROUP, 90, 19, 178, 13, IDC_ADDRESS);
+		SetDlgItemTextW(dlg, IDC_ADDRESS, Widen(st->s->hostGameSpyAddress).c_str());
+		std::wstring cue = servers::LanAddress() + L" (this PC on your network)";
+		SendDlgItemMessageW(dlg, IDC_ADDRESS, EM_SETCUEBANNER, TRUE, (LPARAM)cue.c_str());
+		Control(dlg, L"STATIC",
+		        L"Leave it empty for players on your network. For players over the internet: your public address, with TCP 80, "
+		        L"28910 and 29900-29920 and UDP 27900-27901 forwarded to this PC on your router. Applies the next time the server "
+		        L"starts.",
+		        SS_LEFT, 15, 37, 330, 26, -1);
+		Control(dlg, L"STATIC", L"Players create their GameSpy accounts in the game (Create New GameSpy ID).", SS_LEFT, 15, 66, 330, 10, -1);
+		Control(dlg, L"STATIC", L"Show", SS_LEFT, 10, 93, 24, 10, -1);
+		HWND view = Control(dlg, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP | WS_GROUP, 36, 91, 100, 80, IDC_VIEW);
+		for (const wchar_t *v : {L"Players", L"Careers", L"Last games"}) SendMessageW(view, CB_ADDSTRING, 0, (LPARAM)v);
+		SendMessageW(view, CB_SETCURSEL, 0, 0);
+		st->list = MakeList(dlg, 10, 108, 340, 126);
+		Control(dlg, L"BUTTON", L"Ban", BS_PUSHBUTTON | WS_TABSTOP, 10, 240, 50, 14, IDC_A);
+		Control(dlg, L"BUTTON", L"Unban", BS_PUSHBUTTON | WS_TABSTOP, 64, 240, 50, 14, IDC_B);
+		Control(dlg, L"BUTTON", L"New password...", BS_PUSHBUTTON | WS_TABSTOP, 118, 240, 70, 14, IDC_C);
+		Control(dlg, L"BUTTON", L"Refresh", BS_PUSHBUTTON | WS_TABSTOP, 192, 240, 50, 14, IDC_REFRESH);
+		Control(dlg, L"BUTTON", L"Close", BS_DEFPUSHBUTTON | WS_TABSTOP, 300, 240, 50, 14, IDOK);
+		ui::ThemeDialog(dlg);
+		LoadGameSpy(dlg, *st);
+		return TRUE;
+	}
+	case WM_COMMAND:
+		switch (LOWORD(wp)) {
+		case IDC_VIEW:
+			if (HIWORD(wp) == CBN_SELCHANGE) {
+				st->view = (GsView)SendDlgItemMessageW(dlg, IDC_VIEW, CB_GETCURSEL, 0, 0);
+				LoadGameSpy(dlg, *st);
+			}
+			return TRUE;
+		case IDC_A:
+		case IDC_B:
+		case IDC_C: GameSpyAction(dlg, *st, LOWORD(wp)); return TRUE;
+		case IDC_REFRESH: LoadGameSpy(dlg, *st); return TRUE;
+		case IDOK:
+		case IDCANCEL: {
+			std::string address = Narrow(ItemText(dlg, IDC_ADDRESS));
+			std::string err;
+			settings::Settings s = *st->s;
+			if (!settings::Set(s, "host_gamespy_address", address, &err)) {
+				MessageBoxW(dlg, L"The address is a host name or an IP address, without spaces or slashes.", L"PSPC", MB_ICONINFORMATION);
+				SetFocus(GetDlgItem(dlg, IDC_ADDRESS));
+				return TRUE;
+			}
+			st->changed = s.hostGameSpyAddress != st->s->hostGameSpyAddress;
+			*st->s = s;
+			EndDialog(dlg, IDOK);
+			return TRUE;
+		}
+		}
+		break;
+	}
+	return FALSE;
+}
+
 // ---- a server's log
 
 struct LogState {
@@ -618,9 +769,10 @@ INT_PTR CALLBACK LogProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
 
 }  // namespace
 
-bool ChooseServer(HWND owner, const wchar_t *title, const wchar_t *intro, bool allowNone, Target *target, std::wstring *address) {
-	ChooseState st{intro, allowNone, *target, *address};
-	if (Run(owner, title, 270, allowNone ? 132 : 116, ChooseProc, &st) != IDOK) return false;
+bool ChooseServer(HWND owner, const wchar_t *title, const wchar_t *intro, bool allowNone, Target *target, std::wstring *address,
+                  const wchar_t *publicOption) {
+	ChooseState st{intro, allowNone, *target, *address, publicOption};
+	if (Run(owner, title, 270, (short)(116 + (allowNone ? 16 : 0) + (publicOption ? 16 : 0)), ChooseProc, &st) != IDOK) return false;
 	*target = st.target;
 	*address = st.address;
 	return true;
@@ -635,6 +787,13 @@ bool ManageSfco(HWND owner, settings::Settings &s) {
 	SfcoState st;
 	st.s = &s;
 	Run(owner, L"Syphon Filter: Combat Ops server", 360, 262, SfcoProc, &st);
+	return st.changed;
+}
+
+bool ManageGameSpy(HWND owner, settings::Settings &s) {
+	GameSpyState st;
+	st.s = &s;
+	Run(owner, L"GameSpy server", 360, 262, GameSpyProc, &st);
 	return st.changed;
 }
 

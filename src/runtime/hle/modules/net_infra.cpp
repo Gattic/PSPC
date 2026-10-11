@@ -10,6 +10,10 @@
 // either place, whose format this is (games[].known_working_ids / other_ids / not_working_ids,
 // domains, dns). pspc.ini infra_dns= is a revival DNS server for every game.
 //
+// A domain "*.example.com" covers every name under example.com (the longest such match wins); its
+// target may be "*.other.net", which keeps the part "*" matched: "*.gamespy.com": "*.openspy.net"
+// sends gpcm.gamespy.com to gpcm.openspy.net.
+//
 // Games resolve names three ways and all are covered: sceNetResolver, sceHttp, and DNS queries
 // they send themselves over UDP (SCE-RT / Medius games do), which the socket layer hands to
 // InfraAnswerDnsQuery. With a revival DNS server the access point also reports it as the DNS server.
@@ -76,6 +80,24 @@ bool ReadTable(const fs::path &file, const std::string &discId, GameEntry *out) 
 	return false;
 }
 
+// The target of a "*.suffix" domain covering host ("" if none does).
+std::string WildcardTarget(const std::map<std::string, std::string> &domains, const std::string &host) {
+	std::string target, prefix;
+	size_t best = 0;
+	for (const auto &kv : domains) {
+		if (kv.first.size() < 3 || kv.first.compare(0, 2, "*.") != 0) continue;
+		const std::string suffix = kv.first.substr(1);  // ".example.com"
+		if (host.size() <= suffix.size() || suffix.size() <= best ||
+		    host.compare(host.size() - suffix.size(), suffix.size(), suffix) != 0)
+			continue;
+		best = suffix.size();
+		target = kv.second;
+		prefix = host.substr(0, host.size() - suffix.size());
+	}
+	if (target.size() > 2 && target.compare(0, 2, "*.") == 0) target = prefix + target.substr(1);
+	return target;
+}
+
 u32 ResolveAddress(const std::string &addr) {
 	u32 a = 0;
 	if (addr.empty()) return 0;
@@ -127,7 +149,7 @@ bool InfraRedirect(const std::string &hostIn, u32 *addr) {
 			return c->second != 0;
 		}
 		auto it = g_entry.domains.find(host);
-		if (it != g_entry.domains.end()) target = it->second;
+		target = it != g_entry.domains.end() ? it->second : WildcardTarget(g_entry.domains, host);
 		dnsServer = g_dnsServer;
 	}
 	u32 a = 0;

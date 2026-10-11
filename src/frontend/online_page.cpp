@@ -19,6 +19,7 @@ using std::min;
 #include <string>
 #include <vector>
 
+#include "common/json.h"
 #include "common/settings.h"
 #include "frontend/server_dialogs.h"
 #include "frontend/servers.h"
@@ -117,6 +118,22 @@ std::wstring ServerName(const std::string &url) { return OnOwnNetwork() ? L"this
 
 std::wstring GameUmd() { return g_hooks.findGame ? g_hooks.findGame(servers::kSfcoDiscId) : L""; }
 
+// The setting that starts a server with PSPC.
+bool &AutoStart(settings::Settings &s, Kind k) {
+	return k == Kind::Network ? s.hostNetwork : k == Kind::Sfco ? s.hostSfco : k == Kind::GameSpy ? s.hostGameSpy : s.hostAdhoc;
+}
+
+// Where the GameSpy games go online (they share one redirect: the first game's says).
+std::string GameSpyRedirect() { return servers::Redirect(servers::kGameSpyGames[0].discId, servers::kGameSpyDomain); }
+
+bool SetGameSpyRedirect(const std::string &target, std::wstring *error) {
+	for (const servers::GameSpyGame &g : servers::kGameSpyGames)
+		if (!servers::SetRedirect(g.name, g.discId, servers::kGameSpyDomain, target, error)) return false;
+	return true;
+}
+
+std::wstring GameSpyAddress() { return g_s.hostGameSpyAddress.empty() ? servers::LanAddress() : Widen(g_s.hostGameSpyAddress); }
+
 // ---- what the cards say
 
 struct Texts {
@@ -151,6 +168,21 @@ Texts TextsOf(const Card &c) {
 		                     : L"Official missions from " + fs::path(umd).filename().wstring() + L".";
 		break;
 	}
+	case Kind::GameSpy: {
+		std::string to = GameSpyRedirect();
+		t.you = to.empty()                   ? L"Elite Squadron has no GameSpy server to go online to: choose one."
+		        : IsLocalHost(to)            ? L"Elite Squadron goes online to this PC's server."
+		        : to == servers::kOpenSpyTarget ? L"Elite Squadron goes online to OpenSpy (openspy.net), the public GameSpy revival."
+		                                     : L"Elite Squadron goes online to " + Widen(to) + L".";
+		if (st == State::Running) {
+			json::Value status = json::Value::Parse(servers::Status(Kind::GameSpy));
+			size_t online = status["online"].Array().size(), games = status["games"].Array().size();
+			t.host = L"Running: " + std::to_wstring(online) + (online == 1 ? L" player" : L" players") + L" online, " + std::to_wstring(games) +
+			         (games == 1 ? L" game" : L" games") + L" hosted. Other PCs use " + GameSpyAddress() + L".";
+		}
+		t.note = L"Players make their GameSpy accounts in the game: Create New GameSpy ID.";
+		break;
+	}
 	case Kind::Adhoc: {
 		const bool ours = IsLocalHost(g_s.adhocServer);
 		t.you = ours ? L"Ad hoc play goes through this PC's server." : L"Ad hoc play goes through " + Widen(g_s.adhocServer) + L".";
@@ -168,9 +200,10 @@ Texts TextsOf(const Card &c) {
 		t.hostColor = ui::kAmber;
 	}
 	if (st == State::Stopped) {
-		t.host = c.kind == Kind::Network ? L"Run it here for you and your friends: accounts, sign-in and friend lists."
-		         : c.kind == Kind::Sfco  ? L"Host the game's lobby, matches, shared missions and leaderboards here."
-		                                 : L"Needed for ad hoc play between PSPC windows on this PC, or with friends.";
+		t.host = c.kind == Kind::Network   ? L"Run it here for you and your friends: accounts, sign-in and friend lists."
+		         : c.kind == Kind::Sfco    ? L"Host the game's lobby, matches, shared missions and leaderboards here."
+		         : c.kind == Kind::GameSpy ? L"Host GameSpy here: accounts, friends, games to join and leaderboards."
+		                                   : L"Needed for ad hoc play between PSPC windows on this PC, or with friends.";
 		if (!missing.empty()) {
 			t.host = missing;
 			t.hostColor = ui::kAmber;
@@ -278,7 +311,7 @@ void PaintCard(Gdiplus::Graphics &g, const Card &c) {
 	Pill(g, r, c.shown);
 	Texts t = TextsOf(c);
 	// The rows: a label, the text, the buttons (children) on the right.
-	const wchar_t *labels[3] = {c.kind == Kind::Network ? L"YOU" : c.kind == Kind::Sfco ? L"YOUR GAME" : L"YOUR GAMES", L"THIS PC", L""};
+	const wchar_t *labels[3] = {c.kind == Kind::Network ? L"YOU" : c.kind == Kind::Adhoc ? L"YOUR GAMES" : L"YOUR GAME", L"THIS PC", L""};
 	float textX = r.X + Df(kCardPad + kLabelW);
 	float buttonsW[3] = {Df(118 + 16) + (c.kind == Kind::Network && IsWindowVisible(c.b[kYou2]) ? Df(136) : 0),
 	                     Df(80 + 8 + 104 + 16) + (c.b[kManage] ? Df(126) : 0), 0};
@@ -311,7 +344,7 @@ void Paint(HDC hdc, int w, int h) {
 	g.Clear(ui::C(ui::kBg));
 	float y0 = -(float)g_scroll;
 	ui::Text(g, L"Online", RectF(Df(kPad), y0 + Df(18), Df(400), Df(30)), Df(22), ui::C(ui::kText), true);
-	ui::Text(g, L"Sony's servers for PSP games are gone; PSPC brings its own. Run them here for you and your friends, or use someone else's.",
+	ui::Text(g, L"The servers PSP games went online to (Sony's, GameSpy's) are gone; PSPC brings its own. Run them here for you and your friends, or use someone else's.",
 	         RectF(Df(kPad), y0 + Df(48), (float)w - 2 * Df(kPad), Df(36)), Df(12.5f), ui::C(ui::kTextFaint), false, 0, false, true);
 	for (const Card &c : g_cards) PaintCard(g, c);
 	// How friends join.
@@ -322,7 +355,8 @@ void Paint(HDC hdc, int w, int h) {
 	         L"Playing on a friend's server: in PSPC Network choose Account... and enter their address, and in each game choose "
 	         L"Change... and enter it too. Hosting for friends on other PCs: when Windows asks whether PSPC's servers (Python, "
 	         L"pspc.exe) may use the network, allow private networks. Over the internet, forward the servers' ports on your router "
-	         L"to this PC (PSPC Network: the port in its address; Combat Ops: 10070-10079 and 10443; ad hoc: 27312).",
+	         L"to this PC (PSPC Network: the port in its address; Combat Ops: 10070-10079 and 10443; GameSpy: TCP 80, 28910 and "
+	         L"29900-29920, UDP 27900-27901; ad hoc: 27312).",
 	         RectF(Df(kPad) + Df(26), fy, fw - Df(26), Df(80)), Df(12), ui::C(ui::kTextFaint), false, 0, false, true);
 	// Where the view is, when it doesn't show everything.
 	if (g_contentH > h) {
@@ -355,6 +389,7 @@ void PointGameHere(Kind k) {
 	std::wstring error;
 	if (k == Kind::Sfco && servers::Redirect(servers::kSfcoDiscId, servers::kSfcoDomain).empty())
 		servers::SetRedirect("Syphon Filter: Combat Ops", servers::kSfcoDiscId, servers::kSfcoDomain, "127.0.0.1", &error);
+	if (k == Kind::GameSpy && GameSpyRedirect().empty()) SetGameSpyRedirect("127.0.0.1", &error);
 }
 
 bool StartServer(Kind k) {
@@ -414,6 +449,18 @@ void ChangeTarget(Card &c) {
 		std::string target = t == Target::ThisPc ? "127.0.0.1" : t == Target::Other ? Narrow(address) : "";
 		if (!servers::SetRedirect("Syphon Filter: Combat Ops", servers::kSfcoDiscId, servers::kSfcoDomain, target, &error))
 			MessageBoxW(g_page, error.c_str(), L"PSPC", MB_ICONWARNING);
+	} else if (c.kind == Kind::GameSpy) {
+		std::string to = GameSpyRedirect();
+		Target t = to.empty() ? Target::None : IsLocalHost(to) ? Target::ThisPc : to == servers::kOpenSpyTarget ? Target::Public : Target::Other;
+		std::wstring address = t == Target::Other ? Widen(to) : L"";
+		if (!serverdlg::ChooseServer(g_page, L"GameSpy online",
+		                             L"Where should Star Wars Battlefront: Elite Squadron go when you choose online play? Its players "
+		                             L"log in with GameSpy accounts on that server.",
+		                             true, &t, &address, L"OpenSpy (openspy.net), the public GameSpy revival"))
+			return;
+		std::wstring error;
+		std::string target = t == Target::ThisPc ? "127.0.0.1" : t == Target::Other ? Narrow(address) : t == Target::Public ? servers::kOpenSpyTarget : "";
+		if (!SetGameSpyRedirect(target, &error)) MessageBoxW(g_page, error.c_str(), L"PSPC", MB_ICONWARNING);
 	} else {
 		Target t = IsLocalHost(g_s.adhocServer) ? Target::ThisPc : Target::Other;
 		std::wstring address = IsLocalHost(g_s.adhocServer) ? L"" : Widen(g_s.adhocServer);
@@ -435,6 +482,10 @@ void Command(Card &c, int which) {
 	case kManage:
 		if (c.kind == Kind::Network) {
 			serverdlg::NetworkAccounts(g_page);
+		} else if (c.kind == Kind::GameSpy) {
+			Reload();
+			settings::Settings s = g_s;
+			if (serverdlg::ManageGameSpy(g_page, s)) Modify([&](settings::Settings &f) { f.hostGameSpyAddress = s.hostGameSpyAddress; });
 		} else {
 			Reload();
 			settings::Settings s = g_s;
@@ -449,7 +500,7 @@ void Command(Card &c, int which) {
 	case kAuto: {
 		bool on = !ui::Checked(c.b[kAuto]);
 		ui::SetChecked(c.b[kAuto], on);
-		Modify([&](settings::Settings &s) { (c.kind == Kind::Network ? s.hostNetwork : c.kind == Kind::Sfco ? s.hostSfco : s.hostAdhoc) = on; });
+		Modify([&](settings::Settings &s) { AutoStart(s, c.kind) = on; });
 		break;
 	}
 	case kLan: {
@@ -464,8 +515,9 @@ void Command(Card &c, int which) {
 		break;
 	}
 	case kCopy:
-		CopyText(c.kind == Kind::Network ? servers::NetworkUrl(g_s, false)
-		                                 : (g_s.hostSfcoAddress.empty() ? servers::LanAddress() : Widen(g_s.hostSfcoAddress)));
+		CopyText(c.kind == Kind::Network   ? servers::NetworkUrl(g_s, false)
+		         : c.kind == Kind::GameSpy ? GameSpyAddress()
+		                                   : (g_s.hostSfcoAddress.empty() ? servers::LanAddress() : Widen(g_s.hostSfcoAddress)));
 		break;
 	}
 	PollAll();
@@ -506,6 +558,8 @@ void MakeCards() {
 	g_cards = {
 		{Kind::Network, ui::kIconPeople, L"PSPC Network", L"Sign-in, online IDs and friends for online games: PSPC's stand-in for the PlayStation Network."},
 		{Kind::Sfco, ui::kIconGamepad, L"Syphon Filter: Combat Ops", L"The game's own online service: lobby, matches, shared missions, cells and leaderboards."},
+		{Kind::GameSpy, ui::kIconGlobe, L"GameSpy: Star Wars Battlefront: Elite Squadron",
+		 L"GameSpy's services for the game: accounts, friends, games to join and leaderboards."},
 		{Kind::Adhoc, ui::kIconWifi, L"Ad hoc", L"Local multiplayer (ad hoc mode) over a network, as PPSSPP's ad hoc servers do it."},
 	};
 	for (size_t i = 0; i < g_cards.size(); i++) {
@@ -527,7 +581,7 @@ void MakeCards() {
 
 void SyncToggles() {
 	for (Card &c : g_cards) {
-		ui::SetChecked(c.b[kAuto], c.kind == Kind::Network ? g_s.hostNetwork : c.kind == Kind::Sfco ? g_s.hostSfco : g_s.hostAdhoc);
+		ui::SetChecked(c.b[kAuto], AutoStart(g_s, c.kind));
 		if (c.b[kLan]) ui::SetChecked(c.b[kLan], g_s.hostNetworkLan);
 	}
 }
@@ -563,6 +617,8 @@ LRESULT CALLBACK PageProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		if (!g_inTimer) {
 			g_inTimer = true;
 			PollAll();
+			// The GameSpy card shows who is online: kept current.
+			if (servers::Poll(Kind::GameSpy) == State::Running) InvalidateRect(hwnd, nullptr, FALSE);
 			g_inTimer = false;
 		}
 		return 0;
@@ -639,9 +695,8 @@ void StartAutomatic() {
 	Reload();
 	std::wstring failed;
 	// PSPC Network first: the game server checks its sign-ins.
-	for (Kind k : {Kind::Network, Kind::Adhoc, Kind::Sfco}) {
-		bool on = k == Kind::Network ? g_s.hostNetwork : k == Kind::Sfco ? g_s.hostSfco : g_s.hostAdhoc;
-		if (!on) continue;
+	for (Kind k : {Kind::Network, Kind::Adhoc, Kind::Sfco, Kind::GameSpy}) {
+		if (!AutoStart(g_s, k)) continue;
 		std::wstring error;
 		if (!servers::Start(k, g_s, k == Kind::Sfco ? GameUmd() : L"", &error)) {
 			Card *c = CardOf(k);

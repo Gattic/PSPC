@@ -71,7 +71,7 @@ static void Usage() {
 	        "  --flash0 <dir>       flash0 root (default: <exe>/flash0)\n"
 	        "  --host0 <dir>        host0: root (default: the program's folder)\n"
 	        "  --umd <image>        insert a disc image while running a .prx/.elf/.pbp\n"
-	        "  --osk-text <text>    headless: what the on-screen keyboard returns\n"
+	        "  --osk-text <text>    headless: what the on-screen keyboard returns (a|b|c: one per keyboard in turn)\n"
 	        "  --fw <ver>           firmware version reported to games, e.g. 6.60 or 4.01\n"
 	        "  --scale <n>          window scale (default 2)\n"
 	        "  --version            print PSPC's version\n"

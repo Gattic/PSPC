@@ -19,7 +19,7 @@ What it does:
      running this script), laid out like python.org's "embeddable package": python.exe,
      pythonw.exe, the core DLLs, the extension modules the game servers need (and the DLLs they
      import), the standard library compiled into python3XY.zip, and a python3XY._pth that puts
-     ..\server and ..\tools on sys.path, so `python -m pspc_network ...` / `-m pspc_medius ...`
+     ..\server and ..\tools on sys.path, so `python -m pspc_network ...` / `-m pspc_medius ...` / `-m pspc_gamespy ...`
      work from any folder. The servers' .py files get unchecked-hash .pyc files (used as they are,
      never revalidated) so Python never writes __pycache__ folders that an uninstall would leave
      behind.
@@ -30,7 +30,7 @@ What it does:
 Installed layout (INSTALLDIR = %LOCALAPPDATA%\Programs\PSPC; msiexec /i <msi> INSTALLDIR=<dir>):
     pspc.exe, pspc-launcher.exe, pspc-iso.exe, pspc-decrypt.exe, SDL2.dll
     data\        data/* of the repository
-    server\      pspc_network\, pspc_medius\ (the game servers' .py files), README.md
+    server\      pspc_network\, pspc_medius\, pspc_gamespy\ (the servers' .py files), README.md
     tools\       pspc_install_fw.py
     python\      the private Python runtime (python.exe -m pspc_network ...)
     docs\        docs/*.md
@@ -102,7 +102,7 @@ BINARIES = ('pspc.exe', 'pspc-launcher.exe', 'pspc-iso.exe', 'pspc-decrypt.exe',
 LAUNCHER = 'pspc-launcher.exe'
 TOP_FILES = set(BINARIES) | {'README.md', 'LICENSE.txt', 'THIRD_PARTY.md'}
 TOP_DIRS = {'data', 'server', 'tools', 'python', 'docs', 'Games', 'plugins'}
-SERVER_PACKAGES = ('pspc_network', 'pspc_medius')
+SERVER_PACKAGES = ('pspc_network', 'pspc_medius', 'pspc_gamespy')
 # What pspc and the developer keep in bin\ (and what PSPC writes at run time): never packaged.
 FORBIDDEN_NAMES = {'flash0', 'flash1', 'ms0', 'cache', 'pspc.ini', 'screenshots', 'servers', 'pspc-recomp.exe',
                    'pspc_unittests.exe', 'pspc_decrypt_tests.exe'}

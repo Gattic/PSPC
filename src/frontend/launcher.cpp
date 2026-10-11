@@ -1583,7 +1583,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 // PSPC_LAUNCHER_SNAPSHOT=<file.png>: render the window (off screen) to a PNG and exit; with
-// PSPC_LAUNCHER_SNAPSHOT_DIALOG=settings|plugins|network, the dialog instead, with
+// PSPC_LAUNCHER_SNAPSHOT_DIALOG=settings|plugins|network|accounts|manage|gamespy|log|choose|choosegs, the dialog instead, with
 // PSPC_LAUNCHER_SNAPSHOT_PAGE=online the Online page, with PSPC_LAUNCHER_SNAPSHOT_DELAY=<ms> later than
 // 1.5 s, and with PSPC_LAUNCHER_SNAPSHOT_SEARCH=<text>, the library filtered (for checking the look of changes
 // without a desktop session).
@@ -1793,6 +1793,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int show) {
 			settings::Settings s;
 			settings::Load(settings::DefaultPath(), s);
 			serverdlg::ManageSfco(hwnd, s);
+		} else if (g_snapshotDialog == L"gamespy") {
+			settings::Settings s;
+			settings::Load(settings::DefaultPath(), s);
+			serverdlg::ManageGameSpy(hwnd, s);
+		} else if (g_snapshotDialog == L"choosegs") {
+			serverdlg::Target t = serverdlg::Target::Public;
+			std::wstring address;
+			serverdlg::ChooseServer(hwnd, L"GameSpy online", L"Where should Star Wars Battlefront: Elite Squadron go when you choose online play?",
+			                        true, &t, &address, L"OpenSpy (openspy.net), the public GameSpy revival");
 		} else if (g_snapshotDialog == L"choose") {
 			serverdlg::Target t = serverdlg::Target::Other;
 			std::wstring address = L"192.168.1.20";

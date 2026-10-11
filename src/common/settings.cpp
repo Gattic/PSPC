@@ -124,7 +124,7 @@ std::vector<std::string> Keys() {
 	                              "plugins_dir", "volume", "mute",
 	                              "network", "adhoc_server", "np_server", "np_online_id", "np_token", "infra_dns",
 	                              "host_network", "host_network_port", "host_network_lan", "host_sfco", "host_sfco_address",
-	                              "host_sfco_allow_local", "host_adhoc"};
+	                              "host_sfco_allow_local", "host_gamespy", "host_gamespy_address", "host_adhoc"};
 	for (size_t i = 0; i < kNumControls; i++) k.push_back(std::string("key.") + kControls[i].name);
 	k.push_back("pad.stick");
 	for (size_t i = 0; i < kNumControls; i++) k.push_back(std::string("pad.") + kControls[i].name);
@@ -144,7 +144,7 @@ bool Set(Settings &s, const std::string &rawKey, const std::string &rawValue, st
 		s.scale = n;
 	} else if (key == "fullscreen" || key == "vsync" || key == "aot" || key == "mute" || key == "network" ||
 	           key == "host_network" || key == "host_network_lan" || key == "host_sfco" || key == "host_sfco_allow_local" ||
-	           key == "host_adhoc") {
+	           key == "host_gamespy" || key == "host_adhoc") {
 		if (!ParseBool(v, b)) return fail("want 0 or 1");
 		(key == "fullscreen"              ? s.fullscreen
 		 : key == "vsync"                 ? s.vsync
@@ -154,14 +154,15 @@ bool Set(Settings &s, const std::string &rawKey, const std::string &rawValue, st
 		 : key == "host_network_lan"      ? s.hostNetworkLan
 		 : key == "host_sfco"             ? s.hostSfco
 		 : key == "host_sfco_allow_local" ? s.hostSfcoAllowLocal
+		 : key == "host_gamespy"          ? s.hostGameSpy
 		 : key == "host_adhoc"            ? s.hostAdhoc
 		                                  : s.mute) = b;
 	} else if (key == "host_network_port") {
 		if (!ParseInt(v, 1, 65535, n)) return fail("want a port, 1-65535");
 		s.hostNetworkPort = n;
-	} else if (key == "host_sfco_address") {
+	} else if (key == "host_sfco_address" || key == "host_gamespy_address") {
 		if (v.find_first_of(" \t/") != std::string::npos) return fail("want a host name or address");
-		s.hostSfcoAddress = v;
+		(key == "host_sfco_address" ? s.hostSfcoAddress : s.hostGameSpyAddress) = v;
 	} else if (key == "adhoc_server") {
 		if (v.empty() || v.find_first_of(" \t/") != std::string::npos) return fail("want a host name or address");
 		s.adhocServer = v;
@@ -254,6 +255,8 @@ std::string Get(const Settings &s, const std::string &key) {
 	if (key == "host_sfco") return B(s.hostSfco);
 	if (key == "host_sfco_address") return s.hostSfcoAddress;
 	if (key == "host_sfco_allow_local") return B(s.hostSfcoAllowLocal);
+	if (key == "host_gamespy") return B(s.hostGameSpy);
+	if (key == "host_gamespy_address") return s.hostGameSpyAddress;
 	if (key == "host_adhoc") return B(s.hostAdhoc);
 	if (key == "pad.stick") return s.padStick;
 	if (key.size() > 4) {
@@ -337,13 +340,17 @@ std::string Template(const Settings &s) {
 	     "# host_network: the PSPC Network server on port host_network_port (host_network_lan=0: this PC\n"
 	     "# only); host_sfco: the Syphon Filter: Combat Ops server, reached at host_sfco_address (empty =\n"
 	     "# this PC's LAN address; host_sfco_allow_local=0: only players with a PSPC Network account);\n"
-	     "# host_adhoc: the ad hoc server. Their databases and logs are in the servers folder.\n";
+	     "# host_gamespy: the GameSpy server (Star Wars Battlefront: Elite Squadron), reached by other PCs\n"
+	     "# at host_gamespy_address (empty = this PC's LAN address); host_adhoc: the ad hoc server. Their\n"
+	     "# databases and logs are in the servers folder.\n";
 	put("host_network");
 	put("host_network_port");
 	put("host_network_lan");
 	put("host_sfco");
 	put("host_sfco_address");
 	put("host_sfco_allow_local");
+	put("host_gamespy");
+	put("host_gamespy_address");
 	put("host_adhoc");
 	t += "\n# Keyboard: key.<control>=<SDL key name>[,<another>]. Names as SDL spells them: A-Z, 0-9,\n"
 	     "# F1-F10, Up, Down, Left, Right, Return, Space, Escape, Tab, Backspace, Left Shift, Right Shift,\n"

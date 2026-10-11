@@ -20,8 +20,9 @@ and [docs/RECOMPILER.md](docs/RECOMPILER.md) for how it works.
 3. Double-click a game to play it. Keyboard and controller controls are under *Settings*, and so
    are the renderer, the resolution (up to 8K with Direct3D 11) and texture upscaling.
 4. **Online:** the sidebar's *Online* page runs PSPC Network (sign-in and friends, PSPC's
-   PlayStation Network stand-in), the Syphon Filter: Combat Ops server and the ad hoc server on
-   your PC with one click, for you and your friends, or points your games at someone else's.
+   PlayStation Network stand-in), the Syphon Filter: Combat Ops server, a GameSpy server (Star
+   Wars Battlefront: Elite Squadron) and the ad hoc server on your PC with one click, for you and
+   your friends, or points your games at someone else's (or, for GameSpy, at OpenSpy).
    Everything they need comes with PSPC.
 5. Optional: the PSP's own menu (the XMB) needs Sony's firmware, which PSPC can't include. With
    Sony's PSP system software update 4.01 (its `EBOOT.PBP`), *Boot XMB* installs it. That also
@@ -55,6 +56,7 @@ results in the interpreter and as native code.
 | Network: infrastructure (virtual access point on the host's network, BSD sockets, DNS, HTTP/HTTPS) and ad hoc play (PPSSPP-compatible ad hoc server, `pspc --adhoc-server`) | Working. [docs/networking.md](docs/networking.md) |
 | PlayStation Network stand-in (PSPC Network: accounts, signed NP tickets, friend lists; redirects to revival servers, PPSSPP infra-dns.json compatible) | Working: Combat Ops signs in. [docs/pspc-network.md](docs/pspc-network.md), server in [server/](server/README.md) |
 | Combat Ops game server (`server/pspc_medius`: SCE-RT/Medius lobby and game servers, SVO portal, mission sharing, leaderboards, cells, message board) | Working on one PC: instances meet in the lobby and play unranked and ranked matches; leaderboards and the message board show in the game. [docs/combat-ops-server.md](docs/combat-ops-server.md) |
+| GameSpy server (`server/pspc_gamespy`: Presence, QR2 master server, server browser, NAT negotiation, stats, leaderboards) for Star Wars Battlefront: Elite Squadron | Working on one PC: accounts are created in the game, players log in, add friends, host and join matches; Player Rankings show. [docs/gamespy-server.md](docs/gamespy-server.md) |
 | M33 layer (SystemCtrl, KUBridge, VshCtrl, config.se, plugins, NID resolver) | Working |
 | Video (sceMpeg, PSMF, psmfplayer, videocodec), JPEG | Working. H.264 via Media Foundation; `video/` 24/30, `jpeg/` 8/11; game movies play with sound |
 | Firmware tooling (M33 extraction, inventory, NID database, Ghidra pipeline, pspc-decrypt) | Working |
@@ -188,6 +190,11 @@ games sign in locally under the name you choose. Games' old server names can be 
 community revival servers with an `infrastructure.json` (PPSSPP's `infra-dns.json` format works
 too). See [docs/pspc-network.md](docs/pspc-network.md). Combat Ops has a server of its own in this
 repository: [docs/combat-ops-server.md](docs/combat-ops-server.md).
+
+**GameSpy.** Games that went online through GameSpy (Star Wars Battlefront: Elite Squadron) use
+the GameSpy server in this repository ([docs/gamespy-server.md](docs/gamespy-server.md)): accounts
+made in the game, friends, hosting and joining matches, and leaderboards. The launcher's *Online*
+page runs it, or points the game at another one or at OpenSpy, the public GameSpy revival.
 
 ```bat
 build\RelWithDebInfo\bin\pspc.exe --np register --server https://np.example.org --id Gabe_Logan

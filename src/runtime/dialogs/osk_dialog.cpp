@@ -17,7 +17,10 @@ namespace utility {
 
 namespace {
 
-std::string g_headlessOskText;  // --osk-text
+// --osk-text: what the keyboard returns headless, one answer per keyboard in turn ("a|b|c"; the last
+// one answers the rest).
+std::vector<std::string> g_headlessOskTexts;
+size_t g_headlessOskNext = 0;
 
 constexpr int OSK_INIT_DELAY_US = 300000;
 constexpr int OSK_SHUTDOWN_DELAY_US = 40000;
@@ -743,11 +746,13 @@ int OskDialog::Update(int animSpeed) {
 	if (Headless()) {
 		// Nobody to type: the --osk-text answer if one was given, else the initial text.
 		if (framesRun_ >= 2 && !IsFadingOut() && pendingStatus_ != STATUS_FINISHED) {
-			if (!g_headlessOskText.empty()) {
-				inputChars_ = Utf8ToUtf16(g_headlessOskText);
+			if (!g_headlessOskTexts.empty()) {
+				const std::string &text = g_headlessOskTexts[std::min(g_headlessOskNext, g_headlessOskTexts.size() - 1)];
+				g_headlessOskNext++;
+				inputChars_ = Utf8ToUtf16(text);
 				u32 maxLen = FieldMaxLength();
 				if (inputChars_.size() > maxLen) inputChars_.resize(maxLen);
-				LOGI("UTIL", "OSK: returning \"%s\" (headless, --osk-text)", g_headlessOskText.c_str());
+				LOGI("UTIL", "OSK: returning \"%s\" (headless, --osk-text)", text.c_str());
 			} else {
 				LOGI("UTIL", "OSK: returning the initial text (headless)");
 			}
@@ -768,6 +773,17 @@ int OskDialog::Shutdown(bool force) {
 	return 0;
 }
 
-void SetHeadlessOskText(const std::string &text) { g_headlessOskText = text; }
+void SetHeadlessOskText(const std::string &text) {
+	g_headlessOskTexts.clear();
+	g_headlessOskNext = 0;
+	if (text.empty()) return;
+	size_t pos = 0;
+	for (;;) {
+		size_t bar = text.find('|', pos);
+		g_headlessOskTexts.push_back(text.substr(pos, bar == std::string::npos ? std::string::npos : bar - pos));
+		if (bar == std::string::npos) break;
+		pos = bar + 1;
+	}
+}
 
 }  // namespace utility
