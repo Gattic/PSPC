@@ -40,6 +40,10 @@ inline void ChargeUs(s64 us) { ChargeCycles(us * (s64)(kCpuHz / 1000000)); }
 // A syscall that keeps the CPU busy: better threads that become ready meanwhile run first (and
 // their time doesn't count), worse ones don't run. Fast-time mode only; elsewhere a no-op.
 void BusyDelayCycles(s64 cycles);
+// A driver call that works on the CPU for busyUs (as BusyDelayCycles) and then blocks for waitUs
+// (worse threads run). In real time all of it is a wait. Does nothing where a thread can't wait
+// (no thread, an interrupt, dispatch off).
+void SpendUs(u64 busyUs, u64 waitUs);
 u64 ScheduleEvent(u64 atUs, std::function<void()> fn);
 void CancelEvent(u64 id);
 // Run fn on the emulation thread as soon as possible (thread-safe; for host threads).

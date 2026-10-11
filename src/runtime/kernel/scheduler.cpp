@@ -47,6 +47,11 @@ constexpr u32 kWaitTimeoutLatencyUs = 18;
 constexpr u32 kWaitTimeoutDeadlineUs = 12;
 // A switch between two threads costs about 5us (pspautotests threads/scheduling/handoff).
 constexpr s64 kSwitchCycles = 1150;
+// A thread a timer woke (sceKernelDelayThread) that takes the CPU from another thread still
+// running spends about 10us more getting there: with a better thread delaying 200us and working
+// 150us after each wake, a busy syscall gets ~190us between wakes (threads/scheduling/
+// preemptsyscall). Onto an idle CPU it doesn't (threads/semaphores/wait).
+constexpr s64 kTimerDispatchCycles = 10 * 222;
 constexpr s64 kThreadExitCycles = 3300;
 
 struct Event {
@@ -233,7 +238,11 @@ void FreeDeadFibers() {
 
 void RunThread(PspThread *t) {
 	if (t->inReadyQueue) RemoveFromReady(t);
-	if (g_lastRun != t && g_lastRun != nullptr) ChargeCycles(kSwitchCycles);
+	if (g_lastRun != t && g_lastRun != nullptr) {
+		const bool preempts = g_lastRun->busy || (g_lastRun->status & (THREADSTATUS_READY | THREADSTATUS_RUNNING)) != 0;
+		ChargeCycles(kSwitchCycles + (t->timerWoken && preempts ? kTimerDispatchCycles : 0));
+	}
+	t->timerWoken = false;
 	g_lastRun = t;
 	g_current = t;
 	t->status = (t->status & ~(THREADSTATUS_READY | THREADSTATUS_WAIT)) | THREADSTATUS_RUNNING;
@@ -463,7 +472,10 @@ void ArmTimeout(PspThread *t) {
 		w->timeoutEventId = 0;
 		if (w->waitPaused) return;  // re-checked when the callbacks return
 		// The interrupt's own time goes to whoever has the CPU (threads/scheduling/preemptsyscall).
-		if (w->waitWakeCycles) ChargeCycles(w->waitWakeCycles);
+		if (w->waitWakeCycles) {
+			ChargeCycles(w->waitWakeCycles);
+			w->timerWoken = true;
+		}
 		TimeoutNow(w);
 	});
 }
@@ -628,6 +640,16 @@ void BusyDelayCycles(s64 cycles) {
 	g_busy.push_back(t->uid);
 	DoWait(t, WAITTYPE_HLEDELAY, 2, 0, 0, 0, false, 0, nullptr);
 	t->busy = false;
+}
+
+void SpendUs(u64 busyUs, u64 waitUs) {
+	PspThread *t = g_current;
+	if (!t || g_inInterrupt || !DispatchEnabled()) return;
+	if (g_fastTime)
+		BusyDelayCycles((s64)(busyUs * kCyclesPerUs));
+	else
+		waitUs += busyUs;
+	if (waitUs) WaitUntil(WAITTYPE_HLEDELAY, t->uid, NowUs() + waitUs, false);
 }
 
 u64 ScheduleEvent(u64 atUs, std::function<void()> fn) {

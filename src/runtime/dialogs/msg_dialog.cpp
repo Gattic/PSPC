@@ -18,7 +18,7 @@ namespace {
 
 // On a PSP this takes 534-550 ms in utility/msgdialog/dialog, and 625-675 ms when the access and
 // graphics threads share one priority and take turns (utility/msgdialog/workshare).
-constexpr int MSG_INIT_DELAY_US = 540000;
+constexpr int MSG_INIT_DELAY_US = 549000;
 constexpr int MSG_INIT_SHARED_DELAY_US = 640000;
 constexpr int MSG_SHUTDOWN_DELAY_US = 26000;
 

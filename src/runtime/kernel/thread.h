@@ -98,6 +98,10 @@ struct PspThread : KObject {
 	u32 intrPreemptCount = 0, threadPreemptCount = 0, releaseCount = 0;
 	SceUID moduleId = 0;
 
+	// The HLE function this thread called last, and hle::DeferToNextCall's action.
+	const void *lastHleCall = nullptr;
+	std::function<void()> deferredAction;
+
 	// Wait bookkeeping (the innermost wait; waits nested in callbacks save the outer one).
 	u32 waitSeq = 0;           // incremented per wait; matches timeout events to their wait
 	bool inReadyQueue = false;
@@ -107,6 +111,7 @@ struct PspThread : KObject {
 	u64 waitDeadline = 0;      // absolute us when the timeout fires, 0 = none
 	u32 waitLatencyUs = 0;     // how far past the deadline the timeout fires (not part of time left)
 	u32 waitWakeCycles = 0;    // CPU time the timer interrupt that ends the wait takes from whoever runs
+	bool timerWoken = false;   // woken by such a timer, not yet run (kTimerDispatchCycles)
 	s32 waitTimeoutResult = 0; // what a timeout wakes the wait with
 	u64 timeoutEventId = 0;
 	u32 waitValue[4] = {};     // per-wait-type data (e.g. event flag pattern)

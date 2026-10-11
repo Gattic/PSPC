@@ -111,6 +111,21 @@ int Delay(int result, u32 us) {
 	return result;
 }
 
+// The memory stick driver works on the CPU for much of a call and waits for the card for the
+// rest. Measured with an SD card in an adapter (threads/scheduling/callcosts): an open takes
+// ~9 ms, of which worse threads get 10-50%; a read 1.5 ms for 5 KB (10-50%) and 20 ms for 210 KB
+// (50-90%); a close ~100 us, all of it busy.
+constexpr u32 kMsOpenBusyUs = 6500, kMsOpenWaitUs = 2500, kMsCloseBusyUs = 100;
+u32 MsReadBusyUs(u32 bytes) { return 800 + (u32)((u64)bytes * 19 / 1000); }
+u32 MsReadWaitUs(u32 bytes) { return 200 + (u32)((u64)bytes * 70 / 1000); }
+
+bool IsMemoryStick(const FileNode *f) { return f->dev && f->dev->Class() == io::DevClass::MemoryStick; }
+
+int Spend(int result, u32 busyUs, u32 waitUs) {
+	sched::SpendUs(busyUs, waitUs);
+	return result;
+}
+
 u32 SdkVersion() {
 	// The compiled SDK version lives in SysMemUserForUser; ask it through its HLE entry point.
 	const hle::HleFunction *fn = hle::FindFunction("SysMemUserForUser", 0xFC114573);
@@ -308,6 +323,7 @@ int sceIoOpen(const char *path, int flags, int mode) {
 	}
 	g_fds[fd]->asyncPrio = g_defaultAsyncPrio;
 	LOGD("IO", "sceIoOpen(%s, %x) -> fd %d", path, flags, fd);
+	if (us && IsMemoryStick(g_fds[fd].get())) return Spend(fd, kMsOpenBusyUs, kMsOpenWaitUs);
 	return Delay(fd, us);
 }
 
@@ -376,6 +392,7 @@ int sceIoRead(int fd, u32 buf, int size) {
 	if (!sched::DispatchEnabled()) return DispatchDisabledError(f->device);
 	if (sched::InInterrupt()) return (int)SCE_KERNEL_ERROR_ILLEGAL_CONTEXT;
 	int r = DoRead(f, buf, size);
+	if (r >= 0 && IsMemoryStick(f) && !f->sectorMode) return Spend(r, MsReadBusyUs((u32)r), MsReadWaitUs((u32)r));
 	return r >= 0 ? Delay(r, RwDelayUs(size)) : r;
 }
 
@@ -413,8 +430,9 @@ int sceIoClose(int fd) {
 	FileNode *f = GetFd(fd);
 	if (!f || f->isDir) return (int)SCE_KERNEL_ERROR_BADF;
 	if (f->pending) return (int)SCE_KERNEL_ERROR_ASYNC_BUSY;
+	const bool ms = IsMemoryStick(f);
 	FreeFd(fd);
-	return Delay(0, 100);
+	return ms ? Spend(0, kMsCloseBusyUs, 0) : Delay(0, 100);
 }
 
 int sceIoReadAsync(int fd, u32 buf, int size) {
@@ -450,8 +468,9 @@ int sceIoCloseAsync(int fd) {
 	if (f->Busy()) return (int)SCE_KERNEL_ERROR_ASYNC_BUSY;
 	CloseHandle(f);
 	f->closePending = true;
-	// No delay for a close (PPSSPP #12549); the descriptor goes once the result is collected.
-	StartAsync(fd, 0, 0);
+	// As long as a sync close: a sceIoWaitAsync right after it waits (threads/scheduling/dispatch).
+	// The descriptor goes once the result is collected.
+	StartAsync(fd, 0, 100);
 	return 0;
 }
 

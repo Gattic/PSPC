@@ -20,8 +20,8 @@ pspautotests (hardware-recorded expectations), run with `tools/run_autotests.py`
 
 | Run | Passed |
 |---|---|
-| Interpreter | 526 / 559 |
-| AOT (native) | 526 / 559, identical to the interpreter test by test |
+| Interpreter | 530 / 559 |
+| AOT (native) | 530 / 559, identical to the interpreter test by test |
 
 The expected output was recorded on PSPs, some with a screen and with psplink's host0:. Where a
 test's recording differs from what pspc gives a test by default, `run_autotests.py` reproduces it

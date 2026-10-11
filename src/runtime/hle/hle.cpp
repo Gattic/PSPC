@@ -151,6 +151,15 @@ void Syscall(Ctx *c, u32 insn, u32 pc) {
 	}
 	SyscallEntry &e = g_syscalls[code];
 	e.calls++;
+	if (kernel::PspThread *t = sched::InInterrupt() ? nullptr : sched::Current()) {
+		const bool repeats = t->lastHleCall == &e;
+		t->lastHleCall = &e;
+		if (t->deferredAction && !repeats) {
+			auto fn = std::move(t->deferredAction);
+			t->deferredAction = nullptr;
+			fn();
+		}
+	}
 	// A syscall breaks an ll/sc pair (cpu/lsu/llsc), and native code runs in the default FP mode.
 	c->llbit = 0;
 	const unsigned guestCsr = _mm_getcsr();
@@ -256,6 +265,13 @@ std::string NidName(const std::string &library, u32 nid) {
 
 const char *CurrentFunctionName() { return g_current ? g_current->name.c_str() : "(none)"; }
 u32 CurrentCallerPc() { return g_currentCallerPc; }
+
+bool DeferToNextCall(std::function<void()> fn) {
+	kernel::PspThread *t = sched::InInterrupt() ? nullptr : sched::Current();
+	if (!t) return false;
+	t->deferredAction = std::move(fn);
+	return true;
+}
 
 void SetReturnU64(Ctx *c, u64 v) {
 	c->r[2] = (u32)v;

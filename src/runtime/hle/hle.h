@@ -7,6 +7,7 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
 #include <string>
 
 #include "allegrex/ctx.h"
@@ -62,6 +63,10 @@ std::string NidName(const std::string &library, u32 nid);
 // Information about the HLE call in progress (valid inside an HLE function).
 const char *CurrentFunctionName();
 u32 CurrentCallerPc();
+// Inside an HLE function: runs fn when the calling thread next calls a different HLE function
+// (replacing what an earlier call deferred), e.g. at the end of a run of calls that a guest
+// printf makes. False, and nothing deferred, without a thread.
+bool DeferToNextCall(std::function<void()> fn);
 
 // Per-call controls.
 void SetReturnU64(Ctx *c, u64 v);

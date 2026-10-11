@@ -13,9 +13,11 @@
 #include "common/log.h"
 #include "fs/vfs.h"
 #include "runtime/core/memory.h"
+#include "runtime/hle/hle.h"
 #include "runtime/kernel/callbacks.h"
 #include "runtime/kernel/errors.h"
 #include "runtime/kernel/scheduler.h"
+#include "runtime/kernel/threads.h"
 
 namespace io {
 
@@ -321,7 +323,14 @@ private:
 
 class EmulatorDevice : public Device {
 public:
-	explicit EmulatorDevice(bool hasDisplay) : hasDisplay_(hasDisplay) {}
+	explicit EmulatorDevice(bool hasDisplay) : hasDisplay_(hasDisplay) {
+		// A thread that ends right after a printf (returning from its entry) makes no further call.
+		static bool listening = false;
+		if (!listening) {
+			listening = true;
+			kernel::AddThreadEndListener([](kernel::PspThread *t) { FlushOutput(t->uid); });
+		}
+	}
 	DevClass Class() const override { return DevClass::Emulator; }
 	int Devctl(const std::string &, u32 cmd, u32 inAddr, u32 inLen, u32 outAddr, u32 outLen, u32 *) override {
 		switch (cmd) {
@@ -329,7 +338,7 @@ public:
 			if (mem::IsValidRange(outAddr, 4)) GWrite32(outAddr, hasDisplay_ ? 1 : 0);
 			return 0;
 		case 2:  // SEND_OUTPUT
-			if (inLen && mem::IsValidRange(inAddr, inLen)) logging::GuestOutput((const char *)GPtr(inAddr), inLen);
+			if (inLen && mem::IsValidRange(inAddr, inLen)) SendOutput((const char *)GPtr(inAddr), inLen);
 			return 0;
 		case 3:  // IS_EMULATOR
 			if (mem::IsValidRange(outAddr, 4)) GWrite32(outAddr, 1);
@@ -345,6 +354,41 @@ public:
 	}
 
 private:
+	// pspautotests' expectations were recorded with stdout going to an unbuffered host0: file:
+	// each printf is a single write, ~1.3 ms over USB that keeps the CPU (a thread of the same
+	// priority doesn't run meanwhile: threads/threads/change; time does pass: intr/waits). Here
+	// a printf arrives in pieces, one call each with nothing in between, so the pieces are kept
+	// together, and the line is logged and the write's time spent when the thread moves on to
+	// another call. With a display the test writes that file as well and pays there.
+	static constexpr u32 kOutputWriteUs = 1300;
+
+	void SendOutput(const char *text, u32 len) {
+		const SceUID tid = sched::CurrentId();
+		if (hasDisplay_ || !tid) {
+			logging::GuestOutput(text, len);
+			return;
+		}
+		PendingOutput()[tid].append(text, len);
+		const bool deferred = hle::DeferToNextCall([tid]() {
+			FlushOutput(tid);
+			sched::SpendUs(kOutputWriteUs, 0);
+		});
+		if (!deferred) FlushOutput(tid);
+	}
+
+	static std::map<SceUID, std::string> &PendingOutput() {
+		static std::map<SceUID, std::string> pending;
+		return pending;
+	}
+
+	static void FlushOutput(SceUID tid) {
+		auto &pending = PendingOutput();
+		auto it = pending.find(tid);
+		if (it == pending.end()) return;
+		logging::GuestOutput(it->second.data(), it->second.size());
+		pending.erase(it);
+	}
+
 	bool hasDisplay_;
 };
 

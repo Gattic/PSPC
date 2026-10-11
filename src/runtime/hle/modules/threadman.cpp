@@ -584,10 +584,11 @@ constexpr s64 kDelayCallCycles = 400;     // up to the "returns at once" decisio
 // Setting up the wait: a thread that a better one's delay hands the CPU to starts waiting late
 // enough that a 1000us delay ends the wait less than 1012us in (threads/semaphores/wait).
 constexpr s64 kDelayWaitCycles = 2750;
-// The timer interrupt that ends a delay takes about 23us of whatever thread has the CPU then: a
+// The timer interrupt that ends a delay takes about 13us of whatever thread has the CPU then, and
+// the woken thread ~10us more to take the CPU over (the scheduler's kTimerDispatchCycles): a
 // better thread delaying 200us at a time costs a busy thread about 45us per wake, switches
 // included (threads/scheduling/preemptsyscall).
-constexpr u32 kDelayWakeCycles = 23 * 222;
+constexpr u32 kDelayWakeCycles = 13 * 222;
 u64 DelayUs(u64 us) {
 	if (us < 200) us = 205;
 	// Wraps around (seen on firmware), and potentially wakes up soon.

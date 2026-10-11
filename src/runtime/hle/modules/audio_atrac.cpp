@@ -1089,14 +1089,25 @@ int UnregisterAndDeleteAtrac(int atracID) {
 	return (int)SCE_ERROR_ATRAC_BAD_ATRACID;
 }
 
-// Setting data decodes the frames before the first sample on the ME: a decoder setup plus a
-// frame decode (pspautotests threads/scheduling/callcosts).
+// Costs from pspautotests threads/scheduling/callcosts, where a worse thread's share of the CPU
+// tells working from waiting. Setting data parses the file and sets up the codec on the CPU (ATRAC3
+// ~200 us, ATRAC3+ ~900 us), then sets up the ME (~50 us, ~200 us) and decodes the frames before
+// the first sample there: ~900 us and ~3.5 ms, worse threads getting 50-90%. Even with no frame to
+// skip the caller waits (audio/atrac/headerfields).
 int AtracFrameUs(const Atrac2 *atrac) { return AudioCodecDecodeUs(atrac->CodecType(), atrac->Channels(), atrac->BytesPerFrame()); }
 
 int AtracSetDataDelay(const Atrac2 *atrac) {
-	const int us = AudioCodecInitUs(atrac->CodecType(), atrac->Channels() == 1) + atrac->SkippedFramesOnSetData() * AtracFrameUs(atrac);
-	return MEScheduleJob(us);
+	const bool plus = atrac->CodecType() == PSP_CODEC_AT3PLUS;
+	sched::SpendUs(plus ? 900 : 200, 0);
+	return MEScheduleJob((plus ? 200 : 50) + atrac->SkippedFramesOnSetData() * AtracFrameUs(atrac));
 }
+
+// The first decode after setting data also sets up the output on the CPU, ~200 us while the ME
+// already decodes, and ATRAC3+'s first frame takes ~500 us longer there (callcosts: ~700 us with
+// 50-90% for worse threads, ~3.0 ms with over 90%).
+bool g_atracFirstDecode[PSP_MAX_ATRAC_IDS] = {};
+constexpr u64 kFirstDecodeBusyUs = 200;
+constexpr int kFirstDecodePlusUs = 500;
 
 u32 AtracSetDataError(int ret, const Track &track) {
 	if (ret != (int)SCE_ERROR_ATRAC_API_FAIL) return (u32)ret;
@@ -1152,7 +1163,10 @@ int AnalyzeAA3(u32 buffer, u32 size, u32 fileSize, Track *track) {
 u32 sceAtracGetAtracID(int codecType) {
 	EnsureInit();
 	if (codecType != PSP_CODEC_AT3 && codecType != PSP_CODEC_AT3PLUS) return SCE_ERROR_ATRAC_INVALID_CODECTYPE;
-	return (u32)AllocAndRegisterAtrac(codecType);
+	const int id = AllocAndRegisterAtrac(codecType);
+	// 10-30 us of work (callcosts).
+	if (id >= 0) sched::SpendUs(20, 0);
+	return (u32)id;
 }
 
 u32 sceAtracAddStreamData(int atracID, u32 bytesToAdd) {
@@ -1192,7 +1206,15 @@ u32 sceAtracDecodeData(int atracID, u32 outAddr, u32 numSamplesAddr, u32 finishF
 	}
 
 	if (ret == 0 || ret == (int)SCE_ERROR_ATRAC_API_FAIL) {
-		const int delay = AtracDecodeDelay(atrac);
+		const bool first = g_atracFirstDecode[atracID];
+		g_atracFirstDecode[atracID] = false;
+		int delay = first && atrac->CodecType() == PSP_CODEC_AT3PLUS ? MEScheduleJob(AtracFrameUs(atrac) + kFirstDecodePlusUs)
+		                                                             : AtracDecodeDelay(atrac);
+		if (first) {
+			const u64 doneUs = sched::NowUs() + (u64)delay;
+			sched::SpendUs(std::min<u64>(kFirstDecodeBusyUs, (u64)delay), 0);
+			delay = (int)(doneUs > sched::NowUs() ? doneUs - sched::NowUs() : 0);
+		}
 		const u32 written = std::min((u32)(atrac->GetOutputChannels() * 2 * numSamplesWritten), (u32)previous.size());
 		if (outAddr && written != 0) {
 			AtracPendingOutput pending{++g_pendingOutputId, outAddr, {}};
@@ -1357,6 +1379,7 @@ u32 SetDataCommon(int atracID, u32 buffer, u32 readSize, u32 bufferSize, int out
 	if (checkCodec && track.codecType != g_atracContextTypes[atracID]) return SCE_ERROR_ATRAC_WRONG_CODECTYPE;
 	ret = atrac->SetData(track, buffer, readSize, bufferSize, 0, outputChannels, false);
 	if (ret < 0 && !(allowNotMono && ret == (int)SCE_ERROR_ATRAC_NOT_MONO)) return AtracSetDataError(ret, track);
+	g_atracFirstDecode[atracID] = true;
 	return DelayResult((u32)ret, AtracSetDataDelay(atrac));
 }
 
@@ -1388,6 +1411,7 @@ int SetDataAndGetIDCommon(u32 buffer, u32 readSize, u32 bufferSize, int outputCh
 		UnregisterAndDeleteAtrac(atracID);
 		return (int)AtracSetDataError(ret, track);
 	}
+	g_atracFirstDecode[atracID] = true;
 	return (int)DelayResult((u32)atracID, AtracSetDataDelay(g_atracContexts[atracID]));
 }
 
