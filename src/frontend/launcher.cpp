@@ -929,7 +929,9 @@ void PlaceButton(HWND b, const Gdiplus::RectF &r, bool show = true) {
 		ShowWindow(b, SW_HIDE);
 		return;
 	}
-	SetWindowPos(b, nullptr, (int)r.X, (int)r.Y, (int)r.Width, (int)r.Height, SWP_NOZORDER | SWP_NOACTIVATE);
+	// Repainted at its new place rather than its old pixels copied there (see online_page.cpp's Place:
+	// a button moved onto another that hadn't moved yet would leave a piece of itself in it).
+	SetWindowPos(b, nullptr, (int)r.X, (int)r.Y, (int)r.Width, (int)r.Height, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
 	ShowWindow(b, SW_SHOWNA);
 }
 

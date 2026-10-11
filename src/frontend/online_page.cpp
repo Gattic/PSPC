@@ -224,14 +224,17 @@ RectF CardRect(int i, int w) {
 
 float RowY(const RectF &card, int row) { return card.Y + Df(kCardPad + 54) + (float)(row * D(kRowH)); }
 
+// Layout moves the buttons together (one DeferWindowPos batch), and each repaints at its new place
+// (SWP_NOCOPYBITS). With their old pixels copied along, a button moving onto one that hadn't moved
+// yet drew over it, and that one then carried the mix to its own new place: scrolling up left
+// pieces of the row above in Log and Manage..., until the page was repainted.
+HDWP g_defer = nullptr;
+
 void Place(HWND b, float x, float y, float w, float h, bool show) {
 	if (!b) return;
-	if (!show) {
-		ShowWindow(b, SW_HIDE);
-		return;
-	}
-	SetWindowPos(b, nullptr, (int)x, (int)y, (int)w, (int)h, SWP_NOZORDER | SWP_NOACTIVATE);
-	ShowWindow(b, SW_SHOWNA);
+	UINT flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS | (show ? SWP_SHOWWINDOW : SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE);
+	if (g_defer) g_defer = DeferWindowPos(g_defer, b, nullptr, (int)x, (int)y, (int)w, (int)h, flags);
+	else SetWindowPos(b, nullptr, (int)x, (int)y, (int)w, (int)h, flags);
 }
 
 void SyncScroll(int h) { g_scroll = std::clamp(g_scroll, 0, std::max(0, g_contentH - h)); }
@@ -242,6 +245,7 @@ void Layout() {
 	GetClientRect(g_page, &rc);
 	g_contentH = D(kHeaderH) + (int)g_cards.size() * (D(kCardH) + D(kCardGap)) + D(110);
 	SyncScroll(rc.bottom);
+	g_defer = BeginDeferWindowPos((int)g_cards.size() * kButtonsPerCard);
 	for (size_t i = 0; i < g_cards.size(); i++) {
 		Card &c = g_cards[i];
 		c.rect = CardRect((int)i, rc.right);
@@ -276,6 +280,8 @@ void Layout() {
 		Place(c.b[kLan], x + Df(178), y, Df(190), bh, c.b[kLan] != nullptr);
 		Place(c.b[kCopy], right - Df(140), y, Df(140), bh, c.shown == State::Running && c.kind != Kind::Adhoc);
 	}
+	if (g_defer) EndDeferWindowPos(g_defer);
+	g_defer = nullptr;
 	InvalidateRect(g_page, nullptr, FALSE);
 }
 
