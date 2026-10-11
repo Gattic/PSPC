@@ -1280,12 +1280,7 @@ void PaintMain(HDC hdc, int w, int h) {
 
 	// Brand.
 	RectF logo(Df(20), Df(22), Df(34), Df(34));
-	LinearGradientBrush grad(PointF(logo.X, logo.Y), PointF(logo.GetRight(), logo.GetBottom()), ui::C(RGB(72, 146, 255)),
-	                         ui::C(RGB(136, 92, 255)));
-	GraphicsPath logoPath;
-	ui::AddRoundRect(logoPath, logo, Df(9));
-	g.FillPath(&grad, &logoPath);
-	ui::Text(g, ui::kIconGames, logo, Df(18), ui::C(RGB(255, 255, 255)), false, 1, true, false, true);
+	ui::DrawLogo(g, logo);
 	ui::Text(g, L"PSPC", RectF(logo.GetRight() + Df(12), logo.Y - Df(2), Df(140), Df(22)), Df(19), ui::C(ui::kText), true, 0);
 	ui::Text(g, L"PSP games on Windows", RectF(logo.GetRight() + Df(12), logo.Y + Df(19), Df(150), Df(16)), Df(11.5f),
 	         ui::C(ui::kTextFaint), false, 0);
@@ -1617,8 +1612,8 @@ bool SavePng(HWND hwnd, const fs::path &file) {
 	return ok;
 }
 
-// The app icon: the sidebar's logo (the gamepad on the blue-violet tile) at the sizes Windows uses,
-// as PNG images in an .ico.
+// The app icon: the sidebar's logo (ui::DrawLogo) at the sizes Windows uses, as PNG images in an
+// .ico.
 bool WriteIcon(const fs::path &file) {
 	CLSID png{};
 	UINT n = 0, size = 0;
@@ -1636,16 +1631,11 @@ bool WriteIcon(const fs::path &file) {
 		{
 			Graphics g(&bmp);
 			g.SetSmoothingMode(SmoothingModeAntiAlias);
+			g.SetPixelOffsetMode(PixelOffsetModeHalf);  // edges on pixel boundaries: crisp small sizes
 			g.SetTextRenderingHint(TextRenderingHintAntiAlias);
 			g.Clear(Color(0, 0, 0, 0));
 			float inset = s <= 24 ? 0.0f : (float)s * 0.04f;
-			RectF tile(inset, inset, (float)s - 2 * inset, (float)s - 2 * inset);
-			LinearGradientBrush grad(PointF(tile.X, tile.Y), PointF(tile.GetRight(), tile.GetBottom()), ui::C(RGB(72, 146, 255)),
-			                         ui::C(RGB(136, 92, 255)));
-			GraphicsPath path;
-			ui::AddRoundRect(path, tile, tile.Width * 0.24f);
-			g.FillPath(&grad, &path);
-			ui::Text(g, ui::kIconGames, tile, tile.Width * 0.56f, ui::C(RGB(255, 255, 255)), false, 1, true, false, true);
+			ui::DrawLogo(g, RectF(inset, inset, (float)s - 2 * inset, (float)s - 2 * inset));
 		}
 		IStream *stream = nullptr;
 		if (CreateStreamOnHGlobal(nullptr, TRUE, &stream) != S_OK) return false;

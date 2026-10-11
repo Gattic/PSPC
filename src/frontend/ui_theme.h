@@ -63,6 +63,9 @@ void DarkTitleBar(HWND hwnd, COLORREF caption = kSidebar);
 // Rounded rectangles.
 void AddRoundRect(Gdiplus::GraphicsPath &path, const Gdiplus::RectF &r, float radius);
 void FillRound(Gdiplus::Graphics &g, const Gdiplus::RectF &r, float radius, const Gdiplus::Color &c);
+// PSPC's logo on its tile, filling `tile` (the sidebar's brand mark and the app icon). Below 32 px
+// it drops the details that wouldn't show.
+void DrawLogo(Gdiplus::Graphics &g, const Gdiplus::RectF &tile);
 void StrokeRound(Gdiplus::Graphics &g, const Gdiplus::RectF &r, float radius, const Gdiplus::Color &c, float width);
 // Text in a GDI+ graphics: the UI or icon face at px pixels; align 0 = left, 1 = center, 2 = right.
 void Text(Gdiplus::Graphics &g, const wchar_t *s, const Gdiplus::RectF &r, float px, const Gdiplus::Color &c,

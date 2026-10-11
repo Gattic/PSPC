@@ -202,6 +202,95 @@ void AddRoundRect(GraphicsPath &path, const RectF &r, float radius) {
 	path.CloseFigure();
 }
 
+// The logo: a widescreen handheld, no particular one - a pale body with a glowing screen, a
+// D-pad on one side and four plain buttons on the other - on a blue-to-violet tile.
+void DrawLogo(Graphics &g, const RectF &tile) {
+	const float s = std::min(tile.Width, tile.Height);
+	const bool compact = s < 28;
+	const RectF t(tile.X + (tile.Width - s) / 2, tile.Y + (tile.Height - s) / 2, s, s);
+	GraphicsPath tilePath;
+	AddRoundRect(tilePath, t, s * 0.235f);
+
+	// The tile: sky blue through indigo to violet, lit from the top.
+	{
+		LinearGradientBrush grad(PointF(t.X, t.Y), PointF(t.GetRight(), t.GetBottom()), Color(255, 56, 189, 248),
+		                         Color(255, 168, 85, 247));
+		const Color colors[] = {Color(255, 56, 189, 248), Color(255, 99, 102, 241), Color(255, 168, 85, 247)};
+		const REAL positions[] = {0.0f, 0.5f, 1.0f};
+		grad.SetInterpolationColors(colors, positions, 3);
+		g.FillPath(&grad, &tilePath);
+		// (Fills of the shapes themselves, not clips: GDI+ clip regions have hard edges.)
+		LinearGradientBrush shine(PointF(t.X, t.Y - 1), PointF(t.X, t.GetBottom() + 1), Color(70, 255, 255, 255),
+		                          Color(0, 255, 255, 255));
+		const Color fade[] = {Color(70, 255, 255, 255), Color(0, 255, 255, 255), Color(0, 255, 255, 255)};
+		const REAL fadeAt[] = {0.0f, 0.55f, 1.0f};
+		shine.SetInterpolationColors(fade, fadeAt, 3);
+		g.FillPath(&shine, &tilePath);
+	}
+
+	// The body, with a soft shadow under it.
+	const float bw = s * (compact ? 0.86f : 0.80f), bh = s * (compact ? 0.46f : 0.40f);
+	const RectF body(t.X + (s - bw) / 2, t.Y + (s - bh) / 2 + s * 0.02f, bw, bh);
+	const float bodyRadius = bh * 0.46f;
+	if (!compact) {
+		for (int i = 6; i >= 1; i--) {
+			const float grow = s * 0.007f * (float)i, drop = s * 0.012f * (float)i;
+			FillRound(g, RectF(body.X - grow, body.Y - grow + drop, body.Width + 2 * grow, body.Height + 2 * grow),
+			          bodyRadius + grow, Color(16, 24, 8, 72));
+		}
+	}
+	{
+		GraphicsPath p;
+		AddRoundRect(p, body, bodyRadius);
+		LinearGradientBrush fill(PointF(body.X, body.Y), PointF(body.X, body.GetBottom()), Color(255, 255, 255, 255),
+		                         Color(255, 222, 226, 242));
+		g.FillPath(&fill, &p);
+	}
+
+	// The screen: wide, glowing cyan to violet to pink, with a glint.
+	const float sw = bw * (compact ? 0.58f : 0.50f), sh = bh * (compact ? 0.70f : 0.66f);
+	const RectF screen(body.X + (bw - sw) / 2, body.Y + (bh - sh) / 2, sw, sh);
+	{
+		GraphicsPath p;
+		AddRoundRect(p, screen, sh * 0.12f);
+		LinearGradientBrush glow(PointF(screen.X, screen.Y), PointF(screen.GetRight(), screen.GetBottom()),
+		                         Color(255, 34, 211, 238), Color(255, 236, 72, 153));
+		const Color colors[] = {Color(255, 34, 211, 238), Color(255, 124, 92, 255), Color(255, 236, 72, 153)};
+		const REAL positions[] = {0.0f, 0.55f, 1.0f};
+		glow.SetInterpolationColors(colors, positions, 3);
+		g.FillPath(&glow, &p);
+		if (!compact) {
+			// A diagonal glint over the upper left: a gradient with a sharp step, spanning the whole
+			// screen (linear gradients repeat past their ends).
+			LinearGradientBrush glint(PointF(screen.X, screen.Y), PointF(screen.GetRight(), screen.GetBottom()),
+			                          Color(46, 255, 255, 255), Color(0, 255, 255, 255));
+			const Color step[] = {Color(46, 255, 255, 255), Color(46, 255, 255, 255), Color(0, 255, 255, 255),
+			                      Color(0, 255, 255, 255)};
+			const REAL stepAt[] = {0.0f, 0.40f, 0.41f, 1.0f};
+			glint.SetInterpolationColors(step, stepAt, 4);
+			g.FillPath(&glint, &p);
+		}
+	}
+	if (compact) return;
+
+	// The controls, centred in the space either side of the screen.
+	const float side = (bw - sw) / 2;
+	const float cy = body.Y + bh / 2;
+	const float lx = body.X + side * 0.52f, rx = body.GetRight() - side * 0.52f;
+	{
+		const float d = bh * 0.34f, arm = d * 0.36f, r = arm * 0.32f;
+		const Color pad(255, 92, 100, 236);
+		FillRound(g, RectF(lx - d / 2, cy - arm / 2, d, arm), r, pad);
+		FillRound(g, RectF(lx - arm / 2, cy - d / 2, arm, d), r, pad);
+	}
+	{
+		const float gap = bh * 0.14f, rad = bh * (s < 48 ? 0.075f : 0.062f);
+		const PointF dots[] = {PointF(rx, cy - gap), PointF(rx + gap, cy), PointF(rx, cy + gap), PointF(rx - gap, cy)};
+		SolidBrush b(Color(255, 150, 96, 246));
+		for (const PointF &c : dots) g.FillEllipse(&b, c.X - rad, c.Y - rad, 2 * rad, 2 * rad);
+	}
+}
+
 void FillRound(Graphics &g, const RectF &r, float radius, const Color &c) {
 	GraphicsPath p;
 	AddRoundRect(p, r, radius);
