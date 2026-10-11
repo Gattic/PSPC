@@ -8,7 +8,9 @@
 #include <windows.h>
 #include <objidl.h>
 #include <commctrl.h>
+#include <dwmapi.h>
 #include <algorithm>
+#include <cmath>
 using std::max;
 using std::min;
 #include <gdiplus.h>
@@ -62,6 +64,7 @@ Hooks g_hooks;
 settings::Settings g_s;
 std::vector<Card> g_cards;
 int g_dpi = 96, g_scroll = 0, g_contentH = 0;
+bool g_contentDirty = true;  // the page's picture (Paint) needs drawing again
 bool g_inTimer = false, g_showingError = false;
 
 int D(int v) { return ui::Px(v, g_dpi); }
@@ -224,27 +227,37 @@ RectF CardRect(int i, int w) {
 
 float RowY(const RectF &card, int row) { return card.Y + Df(kCardPad + 54) + (float)(row * D(kRowH)); }
 
-// Layout moves the buttons together (one DeferWindowPos batch), and each repaints at its new place
-// (SWP_NOCOPYBITS). With their old pixels copied along, a button moving onto one that hadn't moved
-// yet drew over it, and that one then carried the mix to its own new place: scrolling up left
-// pieces of the row above in Log and Manage..., until the page was repainted.
+// Buttons move together (one DeferWindowPos batch) and repaint at their new place (SWP_NOCOPYBITS):
+// with their old pixels copied along, a button moving onto one that hadn't moved yet drew over it,
+// and that one carried the mix to its own new place (pieces of the row above stayed in Log and
+// Manage... after scrolling up). A button already where it belongs is left alone: after a scroll,
+// ScrollWindowEx has moved the ones in view.
 HDWP g_defer = nullptr;
 
 void Place(HWND b, float x, float y, float w, float h, bool show) {
 	if (!b) return;
+	// floor: a position moves by exactly the scroll distance, above the top too (as ScrollWindowEx moves it).
+	const int ix = (int)std::floor(x), iy = (int)std::floor(y), iw = (int)w, ih = (int)h;
+	const bool visible = (GetWindowLongW(b, GWL_STYLE) & WS_VISIBLE) != 0;
+	if (!show && !visible) return;
+	if (show && visible) {
+		RECT cur;
+		GetWindowRect(b, &cur);
+		MapWindowPoints(nullptr, g_page, (POINT *)&cur, 2);
+		if (cur.left == ix && cur.top == iy && cur.right - cur.left == iw && cur.bottom - cur.top == ih) return;
+	}
 	UINT flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS | (show ? SWP_SHOWWINDOW : SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE);
-	if (g_defer) g_defer = DeferWindowPos(g_defer, b, nullptr, (int)x, (int)y, (int)w, (int)h, flags);
-	else SetWindowPos(b, nullptr, (int)x, (int)y, (int)w, (int)h, flags);
+	if (g_defer) g_defer = DeferWindowPos(g_defer, b, nullptr, ix, iy, iw, ih, flags);
+	else SetWindowPos(b, nullptr, ix, iy, iw, ih, flags);
 }
 
 void SyncScroll(int h) { g_scroll = std::clamp(g_scroll, 0, std::max(0, g_contentH - h)); }
 
-void Layout() {
-	if (!g_page) return;
+// The cards' rectangles for the scroll position, and their buttons where they belong; with states,
+// also the buttons' labels, looks and whether they're enabled.
+void PlaceButtons(bool states) {
 	RECT rc;
 	GetClientRect(g_page, &rc);
-	g_contentH = D(kHeaderH) + (int)g_cards.size() * (D(kCardH) + D(kCardGap)) + D(110);
-	SyncScroll(rc.bottom);
 	g_defer = BeginDeferWindowPos((int)g_cards.size() * kButtonsPerCard);
 	for (size_t i = 0; i < g_cards.size(); i++) {
 		Card &c = g_cards[i];
@@ -266,13 +279,15 @@ void Layout() {
 		if (c.b[kManage]) {
 			x -= Df(118 + 8);
 			Place(c.b[kManage], x, y, Df(118), bh, true);
-			EnableWindow(c.b[kManage], canRun);
+			if (states) EnableWindow(c.b[kManage], canRun);
 		}
 		x -= Df(104 + 8);
 		Place(c.b[kStart], x, y, Df(104), bh, true);
-		SetWindowTextW(c.b[kStart], running ? L"Stop" : L"Start");
-		ui::SetLook(c.b[kStart], running ? ui::Look::Secondary : ui::Look::Primary, running ? ui::kIconStop : ui::kIconPlay);
-		EnableWindow(c.b[kStart], canRun || running);
+		if (states) {
+			SetWindowTextW(c.b[kStart], running ? L"Stop" : L"Start");
+			ui::SetLook(c.b[kStart], running ? ui::Look::Secondary : ui::Look::Primary, running ? ui::kIconStop : ui::kIconPlay);
+			EnableWindow(c.b[kStart], canRun || running);
+		}
 		// Row 3: options.
 		y = RowY(r, 2) + off;
 		x = r.X + Df(kCardPad + kLabelW);
@@ -282,7 +297,22 @@ void Layout() {
 	}
 	if (g_defer) EndDeferWindowPos(g_defer);
 	g_defer = nullptr;
+}
+
+// The page changed (texts, states, size): its picture is drawn again.
+void Invalidate() {
+	g_contentDirty = true;
 	InvalidateRect(g_page, nullptr, FALSE);
+}
+
+void Layout() {
+	if (!g_page) return;
+	RECT rc;
+	GetClientRect(g_page, &rc);
+	g_contentH = D(kHeaderH) + (int)g_cards.size() * (D(kCardH) + D(kCardGap)) + D(110);
+	SyncScroll(rc.bottom);
+	PlaceButtons(true);
+	Invalidate();
 }
 
 // ---- painting
@@ -341,14 +371,18 @@ void PaintCard(Gdiplus::Graphics &g, const Card &c) {
 	}
 }
 
-void Paint(HDC hdc, int w, int h) {
+// The whole page at scroll 0 (scrolling copies from it, so a scroll step draws nothing anew), and
+// the frame put together from it with the scroll indicator.
+ui::Canvas g_content, g_frame;
+
+void RenderContent(int w, int ch) {
 	using namespace Gdiplus;
-	if (w <= 0 || h <= 0) return;
-	Bitmap buffer(w, h, PixelFormat32bppPARGB);
-	Graphics g(&buffer);
+	Bitmap canvas(w, ch, w * 4, PixelFormat32bppPARGB, (BYTE *)g_content.bits);
+	Graphics g(&canvas);
 	g.SetSmoothingMode(SmoothingModeAntiAlias);
 	g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
 	g.Clear(ui::C(ui::kBg));
+	g.TranslateTransform(0, (REAL)g_scroll);  // the cards' rectangles are scrolled ones
 	float y0 = -(float)g_scroll;
 	ui::Text(g, L"Online", RectF(Df(kPad), y0 + Df(18), Df(400), Df(30)), Df(22), ui::C(ui::kText), true);
 	ui::Text(g, L"The servers PSP games went online to (Sony's, GameSpy's) are gone; PSPC brings its own. Run them here for you and your friends, or use someone else's.",
@@ -365,14 +399,32 @@ void Paint(HDC hdc, int w, int h) {
 	         L"to this PC (PSPC Network: the port in its address; Combat Ops: 10070-10079 and 10443; GameSpy: TCP 80, 28910 and "
 	         L"29900-29920, UDP 27900-27901; ad hoc: 27312).",
 	         RectF(Df(kPad) + Df(26), fy, fw - Df(26), Df(80)), Df(12), ui::C(ui::kTextFaint), false, 0, false, true);
+}
+
+// Scroll steps repaint this strip at the right edge: the indicator moves differently from the page.
+RECT IndicatorStrip(const RECT &client) { return RECT{client.right - D(12), 0, client.right, client.bottom}; }
+
+void Paint(HDC hdc, int w, int h) {
+	using namespace Gdiplus;
+	if (w <= 0 || h <= 0) return;
+	const int ch = std::max(h, g_contentH);
+	if (!g_content.Ensure(w, ch) || !g_frame.Ensure(w, h)) return;
+	if (g_contentDirty || g_content.fresh) {
+		RenderContent(w, ch);
+		g_contentDirty = g_content.fresh = false;
+	}
+	BitBlt(g_frame.dc, 0, 0, w, h, g_content.dc, 0, g_scroll, SRCCOPY);
 	// Where the view is, when it doesn't show everything.
 	if (g_contentH > h) {
+		GdiFlush();
+		Bitmap frame(w, h, w * 4, PixelFormat32bppPARGB, (BYTE *)g_frame.bits);
+		Graphics g(&frame);
+		g.SetSmoothingMode(SmoothingModeAntiAlias);
 		float trackH = (float)h - Df(16), thumbH = std::max(Df(40), trackH * (float)h / (float)g_contentH);
 		float thumbY = Df(8) + (trackH - thumbH) * (float)g_scroll / (float)std::max(1, g_contentH - h);
 		ui::FillRound(g, RectF((float)w - Df(8), thumbY, Df(4), thumbH), Df(2), ui::C(ui::kBorder));
 	}
-	Graphics screen(hdc);
-	screen.DrawImage(&buffer, 0, 0);
+	BitBlt(hdc, 0, 0, w, h, g_frame.dc, 0, 0, SRCCOPY);
 }
 
 // ---- actions
@@ -598,7 +650,20 @@ void Scroll(int to) {
 	GetClientRect(g_page, &rc);
 	int before = g_scroll;
 	g_scroll = std::clamp(to, 0, std::max(0, g_contentH - (int)rc.bottom));
-	if (g_scroll != before) Layout();
+	if (g_scroll == before) return;
+	// The page and the buttons in view move together in one copy (ScrollWindowEx), and only what comes
+	// into view is painted - from the page's picture - before the next wheel message is handled.
+	// (Repainting the page and every button for each step took longer than a screen refresh, and
+	// left to WM_PAINT, which waits for input to be handled, it caught up piecemeal: while the wheel
+	// turned, text and buttons showed at old and new places at once.) Buttons out of view, which
+	// ScrollWindowEx doesn't move, are put in place after. All of it right after the screen was
+	// composed (DwmFlush), so that it's done before the next frame shows it.
+	DwmFlush();
+	ScrollWindowEx(g_page, 0, before - g_scroll, nullptr, nullptr, nullptr, nullptr, SW_SCROLLCHILDREN | SW_INVALIDATE);
+	PlaceButtons(false);
+	RECT strip = IndicatorStrip(rc);
+	InvalidateRect(g_page, &strip, FALSE);
+	RedrawWindow(g_page, nullptr, nullptr, RDW_UPDATENOW | RDW_ALLCHILDREN);
 }
 
 LRESULT CALLBACK PageProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
@@ -625,7 +690,7 @@ LRESULT CALLBACK PageProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 			g_inTimer = true;
 			PollAll();
 			// The GameSpy card shows who is online: kept current.
-			if (servers::Poll(Kind::GameSpy) == State::Running) InvalidateRect(hwnd, nullptr, FALSE);
+			if (servers::Poll(Kind::GameSpy) == State::Running) Invalidate();
 			g_inTimer = false;
 		}
 		return 0;
@@ -633,7 +698,20 @@ LRESULT CALLBACK PageProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		g_dpi = ui::DpiOf(hwnd);
 		Layout();
 		return 0;
-	case WM_MOUSEWHEEL: Scroll(g_scroll - GET_WHEEL_DELTA_WPARAM(wp) * D(kRowH) / WHEEL_DELTA); return 0;
+	case WM_MOUSEWHEEL: {
+		// Wheel messages that queued up while the last step painted make one step (touchpads and fast
+		// wheels send many), and fractions of a step add up rather than being dropped.
+		static int rest = 0;
+		int delta = GET_WHEEL_DELTA_WPARAM(wp);
+		MSG m;
+		while (PeekMessageW(&m, nullptr, WM_MOUSEWHEEL, WM_MOUSEWHEEL, PM_NOREMOVE) && (m.hwnd == hwnd || IsChild(hwnd, m.hwnd)) &&
+		       PeekMessageW(&m, m.hwnd, WM_MOUSEWHEEL, WM_MOUSEWHEEL, PM_REMOVE))
+			delta += GET_WHEEL_DELTA_WPARAM(m.wParam);
+		int units = delta * D(kRowH) + rest;
+		rest = units % WHEEL_DELTA;
+		Scroll(g_scroll - units / WHEEL_DELTA);
+		return 0;
+	}
 	case WM_LBUTTONDOWN: SetFocus(hwnd); return 0;
 	case WM_KEYDOWN: {
 		RECT rc;

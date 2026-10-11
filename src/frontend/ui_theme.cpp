@@ -82,6 +82,10 @@ struct ButtonInfo {
 	std::wstring glyph, detail;
 	bool hot = false;
 	bool on = false;  // Toggle
+	// The last picture drawn and what it showed: drawn again only when that changes, copied
+	// otherwise (a button scrolled back into view costs a copy rather than GDI+ drawing).
+	Canvas picture;
+	std::wstring shows;
 };
 std::map<HWND, ButtonInfo> g_buttons;
 
@@ -102,15 +106,52 @@ LRESULT CALLBACK ButtonSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_
 		InvalidateRect(hwnd, nullptr, FALSE);
 		break;
 	case WM_ERASEBKGND: return 1;  // painted whole in WM_DRAWITEM
-	case WM_NCDESTROY:
+	case WM_NCDESTROY: {
 		RemoveWindowSubclass(hwnd, ButtonSubclass, 0);
-		g_buttons.erase(hwnd);
+		auto it = g_buttons.find(hwnd);
+		if (it != g_buttons.end()) {
+			it->second.picture.Release();
+			g_buttons.erase(it);
+		}
 		break;
+	}
 	}
 	return DefSubclassProc(hwnd, msg, wp, lp);
 }
 
 }  // namespace
+
+bool Canvas::Ensure(int cw, int ch) {
+	if (dc && cw == w && ch == h) return true;
+	Release();
+	BITMAPINFO bi{};
+	bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+	bi.bmiHeader.biWidth = cw;
+	bi.bmiHeader.biHeight = -ch;  // top-down
+	bi.bmiHeader.biPlanes = 1;
+	bi.bmiHeader.biBitCount = 32;
+	bi.bmiHeader.biCompression = BI_RGB;
+	dc = CreateCompatibleDC(nullptr);
+	bmp = dc ? CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0) : nullptr;
+	if (!bmp) {
+		if (dc) DeleteDC(dc);
+		dc = nullptr;
+		return false;
+	}
+	old = (HBITMAP)SelectObject(dc, bmp);
+	w = cw;
+	h = ch;
+	fresh = true;
+	return true;
+}
+
+void Canvas::Release() {
+	if (!dc) return;
+	SelectObject(dc, old);
+	DeleteObject(bmp);
+	DeleteDC(dc);
+	*this = Canvas();
+}
 
 const wchar_t *TextFace() { return L"Segoe UI"; }
 
@@ -228,20 +269,9 @@ bool IsHot(HWND button) {
 	return it != g_buttons.end() && it->second.hot;
 }
 
-void DrawOwnerButton(const DRAWITEMSTRUCT *di, COLORREF background) {
-	auto it = g_buttons.find(di->hwndItem);
-	ButtonInfo info = it != g_buttons.end() ? it->second : ButtonInfo{};
-	int w = di->rcItem.right - di->rcItem.left, h = di->rcItem.bottom - di->rcItem.top;
-	if (w <= 0 || h <= 0) return;
-	int dpi = DpiOf(di->hwndItem);
-	bool down = di->itemState & ODS_SELECTED, disabled = di->itemState & ODS_DISABLED;
-	bool focus = (di->itemState & ODS_FOCUS) && !(di->itemState & ODS_NOFOCUSRECT);
-	bool hot = info.hot && !disabled;
-	wchar_t label[128];
-	GetWindowTextW(di->hwndItem, label, 128);
-
-	Bitmap buffer(w, h, PixelFormat32bppPARGB);
-	Graphics g(&buffer);
+// A button's picture: its look in its state, with its label (textPx: the label's size).
+static void RenderButton(Graphics &g, const ButtonInfo &info, const wchar_t *label, int w, int h, int dpi, bool down, bool disabled, bool focus,
+                  bool hot, float textPx, COLORREF background) {
 	g.SetSmoothingMode(SmoothingModeAntiAlias);
 	g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
 	g.Clear(C(background));
@@ -283,21 +313,13 @@ void DrawOwnerButton(const DRAWITEMSTRUCT *di, COLORREF background) {
 		float knob = sh - Pxf(6, dpi);
 		SolidBrush k(C(info.on ? RGB(255, 255, 255) : kTextDim));
 		g.FillEllipse(&k, RectF(info.on ? track.GetRight() - knob - Pxf(3, dpi) : track.X + Pxf(3, dpi), sy + Pxf(3, dpi), knob, knob));
-		float textPx = Pxf(13, dpi), x = track.GetRight() + Pxf(10, dpi);
-		Text(g, label, RectF(x, 0, (REAL)w - x, (REAL)h), textPx, C(disabled ? kTextFaint : info.on ? kText : kTextDim));
+		float togglePx = Pxf(13, dpi), x = track.GetRight() + Pxf(10, dpi);
+		Text(g, label, RectF(x, 0, (REAL)w - x, (REAL)h), togglePx, C(disabled ? kTextFaint : info.on ? kText : kTextDim));
 		if (focus) StrokeRound(g, RectF(1, 1, (REAL)w - 2, (REAL)h - 2), radius, C(kAccentHot), Pxf(1.5f, dpi));
-		Graphics screen(di->hDC);
-		screen.DrawImage(&buffer, (INT)di->rcItem.left, (INT)di->rcItem.top);
 		return;
 	}
 	}
 
-	// Text the size of the button's font when it has one (dialogs), else 14 px.
-	float textPx = Pxf(14, dpi);
-	if (HFONT f = (HFONT)SendMessageW(di->hwndItem, WM_GETFONT, 0, 0)) {
-		LOGFONTW lf{};
-		if (GetObjectW(f, sizeof(lf), &lf) && lf.lfHeight) textPx = (float)std::abs(lf.lfHeight);
-	}
 	const float glyphPx = Pxf(16, dpi), gap = Pxf(10, dpi);
 	bool bold = info.look == Look::Primary || info.look == Look::NavActive;
 	bool left = info.look == Look::Nav || info.look == Look::NavActive;
@@ -329,9 +351,45 @@ void DrawOwnerButton(const DRAWITEMSTRUCT *di, COLORREF background) {
 		Text(g, label, RectF(x, 0, (REAL)w - x, (REAL)h), textPx, text, bold);
 	}
 	if (focus) StrokeRound(g, RectF(1, 1, (REAL)w - 2, (REAL)h - 2), radius, C(kAccentHot), Pxf(1.5f, dpi));
+}
 
-	Graphics screen(di->hDC);
-	screen.DrawImage(&buffer, (INT)di->rcItem.left, (INT)di->rcItem.top);
+void DrawOwnerButton(const DRAWITEMSTRUCT *di, COLORREF background) {
+	auto it = g_buttons.find(di->hwndItem);
+	ButtonInfo *slot = it != g_buttons.end() ? &it->second : nullptr;
+	const ButtonInfo info = slot ? *slot : ButtonInfo{};
+	int w = di->rcItem.right - di->rcItem.left, h = di->rcItem.bottom - di->rcItem.top;
+	if (w <= 0 || h <= 0) return;
+	int dpi = DpiOf(di->hwndItem);
+	bool down = di->itemState & ODS_SELECTED, disabled = di->itemState & ODS_DISABLED;
+	bool focus = (di->itemState & ODS_FOCUS) && !(di->itemState & ODS_NOFOCUSRECT);
+	bool hot = info.hot && !disabled;
+	wchar_t label[128];
+	GetWindowTextW(di->hwndItem, label, 128);
+	// Text the size of the button's font when it has one (dialogs), else 14 px.
+	float textPx = Pxf(14, dpi);
+	if (HFONT f = (HFONT)SendMessageW(di->hwndItem, WM_GETFONT, 0, 0)) {
+		LOGFONTW lf{};
+		if (GetObjectW(f, sizeof(lf), &lf) && lf.lfHeight) textPx = (float)std::abs(lf.lfHeight);
+	}
+	// What the picture shows; the same as last time, the last picture is copied.
+	wchar_t key[96];
+	swprintf(key, 96, L"%d,%d,%d,%d,%d%d%d%d%d,%06lx,%.2f|", w, h, dpi, (int)info.look, (int)down, (int)disabled, (int)focus, (int)hot, (int)info.on,
+	         (unsigned long)background, textPx);
+	std::wstring shows = std::wstring(key) + label + L'|' + info.glyph + L'|' + info.detail;
+	if (slot && slot->picture.dc && slot->picture.w == w && slot->picture.h == h && slot->shows == shows) {
+		BitBlt(di->hDC, di->rcItem.left, di->rcItem.top, w, h, slot->picture.dc, 0, 0, SRCCOPY);
+		return;
+	}
+	static Canvas scratch;  // for a button without a look of its own
+	Canvas &picture = slot ? slot->picture : scratch;
+	if (!picture.Ensure(w, h)) return;
+	{
+		Bitmap buffer(w, h, w * 4, PixelFormat32bppPARGB, (BYTE *)picture.bits);
+		Graphics g(&buffer);
+		RenderButton(g, info, label, w, h, dpi, down, disabled, focus, hot, textPx, background);
+	}  // GDI+ is done with the pixels
+	if (slot) slot->shows = shows;
+	BitBlt(di->hDC, di->rcItem.left, di->rcItem.top, w, h, picture.dc, 0, 0, SRCCOPY);
 }
 
 // ---- dialogs: standard controls in the dark look

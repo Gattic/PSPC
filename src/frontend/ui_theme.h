@@ -69,6 +69,19 @@ void Text(Gdiplus::Graphics &g, const wchar_t *s, const Gdiplus::RectF &r, float
           bool bold = false, int align = 0, bool vcenter = true, bool wrap = false, bool icon = false);
 Gdiplus::SizeF Measure(Gdiplus::Graphics &g, const wchar_t *s, float px, bool bold = false, float maxWidth = 10000);
 
+// A 32-bit top-down DIB section selected into a memory DC: GDI copies from and to it, GDI+ draws on
+// its pixels (Gdiplus::Bitmap(w, h, w * 4, PixelFormat32bppPARGB, bits)). Ensure (re)makes it at a
+// size (fresh: just made, nothing drawn on it yet); Release frees it. Copies share the handles.
+struct Canvas {
+	HDC dc = nullptr;
+	HBITMAP bmp = nullptr, old = nullptr;
+	void *bits = nullptr;
+	int w = 0, h = 0;
+	bool fresh = false;
+	bool Ensure(int cw, int ch);
+	void Release();
+};
+
 // Owner-drawn buttons (BS_OWNERDRAW). Style and glyph are set once per button; hover is tracked.
 // Toggle: a switch and its label (SetChecked / Checked hold the state; the owner flips it on click).
 enum class Look { Primary, Secondary, Ghost, Nav, NavActive, Icon, Toggle };
