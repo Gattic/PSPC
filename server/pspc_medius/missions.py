@@ -22,12 +22,13 @@ import logging
 import secrets
 import time
 
-from . import umd
+from . import results, umd
 from .http import Response
 
 log = logging.getLogger('medius.missions')
 
-NOT_RATED = -9999
+NOT_RATED = -9999                       # MissionVoteGet: this player hasn't rated it
+VOTE_NONE, VOTE_INAPPROPRIATE = -1, -2  # MissionVoteCast ratings besides 1-5
 # MissionListType: which list a query is for. Lists the game keeps per player (it adds to them with
 # MissionListAdd) are stored as such; the others are computed.
 LIST_OFFICIAL = 3
@@ -94,7 +95,7 @@ class MissionServer:
     # ---- records
 
     def mission_xml(self, m, account_id=0):
-        votes = self.store.q('SELECT COUNT(*) AS n, AVG(vote) AS avg FROM mission_votes WHERE mission_id = ? AND vote >= 0',
+        votes = self.store.q('SELECT COUNT(*) AS n, AVG(vote) AS avg FROM mission_votes WHERE mission_id = ? AND vote > 0',
                              (m['mission_id'],))[0]
         fields = [
             ('MissionID', m['mission_id']), ('MissionName', m['name']), ('Author', m['author']),
@@ -144,7 +145,7 @@ class MissionServer:
         q = req.query
         size = min(max(_int(q, 'Size', 25), 1), 100)
         rows = self.store.q('SELECT m.*, (SELECT AVG(vote) FROM mission_votes v WHERE v.mission_id = m.mission_id AND '
-                            'vote >= 0) AS rating FROM missions m WHERE hidden = 0 ORDER BY rating DESC, downloads DESC '
+                            'vote > 0) AS rating FROM missions m WHERE hidden = 0 ORDER BY rating DESC, downloads DESC '
                             'LIMIT ?', (size,))
         return spywars('MissionVoteGetTopList', q.get('TransactionID', 0), ''.join(self.mission_xml(m) for m in rows))
 
@@ -179,28 +180,51 @@ class MissionServer:
                            (self.account_of(req), _int(q, 'MissionID')))
         return spywars('MissionVoteGet', q.get('TransactionID', 0), '<Rating>%d</Rating>\n' % (v['vote'] if v else NOT_RATED))
 
+    def match_key(self, req, account):
+        """Which match a post-match report is about: the ranked game's SVO id, else the lobby game
+        the player is in and its match number."""
+        game_id = _int(req.query, 'SVOGameID', -1)
+        if game_id > 0:
+            return 'svo:%d' % game_id
+        p = self.server.lobby.find_player(account_id=account)
+        if p is not None and p.game is not None:
+            return 'game:%s:%d:%d' % (self.server.records.run, p.game.id, p.game.match)
+        return None
+
     def vote_cast(self, req):
+        """After every match (ranked or not), each player rates the mission: Rating 1-5, -1 = no vote,
+        -2 = inappropriate. Counts the mission as played, once per match."""
         q = req.query
         mission_id = _int(q, 'MissionID')
-        vote = _int(q, 'Rating', _int(q, 'Vote', NOT_RATED))
-        account = self.account_of(req)
-        if vote == 6:  # "Inappropriate"
-            self.store.x('UPDATE missions SET inappropriate = inappropriate + 1 WHERE mission_id = ?', (mission_id,))
-        else:
+        rating = _int(q, 'Rating', VOTE_NONE)
+        account = _int(q, 'AccountID') or self.account_of(req)
+        if 1 <= rating <= 5 or rating == VOTE_INAPPROPRIATE:
             self.store.x('INSERT OR REPLACE INTO mission_votes (account_id, mission_id, vote) VALUES (?, ?, ?)',
-                         (account, mission_id, vote))
-        log.info('missions: %d rated mission %d: %d (%s)', account, mission_id, vote, q)
-        return spywars('MissionVoteCast', q.get('TransactionID', 0))
+                         (account, mission_id, rating))
+            if rating == VOTE_INAPPROPRIATE:
+                self.store.x('UPDATE missions SET inappropriate = (SELECT COUNT(*) FROM mission_votes WHERE mission_id = ? '
+                             'AND vote = ?) WHERE mission_id = ?', (mission_id, VOTE_INAPPROPRIATE, mission_id))
+        key = self.match_key(req, account)
+        if key is not None and self.store.first_report(key, mission_id):
+            self.store.x('UPDATE missions SET plays = plays + 1 WHERE mission_id = ?', (mission_id,))
+        log.info('missions: %d rated mission %d: %d (%s, match %s)', account, mission_id, rating,
+                 results.GAME_MODES.get(_int(q, 'gameMode'), q.get('gameMode')), key)
+        return results.ok()
 
     def post_stats(self, req):
+        """After a ranked team match: PlayTime (minutes) and WinningTeam (0 draw, 1 or 2), from every
+        player; counted once per game."""
         q = req.query
         mission_id = _int(q, 'MissionID')
-        log.info('missions: stats for %d: %s', mission_id, q)
-        self.store.x('UPDATE missions SET plays = plays + 1, play_time = play_time + ?, team_a_wins = team_a_wins + ?, '
-                     'team_b_wins = team_b_wins + ? WHERE mission_id = ?',
-                     (_int(q, 'PlayTime'), 1 if _int(q, 'Winner', -1) == 0 else 0, 1 if _int(q, 'Winner', -1) == 1 else 0,
-                      mission_id))
-        return spywars('MissionPostStats', q.get('TransactionID', 0))
+        game_id = _int(q, 'SVOGameID', -1)
+        winner = _int(q, 'WinningTeam')
+        log.info('missions: game %d on mission %d: %s minutes, winning team %s', game_id, mission_id, q.get('PlayTime'),
+                 winner)
+        if game_id > 0 and mission_id > 0 and self.store.first_report('stats:svo:%d' % game_id, mission_id):
+            self.store.x('UPDATE missions SET play_time = play_time + ?, team_a_wins = team_a_wins + ?, '
+                         'team_b_wins = team_b_wins + ? WHERE mission_id = ?',
+                         (_int(q, 'PlayTime'), 1 if winner == 1 else 0, 1 if winner == 2 else 0, mission_id))
+        return results.ok()
 
     # ---- uploading and downloading missions
 
@@ -275,10 +299,9 @@ class MissionServer:
         q = req.query
         clan_id = _int(q, 'CellD', _int(q, 'CellID'))
         c = self.store.clan(clan_id)
-        stats = {r['mode']: r for r in self.store.q('SELECT * FROM clan_game_stats WHERE clan_id = ?', (clan_id,))}
+        results = self.store.cell_results(clan_id)      # records.py counts them from members' ranked games
         body = '<ClanName>%s</ClanName>\n' % esc(c['name'] if c else '')
-        for mode in ('Sabotage', 'Retrieval', 'TeamDeathmatch'):
-            r = stats.get(mode)
-            body += '<%s><PlayCount>%d</PlayCount><WinCount>%d</WinCount></%s>\n' % (
-                mode, r['plays'] if r else 0, r['wins'] if r else 0, mode)
+        for tag, mode in (('Sabotage', 'SAB'), ('Retrieval', 'RET'), ('TeamDeathmatch', 'TDM')):
+            games, wins = results.get(mode, (0, 0))
+            body += '<%s><PlayCount>%d</PlayCount><WinCount>%d</WinCount></%s>\n' % (tag, games, wins or 0, tag)
         return spywars('CellGetStats', q.get('TransactionID', 0), body)

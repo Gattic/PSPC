@@ -12,6 +12,8 @@ import logging
 
 from .http import Response
 from .missions import MissionServer
+from .portal import Portal
+from .results import GameService
 from .tickets import find_ticket
 
 log = logging.getLogger('medius.svo')
@@ -34,14 +36,14 @@ class Svo:
         self.server = server
         self.routes = {
             '': self.root,
-            'home.svml': self.home,
             'account/TicketLogin': self.ticket_login,
         }
-        for name, path in SERVICE_URIS:
-            if path.startswith('game/'):
-                self.routes[path] = lambda req, kind=path[5:]: self.game_report(req, kind)
         self.missions = MissionServer(server)
         self.routes.update(self.missions.routes())
+        self.games = GameService(server, self)
+        self.routes.update(self.games.routes())
+        self.portal = Portal(server, self)
+        self.routes.update(self.portal.routes())
 
     @property
     def base(self):
@@ -65,7 +67,7 @@ class Svo:
                  ' (%d bytes)' % len(req.body) if req.body else '')
         if handler is None:
             log.warning('svo %s: no page %s; headers %s', req.peer[0], req.target, req.headers)
-            resp = Response(404, svml('<TEXT name="t" x="20" y="20" width="440" height="30">Page not found</TEXT>'),
+            resp = Response(404, svml('<TEXT name="t" x="240" y="80" align="center">Page not found</TEXT>'),
                             'text/svml')
         else:
             resp = handler(req)
@@ -90,21 +92,6 @@ class Svo:
         body.append('<REDIRECT name="redirect" href="%s" />' % esc(self.uri('home.svml')))
         return Response(200, svml('\n'.join(body)), 'text/svml')
 
-    def home(self, req):
-        return Response(200, svml('<TEXT name="welcome" x="20" y="20" width="440" height="30">%s</TEXT>'
-                                  % esc(self.server.game.news)), 'text/svml')
-
-    def game_report(self, req, kind):
-        """The end-of-game services (finishGameURI, gamePostBinaryStatsURI, createGame...): what the game
-        sends is kept in the database (game_reports) and acknowledged."""
-        account = self.missions.account_of(req)
-        self.server.store.add_game_report(account, kind, req.target.partition('?')[2], req.body)
-        log.info('svo %s: game report %s from %d: query %s, %d-byte body %s', req.peer[0], kind, account, req.query,
-                 len(req.body), req.body[:64].hex())
-        if kind == 'Finish':
-            return Response(200, svml('<REDIRECT name="redirect" href="%s" />' % esc(self.uri('home.svml'))), 'text/svml')
-        return Response(200, '<?xml version="1.0" encoding="UTF-8"?>\n<XML><Status>OK</Status></XML>\n', 'text/xml')
-
     async def ticket_login(self, req):
         at, blob = find_ticket(req.body)
         log.info('svo %s: TicketLogin query %s, %d-byte body, ticket at %d; head %s', req.peer[0], req.query,
@@ -117,7 +104,7 @@ class Svo:
         account = self.server.store.account(app_id, name)
         cookies = {'AcctID': account['account_id'], 'AcctName': name, 'LangID': req.query.get('languageID', '1')}
         resp = Response(200, sp_login(20600, 'ACCT_LOGIN_SUCCESS', account['account_id']), 'text/xml')
-        resp.headers['Set-Cookie'] = '; '.join('%s=%s' % kv for kv in cookies.items()) + '; Path=/'
+        resp.headers['Set-Cookie'] = ['%s=%s; Path=/' % kv for kv in cookies.items()]
         return resp
 
 
@@ -138,9 +125,7 @@ SERVICE_URIS = [
     ('CellGetStatsURI', 'cell/GetStats'),
     ('gamePostBinaryStatsURI', 'game/PostBinaryStats'),
     ('finishGameURI', 'game/Finish'),
-    ('createGameURI', 'game/Create'),
-    ('createGamePlayerURI', 'game/CreatePlayer'),
-    ('createGameSubmitURI', 'game/CreateSubmit'),
+    ('createGameURI', 'game/Create?gameMode=%d'),       # the game printf's the mode into it
 ]
 
 

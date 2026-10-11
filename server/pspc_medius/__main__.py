@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""python -m pspc_medius [--db file] serve|accounts|ban|unban|missions ... (see server/README.md)."""
+"""python -m pspc_medius [--db file] serve|accounts|ban|unban|missions|news|board ... (see docs/combat-ops-server.md)."""
 
 import argparse
 import asyncio
@@ -80,6 +80,40 @@ def missions(store, args):
     return 0
 
 
+def news(store, args):
+    if args.action == 'list':
+        for r in store.news(100):
+            print('%5d %s  %s' % (r['news_id'], time.strftime('%Y-%m-%d', time.gmtime(r['created'])), r['text']))
+    elif args.action == 'add':
+        text = ' '.join(args.rest).strip()
+        if not text:
+            print('news add needs the text')
+            return 2
+        print('news item %d added' % store.add_news(text))
+    else:
+        if not args.rest or not args.rest[0].isdigit():
+            print('news delete needs an id')
+            return 2
+        store.delete_news(int(args.rest[0]))
+        print('news item %s deleted' % args.rest[0])
+    return 0
+
+
+def board(store, args):
+    if args.action == 'list':
+        rows = store.q('SELECT * FROM board_posts ORDER BY post_id DESC LIMIT 50')
+        for r in rows:
+            print('%5d %-10s %-16s %s%s%s' % (r['post_id'], r['board'], r['author'], 're %d: ' % r['reply_to'] if r['reply_to'] else '',
+                                             r['subject'] or r['body'][:40], '  (hidden)' if r['hidden'] else ''))
+        return 0
+    if not args.rest or not args.rest[0].isdigit():
+        print('board %s needs a post id' % args.action)
+        return 2
+    store.set_post_hidden(int(args.rest[0]), args.action == 'hide')
+    print('post %s %s' % (args.rest[0], 'hidden' if args.action == 'hide' else 'shown'))
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog='python -m pspc_medius', description=__doc__)
     ap.add_argument('--db', default='pspc_medius.sqlite', help='database file (default: %(default)s)')
@@ -106,6 +140,12 @@ def main(argv=None):
     m.add_argument('action', choices=('list', 'import', 'hide', 'unhide', 'delete'),
                    help="list; import <UMD>: add the game's own missions as official ones; hide/unhide/delete <id>")
     m.add_argument('target', nargs='?', help='the UMD (ISO or CSO image, or folder) for import; a mission id otherwise')
+    n = sub.add_parser('news', help='the news shown on the Community pages')
+    n.add_argument('action', choices=('list', 'add', 'delete'))
+    n.add_argument('rest', nargs='*', help='add: the text; delete: the id')
+    b = sub.add_parser('board', help='moderate the message board')
+    b.add_argument('action', choices=('list', 'hide', 'unhide'))
+    b.add_argument('rest', nargs='*', help='hide/unhide: the post id (hiding a topic hides its replies)')
     args = ap.parse_args(argv)
     handlers = [logging.StreamHandler(sys.stdout)]
     if args.log_file:
@@ -118,6 +158,10 @@ def main(argv=None):
     try:
         if args.command == 'missions':
             return missions(store, args)
+        if args.command == 'news':
+            return news(store, args)
+        if args.command == 'board':
+            return board(store, args)
         app_id = GAMES[args.game].app_ids[0]
         if args.command == 'accounts':
             for a in store.q('SELECT * FROM accounts WHERE app_id = ? ORDER BY account_id', (app_id,)):

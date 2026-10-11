@@ -413,8 +413,10 @@ request(LOBBY, 0x66, 'RespondToClanInvitation', ('MessageID', MID), ('SessionKey
 response(LOBBY, 0x67, 'RespondToClanInvitationResponse', ('MessageID', MID), ('StatusCode', I32))
 request(LOBBY, 0x6C, 'GetMyClanMessages', ('MessageID', MID), ('SessionKey', SESSIONKEY), ('ClanID', I32), ('Start', I32),
         ('PageSize', I32))
-response(LOBBY, 0x6D, 'GetMyClanMessagesResponse', ('MessageID', MID), ('StatusCode', I32), ('ClanID', I32),
-         ('Message', CLANMSG), ('EndOfList', BOOL))
+# Combat Ops' client library reads the answer as LOBBY_EXT 0x77 (its 1/0x6D isn't registered), with the
+# message's id (what ModifyClanMessage names) after the cell's.
+response(LOBBY_EXT, 0x77, 'GetMyClanMessagesResponse', ('MessageID', MID), ('StatusCode', I32), ('ClanID', I32),
+         ('ClanMessageID', I32), ('Message', CLANMSG), ('EndOfList', BOOL))
 request(LOBBY, 0x6E, 'SendClanMessage', ('MessageID', MID), ('SessionKey', SESSIONKEY), ('Message', CLANMSG))
 response(LOBBY, 0x6F, 'SendClanMessageResponse', ('MessageID', MID), ('StatusCode', I32))
 request(LOBBY, 0x70, 'ModifyClanMessage', ('MessageID', MID), ('SessionKey', SESSIONKEY), ('ClanMessageID', I32),

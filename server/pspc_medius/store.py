@@ -105,13 +105,6 @@ CREATE TABLE IF NOT EXISTS mission_votes (
     vote INTEGER NOT NULL,
     PRIMARY KEY (account_id, mission_id)
 );
-CREATE TABLE IF NOT EXISTS clan_game_stats (
-    clan_id INTEGER NOT NULL,
-    mode TEXT NOT NULL,
-    plays INTEGER NOT NULL DEFAULT 0,
-    wins INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (clan_id, mode)
-);
 CREATE TABLE IF NOT EXISTS blobs (
     file_id TEXT PRIMARY KEY,
     owner_id INTEGER NOT NULL,
@@ -126,6 +119,60 @@ CREATE TABLE IF NOT EXISTS game_reports (
     query TEXT NOT NULL,
     data BLOB NOT NULL,
     created INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS news (
+    news_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT NOT NULL,
+    created INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS board_posts (
+    post_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    board TEXT NOT NULL,
+    account_id INTEGER NOT NULL,
+    author TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    body TEXT NOT NULL,
+    reply_to INTEGER NOT NULL DEFAULT 0,
+    hidden INTEGER NOT NULL DEFAULT 0,
+    created INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS board_posts_board ON board_posts (board, hidden, created);
+CREATE TABLE IF NOT EXISTS cell_matches (
+    clan_id INTEGER NOT NULL,
+    mode TEXT NOT NULL,
+    match_key TEXT NOT NULL,
+    won INTEGER NOT NULL DEFAULT 0,
+    created INTEGER NOT NULL,
+    PRIMARY KEY (clan_id, mode, match_key)
+);
+CREATE TABLE IF NOT EXISTS svo_games (
+    game_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    world_id INTEGER NOT NULL,
+    mode INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    host_id INTEGER NOT NULL,
+    players TEXT NOT NULL,
+    created INTEGER NOT NULL,
+    finished INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS svo_results (
+    game_id INTEGER NOT NULL,
+    account_id INTEGER NOT NULL,
+    mode INTEGER NOT NULL,
+    result INTEGER NOT NULL,
+    end_status INTEGER NOT NULL,
+    clan_id INTEGER NOT NULL,
+    kills INTEGER NOT NULL,
+    deaths INTEGER NOT NULL,
+    headshots INTEGER NOT NULL,
+    query TEXT NOT NULL,
+    created INTEGER NOT NULL,
+    PRIMARY KEY (game_id, account_id)
+);
+CREATE TABLE IF NOT EXISTS mission_plays (
+    match_key TEXT NOT NULL,
+    mission_id INTEGER NOT NULL,
+    PRIMARY KEY (match_key, mission_id)
 );
 """
 
@@ -174,13 +221,21 @@ class Store:
     def touch_login(self, account_id):
         self.x('UPDATE accounts SET last_login = ? WHERE account_id = ?', (int(time.time()), account_id))
 
+    stats_version = 0          # bumped whenever a player's stats change (leaderboard caches)
+
+    def all_stats(self, app_id):
+        return self.q('SELECT account_id, name, stats, last_login FROM accounts WHERE app_id = ? AND banned = 0',
+                      (app_id,))
+
     def set_stats(self, account_id, stats):
+        self.stats_version += 1
         self.x('UPDATE accounts SET stats = ? WHERE account_id = ?', (bytes(stats), account_id))
 
     def set_ladder_stats(self, account_id, stats):
         self.x('UPDATE accounts SET ladder_stats = ? WHERE account_id = ?', (bytes(stats), account_id))
 
     def set_banned(self, app_id, name, banned):
+        self.stats_version += 1              # leaderboards leave banned players out
         self.x('UPDATE accounts SET banned = ? WHERE app_id = ? AND name = ?', (1 if banned else 0, app_id, name))
 
     # ---- buddies and ignore lists
@@ -240,6 +295,7 @@ class Store:
         self.x('DELETE FROM clan_members WHERE clan_id = ?', (clan_id,))
         self.x('DELETE FROM clan_invitations WHERE clan_id = ?', (clan_id,))
         self.x('DELETE FROM clan_messages WHERE clan_id = ?', (clan_id,))
+        self.x('DELETE FROM cell_matches WHERE clan_id = ?', (clan_id,))
         self.x('DELETE FROM clans WHERE clan_id = ?', (clan_id,))
 
     def clan_members(self, clan_id):
@@ -320,6 +376,96 @@ class Store:
     def add_game_report(self, account_id, kind, query, data):
         return self.x('INSERT INTO game_reports (account_id, kind, query, data, created) VALUES (?, ?, ?, ?, ?)',
                       (account_id, kind, query, bytes(data), int(time.time())))
+
+    # ---- cell (clan) results and SVO game records
+
+    def record_cell_match(self, clan_id, mode, match_key, won):
+        self.x('INSERT OR IGNORE INTO cell_matches (clan_id, mode, match_key, created) VALUES (?, ?, ?, ?)',
+               (clan_id, mode, match_key, int(time.time())))
+        if won:
+            self.x('UPDATE cell_matches SET won = 1 WHERE clan_id = ? AND mode = ? AND match_key = ?',
+                   (clan_id, mode, match_key))
+
+    def cell_results(self, clan_id):
+        """{mode: (games, wins)}"""
+        return {r['mode']: (r['games'], r['wins']) for r in self.q(
+            'SELECT mode, COUNT(*) AS games, SUM(won) AS wins FROM cell_matches WHERE clan_id = ? GROUP BY mode',
+            (clan_id,))}
+
+    def all_cell_results(self):
+        return self.q('SELECT clan_id, mode, COUNT(*) AS games, SUM(won) AS wins FROM cell_matches GROUP BY clan_id, mode')
+
+    def create_svo_game(self, world_id, mode, name, host_id, players):
+        return self.x('INSERT INTO svo_games (world_id, mode, name, host_id, players, created) VALUES (?, ?, ?, ?, ?, ?)',
+                      (world_id, mode, name, host_id, players, int(time.time())))
+
+    def svo_game(self, game_id):
+        return self.one('SELECT * FROM svo_games WHERE game_id = ?', (game_id,))
+
+    def add_svo_result(self, game_id, account_id, fields, query):
+        def num(name, default=0):
+            try:
+                return int(fields.get(name, default))
+            except (TypeError, ValueError):
+                return default
+        self.x('INSERT OR REPLACE INTO svo_results (game_id, account_id, mode, result, end_status, clan_id, kills, deaths, '
+               'headshots, query, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+               (game_id, account_id, num('gameMode'), num('gameResult', -1), num('endStatus'), num('clanid', -1),
+                num('totalKills'), num('deaths'), num('headshots'), query, int(time.time())))
+        self.x('UPDATE svo_games SET finished = ? WHERE game_id = ?', (int(time.time()), game_id))
+
+    def recent_svo_games(self, limit=10):
+        return self.q('SELECT * FROM svo_games WHERE finished > 0 ORDER BY finished DESC LIMIT ?', (limit,))
+
+    def svo_results(self, game_id):
+        return self.q('SELECT r.*, a.name FROM svo_results r LEFT JOIN accounts a ON a.account_id = r.account_id '
+                      'WHERE r.game_id = ? ORDER BY r.kills DESC', (game_id,))
+
+    def first_report(self, match_key, mission_id):
+        """True the first time a match reports a mission (every player posts the same match)."""
+        if self.one('SELECT 1 FROM mission_plays WHERE match_key = ? AND mission_id = ?', (match_key, mission_id)):
+            return False
+        self.x('INSERT INTO mission_plays (match_key, mission_id) VALUES (?, ?)', (match_key, mission_id))
+        return True
+
+    # ---- news and the message board (the Community pages)
+
+    def news(self, limit=20):
+        return self.q('SELECT * FROM news ORDER BY news_id DESC LIMIT ?', (limit,))
+
+    def add_news(self, text):
+        return self.x('INSERT INTO news (text, created) VALUES (?, ?)', (text, int(time.time())))
+
+    def delete_news(self, news_id):
+        self.x('DELETE FROM news WHERE news_id = ?', (news_id,))
+
+    def board_threads(self, board, offset=0, limit=10):
+        """A board's threads, newest activity first, with their reply counts."""
+        return self.q('SELECT p.*, (SELECT COUNT(*) FROM board_posts r WHERE r.reply_to = p.post_id AND r.hidden = 0) '
+                      'AS replies, COALESCE((SELECT MAX(r.created) FROM board_posts r WHERE r.reply_to = p.post_id AND '
+                      'r.hidden = 0), p.created) AS active FROM board_posts p WHERE p.board = ? AND p.reply_to = 0 AND '
+                      'p.hidden = 0 ORDER BY active DESC, p.post_id DESC LIMIT ? OFFSET ?', (board, limit, offset))
+
+    def board_thread_count(self, board):
+        return self.one('SELECT COUNT(*) AS n FROM board_posts WHERE board = ? AND reply_to = 0 AND hidden = 0',
+                        (board,))['n']
+
+    def board_post(self, post_id):
+        return self.one('SELECT * FROM board_posts WHERE post_id = ? AND hidden = 0', (post_id,))
+
+    def board_replies(self, post_id):
+        return self.q('SELECT * FROM board_posts WHERE reply_to = ? AND hidden = 0 ORDER BY post_id', (post_id,))
+
+    def add_board_post(self, board, account_id, author, subject, body, reply_to=0):
+        return self.x('INSERT INTO board_posts (board, account_id, author, subject, body, reply_to, created) '
+                      'VALUES (?, ?, ?, ?, ?, ?, ?)', (board, account_id, author, subject, body, reply_to, int(time.time())))
+
+    def recent_posts_by(self, account_id, since):
+        return self.one('SELECT COUNT(*) AS n FROM board_posts WHERE account_id = ? AND created >= ?',
+                        (account_id, since))['n']
+
+    def set_post_hidden(self, post_id, hidden):
+        self.x('UPDATE board_posts SET hidden = ? WHERE post_id = ? OR reply_to = ?', (1 if hidden else 0, post_id, post_id))
 
     # ---- files players upload
 

@@ -4,8 +4,10 @@ stats and files."""
 
 import asyncio
 import logging
+import struct
 
 from . import messages as M
+from . import stats
 from .service import MediusConnection
 
 log = logging.getLogger('medius')
@@ -97,9 +99,29 @@ class LobbyServer(MediusConnection):
     # ---- stats
 
     def on_AccountUpdateStats(self, m):
-        if self.player is not None:
-            self.server.store.set_stats(self.player.account_id, m['Stats'])
+        self.store_stats(m['Stats'])
         self.reply('AccountUpdateStatsResponse', MessageID=m['MessageID'], StatusCode=M.SUCCESS)
+
+    def store_stats(self, blob):
+        """Keeps the player's statistics record if it moves forward (stats.progress); counts what it
+        adds for their cell."""
+        p = self.player
+        if p is None:
+            return
+        account = self.server.store.account_by_id(p.account_id)
+        old = bytes(account['stats']) if account else b''
+        if bytes(blob) == old:
+            return
+        if not stats.progress(old, blob):
+            new = stats.decode_player(blob)
+            if new is None:     # some PlayerReports during a match carry something else than the record
+                log.debug('mls %s: %s sent stats that are not a player record; ignored', self.who(), p.name)
+            else:
+                log.warning('mls %s: kept the stored stats of %s: the new record has less (XP %s -> %s)', self.who(),
+                            p.name, (stats.decode_player(old) or {}).get('xp'), new['xp'])
+            return
+        self.server.store.set_stats(p.account_id, blob)
+        self.server.records.record_progress(p.account_id, old, blob, p.game)
 
     # ---- lists: one response per entry; an empty list is a single NoResult with EndOfList
 
@@ -289,18 +311,27 @@ class LobbyServer(MediusConnection):
                 g.generic[i] = m['GenericField%d' % (i + 1)]
         # WorldClosed means the match has started and takes no more players (it stays listed as in
         # progress); the game ends when its DME world empties.
+        if g.status not in (M.WORLD_ACTIVE, M.WORLD_CLOSED) and m['WorldStatus'] in (M.WORLD_ACTIVE, M.WORLD_CLOSED):
+            g.match += 1
         g.status = m['WorldStatus']
 
     on_WorldReport = on_WorldReport0 = _report
 
     def on_PlayerReport(self, m):
-        if self.player is not None:
-            self.server.store.set_stats(self.player.account_id, m['Stats'])
+        self.store_stats(m['Stats'])
 
     def on_EndGameReport(self, m):
         g = self.lobby.games.get(m['MediusWorldID'])
         log.info('mls %s: game %s ended: winning team %r, player %r, score %d', self.who(), g.name if g else m['MediusWorldID'],
                  m['WinningTeam'], m['WinningPlayer'], m['FinalScore'])
+
+    def on_raw_4_75(self, body):
+        """TextFilter (a cell's name and tag, before creating it): [MessageID][SessionKey][4][length]
+        [text]. Answered "passes": MessageID, then two zero ints (status, filter type)."""
+        mid = body[:21]
+        n = int.from_bytes(body[42:46], 'little') if len(body) >= 46 else 0
+        log.info('mls %s: text check %r: passes', self.who(), body[46:46 + n].decode('latin-1', 'replace'))
+        self.send_app(bytes((M.LOBBY_EXT, 0x76)) + mid.ljust(21, b'\0') + bytes(3 + 8))
 
     def on_SessionEnd(self, m):
         # Leaving online play: answer, then sign out (which closes this connection).
@@ -353,6 +384,21 @@ class LobbyServer(MediusConnection):
             else:
                 q.lobby.reply('ChatFwdMessage', MessageID='', OriginatorAccountID=self.player.account_id,
                               OriginatorAccountName=self.player.name, MessageType=m['MessageType'], Message=text)
+
+    def on_raw_4_73(self, body):
+        """GenericChatMessage1, the only chat Combat Ops sends (lobby, whisper, cell, buddies):
+        [MessageID][SessionKey][2][type i32][target i32][length i32][text]. Forwarded as
+        GenericChatFwdMessage1 (4/0x74): [time u32][sender id][type][sender name 32][length][text]."""
+        if self.player is None or len(body) < 0x34:
+            return
+        mtype, target, n = struct.unpack_from('<iii', body, 0x28)
+        text = body[0x34:0x34 + max(0, min(n, 512))].split(b'\0', 1)[0]
+        log.info('mls %s: %s chats (type %d, target %d): %r', self.who(), self.player.name, mtype, target,
+                 text.decode('latin-1', 'replace'))
+        fwd = struct.pack('<Iii32si', self.server.unix_time() & 0xFFFFFFFF, self.player.account_id, mtype,
+                          self.player.name.encode('latin-1', 'replace')[:31], len(text) + 1) + text + b'\0'
+        for q in self.recipients(mtype, target):
+            q.lobby.send_app(bytes((M.LOBBY_EXT, 0x74)) + fwd)
 
     def on_ChatMessage(self, m):
         self._chat(m, False)
@@ -531,8 +577,11 @@ class LobbyServer(MediusConnection):
     def on_GetMyClanMessages(self, m):
         rows = self.server.store.clan_messages(m['ClanID'])
         rows = self.page(rows, m['Start'], m['PageSize'])
-        self.reply_list('GetMyClanMessagesResponse', m['MessageID'],
-                        [{'ClanID': m['ClanID'], 'Message': r['text']} for r in rows])
+        # The game shows the newest as the cell's Message of the Day. "No result" is an error to it
+        # ("Failed to get The Message Of The Day"): with none set, answer one empty message.
+        entries = [{'ClanID': m['ClanID'], 'ClanMessageID': r['message_id'], 'Message': r['text']} for r in rows]
+        entries = entries or [{'ClanID': m['ClanID'], 'ClanMessageID': 0, 'Message': ''}]
+        self.reply_list('GetMyClanMessagesResponse', m['MessageID'], entries)
 
     def on_SendClanMessage(self, m):
         led = self.server.store.clans_led_by(self.player.account_id)

@@ -14,6 +14,7 @@ from .dme import GameServer
 from . import http
 from . import sslv3
 from .lobby import LobbyServer
+from .records import Records
 from .svo import Svo
 from .universe import UniverseInformation
 from .world import Lobby
@@ -107,6 +108,7 @@ class MediusServer:
         self._servers = []
         self._nat = None
         self.dme = GameServer(self)
+        self.records = Records(self)
 
     # ---- helpers for the services
 

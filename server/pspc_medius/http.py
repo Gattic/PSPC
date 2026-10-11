@@ -39,6 +39,8 @@ class Response:
 
 async def _read_request(reader, peer):
     line = await reader.readline()
+    while line in (b'\r\n', b'\n'):      # the game's HTTP client sends stray CRLFs after POST bodies
+        line = await reader.readline()
     if not line:
         return None
     try:
@@ -100,7 +102,8 @@ def serve(handler):
                 head = ['HTTP/1.1 %d %s' % (resp.status, REASONS.get(resp.status, 'OK')),
                         'Content-Type: %s' % resp.content_type, 'Content-Length: %d' % len(resp.body),
                         'Connection: %s' % ('keep-alive' if keep else 'close'), 'Cache-Control: no-cache']
-                head += ['%s: %s' % kv for kv in resp.headers.items()]
+                for k, v in resp.headers.items():        # a list value repeats the header (Set-Cookie)
+                    head += ['%s: %s' % (k, x) for x in (v if isinstance(v, list) else [v])]
                 writer.write(('\r\n'.join(head) + '\r\n\r\n').encode('latin-1') + (resp.body if req.method != 'HEAD' else b''))
                 await writer.drain()
                 if not keep:

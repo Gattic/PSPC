@@ -70,6 +70,7 @@ class Game:
         self.attributes = fields.get('Attributes', 0)
         self.stats = bytes(256)
         self.status = 1            # MediusWorldStatus: WorldPendingCreation
+        self.match = 0             # counts the matches played in this world (staging -> closed)
         self.players = {}          # account id -> Player, as the DME reports them
         self.dme = None            # dme.World
 

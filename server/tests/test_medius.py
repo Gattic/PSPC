@@ -9,6 +9,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 import shutil
 import socket
 import struct
@@ -16,18 +17,21 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 import zlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
-from pspc_medius import crypto, rt, sslv3, umd  # noqa: E402
+from pspc_medius import crypto, records, rt, sslv3, stats, umd  # noqa: E402
 from pspc_medius import messages as M  # noqa: E402
 from pspc_medius import structs as S  # noqa: E402
 from pspc_medius.games import GAMES  # noqa: E402
 from pspc_medius.missions import spywars  # noqa: E402
+from pspc_medius.records import Records  # noqa: E402
 from pspc_medius.server import Config, MediusServer  # noqa: E402
 from pspc_medius.store import Store  # noqa: E402
 from pspc_medius.svo import svomac  # noqa: E402
@@ -420,7 +424,7 @@ class Ssl3Client:
         return 0
 
 
-class ServerTests(unittest.TestCase):
+class ServerCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         logging.getLogger('medius').setLevel(logging.ERROR)
@@ -503,6 +507,15 @@ class ServerTests(unittest.TestCase):
 
     # ---- tests
 
+    def post(self, path, fields):
+        url = 'http://127.0.0.1:%d%s%s' % (self.config.http_port, self.server.game.svo_path, path)
+        data = urllib.parse.urlencode(fields).encode()
+        req = urllib.request.Request(url, data, {'Content-Type': 'application/x-www-form-urlencoded'})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.read()
+
+
+class ServerTests(ServerCase):
     def test_universe_information(self):
         muis = self.client(self.config.muis_port)
         muis.connect()
@@ -623,6 +636,274 @@ class ServerTests(unittest.TestCase):
         self.http('game/Finish?TransactionID=1&AccountID=5')
         row = self.store.one("SELECT * FROM game_reports WHERE kind = 'Finish' ORDER BY report_id DESC LIMIT 1")
         self.assertEqual(row['query'], 'TransactionID=1&AccountID=5')
+
+    def test_ranked_game(self):
+        # the root page gives createGameURI with a %d for the mode
+        root = self.http('')[0].decode()
+        create = [line for line in root.splitlines() if 'createGameURI' in line][0]
+        self.assertIn('game/Create?gameMode=%d', create)
+        form = ET.fromstring(self.http('game/Create?gameMode=8')[0]).find('Create_Game')
+        names = [f.get('name') for f in form]
+        self.assertEqual(tuple(names), ('gameMode', 'scertGameID', 'gameName', 'hostPlayerList', 'remotePlayerList',
+                                        'timePerDiv', 'numDivs', 'locationID'))
+        self.assertIsNone(form.find('status'))
+        values = {'gameMode': '8', 'scertGameID': '3', 'gameName': 'Host-1', 'hostPlayerList': '1',
+                  'remotePlayerList': '2,3,4', 'timePerDiv': '100', 'numDivs': '2', 'locationID': '1'}
+        submit = urllib.parse.urlparse(form.get('action')).path[len(self.server.game.svo_path):]
+        done = ET.fromstring(self.http(submit + '?' + urllib.parse.urlencode([(n, values[n]) for n in names]))[0])
+        self.assertEqual(done.findtext('Create_Game/status/message'), 'GAME_CREATE_SUCCESS')
+        game_id = int(done.findtext('Create_Game/gameID'))
+        self.assertGreater(game_id, 0)
+        # every player posts its result; the replies must carry <id>0</id>
+        reply = self.post('game/Finish', {'SVOGameID': game_id, 'endStatus': 1, 'gameMode': 8, 'totalKills': 7,
+                                          'deaths': 2, 'headshots': 1, 'clanid': -1, 'gameResult': 0})
+        self.assertIn(b'<id>0</id>', reply)
+        row = self.store.one('SELECT * FROM svo_results WHERE game_id = ?', (game_id,))
+        self.assertEqual((row['kills'], row['deaths'], row['result']), (7, 2, 0))
+        # mission stats come from every player: counted once
+        for account in (1, 2):
+            self.assertIn(b'<id>0</id>', self.post('mission/PostStats', {
+                'SVOGameID': game_id, 'endStatus': 1, 'gameMode': 8, 'TransactionID': 54321, 'AccountID': account,
+                'MissionID': self.mission_id, 'PlayTime': 15, 'WinningTeam': 2}))
+        m = self.store.one('SELECT * FROM missions WHERE mission_id = ?', (self.mission_id,))
+        self.assertEqual((m['team_b_wins'], m['play_time'] >= 15), (1, True))
+        # votes: -1 is no vote, -2 inappropriate; plays counted once per match
+        plays = m['plays']
+        for account, rating in ((1, 4), (2, -1), (3, -2)):
+            self.assertIn(b'<id>0</id>', self.post('mission/VoteCast', {
+                'SVOGameID': game_id, 'endStatus': 1, 'gameMode': 8, 'TransactionID': 12345, 'AccountID': account,
+                'MissionID': self.mission_id, 'Rating': rating}))
+        m = self.store.one('SELECT * FROM missions WHERE mission_id = ?', (self.mission_id,))
+        votes = {r['account_id']: r['vote'] for r in self.store.q('SELECT * FROM mission_votes WHERE mission_id = ?',
+                                                                    (self.mission_id,))}
+        self.assertEqual((votes.get(1), votes.get(2), votes.get(3)), (4, None, -2))
+        self.assertEqual((m['plays'], m['inappropriate']), (plays + 1, 1))
+
+    def test_stray_crlf_between_requests(self):
+        s = socket.create_connection(('127.0.0.1', self.config.http_port), timeout=5)
+        self.addCleanup(s.close)
+        path = self.server.game.svo_path
+        body = b'TransactionID=1'
+        s.sendall(b'POST %smission/VoteCast HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\n\r\n%s\r\n\r\n'
+                  b'GET %shome.svml HTTP/1.1\r\nHost: x\r\n\r\n' % (path.encode(), len(body), body, path.encode()))
+        data = b''
+        while data.count(b'HTTP/1.') < 2:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        self.assertEqual(data.count(b'HTTP/1.0 200') + data.count(b'HTTP/1.1 200'), 2)
+
+    def test_lobby_chat(self):
+        alice, alice_session = self.lobby('Chatter1')
+        bob, _ = self.lobby('Chatter2')
+        text = b'gg everyone'
+        alice.send(rt.CLIENT_APP_TOSERVER, bytes((M.LOBBY_EXT, 0x73)) + b'4'.ljust(21, b'\0') +
+                   alice_session.encode().ljust(17, b'\0') + bytes(2) + struct.pack('<iii', M.CHAT_BROADCAST, 0, len(text) + 1)
+                   + text + b'\0')
+        while True:
+            m = bob.recv(rt.SERVER_APP)
+            if m.payload[:2] == bytes((M.LOBBY_EXT, 0x74)):
+                break
+        sender, mtype, name, n = struct.unpack_from('<ii32si', m.payload, 2 + 4)
+        self.assertEqual((mtype, name.rstrip(b'\0'), m.payload[2 + 48:2 + 48 + n].rstrip(b'\0')),
+                         (M.CHAT_BROADCAST, b'Chatter1', text))
+
+    def test_text_filter(self):
+        mls, session = self.lobby('Namer')
+        text = b'Cell1'
+        mls.send(rt.CLIENT_APP_TOSERVER, bytes((M.LOBBY_EXT, 0x75)) + b'9'.ljust(21, b'\0') +
+                 session.encode().ljust(17, b'\0') + bytes(4) + struct.pack('<i', len(text)) + text)
+        while True:
+            m = mls.recv(rt.SERVER_APP)
+            if m.payload[:2] == bytes((M.LOBBY_EXT, 0x76)):
+                break
+        self.assertEqual((m.payload[2:4], len(m.payload[2:]), m.payload[26:]), (b'9\0', 32, bytes(8)))
+
+
+VISIBLE = {'TEXT', 'BUTTON', 'RECTANGLE', 'LINE', 'TEXTAREA', 'GRID', 'IMAGE', 'LISTBOX', 'SELECT', 'INPUT'}
+
+
+def check_svml(test, body, where):
+    """The rules the game's SVML browser imposes (see portal.py)."""
+    text = body.decode('utf-8')
+    for entity in re.findall(r'&[^;\s]*;', text):
+        test.assertIn(entity, ('&amp;', '&lt;', '&gt;', '&quot;', '&apos;'), where)
+    root = ET.fromstring(body)
+    test.assertEqual(root.tag, 'SVML', where)
+    test.assertLessEqual(len(root), 256, where)
+    for el in root:
+        for child in el.iter():
+            if child is not el and child.tag in VISIBLE:
+                test.assertEqual(el.tag, 'FORM', '%s: %s nested in %s' % (where, child.tag, el.tag))
+        if el.tag == 'GRID':
+            cols = el.find('COLUMNS')
+            test.assertIsNotNone(cols, where)
+            test.assertEqual(len(cols.findall('COLUMN')), int(el.get('numCols')), where)
+            rows = el.find('ROWS').findall('ROW')
+            test.assertLessEqual(len(rows), int(el.get('numTotalRows')), where)
+            for attr in ('numVisRows', 'colWidth', 'rowHeight'):
+                test.assertGreater(float(el.get(attr)), 0, '%s: GRID %s' % (where, attr))
+            for row in rows:
+                test.assertEqual(len(row.findall('CELL')), int(el.get('numCols')), where)
+        if el.tag in ('TEXT', 'BUTTON'):
+            test.assertLess(len(el.text or ''), 128, where)
+        if el.tag in VISIBLE and el.get('y') is not None:
+            test.assertGreaterEqual(float(el.get('y')), 38, '%s: %s under the tab header' % (where, el.tag))
+    return root
+
+
+class PortalTests(ServerCase):
+    """The Community pages, with some players, a cell, posts and news to show."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        s = cls.store
+        cls.ids = {}
+        for i, name in enumerate(('Gabe_Logan', 'Lian_Xing', "Teresa_O'Hara", 'Mara<Aramov>')):
+            a = s.account(SFCO_APP_ID, name)
+            cls.ids[name] = a['account_id']
+            s.set_stats(a['account_id'], stats.encode_player(
+                xp=100 * (i + 1), kills=20 * (i + 1), deaths=10, headshots=i, played={'TDM': 3 + i, 'RET': 2},
+                won={'TDM': 1 + i, 'RET': 1}, online_id=name))
+        clan = s.create_clan(SFCO_APP_ID, 'Shadow Ops', cls.ids['Gabe_Logan'])
+        s.invite_to_clan(clan, cls.ids['Lian_Xing'], '')
+        s.x("UPDATE clan_invitations SET response = 1")
+        s.x('INSERT OR IGNORE INTO clan_members (clan_id, account_id) VALUES (?, ?)', (clan, cls.ids['Lian_Xing']))
+        s.add_clan_message(clan, 'Train hard & fight "smart"')
+        s.record_cell_match(clan, 'TDM', 'k1', True)
+        cls.clan = clan
+        s.add_news('Servers are back online!')
+        cls.topic = s.add_board_post('general', cls.ids['Gabe_Logan'], 'Gabe_Logan', 'Hello <agents>', 'First post & more')
+        s.add_board_post('general', cls.ids['Lian_Xing'], 'Lian_Xing', '', 'Welcome back', cls.topic)
+
+    def page(self, path, cookie=None):
+        headers = {'Cookie': 'AcctID=%d' % cookie} if cookie else {}
+        body, h = self.http(path, headers)
+        self.assertEqual(h.get('Content-Type'), 'text/svml', path)
+        return check_svml(self, body, path), body
+
+    def test_every_page_is_valid_svml(self):
+        me = self.ids['Lian_Xing']
+        paths = ['home.svml', 'news.svml', 'find.svml', 'board.svml', 'topics.svml?b=general', 'topic.svml?id=%d' % self.topic,
+                 'post.svml?b=general', 'post.svml?b=general&reply=%d' % self.topic, 'cells.svml', 'cells.svml?b=xp',
+                 'cell.svml?id=%d' % self.clan, 'cell.svml?id=999', 'agent.svml?id=%d' % me, 'agent.svml?name=Nobody',
+                 'missions.svml', 'missions.svml?b=played', 'missions.svml?b=new', 'mission.svml?id=%d' % self.mission_id]
+        paths += ['lb.svml?b=%s' % key for key in records.PLAYER_BOARDS] + ['lb.svml?b=xp&p=5']
+        for path in paths:
+            self.page(path, me)
+
+    def test_leaderboard(self):
+        root, body = self.page('lb.svml?b=xp', self.ids['Lian_Xing'])
+        rows = root.find('GRID/ROWS').findall('ROW')
+        names = [r.findall('CELL')[1].text for r in rows]
+        self.assertEqual(names[0], 'Mara<Aramov>')                  # the most XP
+        self.assertIn(b'Teresa_O&apos;Hara', body)
+        mine = root.find('GRID/ROWS/MY_RECORD_ROW').findall('CELL')
+        self.assertEqual(mine[1].text, 'Lian_Xing')
+
+    def test_agent_and_cell(self):
+        root, body = self.page('agent.svml?name=Gabe_Logan')
+        self.assertIn(b'Rank R1', body)
+        self.assertIn(b'Shadow Ops', body)
+        root, body = self.page('cell.svml?id=%d' % self.clan)
+        self.assertIn(b'Train hard &amp; fight &quot;smart&quot;', body)
+        self.assertIn(b'1 won / 1', body)
+
+    def test_cell_stats_for_the_game(self):
+        # the game's own cell profile reads CellGetStatsURI
+        root = ET.fromstring(self.http('cell/GetStats?TransactionID=7&CellD=%d' % self.clan)[0]).find('SpyWars')
+        self.assertEqual((root.findtext('TransactionID'), root.findtext('ClanName')), ('7', 'Shadow Ops'))
+        self.assertEqual((root.findtext('TeamDeathmatch/PlayCount'), root.findtext('TeamDeathmatch/WinCount')), ('1', '1'))
+        self.assertEqual(root.findtext('Sabotage/PlayCount'), '0')
+
+    def test_message_board_post_and_reply(self):
+        author = self.ids['Teresa_O\'Hara']
+        url = 'http://127.0.0.1:%d%sboard/submit' % (self.config.http_port, self.server.game.svo_path)
+
+        def post(fields):
+            req = urllib.request.Request(url, urllib.parse.urlencode(fields).encode(),
+                                         {'Content-Type': 'application/x-www-form-urlencoded', 'Cookie': 'AcctID=%d' % author})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.read()
+        reply = post({'subject': 'LFG tonight', 'b': 'games', 'reply': 0, 'body': 'Anyone up for TDM?'})
+        self.assertIn(b'Posted.', reply)
+        check_svml(self, reply, 'board/submit')
+        topic = self.store.one("SELECT * FROM board_posts WHERE board = 'games' ORDER BY post_id DESC LIMIT 1")
+        self.assertEqual((topic['author'], topic['subject']), ("Teresa_O'Hara", 'LFG tonight'))
+        self.assertIn(b'Please wait', post({'b': 'games', 'reply': topic['post_id'], 'body': 'too fast'}))
+        self.store.x('UPDATE board_posts SET created = created - 60')
+        post({'b': 'games', 'reply': topic['post_id'], 'body': 'Count me in'})
+        root, body = self.page('topic.svml?id=%d' % topic['post_id'])
+        self.assertIn(b'Count me in', body)
+        root, body = self.page('topics.svml?b=games')
+        self.assertIn(b'LFG tonight', body)
+        anonymous = urllib.request.Request(url, b'b=games&body=hi', {'Content-Type': 'application/x-www-form-urlencoded'})
+        with urllib.request.urlopen(anonymous, timeout=5) as r:
+            self.assertIn(b'Sign in', r.read())
+
+
+class StatsTests(unittest.TestCase):
+    def test_round_trip(self):
+        blob = stats.encode_player(cell_id=4, cell_patch=12, cell_name='Shadows', cell_tag='SHD', xp=350,
+                                   played={'TDM': 5, 'DM': 2}, won={'TDM': 3}, kills=40, deaths=20, headshots=9,
+                                   online_id='Gabe')
+        s = stats.decode_player(blob)
+        self.assertEqual((s['cell_id'], s['cell_tag'], s['rank'], s['xp'], s['games'], s['wins'], s['won']['TDM']),
+                         (4, 'SHD', 'R3', 350, 7, 3, 3))
+        self.assertEqual((stats.rank_of(0), stats.rank_of(99), stats.rank_of(100), stats.rank_of(1000)),
+                         ('R0', 'R0', 'R1', 'T3'))
+        self.assertIsNone(stats.decode_player(bytes(256)))
+        self.assertIsNone(stats.decode_player(b'short'))
+
+    def test_progress(self):
+        old = stats.encode_player(xp=300, played={'TDM': 5}, won={'TDM': 2}, kills=10)
+        self.assertTrue(stats.progress(old, stats.encode_player(xp=320, played={'TDM': 6}, won={'TDM': 2}, kills=12)))
+        self.assertFalse(stats.progress(old, stats.encode_player(xp=0)))               # a reset console
+        self.assertFalse(stats.progress(old, b'garbage'))
+        self.assertTrue(stats.progress(b'', stats.encode_player(xp=0)))                 # a new account
+        self.assertTrue(stats.progress(old, stats.encode_player(xp=300, played={'TDM': 5}, won={'TDM': 2}, kills=10,
+                                                                cell_id=3)))           # joined a cell
+
+
+class RecordsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.store = Store(os.path.join(self.tmp, 'r.sqlite'))
+        game = GAMES['sfco']()
+        self.server = types.SimpleNamespace(store=self.store, game=game, lobby=types.SimpleNamespace(by_account={}))
+        self.records = Records(self.server)
+        self.ids = {}
+        for name, xp, kills, wins in (('Alpha', 500, 30, 4), ('Bravo', 500, 50, 6), ('Charlie', 900, 10, 1),
+                                      ('Delta', 0, 0, 0)):
+            a = self.store.account(SFCO_APP_ID, name)
+            self.ids[name] = a['account_id']
+            self.store.set_stats(a['account_id'], stats.encode_player(xp=xp, kills=kills, played={'TDM': wins + 1},
+                                                                      won={'TDM': wins}))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.addCleanup(self.store.close)
+
+    def test_player_boards(self):
+        xp = [(pos, name) for pos, _, name, _, _ in self.records.board('xp')]
+        self.assertEqual(xp, [(1, 'Charlie'), (2, 'Bravo'), (3, 'Alpha'), (4, 'Delta')])   # ties: more wins first
+        kills = [name for _, _, name, _, _ in self.records.board('kills')]
+        self.assertEqual(kills, ['Bravo', 'Alpha', 'Charlie'])                             # no zero rows
+        self.assertEqual(self.records.board('won_TDM')[0][3], 6)
+
+    def test_cell_matches_count_once(self):
+        clan = self.store.create_clan(SFCO_APP_ID, 'Shadows', self.ids['Alpha'])
+        game = types.SimpleNamespace(id=7, match=1)
+        for name in ('Alpha', 'Bravo'):
+            old = self.store.account_by_id(self.ids[name])['stats']
+            s = stats.decode_player(old)
+            s['played']['TDM'] += 1
+            s['won']['TDM'] += 1 if name == 'Bravo' else 0
+            new = stats.encode_player(cell_id=clan, xp=s['xp'], played=s['played'], won=s['won'], kills=s['kills'])
+            self.records.record_progress(self.ids[name], old, new, game)
+        self.assertEqual(self.store.cell_results(clan), {'TDM': (1, 1)})
+        board = self.records.cell_board('wins')
+        self.assertEqual((board[0][1]['clan']['name'], board[0][1]['wins']), ('Shadows', 1))
 
 
 if __name__ == '__main__':

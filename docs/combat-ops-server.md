@@ -7,10 +7,12 @@ official mission list), cells (clans), buddies and stats. It speaks the protocol
 built for: SCE-RT/Medius (lobby and game servers) and SVO (the game's web portal, including its
 SSL 3.0 login page). Python 3.9 or later, standard library only; one SQLite database file.
 
-**State.** Two PSPC instances on one PC sign in, meet in the lobby, host and join a game, download
-the mission, play a full match together through it, rate the mission afterwards and return to the
-lobby (unranked games so far: ranked rules need more players). Play across the internet hasn't
-been tried yet (see [Hosting on the internet](#hosting-on-the-internet)).
+**State.** PSPC instances on one PC sign in, meet in the lobby, host and join games, download the
+mission and play full matches through it, unranked with two players and ranked with four (the
+game's minimum): the ranked game is registered, every player's result and new stats come in, and
+they rate the mission and return to the lobby. Cells, buddy invitations, chat and the Community
+pages (leaderboards, profiles, cell standings, message board) work in the game. Play across the
+internet hasn't been tried yet (see [Hosting on the internet](#hosting-on-the-internet)).
 
 ## Quick start (one PC)
 
@@ -73,21 +75,56 @@ match the players' games also send UDP straight to each other (peer to peer) as 
 the DME, as the PSP did; whether that needs ports forwarded on players' routers hasn't been
 tested yet. Use `--network` with a PSPC Network server so names are checked.
 
+## Community, leaderboards and stats
+
+The online menu's **Community** tab is a web page the game's browser loads from the server. The
+server's pages (SVML, the browser's own markup) offer:
+
+| Page | |
+|---|---|
+| Home | the latest news, players online and games running, your rank and record |
+| Leaderboards | top agents by XP, wins, kills, kill/death ratio (25 kills or more), headshots, objectives, revives, and wins per combat type; 9 per page with your own standing underneath. X on an agent opens their profile |
+| Find an Agent | type an online ID |
+| Agent profile | rank, XP and leaderboard position; games and wins per combat type; kills, deaths, headshots, revives, objectives; their cell. "Game profile" opens the game's own profile screen, from which players can invite them as a buddy or to a cell |
+| Cell Standings | cells by match wins, by their agents' XP, or by size; a cell's page has its Message of the Day, games and wins per team mode, and its agents ("Game profile" opens the game's own cell screen) |
+| Message Board | four boards (General, Looking for a Game, Cells & Recruiting, Mission Makers): topics, replies, posting with the game's keyboard (one post per 30 seconds, 50 a day) |
+| Mission Charts | shared missions by rating, by plays, or newest, and each mission's record |
+| News | what the operator posts (`news add`) |
+
+**Where the numbers come from.** The game keeps each player's record itself (rank, XP, games and
+wins per combat type, kills and so on) and stores it on the server; the server decodes it for the
+pages (`stats.py`). The game only updates it after **ranked** games, which need at least four
+players and even teams; unranked games count for mission plays and ratings only. The server keeps
+a record from going backwards (a console that lost its save can't overwrite its stats with zeros).
+A cell's games and wins per team mode (shown on the game's own cell profile and on the cell page)
+are counted when a member's record shows a new ranked Retrieval, Sabotage or Team Deathmatch game:
+once per cell per match, won if any member won.
+
+**Ranked games** also report to the server: when one starts, the host creates a game record (the
+match doesn't start without it), and at the end each player posts their result (kills by weapon
+class, deaths, headshots, win or loss); team modes add the mission's play time and winning team.
+These are stored (`svo_games`, `svo_results`).
+
 ## Administration
 
 The same command manages the database; it's safe to use while the server runs.
 
 ```sh
 python -m pspc_medius --db sfco.sqlite accounts                    # players who have signed in
-python -m pspc_medius --db sfco.sqlite ban Some_Cheater
+python -m pspc_medius --db sfco.sqlite ban Some_Cheater            # also drops them from the leaderboards
 python -m pspc_medius --db sfco.sqlite unban Some_Cheater
 python -m pspc_medius --db sfco.sqlite missions list               # shared missions, downloads, plays
 python -m pspc_medius --db sfco.sqlite missions import SFCO.iso    # official missions from the disc
 python -m pspc_medius --db sfco.sqlite missions hide 42            # hide an inappropriate one (unhide, delete)
+python -m pspc_medius --db sfco.sqlite news add "Tournament on Saturday at 20:00 UTC"
+python -m pspc_medius --db sfco.sqlite news list                   # news delete <id> removes one
+python -m pspc_medius --db sfco.sqlite board list                  # the latest posts
+python -m pspc_medius --db sfco.sqlite board hide 17               # hide a post (a topic with its replies); unhide
 ```
 
-The database holds accounts (by online ID), buddies and ignore lists, cells, stats, uploaded
-missions and files, and what the game sends at the end of matches (`game_reports`). Back it up.
+The database holds accounts (by online ID) and their stats, buddies and ignore lists, cells and
+their results, uploaded missions and files, ratings, the message board and news, and ranked game
+results. Back it up.
 
 ## How it works
 
@@ -99,6 +136,9 @@ missions and files, and what the game sends at the end of matches (`game_reports
 | Players, channels, games | `world.py` |
 | DME: game worlds, TCP and UDP relay | `dme.py` |
 | SVO portal (SVML pages, `X-SVOMac`), SSL 3.0 server, HTTP | `svo.py`, `sslv3.py`, `http.py` |
+| Community pages | `portal.py` |
+| Stats records, leaderboards, cell results | `stats.py`, `records.py` |
+| Ranked games: create, results | `results.py` |
 | Mission server, mission files, reading the UMD | `missions.py`, `umd.py` |
 | Game settings (app ID, channels, files such as `LobbySettings.ini`) | `games.py` |
 | Database | `store.py` |
@@ -129,6 +169,20 @@ EndGameReport).
   (`FILENAME`, `LVL_THEMEID`, `PVPGAMEMODE`, `LVL_CHUNKn`, ...). Files on the disc have a 0x1C-byte
   `qDEFSCE` header the game doesn't accept over the network, so the server strips it.
 - World status 3 means closed to new players (a match is running), not ended.
+- The message table follows horizon-server, but this client library differs in places, checked
+  against its own message registrations: lobby chat is `GenericChatMessage1` (LOBBY_EXT 0x73,
+  forwarded as 0x74, variable length), a cell's messages come back as LOBBY_EXT 0x77, a cell
+  name check is a text filter request (LOBBY_EXT 0x75), and buddy invitations go through
+  `BuddyGetPermission` (LOBBY_EXT 0x63) and `AddToBuddyListFwdConfirmation` (0x06/0x07).
+- The player stats record (256 bytes, written by the game): magic 0x12345678, cell id, patch,
+  name and tag, rank string, XP (0-1000, ranks R0-T3 every 100), games and wins per combat type,
+  kills, deaths, suicides, revives, objectives, headshots, online ID (`stats.py`).
+- Ranked games: `createGameURI` is printf'd with the mode; the server answers a `<Create_Game>`
+  form, then a `GAME_CREATE_SUCCESS` with a positive `<gameID>`. Result posts (finish, mission
+  stats, vote) are form POSTs that need `<id>0</id>` back. The game's HTTP client sends stray
+  CRLFs after POST bodies.
+- SVML in this browser: visible tags are direct children of `<SVML>` (form fields inside FORM),
+  pixel coordinates, `#AARRGGBB` colors, five XML entities, 256 tags a page (`portal.py`).
 
 ## Tests
 
@@ -136,15 +190,17 @@ EndGameReport).
 python -m unittest discover -s server/tests       # from the repository root
 ```
 
-`test_medius.py` covers the ciphers, layouts and file formats, then runs the server and drives it
-like two consoles: handshakes, sign-in, a game hosted and joined, game traffic relayed over TCP
-and UDP (including encrypted list messages), the SVO pages over HTTP and SSL 3.0, and the mission
-server. With `Games/SFCO.iso` present it also reads the disc's missions.
+`test_medius.py` covers the ciphers, layouts, file formats and stats records, then runs the server
+and drives it like consoles do: handshakes, sign-in, a game hosted and joined, game traffic
+relayed over TCP and UDP (including encrypted list messages), buddy invitations, chat checks, the
+SVO pages over HTTP and SSL 3.0, the mission server, the ranked game exchange and result posts,
+the leaderboards and cell results, and every Community page (checked against the browser's
+rules), including posting on the message board. With `Games/SFCO.iso` present it also reads the
+disc's missions.
 
 ## Limits
 
-- Players' stats (rank, XP, wins and games per mode) are kept as the game reports them, but there
-  are no ladders (rankings across players) yet.
-- Cell statistics (games played and won per mode) stay at zero.
-- What the game sends to the portal at the end of a match is recorded (`game_reports`) but not
-  used yet.
+- Leaderboards and cell results only move with ranked games (the game's rule, not the server's).
+- The message board has no editing or deleting by players; operators hide posts with `board hide`.
+- The game's own player and cell profile screens show what the game stores; the Community pages
+  show more.
