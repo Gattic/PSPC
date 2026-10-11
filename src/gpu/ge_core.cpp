@@ -69,6 +69,7 @@ struct DisplayList {
 	bool bboxResult;
 	u32 stackAddr;
 	bool hung;  // an undefined SIGNAL hangs the GE until sceGeBreak(1)
+	bool clearStarted;  // its first clear has paid ClearSetupCycles
 };
 
 struct PendingInterrupt {
@@ -86,6 +87,9 @@ DisplayList *currentList = nullptr;
 int nextListID = 0;
 bool interruptRunning = false;
 bool isbreak = false;
+// The GE's LISTADDR register, which sceGeDrawSync(1) reads: the current list's pc, except that a
+// sceGeBreak(0) runs geman's own list and leaves 0 there until a list (re)starts (uOFW ge.c).
+bool listAddrCleared = false;
 GPURunState gpuState = GPUSTATE_DONE;
 // Timing (PPSSPP's model): the GE runs a list at once, but what it does happens when it would on
 // hardware, on the CPU clock (hooks.getTicks). Without a clock everything happens at time 0.
@@ -398,13 +402,18 @@ int PerVertexCycles() {
 }
 
 // How long a clear takes to fill, measured on a PSP (pspautotests gpu/timing/blittiming, through
-// PPSSPP, which doesn't charge it): ns per pixel at 222 MHz, by framebuffer format.
+// PPSSPP, which doesn't charge it): ns per pixel at 222 MHz, by framebuffer format. Those probes
+// timed one full-screen clear per list, start and sync included: that part is the ~85 us a list
+// pays for its first clear, and 60 clears in one list take ~56 ms, not 60 x 1.02 ms
+// (threads/scheduling/syscallkinds).
+constexpr int ClearSetupCycles = 85 * 222;
+
 int ClearFillCycles(GEPrimitiveType prim, const u8 *verts, const u8 *inds, int count, u32 vertType) {
 	if (prim != GE_PRIM_RECTANGLES || !gstate.isModeThrough() || !gstate.isModeClear() ||
 		(vertType & GE_VTYPE_POS_MASK) != GE_VTYPE_POS_16BIT)
 		return 0;
 	const bool is32Bit = gstate.FrameBufFormat() == GE_FORMAT_8888;
-	const double ns = is32Bit ? (gstate.isClearModeDepthMask() ? 7.82 : 5.28) : 3.77;
+	const double ns = is32Bit ? (gstate.isClearModeDepthMask() ? 7.17 : 4.63) : 3.12;
 	const int left = gstate.getScissorX1(), top = gstate.getScissorY1();
 	const int right = gstate.getScissorX2() + 1, bottom = gstate.getScissorY2() + 1;
 	const int idxType = (int)((vertType & GE_VTYPE_IDX_MASK) >> 11);
@@ -418,7 +427,14 @@ int ClearFillCycles(GEPrimitiveType prim, const u8 *verts, const u8 *inds, int c
 		if (x1 > x0 && y1 > y0)
 			pixels += (double)(x1 - x0) * (y1 - y0);
 	}
-	return (int)(pixels * ns * (double)(222000000 / 1000000) / 1000.0);
+	if (pixels == 0.0)
+		return 0;
+	int setup = 0;
+	if (currentList && !currentList->clearStarted) {
+		currentList->clearStarted = true;
+		setup = ClearSetupCycles;
+	}
+	return setup + (int)(pixels * ns * (double)(222000000 / 1000000) / 1000.0);
 }
 
 void Execute_Prim(u32 op) {
@@ -1040,6 +1056,7 @@ void ProcessDLQueue() {
 			return;
 
 		currentList = &list;
+		listAddrCleared = false;
 		if (!list.started && list.context)
 			SaveContextTo(list.context);
 		list.started = true;
@@ -1221,6 +1238,7 @@ void ResetLists() {
 	currentList = nullptr;
 	interruptRunning = false;
 	isbreak = false;
+	listAddrCleared = false;
 	drawCompleteTicks = 0;
 	busyTicks = 0;
 	gpuState = GPUSTATE_DONE;
@@ -1422,6 +1440,7 @@ int EnqueueList(u32 listpc, u32 stall, int callbackId, u32 optParamAddr, bool he
 	dl.stall = stall & 0x0FFFFFFF;
 	dl.hwStall = dl.stall;
 	dl.resumeHw = false;
+	dl.clearStarted = false;
 	dl.callbackId = callbackId >= 0 ? callbackId : -1;
 	dl.stackptr = 0;
 	dl.signal = SIGNAL_NONE;
@@ -1550,8 +1569,9 @@ int DrawSync(int mode) {
 	}
 	if (!top || top->state == DL_STATE_COMPLETED)
 		return 0;
-	// The firmware compares the stall address against the hardware's pc.
-	if (top->state != DL_STATE_QUEUED && top->pc == top->stall)
+	// The firmware compares the first list's stall address against the hardware's LISTADDR.
+	const u32 listAddr = listAddrCleared || !currentList ? 0 : currentList->pc;
+	if (top->state != DL_STATE_QUEUED && top->stall == listAddr)
 		return 3;
 	return 2;
 }
@@ -1598,6 +1618,7 @@ int Break(int mode, u32 paramAddr) {
 			UpdatePendingInterrupt(i);
 		nextListID = 0;
 		currentList = nullptr;
+		listAddrCleared = true;
 		return 0;
 	}
 	if (currentList->state == DL_STATE_NONE || currentList->state == DL_STATE_COMPLETED)
@@ -1621,6 +1642,7 @@ int Break(int mode, u32 paramAddr) {
 	currentList->state = DL_STATE_PAUSED;
 	currentList->signal = SIGNAL_HANDLER_SUSPEND;
 	isbreak = interruptRunning || !cpuInterruptsEnabled;
+	listAddrCleared = true;
 	return (int)(LIST_ID_MAGIC ^ (u32)currentList->id);
 }
 
@@ -1629,6 +1651,7 @@ int Continue() {
 		return 0;
 	if (currentList->state == DL_STATE_PAUSED) {
 		currentList->hwStall = currentList->stall;
+		listAddrCleared = false;
 		if (!isbreak) {
 			// Inside the pause window (PAUSE signal seen, FINISH not yet).
 			if (currentList->signal == SIGNAL_HANDLER_PAUSE)

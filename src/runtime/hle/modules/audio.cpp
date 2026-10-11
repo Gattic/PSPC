@@ -131,6 +131,10 @@ struct AudioSRCChannel {
 // (PPSSPP's docs/sceAudio.md puts it at about 100us; audio/output2/rest, measured after two
 // checkpoint prints, fits 50us best here).
 constexpr u64 kSrcRetireEarlyUs = 50;
+// After its last buffer's time is up the SRC output still plays out what the DMA fetched last;
+// a NULL output in that window waits for it. Fitted: in audio/sceaudio/output the second NULL
+// comes ~100 us after the end and waits under 1 ms, the third comes later and doesn't wait.
+constexpr u64 kSrcPlayoutUs = 500;
 
 AudioChannel g_chans[PSP_AUDIO_CHANNEL_MAX];
 AudioSRCChannel g_src;
@@ -333,7 +337,16 @@ u32 SRCWait(AudioSRCChannel &chan, u32 result) {
 
 u32 SRCEnqueueBlocking(AudioSRCChannel &chan, u32 samplePtr, int vol) {
 	bool mustWait;
+	const bool drainOnly = samplePtr == 0 && chan.reserved && chan.bufferCount == 0;
 	u32 result = SRCEnqueue(chan, samplePtr, vol, &mustWait);
+	if (drainOnly) {
+		// Nothing is queued, but the output may still be playing out (kSrcPlayoutUs).
+		const u64 now = sched::NowUs(), end = chan.lastEndUs + kSrcPlayoutUs;
+		if (result == 0 && chan.lastEndUs != 0 && end > now && sched::Current() && sched::DispatchEnabled() &&
+			!sched::InInterrupt())
+			sched::WaitUntil(WAITTYPE_HLEDELAY, sched::CurrentId(), end, false);
+		return result;
+	}
 	if (!mustWait) return result;
 	return SRCWait(chan, result);
 }

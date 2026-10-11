@@ -68,6 +68,10 @@ SceUID CreateThread(const char *name, u32 entry, s32 prio, s32 stackSize, u32 at
 	t->moduleId = moduleId;
 
 	u32 size = AlignUp((u32)stackSize, 0x100);
+	if (size == 0) {  // 0xFFFFFF01 and up wrap to 0: no stack that big (threads/threads/create)
+		delete t;
+		return (s32)SCE_KERNEL_ERROR_NO_MEMORY;
+	}
 	BlockAllocator &alloc = stackAlloc ? *stackAlloc : (attr & PSP_THREAD_ATTR_KERNEL) ? g_kernelMem : g_userMem;
 	u32 stack = alloc.Alloc(size, (attr & PSP_THREAD_ATTR_LOW_STACK) == 0, ("stack/" + t->name).c_str());
 	if (!stack) {

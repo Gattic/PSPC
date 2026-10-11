@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -85,6 +86,12 @@ private:
 	HostFsOptions opt_;
 
 	std::mutex mutex_;
+	// Files the guest created in this session (not FAT): psplink's host0: shows those 0644, the
+	// files that were there already 0664 (io/file/file). Keys: lower-case host paths.
+	std::set<std::wstring> created_;
+	mutable std::mutex createdMutex_;
+	bool Created(const std::wstring &hostPath) const;
+	void SetCreated(const std::wstring &hostPath, bool created);
 	std::map<s32, std::shared_ptr<OpenFile>> files_;
 	std::map<s32, std::shared_ptr<OpenDir>> dirs_;
 	s32 nextHandle_ = 1;

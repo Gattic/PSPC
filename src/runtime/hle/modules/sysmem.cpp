@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // SysMemUserForUser: partition memory, firmware/SDK version queries, sceKernelPrintf.
+#include <algorithm>
 #include <cstdarg>
+#include <memory>
 #include <string>
+#include <vector>
 
 #include "common/log.h"
 #include "runtime/hle/hle_wrap.h"
@@ -106,18 +109,60 @@ int sceKernelGetMemoryBlockAddr(SceUID id, u32 outPtr) {
 
 // ---- SysMemForKernel heaps ----
 
+// A heap is a chain of partition blocks, as in the firmware's heap.c (uOFW): each block keeps 24
+// bytes of header and an 8-byte end marker, and every allocation carries 8 bytes of its own, in
+// 8-byte units. A heap created with flag 1 grows: an allocation no block can hold adds a block
+// big enough for it (sysmem/kernel/heapgrow), and a grown block that empties goes back. Flag 2
+// takes the blocks from the top of the partition.
 struct KernelHeap : KObject {
 	static constexpr KType kType = KType::Other;
 	KType Type() const override { return kType; }
+	struct Block {
+		u32 address = 0, size = 0;
+		BlockAllocator alloc;
+	};
 	int partition = 0;
-	u32 size = 0, address = 0;
+	u32 size = 0;  // as created, in 8-byte units
 	int flags = 0;
-	BlockAllocator alloc;
+	std::vector<std::unique_ptr<Block>> blocks;  // blocks[0] is the one made with the heap
 };
+
+constexpr u32 kHeapBlockHeader = 24, kHeapBlockEnd = 8, kHeapGrowSlack = 40;
 
 KernelHeap *GetHeap(SceUID id) {
 	KObject *o = GetAny(id);
 	return o && o->Type() == KType::Other ? dynamic_cast<KernelHeap *>(o) : nullptr;
+}
+
+bool AddHeapBlock(KernelHeap *h, u32 size) {
+	BlockAllocator *a = AllocatorForPartitionId(h->partition, true);
+	if (!a) return false;
+	u32 addr = a->Alloc(size, (h->flags & 2) != 0, ("KernelHeap/" + h->name).c_str());
+	if (!addr) return false;
+	auto b = std::make_unique<KernelHeap::Block>();
+	b->address = addr;
+	b->size = a->BlockSize(addr);
+	b->alloc.Init(addr + kHeapBlockHeader, size - kHeapBlockHeader - kHeapBlockEnd, 8);
+	h->blocks.push_back(std::move(b));
+	return true;
+}
+
+// memSize includes the allocation's own 8 bytes; dataSize and align are what the caller asked.
+u32 HeapAlloc(KernelHeap *h, u32 memSize, u32 dataSize, u32 align) {
+	for (auto &b : h->blocks) {
+		if (u32 p = b->alloc.Alloc(memSize, true, "heapblock", align)) return p;
+	}
+	if (!(h->flags & 1)) return 0;
+	// The firmware's growth size: the heap's own size, or enough for this allocation.
+	u32 newSize = h->size;
+	if (align == 0) {
+		if (newSize - kHeapGrowSlack < dataSize) newSize = AlignUp(dataSize, 8) + kHeapGrowSlack;
+	} else {
+		u32 shift = (32 % align) ? align - 32 % align : 0;
+		newSize = std::max(newSize, AlignUp(dataSize, 8) + shift + kHeapGrowSlack);
+	}
+	if (!AddHeapBlock(h, newSize)) return 0;
+	return h->blocks.back()->alloc.Alloc(memSize, true, "heapblock", align);
 }
 
 int sceKernelCreateHeap(int partition, int size, int flags, const char *name) {
@@ -127,19 +172,14 @@ int sceKernelCreateHeap(int partition, int size, int flags, const char *name) {
 	if (!a) return (int)SCE_KERNEL_ERROR_ILLEGAL_PARTITION;
 	if (size <= 0) return (int)SCE_KERNEL_ERROR_HEAPBLOCK_ALLOC_FAILED;
 	if (!name) return (int)SCE_KERNEL_ERROR_ERROR;
-	u32 allocSize = ((u32)size + 3) & ~3u;
-	// flags is ignored: every value creates a heap.
-	u32 addr = a->Alloc(allocSize, true, ("KernelHeap/" + std::string(name)).c_str());
-	if (!addr) return (int)SCE_KERNEL_ERROR_NO_MEMORY;
-	auto *h = new KernelHeap();
+	// Every flags value creates a heap; only bits 0 (grow) and 1 (high) mean anything.
+	auto h = std::make_unique<KernelHeap>();
 	h->name = name;
 	h->partition = partition;
 	h->flags = flags;
-	h->size = a->BlockSize(addr);
-	h->address = addr;
-	// The first 128 bytes hold the heap's own bookkeeping.
-	h->alloc.Init(addr + 128, h->size > 128 ? h->size - 128 : 0, 16);
-	return Register(h);
+	h->size = std::max(AlignUp((u32)size, 8), kHeapBlockHeader + kHeapBlockEnd + 8);
+	if (!AddHeapBlock(h.get(), h->size)) return (int)SCE_KERNEL_ERROR_NO_MEMORY;
+	return Register(h.release());
 }
 
 u32 sceKernelAllocHeapMemory(SceUID id, int size) {
@@ -147,38 +187,49 @@ u32 sceKernelAllocHeapMemory(SceUID id, int size) {
 	// Returns a pointer, so every failure is a null pointer.
 	if (!h) return 0;
 	// There are 8 bytes at the end of every block, reserved.
-	return h->alloc.Alloc((u32)size + 8, true, "heapblock");
+	return HeapAlloc(h, (u32)size + 8, (u32)size, 0);
 }
 
 u32 sceKernelAllocHeapMemoryWithOption(SceUID id, u32 size, u32 paramsPtr) {
 	KernelHeap *h = GetHeap(id);
 	if (!h) return 0;
-	u32 grain = 4;
+	u32 grain = 4, align = 0;
 	if (paramsPtr != 0) {
 		if ((paramsPtr & 3) || !mem::IsValidRange(paramsPtr, 8)) return 0;
 		// The size field isn't validated; only the alignment matters, a power of 2 from 4 to
 		// 0x80 (0 means no preference).
-		grain = GRead32(paramsPtr + 4);
-		if (grain == 0) grain = 4;
-		else if (grain < 4 || grain > 0x80 || (grain & (grain - 1)) != 0) return 0;
+		align = GRead32(paramsPtr + 4);
+		if (align != 0 && (align < 4 || align > 0x80 || (align & (align - 1)) != 0)) return 0;
+		if (align != 0) grain = align;
 	}
 	u32 memSize = size + 8;
 	if (grain > 16) memSize = AlignUp(memSize, grain);
-	return h->alloc.Alloc(memSize, true, "heapblock", grain);
+	return HeapAlloc(h, memSize, size, align);
 }
 
 int sceKernelFreeHeapMemory(SceUID id, u32 block) {
 	KernelHeap *h = GetHeap(id);
 	if (!h) return (int)SCE_KERNEL_ERROR_UNKNOWN_UID;
 	if (block == 0) return 0;
-	if (!h->alloc.Free(block)) return (int)0x80000103;  // SCE_KERNEL_ERROR_INVALID_POINTER
-	return 0;
+	for (size_t i = 0; i < h->blocks.size(); i++) {
+		KernelHeap::Block &b = *h->blocks[i];
+		if (!b.alloc.Contains(block)) continue;
+		if (!b.alloc.Free(block)) break;
+		if (i != 0 && b.alloc.TotalFree() == b.alloc.Size()) {
+			if (BlockAllocator *a = AllocatorForAddress(b.address)) a->Free(b.address);
+			h->blocks.erase(h->blocks.begin() + i);
+		}
+		return 0;
+	}
+	return (int)0x80000103;  // SCE_KERNEL_ERROR_INVALID_POINTER
 }
 
 int sceKernelDeleteHeap(SceUID id) {
 	KernelHeap *h = GetHeap(id);
 	if (!h) return (int)SCE_KERNEL_ERROR_UNKNOWN_UID;
-	if (BlockAllocator *a = AllocatorForAddress(h->address)) a->Free(h->address);
+	for (auto &b : h->blocks) {
+		if (BlockAllocator *a = AllocatorForAddress(b->address)) a->Free(b->address);
+	}
 	Destroy(id);
 	return 0;
 }

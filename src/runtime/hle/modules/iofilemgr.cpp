@@ -14,6 +14,7 @@
 #include "common/log.h"
 #include "fs/vfs.h"
 #include "runtime/hle/hle_wrap.h"
+#include "runtime/core/cpu.h"
 #include "runtime/hle/modules/modules.h"
 #include "runtime/io/io.h"
 #include "runtime/kernel/callbacks.h"
@@ -59,6 +60,7 @@ struct FileNode {
 	u32 asyncCbArg = 0;
 	s32 asyncPrio = -1;
 	u64 asyncEvent = 0;
+	bool asyncThread = false;  // the fd's async thread exists (made by its first async call)
 	std::vector<AsyncWaiter> waiters;
 
 	vfs::FileSystem *Fs() const { return dev ? dev->Fs() : nullptr; }
@@ -162,6 +164,12 @@ void CompleteAsync(int fd) {
 
 void StartAsync(int fd, s64 result, u32 us) {
 	FileNode *f = GetFd(fd);
+	// The first async call creates the fd's I/O thread, and creating a thread resumes dispatch
+	// unless interrupts are off (threads/scheduling/dispatch).
+	if (!f->asyncThread) {
+		f->asyncThread = true;
+		if (*g_intrEnabled) sched::SetDispatchEnabled(true);
+	}
 	f->pending = true;
 	f->hasResult = false;
 	f->asyncResult = result;
@@ -391,7 +399,10 @@ s64 sceIoLseek(int fd, s64 offset, int whence) {
 	if (!f) return (s32)SCE_KERNEL_ERROR_BADF;
 	if (f->Busy()) return (s32)SCE_KERNEL_ERROR_ASYNC_BUSY;
 	s64 r = DoSeek(f, offset, whence);
-	sched::Reschedule();
+	// On host0: every call is a USB round trip that waits, so a thread of the same priority runs
+	// meanwhile (font/openfile); elsewhere a seek only gives way to a higher priority.
+	if (f->device == "host0" && !f->isTty) Delay(0, 100);
+	else sched::Reschedule();
 	return r;
 }
 

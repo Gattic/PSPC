@@ -92,7 +92,9 @@ int JpegCsc(u32 imageAddr, u32 yCbCrAddr, int widthHeight, int bufferWidth, u32 
 	// Very approximate, from tests on a PSP. Usually under.
 	usec += 60 + 6 * height + width / 2 + width / 4;
 
-	if ((widthHeight & 0x00010001) == 0 && height > 1) {
+	// 2x2 blocks share one chroma sample only in 4:2:0 (0x20202); 0x20201 and 0x20101 have a
+	// chroma row per pixel row (jpeg/csc "short cb/cr").
+	if ((chroma & 0x000FFFFF) == 0x00020202 && (widthHeight & 0x00010001) == 0 && height > 1) {
 		for (int y = 0; y < height; y += 2) {
 			for (int x = 0; x < width; x += 2) {
 				const u8 y0 = Y[width * y + x];

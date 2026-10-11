@@ -248,7 +248,29 @@ struct HostFileSystem::EntryInfo {
 	DWORD attrs = 0;
 	u64 size = 0;
 	FILETIME ctime{}, atime{}, mtime{};
+	bool created = false;  // by the guest, this session (Created)
 };
+
+namespace {
+
+std::wstring CreatedKey(const std::wstring &hostPath) {
+	std::wstring k = hostPath;
+	CharLowerBuffW(k.data(), (DWORD)k.size());
+	return k;
+}
+
+}  // namespace
+
+bool HostFileSystem::Created(const std::wstring &hostPath) const {
+	std::lock_guard<std::mutex> lock(createdMutex_);
+	return !created_.empty() && created_.count(CreatedKey(hostPath)) != 0;
+}
+
+void HostFileSystem::SetCreated(const std::wstring &hostPath, bool created) {
+	std::lock_guard<std::mutex> lock(createdMutex_);
+	if (created) created_.insert(CreatedKey(hostPath));
+	else created_.erase(CreatedKey(hostPath));
+}
 
 struct HostFileSystem::OpenFile {
 	std::mutex m;
@@ -480,6 +502,9 @@ s32 HostFileSystem::Open(std::string_view path, u32 flags, s32 mode) {
 	if (h == INVALID_HANDLE_VALUE) {
 		return MapWin32Error(GetLastError());
 	}
+	if (!exists && !opt_.fat) {
+		SetCreated(hp, true);
+	}
 	auto f = std::make_shared<OpenFile>();
 	f->h = h;
 	f->flags = flags;
@@ -616,7 +641,7 @@ void HostFileSystem::FillStat(const EntryInfo &e, SceIoStat *out) const {
 		out->st_attr = (dir ? FIO_SO_IFDIR : FIO_SO_IFREG) | (ro ? FAT_ATTR_READONLY : 0) |
 			((e.attrs & FILE_ATTRIBUTE_HIDDEN) ? FAT_ATTR_HIDDEN : 0) | ((e.attrs & FILE_ATTRIBUTE_SYSTEM) ? FAT_ATTR_SYSTEM : 0);
 	} else {
-		out->st_mode = (s32)(type | (dir ? 0777 : (ro ? 0444 : 0664)));
+		out->st_mode = (s32)(type | (dir ? 0777 : (ro ? 0444 : (e.created ? 0644 : 0664))));
 		out->st_attr = dir ? FIO_SO_IFDIR : FIO_SO_IFREG;
 	}
 	out->st_size = dir ? 0 : (s64)e.size;
@@ -646,6 +671,7 @@ s32 HostFileSystem::GetStat(std::string_view path, SceIoStat *out) {
 	e.ctime = d.ftCreationTime;
 	e.atime = d.ftLastAccessTime;
 	e.mtime = d.ftLastWriteTime;
+	e.created = Created(hp);
 	FillStat(e, out);
 	return 0;
 }
@@ -713,6 +739,7 @@ s32 HostFileSystem::Remove(std::string_view path) {
 	if (!DeleteFileW(hp.c_str())) {
 		return MapWin32Error(GetLastError());
 	}
+	SetCreated(hp, false);
 	return 0;
 }
 
@@ -796,6 +823,10 @@ s32 HostFileSystem::Rename(std::string_view from, std::string_view to) {
 	}
 	if (!MoveFileExW(src.c_str(), dst.c_str(), MOVEFILE_COPY_ALLOWED)) {  // copy: roots may be on other volumes
 		return MapWin32Error(GetLastError());
+	}
+	if (Created(src)) {
+		SetCreated(src, false);
+		SetCreated(dst, true);
 	}
 	return 0;
 }
@@ -891,6 +922,7 @@ void HostFileSystem::ListInto(const std::wstring &dir, std::vector<EntryInfo> *e
 		// NTFS updates the copy in the directory lazily (the access time, the size of a file being
 		// written): take the file's own record, as GetStat does, so a listing and a stat of the
 		// same file agree like on the PSP's FAT (the XMB compares them before copying a save).
+		e.created = Created(dir + L"\\" + fd.cFileName);
 		WIN32_FILE_ATTRIBUTE_DATA a;
 		if (GetFileAttributesExW((dir + L"\\" + fd.cFileName).c_str(), GetFileExInfoStandard, &a)) {
 			e.attrs = a.dwFileAttributes;

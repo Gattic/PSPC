@@ -16,9 +16,10 @@ namespace utility {
 
 namespace {
 
-// On a PSP this takes 534-550 ms in utility/msgdialog/dialog (but ~650 ms in workshare, whose dialog
-// threads all share one priority).
+// On a PSP this takes 534-550 ms in utility/msgdialog/dialog, and 625-675 ms when the access and
+// graphics threads share one priority and take turns (utility/msgdialog/workshare).
 constexpr int MSG_INIT_DELAY_US = 540000;
+constexpr int MSG_INIT_SHARED_DELAY_US = 640000;
 constexpr int MSG_SHUTDOWN_DELAY_US = 26000;
 
 constexpr u32 SIZE_V1 = 572, SIZE_V2 = 580, SIZE_V3 = 708;
@@ -120,7 +121,9 @@ int MsgDialog::Init(u32 paramAddr) {
 	}
 	LOGI("UTIL", "MsgDialog: \"%s\" (options %08x)", msgText_, params_.options);
 
-	ChangeStatusInit(MSG_INIT_DELAY_US);
+	const DialogCommon *common = GetCommonParam();
+	ChangeStatusInit(common && common->accessThread == common->graphicsThread ? MSG_INIT_SHARED_DELAY_US
+	                                                                          : MSG_INIT_DELAY_US);
 	UpdateButtons();
 	InitCommon();
 	StartFade(true);
