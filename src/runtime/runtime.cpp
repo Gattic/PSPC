@@ -254,23 +254,28 @@ void ReportGpuStats() {
 #endif
 }
 
-#if PSPC_HAVE_GPU
-// The GE renderer (Options::renderer). Lives until the process ends.
-std::unique_ptr<gpu::RenderBackend> g_renderBackend;
-
-void SetUpRenderer(const Options &o) {
+// The GE renderer's name (Options::renderer, else $PSPC_RENDERER, else software), lower case.
+std::string RendererName(const Options &o) {
 	std::string name = o.renderer;
 	if (name.empty()) {
 		const char *env = getenv("PSPC_RENDERER");
 		name = env && *env ? env : "software";
 	}
-	name = ToLower(name);
+	return ToLower(name);
+}
+
+#if PSPC_HAVE_GPU
+// The GE renderer (Options::renderer). Lives until the process ends.
+std::unique_ptr<gpu::RenderBackend> g_renderBackend;
+
+void SetUpRenderer(const Options &o) {
+	const std::string name = RendererName(o);
 	int scale = o.renderScale;
 	if (scale <= 0) {
 		const char *env = getenv("PSPC_RENDER_SCALE");
 		scale = env ? atoi(env) : 1;
 	}
-	scale = std::clamp(scale, 1, 4);
+	scale = std::clamp(scale, 1, 16);
 	gpu::SetRenderBackend(nullptr);
 	if (name == "software")
 		return;
@@ -281,6 +286,9 @@ void SetUpRenderer(const Options &o) {
 			d.scale = scale;
 			d.warp = name == "d3d11-warp";
 			d.privateVram = mem::PrivateVramView();
+			d.window = host::NativeWindow();
+			d.textureFilter = o.textureFilter == "nearest" ? 1 : o.textureFilter == "linear" ? 2 : 0;
+			d.textureUpscale = std::clamp(o.textureUpscale, 1, 4);
 			if (const char *a = getenv("PSPC_D3D11_ADAPTER")) d.adapter = atoi(a);
 			std::string err;
 			g_renderBackend = gpu::hw::CreateD3D11Backend(d, &err);
@@ -290,12 +298,23 @@ void SetUpRenderer(const Options &o) {
 				LOGW("RUNTIME", "D3D11 renderer unavailable (%s); using the software renderer", err.c_str());
 				return;
 			}
+			// It presents to the window itself, CPU images (software-drawn screens, dialogs) too.
+			if (d.window)
+				host::SetFramePresenter([](const u32 *px, int w, int h, int stride) {
+					return g_renderBackend && g_renderBackend->PresentImage(px, w, h, stride);
+				});
 		}
 		gpu::SetRenderBackend(g_renderBackend.get());
 		return;
 	}
 #endif
 	LOGW("RUNTIME", "Unknown renderer \"%s\"; using the software renderer", name.c_str());
+}
+
+// The window is about to close: the renderer stops presenting to it.
+void ReleaseRendererWindow() {
+	host::SetFramePresenter(nullptr);
+	if (g_renderBackend) g_renderBackend->ReleaseWindow();
 }
 #endif
 
@@ -480,6 +499,7 @@ int Run(const Options &o) {
 	hc.pads = o.padBindings;
 	hc.padStick = o.padStick;
 	hc.screenshotDir = o.screenshotDir;
+	hc.gpuPresent = RendererName(o).rfind("d3d11", 0) == 0;
 	{
 		// Screenshot names: the game file's name (its folder's for EBOOT.PBP).
 		fs::path f = fs::u8path(o.file.empty() ? std::string("xmb") : o.file);
@@ -517,6 +537,9 @@ int Run(const Options &o) {
 			io::Init();
 			if (!PrepareBoot(o, bt)) return 2;
 			int code = RunOnce(o, bt);
+#if PSPC_HAVE_GPU
+			ReleaseRendererWindow();
+#endif
 			std::string next;
 			std::vector<u8> args;
 			if (code == boot::kExitLoadExec && boot::TakeLoadExecRequest(next, args)) {

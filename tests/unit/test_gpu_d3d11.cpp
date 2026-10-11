@@ -4,6 +4,7 @@
 #if PSPC_TEST_GPU_HW
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -290,6 +291,111 @@ TEST(gpu_d3d11_matches_software) {
 		if (diffs3 > 480 * 272 / 20)
 			printf("  format %d: %d pixels differ at 3x\n", fmt, diffs3);
 		CHECK(diffs3 <= 480 * 272 / 20);
+		// Near the largest scale: a 7680 x 4080 surface (narrower than 2048 PSP pixels: within D3D11's
+		// largest texture). (Odd scales: written back from the center sample, as at 1x; even ones average
+		// the four around the center, further from the software image.)
+		if (fmt == GE_FORMAT_8888) {
+			const std::vector<u8> hw15 = Render(fmt, 15);
+			const int diffs15 = CountDiffs(sw, hw15, fmt, 8, 8);
+			if (diffs15 > 480 * 272 / 20)
+				printf("  format %d: %d pixels differ at 15x\n", fmt, diffs15);
+			CHECK(diffs15 <= 480 * 272 / 20);
+		}
+	}
+}
+
+namespace {
+
+// A 32 x 32 texture split along its diagonal (white above, black below) drawn 1:1, with nearest filtering,
+// over mid gray at render scale 4. Returns the display image at outScale (0: the render scale).
+std::vector<u32> RenderDiagonal(int textureFilter, int textureUpscale, int outScale, int *w, int *h) {
+	Env env;
+	hw::D3D11Options o;
+	o.scale = 4;
+	o.warp = true;
+	o.textureFilter = textureFilter;
+	o.textureUpscale = textureUpscale;
+	std::string err;
+	std::unique_ptr<RenderBackend> backend = hw::CreateD3D11Backend(o, &err);
+	if (!backend)
+		return {};
+	SetRenderBackend(backend.get());
+	for (int v = 0; v < 32; ++v)
+		for (int u = 0; u < 32; ++u)
+			GWrite32(TEX + (u32)(v * 32 + u) * 4, u + v < 32 ? 0xFFFFFFFFu : 0xFF000000u);
+	DL dl;
+	dl.C(GE_CMD_FRAMEBUFPTR, 0).C(GE_CMD_FRAMEBUFWIDTH, 512).C(GE_CMD_FRAMEBUFPIXFORMAT, GE_FORMAT_8888);
+	dl.C(GE_CMD_SCISSOR1, 0).C(GE_CMD_SCISSOR2, 479 | (271 << 10)).C(GE_CMD_REGION1, 0).C(GE_CMD_REGION2, 479 | (271 << 10));
+	TVert clr[2] = { { 0xFF808080, 0, 0, 0, 0 }, { 0xFF808080, 480, 272, 0, 0 } };
+	memcpy(GPtr(VERTS + 0x70000), clr, sizeof(clr));
+	dl.C(GE_CMD_CLEARMODE, 1 | (7 << 8)).C(GE_CMD_VERTEXTYPE, VT_C8888_P16).Prim(GE_PRIM_RECTANGLES, 2, VERTS + 0x70000).C(GE_CMD_CLEARMODE, 0);
+	dl.C(GE_CMD_TEXTUREMAPENABLE, 1).C(GE_CMD_TEXFORMAT, GE_TFMT_8888).C(GE_CMD_TEXMODE, 0);
+	dl.C(GE_CMD_TEXADDR0, TEX & 0xFFFFF0).C(GE_CMD_TEXBUFWIDTH0, 32 | ((TEX >> 8) & 0x0F0000));
+	dl.C(GE_CMD_TEXSIZE0, 5 | (5 << 8)).C(GE_CMD_TEXFUNC, GE_TEXFUNC_REPLACE | 0x100).C(GE_CMD_TEXFILTER, 0).C(GE_CMD_TEXWRAP, 1 | (1 << 8));
+	TTVert sp[2] = { { 0, 0, 0xFFFFFFFF, 100, 100, 0, 0 }, { 32, 32, 0xFFFFFFFF, 132, 132, 0, 0 } };
+	memcpy(GPtr(VERTS + 0x60000), sp, sizeof(sp));
+	dl.C(GE_CMD_VERTEXTYPE, VT_T16_C8888_P16).Prim(GE_PRIM_RECTANGLES, 2, VERTS + 0x60000);
+	dl.C(GE_CMD_FINISH).C(GE_CMD_END);
+	EnqueueList(dl.start, 0, -1, 0, false);
+	Run();
+	DrawSync(0);
+	std::vector<u32> img;
+	if (!backend->GetDisplayImage(VRAM, 512, GE_FORMAT_8888, 480, 272, img, w, h, outScale))
+		img.clear();
+	SetRenderBackend(nullptr);
+	return img;
+}
+
+// Along the diagonal: the largest step between consecutive rows in where the white part ends, and how
+// many pixels are neither white nor black (filtered).
+void DiagonalShape(const std::vector<u32> &img, int w, int *maxStep, int *blended) {
+	*maxStep = 0;
+	*blended = 0;
+	int last = -1;
+	for (int y = 101 * 4; y < 131 * 4; ++y) {
+		int x = 100 * 4;
+		while (x < 132 * 4 && (img[(size_t)y * w + x] & 0xFF) >= 128)
+			++x;
+		if (last >= 0)
+			*maxStep = std::max(*maxStep, std::abs(x - last));
+		last = x;
+		for (int i = 100 * 4; i < 132 * 4; ++i) {
+			const u32 r = img[(size_t)y * w + i] & 0xFF;
+			*blended += r > 16 && r < 239;
+		}
+	}
+}
+
+}  // namespace
+
+TEST(gpu_d3d11_texture_upscaling_and_filtering) {
+	int w = 0, h = 0, step = 0, blended = 0;
+	// The game's nearest filtering at 4x: a staircase, 4 render pixels a texel.
+	std::vector<u32> plain = RenderDiagonal(0, 1, 0, &w, &h);
+	if (plain.empty()) {
+		printf("  (D3D11 WARP unavailable)\n");
+		return;
+	}
+	CHECK(w == 1920 && h == 1088);
+	DiagonalShape(plain, w, &step, &blended);
+	CHECK(step == 4 && blended == 0);
+	// Textures upscaled 4x with xBR: the diagonal is a line, a render pixel a row.
+	std::vector<u32> xbr = RenderDiagonal(0, 4, 0, &w, &h);
+	DiagonalShape(xbr, w, &step, &blended);
+	if (step > 2)
+		printf("  xBR diagonal: steps of %d pixels\n", step);
+	CHECK(!xbr.empty() && step <= 2);
+	// Linear filtering forced: the edge is blended.
+	std::vector<u32> linear = RenderDiagonal(2, 1, 0, &w, &h);
+	DiagonalShape(linear, w, &step, &blended);
+	CHECK(!linear.empty() && blended > 100);
+	// Read back at 2x: averaged down, flat areas keep their colors.
+	std::vector<u32> half = RenderDiagonal(0, 1, 2, &w, &h);
+	CHECK(w == 960 && h == 544 && !half.empty());
+	if (!half.empty()) {
+		CHECK((half[(size_t)(102 * 2) * w + 102 * 2] & 0xFFFFFF) == 0xFFFFFF);
+		CHECK((half[(size_t)(130 * 2) * w + 130 * 2] & 0xFFFFFF) == 0x000000);
+		CHECK((half[(size_t)(20 * 2) * w + 20 * 2] & 0xFFFFFF) == 0x808080);
 	}
 }
 #endif

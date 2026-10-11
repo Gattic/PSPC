@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// The Settings dialog: window, native code, firmware version, audio, and the keyboard/controller
-// mapping. Built in code (an empty in-memory dialog template; controls created in WM_INITDIALOG).
+// The Settings dialog: window, graphics (renderer, resolution, textures), native code, firmware version,
+// audio, and the keyboard/controller mapping. Built in code (an empty in-memory dialog template; controls created in WM_INITDIALOG).
 // Rebinding a key: click an entry (or press Enter on it), then press the key.
 #undef WIN32_LEAN_AND_MEAN
 #include "frontend/settings_dialog.h"
@@ -9,6 +9,7 @@
 
 #include <commctrl.h>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -24,6 +25,10 @@ enum : int {
 	IDC_SCALE = 1001,
 	IDC_FULLSCREEN,
 	IDC_VSYNC,
+	IDC_RENDERER,
+	IDC_RESOLUTION,
+	IDC_TEXFILTER,
+	IDC_TEXUPSCALE,
 	IDC_AOT,
 	IDC_FW,
 	IDC_VOLUME,
@@ -220,6 +225,27 @@ LRESULT CALLBACK ListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, D
 	return DefSubclassProc(hwnd, msg, wp, lp);
 }
 
+// Render scales offered (pspc.ini takes any of 1-16), with the displays they fill.
+struct Resolution {
+	int scale;
+	const wchar_t *note;
+};
+const Resolution kResolutions[] = {
+	{1, L"native"}, {2, L""}, {3, L""}, {4, L"1080p"}, {5, L""}, {6, L"1440p"}, {8, L"4K"}, {10, L""}, {12, L"6K"}, {16, L"8K"},
+};
+
+std::wstring ResolutionLabel(int scale, const wchar_t *note) {
+	std::wstring s = std::to_wstring(scale) + L"x   " + std::to_wstring(480 * scale) + L" x " + std::to_wstring(272 * scale);
+	if (note && *note) s += std::wstring(L"   (") + note + L")";
+	return s;
+}
+
+// Resolution and textures are the GPU renderer's.
+void SyncGraphics(HWND dlg) {
+	const bool gpu = SendDlgItemMessageW(dlg, IDC_RENDERER, CB_GETCURSEL, 0, 0) > 0;
+	for (int id : {IDC_RESOLUTION, IDC_TEXFILTER, IDC_TEXUPSCALE}) EnableWindow(GetDlgItem(dlg, id), gpu);
+}
+
 void SetVolumeLabel(HWND dlg) {
 	int v = (int)SendDlgItemMessageW(dlg, IDC_VOLUME, TBM_GETPOS, 0, 0);
 	SetDlgItemTextW(dlg, IDC_VOLUME_VALUE, (std::to_wstring(v) + L"%").c_str());
@@ -241,36 +267,73 @@ void Init(HWND dlg, Dialog &d) {
 	CheckDlgButton(dlg, IDC_FULLSCREEN, d.s.fullscreen ? BST_CHECKED : BST_UNCHECKED);
 	CheckDlgButton(dlg, IDC_VSYNC, d.s.vsync ? BST_CHECKED : BST_UNCHECKED);
 
-	Control(dlg, L"BUTTON", L"Emulation", BS_GROUPBOX, 7, 72, 172, 50, -1);
-	Control(dlg, L"BUTTON", L"Use native code (AOT) when it is built", BS_AUTOCHECKBOX | tab | group, 15, 86, 158, 10, IDC_AOT);
+	Control(dlg, L"BUTTON", L"Graphics", BS_GROUPBOX, 7, 72, 172, 98, -1);
+	Control(dlg, L"STATIC", L"Renderer", SS_LEFT, 15, 86, 62, 9, -1);
+	HWND renderer = Control(dlg, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | tab | group, 80, 84, 91, 80, IDC_RENDERER);
+	SendMessageW(renderer, CB_ADDSTRING, 0, (LPARAM)L"Software (accurate)");
+	SendMessageW(renderer, CB_ADDSTRING, 0, (LPARAM)L"Direct3D 11 (GPU)");
+	// The WARP device (a CPU implementation of D3D11) is for testing: offered only when it is set.
+	if (d.s.renderer == "d3d11-warp") SendMessageW(renderer, CB_ADDSTRING, 0, (LPARAM)L"Direct3D 11 (WARP)");
+	SendMessageW(renderer, CB_SETCURSEL, d.s.renderer == "d3d11" ? 1 : d.s.renderer == "d3d11-warp" ? 2 : 0, 0);
+	Control(dlg, L"STATIC", L"Resolution", SS_LEFT, 15, 102, 62, 9, -1);
+	HWND res = Control(dlg, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | tab, 80, 100, 91, 120, IDC_RESOLUTION);
+	const int scaleNow = d.s.renderScale > 0 ? d.s.renderScale : 1;
+	bool listed = false;
+	for (const Resolution &r : kResolutions) listed |= r.scale == scaleNow;
+	for (const Resolution &r : kResolutions) {
+		if (!listed && r.scale > scaleNow) {
+			// A scale set in pspc.ini that the list doesn't have.
+			LRESULT i = SendMessageW(res, CB_ADDSTRING, 0, (LPARAM)ResolutionLabel(scaleNow, L"").c_str());
+			SendMessageW(res, CB_SETITEMDATA, i, scaleNow);
+			listed = true;
+		}
+		LRESULT i = SendMessageW(res, CB_ADDSTRING, 0, (LPARAM)ResolutionLabel(r.scale, r.note).c_str());
+		SendMessageW(res, CB_SETITEMDATA, i, r.scale);
+	}
+	for (int i = 0; i < (int)SendMessageW(res, CB_GETCOUNT, 0, 0); i++)
+		if ((int)SendMessageW(res, CB_GETITEMDATA, i, 0) == scaleNow) SendMessageW(res, CB_SETCURSEL, i, 0);
+	Control(dlg, L"STATIC", L"Texture filter", SS_LEFT, 15, 118, 62, 9, -1);
+	HWND filter = Control(dlg, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | tab, 80, 116, 91, 80, IDC_TEXFILTER);
+	for (const wchar_t *v : {L"As the game sets it", L"Nearest (sharp)", L"Linear (smooth)"})
+		SendMessageW(filter, CB_ADDSTRING, 0, (LPARAM)v);
+	SendMessageW(filter, CB_SETCURSEL, d.s.textureFilter == "nearest" ? 1 : d.s.textureFilter == "linear" ? 2 : 0, 0);
+	Control(dlg, L"STATIC", L"Texture upscaling", SS_LEFT, 15, 134, 62, 9, -1);
+	HWND upscale = Control(dlg, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | tab, 80, 132, 91, 80, IDC_TEXUPSCALE);
+	for (const wchar_t *v : {L"Off", L"2x (xBR)", L"3x (xBR)", L"4x (xBR)"}) SendMessageW(upscale, CB_ADDSTRING, 0, (LPARAM)v);
+	SendMessageW(upscale, CB_SETCURSEL, d.s.textureUpscale - 1, 0);
+	Control(dlg, L"STATIC", L"Direct3D 11 only. Above the window's size, the picture is supersampled.", SS_LEFT, 15, 149, 158, 18, -1);
+	SyncGraphics(dlg);
+
+	Control(dlg, L"BUTTON", L"Emulation", BS_GROUPBOX, 7, 175, 172, 50, -1);
+	Control(dlg, L"BUTTON", L"Use native code (AOT) when it is built", BS_AUTOCHECKBOX | tab | group, 15, 189, 158, 10, IDC_AOT);
 	CheckDlgButton(dlg, IDC_AOT, d.s.aot ? BST_CHECKED : BST_UNCHECKED);
-	Control(dlg, L"STATIC", L"Firmware version", SS_LEFT, 15, 104, 60, 9, -1);
-	HWND fw = Control(dlg, L"COMBOBOX", L"", CBS_DROPDOWN | WS_VSCROLL | tab, 92, 102, 79, 90, IDC_FW);
+	Control(dlg, L"STATIC", L"Firmware version", SS_LEFT, 15, 207, 60, 9, -1);
+	HWND fw = Control(dlg, L"COMBOBOX", L"", CBS_DROPDOWN | WS_VSCROLL | tab, 92, 205, 79, 90, IDC_FW);
 	for (const wchar_t *v : {L"6.60", L"6.61", L"6.39", L"6.20", L"5.50", L"5.00", L"4.01", L"3.90"})
 		SendMessageW(fw, CB_ADDSTRING, 0, (LPARAM)v);
 	SetWindowTextW(fw, Widen(d.s.fw).c_str());
 
-	Control(dlg, L"BUTTON", L"Audio", BS_GROUPBOX, 7, 127, 172, 46, -1);
-	Control(dlg, L"STATIC", L"Volume", SS_LEFT, 15, 143, 34, 9, -1);
-	HWND vol = Control(dlg, TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS | tab | group, 48, 140, 98, 14, IDC_VOLUME);
+	Control(dlg, L"BUTTON", L"Audio", BS_GROUPBOX, 7, 230, 172, 46, -1);
+	Control(dlg, L"STATIC", L"Volume", SS_LEFT, 15, 246, 34, 9, -1);
+	HWND vol = Control(dlg, TRACKBAR_CLASSW, L"", TBS_HORZ | TBS_NOTICKS | tab | group, 48, 243, 98, 14, IDC_VOLUME);
 	SendMessageW(vol, TBM_SETRANGE, FALSE, MAKELPARAM(0, 100));
 	SendMessageW(vol, TBM_SETPAGESIZE, 0, 10);
 	SendMessageW(vol, TBM_SETPOS, TRUE, d.s.volume);
-	Control(dlg, L"STATIC", L"", SS_RIGHT, 147, 143, 24, 9, IDC_VOLUME_VALUE);
+	Control(dlg, L"STATIC", L"", SS_RIGHT, 147, 246, 24, 9, IDC_VOLUME_VALUE);
 	SetVolumeLabel(dlg);
-	Control(dlg, L"BUTTON", L"Mute", BS_AUTOCHECKBOX | tab, 15, 157, 100, 10, IDC_MUTE);
+	Control(dlg, L"BUTTON", L"Mute", BS_AUTOCHECKBOX | tab, 15, 260, 100, 10, IDC_MUTE);
 	CheckDlgButton(dlg, IDC_MUTE, d.s.mute ? BST_CHECKED : BST_UNCHECKED);
 
 	Control(dlg, L"STATIC",
 	        L"Saved to pspc.ini next to pspc.exe. A game picks the settings up when it starts; command-line "
 	        L"options override them.",
-	        SS_LEFT, 9, 180, 168, 36, -1);
+	        SS_LEFT, 9, 283, 168, 30, -1);
 
 	// Right column: the input mapping.
-	Control(dlg, L"BUTTON", L"Controls", BS_GROUPBOX, 186, 5, 222, 228, -1);
+	Control(dlg, L"BUTTON", L"Controls", BS_GROUPBOX, 186, 5, 222, 291, -1);
 	d.list = Control(dlg, WC_LISTVIEWW, L"",
 	                 LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER | WS_BORDER | tab | group, 194,
-	                 18, 206, 158, IDC_CONTROLS);
+	                 18, 206, 221, IDC_CONTROLS);
 	ListView_SetExtendedListViewStyle(d.list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
 	RECT lr;
 	GetClientRect(d.list, &lr);
@@ -294,17 +357,17 @@ void Init(HWND dlg, Dialog &d) {
 		UpdateRow(d, (int)i);
 	}
 	SetWindowSubclass(d.list, ListProc, 0, (DWORD_PTR)&d);
-	Control(dlg, L"STATIC", kHint, SS_LEFT, 194, 179, 206, 18, IDC_HINT);
-	Control(dlg, L"STATIC", L"Controller", SS_LEFT, 194, 202, 40, 9, -1);
-	HWND pad = Control(dlg, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | tab | group, 236, 200, 92, 140, IDC_PAD);
+	Control(dlg, L"STATIC", kHint, SS_LEFT, 194, 242, 206, 18, IDC_HINT);
+	Control(dlg, L"STATIC", L"Controller", SS_LEFT, 194, 265, 40, 9, -1);
+	HWND pad = Control(dlg, L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | tab | group, 236, 263, 92, 140, IDC_PAD);
 	SendMessageW(pad, CB_ADDSTRING, 0, (LPARAM)L"(none)");
 	for (size_t i = 0; i < settings::kNumPadNames; i++)
 		SendMessageW(pad, CB_ADDSTRING, 0, (LPARAM)Widen(settings::kPadNames[i]).c_str());
-	Control(dlg, L"BUTTON", L"Clear key", BS_PUSHBUTTON | tab, 334, 199, 66, 14, IDC_CLEAR);
-	Control(dlg, L"BUTTON", L"Reset controls to defaults", BS_PUSHBUTTON | tab, 194, 215, 112, 14, IDC_DEFAULTS);
+	Control(dlg, L"BUTTON", L"Clear key", BS_PUSHBUTTON | tab, 334, 262, 66, 14, IDC_CLEAR);
+	Control(dlg, L"BUTTON", L"Reset controls to defaults", BS_PUSHBUTTON | tab, 194, 278, 112, 14, IDC_DEFAULTS);
 
-	Control(dlg, L"BUTTON", L"OK", BS_DEFPUSHBUTTON | tab | group, 304, 240, 50, 14, IDOK);
-	Control(dlg, L"BUTTON", L"Cancel", BS_PUSHBUTTON | tab, 358, 240, 50, 14, IDCANCEL);
+	Control(dlg, L"BUTTON", L"OK", BS_DEFPUSHBUTTON | tab | group, 304, 302, 50, 14, IDOK);
+	Control(dlg, L"BUTTON", L"Cancel", BS_PUSHBUTTON | tab, 358, 302, 50, 14, IDCANCEL);
 	SyncPadCombo(d);
 }
 
@@ -316,6 +379,19 @@ bool Apply(HWND dlg, Dialog &d) {
 	s.aot = IsDlgButtonChecked(dlg, IDC_AOT) == BST_CHECKED;
 	s.mute = IsDlgButtonChecked(dlg, IDC_MUTE) == BST_CHECKED;
 	s.volume = (int)SendDlgItemMessageW(dlg, IDC_VOLUME, TBM_GETPOS, 0, 0);
+	const int renderer = (int)SendDlgItemMessageW(dlg, IDC_RENDERER, CB_GETCURSEL, 0, 0);
+	// Software keeps an empty renderer= empty ($PSPC_RENDERER may pick another).
+	if (renderer == 0) s.renderer = s.renderer.empty() ? "" : "software";
+	else s.renderer = renderer == 2 ? "d3d11-warp" : "d3d11";
+	const LRESULT res = SendDlgItemMessageW(dlg, IDC_RESOLUTION, CB_GETCURSEL, 0, 0);
+	if (res >= 0) {
+		const int scale = (int)SendDlgItemMessageW(dlg, IDC_RESOLUTION, CB_GETITEMDATA, res, 0);
+		// Unchanged native keeps an empty render_scale= empty ($PSPC_RENDER_SCALE may pick another).
+		s.renderScale = scale == 1 && s.renderScale == 0 ? 0 : scale;
+	}
+	const int filter = (int)SendDlgItemMessageW(dlg, IDC_TEXFILTER, CB_GETCURSEL, 0, 0);
+	s.textureFilter = filter == 1 ? "nearest" : filter == 2 ? "linear" : "auto";
+	s.textureUpscale = std::max(1, (int)SendDlgItemMessageW(dlg, IDC_TEXUPSCALE, CB_GETCURSEL, 0, 0) + 1);
 	wchar_t fw[32] = {};
 	GetDlgItemTextW(dlg, IDC_FW, fw, 32);
 	std::string err;
@@ -354,6 +430,9 @@ INT_PTR CALLBACK DialogProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
 		switch (LOWORD(wp)) {
 		case IDOK:
 			if (Apply(dlg, *d)) EndDialog(dlg, IDOK);
+			return TRUE;
+		case IDC_RENDERER:
+			if (HIWORD(wp) == CBN_SELCHANGE) SyncGraphics(dlg);
 			return TRUE;
 		case IDCANCEL: EndDialog(dlg, IDCANCEL); return TRUE;
 		case IDC_PAD:
@@ -399,7 +478,7 @@ bool ShowSettingsDialog(HWND owner, const fs::path &ini) {
 	d.ini = ini;
 	settings::Load(ini, d.s);
 	g_dlg = &d;
-	std::vector<WORD> tmpl = Template(L"PSPC Settings", 415, 261);
+	std::vector<WORD> tmpl = Template(L"PSPC Settings", 415, 322);
 	INT_PTR r = DialogBoxIndirectParamW(GetModuleHandleW(nullptr), (LPCDLGTEMPLATEW)tmpl.data(), owner, DialogProc, 0);
 	g_dlg = nullptr;
 	return r == IDOK;

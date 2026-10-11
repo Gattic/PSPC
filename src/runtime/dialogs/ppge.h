@@ -100,7 +100,8 @@ void MeasureString(float *w, float *h, std::string_view text, float scale, int w
 // Draws the visible layers over a presented image: RGBA8888 (R in the low byte), width x height
 // at any multiple of 480x272. The dialog layer belongs to the game's screen: without `gameScreen`
 // (a system or plugin screen is shown instead, display priority 0/1) only the system layer is
-// drawn.
+// drawn. Over a transparent image (all 0), the result is the layers alone with premultiplied alpha,
+// for a GPU renderer to lay over its own picture.
 void Composite(u32 *rgba, int width, int height, bool gameScreen = true);
 // Whether a layer would be drawn now.
 bool Visible(Layer layer);

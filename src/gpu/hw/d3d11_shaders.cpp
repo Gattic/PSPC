@@ -58,7 +58,8 @@ struct DrawState {
 	uint texMode;        // clampS | clampT << 1 | minFilt << 2 | magFilt << 3 | mipFilt << 4 | maxLevel << 5 | levelMode << 8
 	int texLevelOffset;  // 1/16 levels
 	int lodSlopeLog;     // GELog16(slope)
-	uint rtt;            // render to texture: format | scale << 4 | 0x100 (texLevels[0]: x in the surface)
+	uint rtt;            // render to texture: format | 0x100 (texLevels[0]: x in the surface); texture scale << 12
+	                     // (the render scale for render to texture, else the texture upscaling factor)
 	uint texLevels[8];   // atlas x | log2(w) << 16 | log2(h) << 20
 	uint rttY;           // render to texture: y in the surface (render-scale pixels)
 	uint3 pad2;
@@ -349,8 +350,8 @@ void TexelPair(float st, int size, bool clampIt, int limit, out int c0, out int 
 }
 uint4 SampleLevel(DrawState st, float s, float t, int level, bool bilinear) {
 	uint info = st.texLevels[level];
-	// A rendered texture is sampled at the render scale.
-	int texScale = (st.rtt & 0x100) ? (int)((st.rtt >> 4) & 0xF) : 1;
+	// A rendered texture is sampled at the render scale, an upscaled one at its scale.
+	int texScale = max((int)((st.rtt >> 12) & 0x1F), 1);
 	int w = (1 << ((info >> 16) & 0xF)) * texScale, h = (1 << ((info >> 20) & 0xF)) * texScale;
 	int limit = 512 * texScale - 1;
 	bool clampS = (st.texMode & 1) != 0, clampT = (st.texMode & 2) != 0;
@@ -556,6 +557,57 @@ void PSMain(PSIn i) {
 }
 )HLSL";
 
+// Display images: a framebuffer's raw pixels as RGBA8888, scaled (CSDisplay and PSPresent).
+static const char kDisplay[] = R"HLSL(
+uint DisplayRGBA(uint raw, uint fmt) {
+	uint r, g, b;
+	if (fmt == 3)
+		return raw | 0xFF000000;
+	if (fmt == 0) {
+		r = raw & 0x1F; g = (raw >> 5) & 0x3F; b = (raw >> 11) & 0x1F;
+		r = (r << 3) | (r >> 2); g = (g << 2) | (g >> 4); b = (b << 3) | (b >> 2);
+	} else if (fmt == 1) {
+		r = raw & 0x1F; g = (raw >> 5) & 0x1F; b = (raw >> 10) & 0x1F;
+		r = (r << 3) | (r >> 2); g = (g << 3) | (g >> 2); b = (b << 3) | (b >> 2);
+	} else {
+		r = (raw & 0xF) * 17; g = ((raw >> 4) & 0xF) * 17; b = ((raw >> 8) & 0xF) * 17;
+	}
+	return r | (g << 8) | (b << 16) | 0xFF000000;
+}
+float3 DisplayColor(Texture2D<uint> src, int2 p, uint fmt) {
+	uint c = DisplayRGBA(src.Load(int3(p, 0)), fmt);
+	return float3(c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF) / 255.0;
+}
+// The average color of the texels under [p0, p1) (texel coordinates in the size-texel region at origin),
+// each weighted by how much of it is covered, averaged in linear light (gamma 2): a supersampled image
+// reduced to its display size.
+float3 AreaAverage(Texture2D<uint> src, int2 origin, int2 size, float2 p0, float2 p1, uint fmt) {
+	int2 t0 = max((int2)floor(p0), 0), t1 = min((int2)ceil(p1), size) - 1;
+	float3 sum = 0.0;
+	float total = 0.0;
+	[loop] for (int y = t0.y; y <= t1.y; ++y) {
+		float wy = min(p1.y, y + 1.0) - max(p0.y, (float)y);
+		[loop] for (int x = t0.x; x <= t1.x; ++x) {
+			float w = wy * (min(p1.x, x + 1.0) - max(p0.x, (float)x));
+			float3 c = DisplayColor(src, origin + int2(x, y), fmt);
+			sum += c * c * w;
+			total += w;
+		}
+	}
+	return total > 0.0 ? sqrt(sum / total) : float3(0.0, 0.0, 0.0);
+}
+// Bilinear filtering at p (texel coordinates, texel centers at +0.5), clamped to the region.
+float3 Bilinear(Texture2D<uint> src, int2 size, float2 p, uint fmt) {
+	p -= 0.5;
+	int2 i = (int2)floor(p);
+	float2 f = p - (float2)i;
+	int2 a = clamp(i, 0, size - 1), b = clamp(i + 1, 0, size - 1);
+	float3 top = lerp(DisplayColor(src, int2(a.x, a.y), fmt), DisplayColor(src, int2(b.x, a.y), fmt), f.x);
+	float3 bottom = lerp(DisplayColor(src, int2(a.x, b.y), fmt), DisplayColor(src, int2(b.x, b.y), fmt), f.x);
+	return lerp(top, bottom, f.y);
+}
+)HLSL";
+
 // Upload, download and display conversion.
 static const char kCompute[] = R"HLSL(
 cbuffer CopyCB : register(b0) {
@@ -563,7 +615,8 @@ cbuffer CopyCB : register(b0) {
 	uint2 size;       // PSP pixels
 	uint copyScale;
 	uint format;      // GE_FORMAT_*, 4 = depth
-	uint2 copyPad;
+	uint outScale;    // CSDisplay: the image's scale, at most copyScale
+	uint copyPad;
 };
 
 Texture2D<uint> srcTex : register(t0);
@@ -615,29 +668,185 @@ void CSReduce(uint3 id : SV_DispatchThreadID) {
 	dstTex[p] = PackRaw((sum + 2) / 4, e);
 }
 
-uint ToRGBA(uint raw) {
-	uint r, g, b;
-	if (format == 3)
-		return raw | 0xFF000000;
-	if (format == 0) {
-		r = raw & 0x1F; g = (raw >> 5) & 0x3F; b = (raw >> 11) & 0x1F;
-		r = (r << 3) | (r >> 2); g = (g << 2) | (g >> 4); b = (b << 3) | (b >> 2);
-	} else if (format == 1) {
-		r = raw & 0x1F; g = (raw >> 5) & 0x1F; b = (raw >> 10) & 0x1F;
-		r = (r << 3) | (r >> 2); g = (g << 3) | (g >> 2); b = (b << 3) | (b >> 2);
-	} else {
-		r = (raw & 0xF) * 17; g = ((raw >> 4) & 0xF) * 17; b = ((raw >> 8) & 0xF) * 17;
-	}
-	return r | (g << 8) | (b << 16) | 0xFF000000;
-}
-
-// Render-scale surface region -> RGBA8888 for display (at 0,0 in dstTex).
+// Render-scale surface region -> RGBA8888 at outScale for display (at 0,0 in dstTex): each pixel the
+// average of the render-scale pixels under it.
 [numthreads(8, 8, 1)]
 void CSDisplay(uint3 id : SV_DispatchThreadID) {
 	uint2 hp = id.xy;
-	if (hp.x >= size.x * copyScale || hp.y >= size.y * copyScale)
+	if (hp.x >= size.x * outScale || hp.y >= size.y * outScale)
 		return;
-	dstTex[hp] = ToRGBA(srcTex[origin * copyScale + hp]);
+	if (outScale == copyScale) {
+		dstTex[hp] = DisplayRGBA(srcTex[origin * copyScale + hp], format);
+		return;
+	}
+	float r = (float)copyScale / (float)outScale;
+	float3 c = AreaAverage(srcTex, (int2)(origin * copyScale), (int2)(size * copyScale), (float2)hp * r, (float2)(hp + 1) * r, format);
+	uint3 q = (uint3)round(saturate(c) * 255.0);
+	dstTex[hp] = q.r | (q.g << 8) | (q.b << 16) | 0xFF000000;
+}
+)HLSL";
+
+// Texture upscaling: xBR level 2, Hyllian's algorithm (after his MIT-licensed xBR-lv2 shader). Every
+// output texel comes from the 5x5 texels around its source texel: where an edge runs through a corner of
+// the source texel, the corner takes the neighbor's color up to the edge, at 45, 30 or 60 degrees, so
+// diagonals and curves come out smooth instead of stepped. Edges are found on luma, with alpha counted
+// (outlines against transparent texels are edges too); colors blend premultiplied by alpha.
+static const char kUpscale[] = R"HLSL(
+cbuffer UpscaleCB : register(b0) {
+	int2 lvOrigin;   // the level in the 1x atlas
+	int2 lvSize;
+	uint factor;
+	uint wrapMode;   // 1: S wraps, 2: T wraps (else clamped at the level's edges)
+	uint2 upPad;
+};
+Texture2D<uint4> upSrc : register(t0);
+RWTexture2D<uint4> upDst : register(u0);
+
+float4 UpTexel(int2 p, int dx, int dy) {
+	int x = p.x + dx, y = p.y + dy;
+	x = (wrapMode & 1) ? ((x % lvSize.x) + lvSize.x) % lvSize.x : clamp(x, 0, lvSize.x - 1);
+	y = (wrapMode & 2) ? ((y % lvSize.y) + lvSize.y) % lvSize.y : clamp(y, 0, lvSize.y - 1);
+	float4 c = (float4)upSrc.Load(int3(lvOrigin + int2(x, y), 0)) / 255.0;
+	return float4(c.rgb * c.a, c.a);
+}
+float Luma(float4 c) {
+	return 48.0 * dot(c.rgb, float3(0.299, 0.587, 0.114)) + 24.0 * c.a;
+}
+float4 Df(float4 a, float4 b) {
+	return abs(a - b);
+}
+bool4 Eq(float4 a, float4 b) {
+	return Df(a, b) < 15.0;
+}
+float4 WeightedDistance(float4 a, float4 b, float4 c, float4 d, float4 e, float4 f, float4 g, float4 h) {
+	return Df(a, b) + Df(a, c) + Df(d, e) + Df(d, f) + 4.0 * Df(g, h);
+}
+
+[numthreads(8, 8, 1)]
+void CSUpscale(uint3 id : SV_DispatchThreadID) {
+	if (id.x >= (uint)lvSize.x * factor || id.y >= (uint)lvSize.y * factor)
+		return;
+	int2 p = (int2)(id.xy / factor);
+	float2 fp = ((float2)(id.xy % factor) + 0.5) / (float)factor;
+	//       A1 B1 C1
+	//    A0  A  B  C C4
+	//    D0  D  E  F F4
+	//    G0  G  H  I I4
+	//       G5 H5 I5
+	float4 A1 = UpTexel(p, -1, -2), B1 = UpTexel(p, 0, -2), C1 = UpTexel(p, 1, -2);
+	float4 A0 = UpTexel(p, -2, -1), A = UpTexel(p, -1, -1), B = UpTexel(p, 0, -1), C = UpTexel(p, 1, -1), C4 = UpTexel(p, 2, -1);
+	float4 D0 = UpTexel(p, -2, 0), D = UpTexel(p, -1, 0), E = UpTexel(p, 0, 0), F = UpTexel(p, 1, 0), F4 = UpTexel(p, 2, 0);
+	float4 G0 = UpTexel(p, -2, 1), G = UpTexel(p, -1, 1), H = UpTexel(p, 0, 1), I = UpTexel(p, 1, 1), I4 = UpTexel(p, 2, 1);
+	float4 G5 = UpTexel(p, -1, 2), H5 = UpTexel(p, 0, 2), I5 = UpTexel(p, 1, 2);
+
+	// The four corners at once, each turned to be the bottom right one: x bottom right, y top right,
+	// z top left, w bottom left.
+	float4 b = float4(Luma(B), Luma(D), Luma(H), Luma(F));
+	float4 c = float4(Luma(C), Luma(A), Luma(G), Luma(I));
+	float4 e = Luma(E).xxxx;
+	float4 d = b.yzwx, f = b.wxyz, g = c.zwxy, h = b.zwxy, i = c.wxyz;
+	float4 i4 = float4(Luma(I4), Luma(C1), Luma(A0), Luma(G5));
+	float4 i5 = float4(Luma(I5), Luma(C4), Luma(A1), Luma(G0));
+	float4 h5 = float4(Luma(H5), Luma(F4), Luma(B1), Luma(D0));
+	float4 f4 = h5.yzwx;
+
+	// The edge lines (45, 30 and 60 degrees) beyond which a corner takes the neighbor's color.
+	const float4 Ao = float4(1.0, -1.0, -1.0, 1.0), Bo = float4(1.0, 1.0, -1.0, -1.0), Co = float4(1.5, 0.5, -0.5, 0.5);
+	const float4 Ax = float4(1.0, -1.0, -1.0, 1.0), Bx = float4(0.5, 2.0, -0.5, -2.0), Cx = float4(1.0, 1.0, -0.5, 0.0);
+	const float4 Ay = float4(1.0, -1.0, -1.0, 1.0), By = float4(2.0, 0.5, -2.0, -0.5), Cy = float4(2.0, 0.0, -1.0, 0.5);
+	const float4 Ci = float4(0.25, 0.25, 0.25, 0.25);
+	float4 fx = Ao * fp.y + Bo * fp.x;
+	float4 fxL = Ax * fp.y + Bx * fp.x;
+	float4 fxU = Ay * fp.y + By * fp.x;
+	// Antialiased over about one output texel.
+	float4 delta = (1.0 / (float)factor).xxxx;
+	float4 deltaL = float4(0.5, 1.0, 0.5, 1.0) / (float)factor;
+	float4 deltaU = deltaL.yxwz;
+	float4 fx45i = saturate((fx + delta - Co - Ci) / (2.0 * delta));
+	float4 fx45 = saturate((fx + delta - Co) / (2.0 * delta));
+	float4 fx30 = saturate((fxL + deltaL - Cx) / (2.0 * deltaL));
+	float4 fx60 = saturate((fxU + deltaU - Cy) / (2.0 * deltaU));
+
+	bool4 lv0 = e != f && e != h;
+	bool4 lv1 = lv0 && ((!Eq(f, b) && !Eq(f, c)) || (!Eq(h, d) && !Eq(h, g)) ||
+	                    (Eq(e, i) && ((!Eq(f, f4) && !Eq(f, i4)) || (!Eq(h, h5) && !Eq(h, i5)))) || Eq(e, g) || Eq(e, c));
+	bool4 lv2L = e != g && d != g;
+	bool4 lv2U = e != c && b != c;
+	float4 wd1 = WeightedDistance(e, c, g, i, h5, f4, h, f);
+	float4 wd2 = WeightedDistance(h, d, i5, f, i4, b, e, i);
+	bool4 edri = wd1 <= wd2 && lv0;
+	bool4 edr = wd1 < wd2 && lv1;
+	bool4 edrL = 2.0 * Df(f, g) <= Df(h, c) && lv2L && edr;
+	bool4 edrU = Df(f, g) >= 2.0 * Df(h, c) && lv2U && edr;
+	fx45 *= (float4)edr;
+	fx30 *= (float4)edrL;
+	fx60 *= (float4)edrU;
+	fx45i *= (float4)edri;
+	bool4 px = Df(e, f) <= Df(e, h);
+	float4 m = max(max(fx30, fx60), max(fx45, fx45i));
+
+	float4 res1 = lerp(E, px.x ? F : H, m.x);
+	res1 = lerp(res1, px.z ? D : B, m.z);
+	float4 res2 = lerp(E, px.y ? B : F, m.y);
+	res2 = lerp(res2, px.w ? H : D, m.w);
+	// Of the two, the one further from E.
+	const float4 one = float4(1.0, 1.0, 1.0, 1.0);
+	float4 r = dot(abs(E - res2), one) >= dot(abs(E - res1), one) ? res2 : res1;
+	float3 rgb = r.a > 0.0 ? r.rgb / r.a : float3(0.0, 0.0, 0.0);
+	upDst[(uint2)lvOrigin * factor + id.xy] = (uint4)round(saturate(float4(rgb, r.a)) * 255.0);
+}
+)HLSL";
+
+// Presentation: an image (a surface at the render scale, or a CPU image) drawn into the window's back
+// buffer at dstOrigin, scaled by 1 / dstScale. Reduced: each pixel the average of the texels under it
+// (supersampling); enlarged: bilinear or nearest. An overlay (RGBA8888, premultiplied alpha, covering
+// the same rectangle) may go over it.
+static const char kPresent[] = R"HLSL(
+cbuffer PresentCB : register(b0) {
+	float2 dstOrigin;  // the image's top left in the window, pixels
+	float2 dstScale;   // source texels per window pixel
+	int2 srcSize;      // the source image, texels
+	uint srcFormat;    // GE_FORMAT_* (3 for a CPU image)
+	uint magFilter;    // enlarging: 0 nearest, 1 bilinear
+	int2 overlaySize;  // 0: no overlay
+	uint2 presentPad;
+};
+Texture2D<uint> presentTex : register(t0);
+Texture2D<uint> overlayTex : register(t1);
+
+float4 OverlayTexel(int2 p) {
+	uint c = overlayTex.Load(int3(clamp(p, 0, overlaySize - 1), 0));
+	return float4(c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF, c >> 24) / 255.0;
+}
+// The overlay, bilinear at p (its texel coordinates).
+float4 Overlay(float2 p) {
+	p -= 0.5;
+	int2 i = (int2)floor(p);
+	float2 f = p - (float2)i;
+	float4 top = lerp(OverlayTexel(i), OverlayTexel(i + int2(1, 0)), f.x);
+	float4 bottom = lerp(OverlayTexel(i + int2(0, 1)), OverlayTexel(i + int2(1, 1)), f.x);
+	return lerp(top, bottom, f.y);
+}
+
+float4 VSPresent(uint id : SV_VertexID) : SV_Position {
+	float2 p = float2((id << 1) & 2, id & 2);
+	return float4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0.0, 1.0);
+}
+
+float4 PSPresent(float4 pos : SV_Position) : SV_Target {
+	float2 p0 = (floor(pos.xy) - dstOrigin) * dstScale, p1 = p0 + dstScale;
+	float3 c;
+	if (dstScale.x > 1.0 || dstScale.y > 1.0)
+		c = AreaAverage(presentTex, int2(0, 0), srcSize, p0, p1, srcFormat);
+	else if (magFilter != 0)
+		c = Bilinear(presentTex, srcSize, (p0 + p1) * 0.5, srcFormat);
+	else
+		c = DisplayColor(presentTex, clamp((int2)floor((p0 + p1) * 0.5), 0, srcSize - 1), srcFormat);
+	if (overlaySize.x > 0) {
+		float4 o = Overlay((pos.xy - dstOrigin) * dstScale * (float2)overlaySize / (float2)srcSize);
+		c = o.rgb + c * (1.0 - o.a);
+	}
+	return float4(c, 1.0);
 }
 )HLSL";
 
@@ -645,7 +854,9 @@ std::string ShaderSource(ShaderKind kind) {
 	switch (kind) {
 	case ShaderKind::Vertex: return std::string(kCommon) + kVertex;
 	case ShaderKind::Pixel: return std::string(kCommon) + kPixel1 + kPixel2;
-	default: return kCompute;
+	case ShaderKind::Upscale: return kUpscale;
+	case ShaderKind::Present: return std::string(kDisplay) + kPresent;
+	default: return std::string(kDisplay) + kCompute;
 	}
 }
 

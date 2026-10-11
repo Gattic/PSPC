@@ -18,9 +18,23 @@ namespace gpu::hw {
 
 using Microsoft::WRL::ComPtr;
 
-enum class ShaderKind { Vertex, Pixel, Compute };
+// Compute: surface uploads, write-backs and display images; Upscale: texture upscaling; Present: drawing
+// an image into the host window.
+enum class ShaderKind { Vertex, Pixel, Compute, Upscale, Present };
 // The HLSL source for a kind of shader (d3d11_shaders.cpp).
 std::string ShaderSource(ShaderKind kind);
+
+// The largest texture side D3D11 allows.
+constexpr int MAX_TEXTURE_SIDE = 16384;
+
+// The factor textures of an atlas this size are scaled up by, at texture upscaling `setting` (1 = off):
+// within the largest texture D3D11 allows.
+inline int TextureUpscale(int setting, int atlasW, int atlasH) {
+	int f = setting;
+	while (f > 1 && (atlasW * f > MAX_TEXTURE_SIDE || atlasH * f > MAX_TEXTURE_SIDE))
+		--f;
+	return f > 1 ? f : 1;
+}
 
 // Per-draw state for the pixel shader; matches DrawState in the HLSL.
 struct DrawStateGpu {
@@ -47,7 +61,7 @@ struct DrawStateGpu {
 	u32 texMode;
 	s32 texLevelOffset;
 	s32 lodSlopeLog;
-	u32 rtt;
+	u32 rtt;  // format | 0x100 (render to texture) | texture scale << 12
 	u32 texLevels[8];
 	u32 rttY;
 	u32 pad2[3];
@@ -105,6 +119,9 @@ public:
 	void Invalidate(u32 start, u32 end);
 	void EndFrame(u64 frame);
 	size_t Size() const { return entries_.size(); }
+	// Texture upscaling: decoded textures are scaled up by TextureUpscale(factor, ...) with `cs`
+	// (CSUpscale, xBR) before they're sampled. The pixel shader samples them at that scale.
+	bool SetUpscale(int factor, ID3D11ComputeShader *cs);
 	u64 decodes = 0, hashes = 0;
 	double hashSeconds = 0, decodeSeconds = 0, pureHashSeconds = 0;
 	u64 hashBytes = 0, decodeTexels = 0;
@@ -126,6 +143,7 @@ private:
 	struct Entry {
 		ComPtr<ID3D11Texture2D> tex;
 		ComPtr<ID3D11ShaderResourceView> srv;
+		ComPtr<ID3D11UnorderedAccessView> uav;  // upscaled textures: the upscaler's target
 		u64 dataHash = 0;
 		u64 checkedRun = 0;
 		bool stale = false;
@@ -135,9 +153,18 @@ private:
 	};
 	ID3D11Device *dev_;
 	ID3D11DeviceContext *ctx_;
+	bool Upscale(Entry &e, const SamplerState &ss, const u32 layout[8], int w, int h, int factor);
+
 	std::unordered_map<Key, Entry, KeyHash> entries_;
 	std::vector<u32> decodeBuf_;
 	u64 frame_ = 0;
+	int upscale_ = 1;
+	ComPtr<ID3D11ComputeShader> upscaleCs_;
+	ComPtr<ID3D11Buffer> upscaleCb_;
+	// The 1x atlas the upscaler reads.
+	ComPtr<ID3D11Texture2D> upSrc_;
+	ComPtr<ID3D11ShaderResourceView> upSrcSrv_;
+	int upSrcW_ = 0, upSrcH_ = 0;
 };
 
 }  // namespace gpu::hw

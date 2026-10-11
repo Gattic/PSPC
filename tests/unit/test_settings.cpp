@@ -64,6 +64,13 @@ TEST(settings_set_validates) {
 	CHECK(!settings::Set(s, "pad.circle", "nope") && s.pads[Index("circle")] == "a,righttrigger");
 	CHECK(settings::Set(s, "pad.stick", "Right") && s.padStick == "right");
 	CHECK(!settings::Set(s, "key.nosuch", "A") && !settings::Set(s, "bogus", "1"));
+	CHECK(settings::Set(s, "render_scale", "16") && s.renderScale == 16);
+	CHECK(!settings::Set(s, "render_scale", "17") && !settings::Set(s, "render_scale", "0") && s.renderScale == 16);
+	CHECK(settings::Set(s, "texture_filter", "Linear") && s.textureFilter == "linear");
+	CHECK(!settings::Set(s, "texture_filter", "bicubic") && s.textureFilter == "linear");
+	CHECK(settings::Set(s, "texture_upscale", "4") && s.textureUpscale == 4);
+	CHECK(!settings::Set(s, "texture_upscale", "5") && s.textureUpscale == 4);
+	CHECK(settings::Get(s, "texture_upscale") == "4" && settings::Get(s, "texture_filter") == "linear");
 }
 
 TEST(settings_lists) {

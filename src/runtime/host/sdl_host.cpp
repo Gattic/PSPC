@@ -3,12 +3,17 @@
 //
 // Input goes through the bindings in Config (pspc.ini, defaults in common/settings.cpp).
 // Hotkeys: F11 toggles fullscreen, F12 saves a screenshot, Ctrl+Q quits like closing the window.
+//
+// Frames come from the emulation thread (PresentFrame) and are shown with an SDL renderer, unless a GPU
+// renderer presents them to the window itself (SetFramePresenter, Config::gpuPresent).
 #include <SDL.h>
+#include <SDL_syswm.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <ctime>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -23,10 +28,16 @@ namespace host {
 namespace {
 
 bool g_headless = true;
+Config g_cfg;
+HWND g_hwnd = nullptr;
 std::mutex g_frameMutex;
 std::vector<u32> g_frame;
 int g_frameW = 0, g_frameH = 0;
 bool g_frameDirty = false;
+// A GPU renderer showing the frames itself (emulation thread only), and F12 waiting for one.
+std::function<bool(const u32 *, int, int, int)> g_presenter;
+std::atomic<bool> g_hasPresenter{false};
+std::atomic<bool> g_screenshotRequested{false};
 
 // Input state read by the emulation thread: buttons from keys and controller buttons, the
 // analog stick from bound keys/buttons ("digital", 128 = centred) or the controller stick.
@@ -106,9 +117,9 @@ void SetFullscreen(SDL_Window *win, bool on) {
 	SDL_ShowCursor(on ? SDL_DISABLE : SDL_ENABLE);
 }
 
-// F12: the presented frame (PSP resolution) as a 24-bit BMP.
-void SaveScreenshot(const Config &cfg, const std::vector<u32> &px, int w, int h) {
-	if (px.empty() || w <= 0 || h <= 0) {
+// F12: the presented frame (at the resolution it was presented) as a 24-bit BMP.
+void SaveScreenshot(const Config &cfg, const u32 *px, int w, int h) {
+	if (!px || w <= 0 || h <= 0) {
 		LOGW("HOST", "Screenshot: nothing has been displayed yet");
 		return;
 	}
@@ -125,7 +136,7 @@ void SaveScreenshot(const Config &cfg, const std::vector<u32> &px, int w, int h)
 	for (int n = 2; fs::exists(file, ec); n++) file = dir / fs::u8path(base + "_" + std::to_string(n) + ".bmp");
 	// XBGR8888 has no alpha mask, so SDL writes a plain 24-bit BMP (the PSP's alpha byte is not
 	// opacity).
-	SDL_Surface *s = SDL_CreateRGBSurfaceWithFormatFrom((void *)px.data(), w, h, 32, w * 4, SDL_PIXELFORMAT_XBGR8888);
+	SDL_Surface *s = SDL_CreateRGBSurfaceWithFormatFrom((void *)px, w, h, 32, w * 4, SDL_PIXELFORMAT_XBGR8888);
 	if (s && SDL_SaveBMP(s, PathToUtf8(file).c_str()) == 0) LOGI("HOST", "Screenshot saved to %s", PathToUtf8(file).c_str());
 	else LOGE("HOST", "Screenshot %s failed: %s", PathToUtf8(file).c_str(), SDL_GetError());
 	if (s) SDL_FreeSurface(s);
@@ -137,6 +148,7 @@ bool IsHeadless() { return g_headless; }
 
 int Run(const Config &cfg, const std::function<int()> &emulation, const std::function<void()> &onQuit) {
 	g_headless = cfg.headless;
+	g_cfg = cfg;
 	if (cfg.headless) return emulation();
 
 	SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
@@ -151,9 +163,18 @@ int Run(const Config &cfg, const std::function<int()> &emulation, const std::fun
 	SDL_Window *win = SDL_CreateWindow(cfg.title.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
 	                                   480 * cfg.windowScale, 272 * cfg.windowScale, winFlags);
 	if (cfg.fullscreen) SDL_ShowCursor(SDL_DISABLE);
-	SDL_Renderer *ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | (cfg.vsync ? SDL_RENDERER_PRESENTVSYNC : 0));
-	SDL_RenderSetLogicalSize(ren, 480, 272);
-	SDL_Texture *tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, 480, 272);
+	SDL_SysWMinfo wm;
+	SDL_VERSION(&wm.version);
+	if (win && SDL_GetWindowWMInfo(win, &wm) && wm.subsystem == SDL_SYSWM_WINDOWS) g_hwnd = wm.info.win.window;
+	// The SDL renderer, unless a GPU renderer will present instead (then made once a frame comes here).
+	SDL_Renderer *ren = nullptr;
+	SDL_Texture *tex = nullptr;
+	auto makeRenderer = [&]() {
+		ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | (cfg.vsync ? SDL_RENDERER_PRESENTVSYNC : 0));
+		SDL_RenderSetLogicalSize(ren, 480, 272);
+		tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, 480, 272);
+	};
+	if (!cfg.gpuPresent || !g_hwnd) makeRenderer();
 
 	SDL_AudioSpec want{}, have{};
 	want.freq = 44100;
@@ -194,6 +215,7 @@ int Run(const Config &cfg, const std::function<int()> &emulation, const std::fun
 				if (k == SDLK_F11 || k == SDLK_F12 || (k == SDLK_q && down && (ev.key.keysym.mod & KMOD_CTRL))) {
 					if (down && !ev.key.repeat) {
 						if (k == SDLK_F11) SetFullscreen(win, !(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN_DESKTOP));
+						else if (k == SDLK_F12 && g_hasPresenter) g_screenshotRequested = true;
 						else if (k == SDLK_F12) screenshot = true;
 						else quit();
 					}
@@ -259,8 +281,9 @@ int Run(const Config &cfg, const std::function<int()> &emulation, const std::fun
 				present = true;
 			}
 		}
-		if (screenshot) SaveScreenshot(cfg, shown, shownW, shownH);
-		if (present) {
+		if (screenshot) SaveScreenshot(cfg, shown.data(), shownW, shownH);
+		if (present && !ren) makeRenderer();
+		if (present && ren) {
 			// A GPU renderer at a render scale above 1 presents larger frames: the texture follows.
 			int texW = 0, texH = 0;
 			SDL_QueryTexture(tex, nullptr, nullptr, &texW, &texH);
@@ -298,8 +321,9 @@ int Run(const Config &cfg, const std::function<int()> &emulation, const std::fun
 	emu.join();
 	for (auto *p : pads) SDL_GameControllerClose(p);
 	if (g_audio) SDL_CloseAudioDevice(g_audio);
-	SDL_DestroyTexture(tex);
-	SDL_DestroyRenderer(ren);
+	if (tex) SDL_DestroyTexture(tex);
+	if (ren) SDL_DestroyRenderer(ren);
+	g_hwnd = nullptr;
 	SDL_DestroyWindow(win);
 	SDL_Quit();
 	return result;
@@ -307,12 +331,37 @@ int Run(const Config &cfg, const std::function<int()> &emulation, const std::fun
 
 void PresentFrame(const u32 *rgba, int width, int height, int stride) {
 	if (g_headless) return;
+	if (g_presenter) {
+		if (stride == width) SaveScreenshotIfRequested(rgba, width, height);
+		if (g_presenter(rgba, width, height, stride)) return;
+	}
 	std::lock_guard<std::mutex> lock(g_frameMutex);
 	g_frame.resize((size_t)width * height);
 	for (int y = 0; y < height; y++) memcpy(&g_frame[(size_t)y * width], rgba + (size_t)y * stride, (size_t)width * 4);
 	g_frameW = width;
 	g_frameH = height;
 	g_frameDirty = true;
+}
+
+void *NativeWindow() { return g_hwnd; }
+
+int FitScale() {
+	RECT rc{};
+	if (!g_hwnd || !GetClientRect(g_hwnd, &rc)) return 0;
+	const int w = rc.right - rc.left, h = rc.bottom - rc.top;
+	const int pictureW = std::min(w, (int)((long long)h * 480 / 272));
+	return std::max(1, (pictureW + 479) / 480);
+}
+
+void SetFramePresenter(std::function<bool(const u32 *, int, int, int)> presenter) {
+	g_presenter = std::move(presenter);
+	g_hasPresenter = (bool)g_presenter;
+}
+
+bool ScreenshotRequested() { return g_screenshotRequested; }
+
+void SaveScreenshotIfRequested(const u32 *rgba, int width, int height) {
+	if (g_screenshotRequested.exchange(false)) SaveScreenshot(g_cfg, rgba, width, height);
 }
 
 CtrlState GetCtrl() {

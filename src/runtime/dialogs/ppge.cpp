@@ -448,6 +448,8 @@ struct Target {
 	int cx1, cy1, cx2, cy2;
 };
 
+// color over d with coverage a. d's alpha accumulates (it stays 255 over an opaque image): over a
+// transparent one, the result is the drawing with premultiplied alpha.
 inline void Blend(u32 &d, u32 color, int a) {
 	if (a <= 0) return;
 	if (a >= 255) {
@@ -458,7 +460,8 @@ inline void Blend(u32 &d, u32 color, int a) {
 	u32 r = ((color & 0xFF) * a + (d & 0xFF) * ia + 127) / 255;
 	u32 g = (((color >> 8) & 0xFF) * a + ((d >> 8) & 0xFF) * ia + 127) / 255;
 	u32 b = (((color >> 16) & 0xFF) * a + ((d >> 16) & 0xFF) * ia + 127) / 255;
-	d = r | (g << 8) | (b << 16) | 0xFF000000;
+	u32 da = a + ((d >> 24) * ia + 127) / 255;
+	d = r | (g << 8) | (b << 16) | (da << 24);
 }
 
 void SetClip(Target &t, const short *clip) {
@@ -492,7 +495,7 @@ void FillRect(Target &t, float x1, float y1, float x2, float y2, u32 color) {
 		for (int x = ix1 + 1; x < ix2 - 1; x++) {
 			const u32 d = row[x];
 			row[x] = ((sr + (d & 0xFF) * ia) / 255) | (((sg + ((d >> 8) & 0xFF) * ia) / 255) << 8) |
-			         (((sb + ((d >> 16) & 0xFF) * ia) / 255) << 16) | 0xFF000000;
+			         (((sb + ((d >> 16) & 0xFF) * ia) / 255) << 16) | ((a + ((d >> 24) * ia + 127) / 255) << 24);
 		}
 	}
 }

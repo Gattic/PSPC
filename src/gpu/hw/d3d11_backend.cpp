@@ -30,7 +30,12 @@
 //    - without it (PSPC_D3D11_SYNC=eager): at every list end and sceGeDrawSync/ListSync.
 //  * Textures are hashed (d3d11_texcache.cpp) after their memory was made current; a texture that is
 //    (part of) a surface in the same pixel format is sampled from the surface itself (render to texture).
-//  * sceDisplay at a render scale above 1 presents the surface itself, converted to RGBA8888.
+//
+// Presentation. With a host window, sceDisplay's framebuffer goes from its surface straight into the
+// window's swap chain, scaled to fit by a pixel shader (averaged down when the render scale is larger
+// than the window: supersampling), so even 8K rendering never comes back to the CPU. Frames that need
+// the CPU (the dialogs and HOME menu drawn over the game, screenshots, framebuffers the GPU didn't draw)
+// are read back at about the window's size, or come as CPU images, and are drawn the same way.
 #include "gpu/hw/d3d11_backend.h"
 
 #include <d3dcompiler.h>
@@ -40,6 +45,7 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -55,8 +61,10 @@ namespace {
 
 constexpr int FMT_DEPTH = 4;
 constexpr u32 VRAM_MASK = VRAM_SIZE - 1;
-constexpr int MAX_SURFACE_W = 2048;
+constexpr int MAX_SURFACE_W = 2048;  // PSP pixels; at most MAX_TEXTURE_SIDE / scale at the render scale
 constexpr int MAX_SURFACE_H = 1024;
+constexpr int MAX_SCALE = 16;
+static_assert(MAX_SURFACE_H * MAX_SCALE <= MAX_TEXTURE_SIDE, "surface height at the largest render scale");
 
 struct TargetCB {
 	float ndcScale[2];
@@ -70,8 +78,49 @@ struct CopyCB {
 	u32 size[2];
 	u32 scale;
 	u32 format;
+	u32 outScale;
+	u32 pad;
+};
+
+struct PresentCB {
+	float dstOrigin[2];
+	float dstScale[2];
+	s32 srcSize[2];
+	u32 srcFormat;
+	u32 magFilter;
+	s32 overlaySize[2];
 	u32 pad[2];
 };
+
+// A 24-bit BMP of an RGBA8888 image (PSPC_HOST_SNAPSHOT).
+void WriteBmp(const char *path, const u8 *rgba, int w, int h, size_t pitch) {
+	const u32 rowBytes = ((u32)w * 3 + 3) & ~3u, size = 54 + rowBytes * (u32)h;
+	std::vector<u8> bmp(size, 0);
+	auto put32 = [&](size_t at, u32 v) { memcpy(&bmp[at], &v, 4); };
+	bmp[0] = 'B';
+	bmp[1] = 'M';
+	put32(2, size);
+	put32(10, 54);
+	put32(14, 40);
+	put32(18, (u32)w);
+	put32(22, (u32)h);
+	bmp[26] = 1;
+	bmp[28] = 24;
+	put32(34, rowBytes * (u32)h);
+	for (int y = 0; y < h; ++y) {
+		const u8 *src = rgba + (size_t)y * pitch;
+		u8 *row = &bmp[54 + (size_t)(h - 1 - y) * rowBytes];
+		for (int x = 0; x < w; ++x) {
+			row[x * 3 + 0] = src[x * 4 + 2];
+			row[x * 3 + 1] = src[x * 4 + 1];
+			row[x * 3 + 2] = src[x * 4 + 0];
+		}
+	}
+	if (FILE *f = fopen(path, "wb")) {
+		fwrite(bmp.data(), 1, bmp.size(), f);
+		fclose(f);
+	}
+}
 
 // rasterizer.cpp ClampFogDepth: the fog factor 0-255 from a vertex's fog depth.
 inline float ClampFogDepth(float fogdepth) {
@@ -255,7 +304,12 @@ public:
 			pendingDraws_ = false;
 		}
 	}
-	bool GetDisplayImage(u32 addr, int stride, int format, int width, int height, std::vector<u32> &out, int *outW, int *outH) override;
+	bool GetDisplayImage(u32 addr, int stride, int format, int width, int height, std::vector<u32> &out, int *outW, int *outH,
+	                     int outScale) override;
+	bool PresentDisplay(u32 addr, int stride, int format, int width, int height, const std::function<void(u32 *, int, int)> &overlay,
+	                    bool capture) override;
+	bool PresentImage(const u32 *rgba, int width, int height, int stride) override;
+	void ReleaseWindow() override;
 	// A guest access to a VRAM page kept inaccessible: writes back what's rendered there.
 	bool OnGuestFault(u32 off);
 	bool Guarded() const { return guard_; }
@@ -296,14 +350,27 @@ private:
 	void ResolveRenderToTexture(const RasterState *states, size_t n);
 	ID3D11ShaderResourceView *FeedbackCopy(Surface *s);
 	void PrintStats();
+	Surface *DisplaySurface(u32 addr, int stride, int format, int width);
+	bool ReadDisplay(Surface *s, int width, int height, int format, int outScale, std::vector<u32> &out);
+	bool EnsureSwapChain();
+	void PictureRect(int *x, int *y, int *w, int *h) const;
+	bool PresentImageLocked(const u32 *rgba, int width, int height, int stride);
+	void DrawPresent(ID3D11ShaderResourceView *src, int srcW, int srcH, int format, bool bilinear, ID3D11ShaderResourceView *overlay = nullptr,
+	                 int overlayW = 0, int overlayH = 0);
+	bool UploadImage(const u32 *rgba, int width, int height, int stride, ComPtr<ID3D11Texture2D> &tex, ComPtr<ID3D11ShaderResourceView> &srv,
+	                 int *texW, int *texH);
 
 	int scale_ = 1;
+	int maxSurfaceW_ = MAX_SURFACE_W;
+	int texFilter_ = 0;  // D3D11Options::textureFilter
+	int texUpscale_ = 1;
+	bool loggedAllocFailure_ = false;
 	ComPtr<ID3D11Device> dev_;
 	ComPtr<ID3D11DeviceContext> ctx_;
 	ComPtr<ID3D11VertexShader> vs_;
 	ComPtr<ID3D11InputLayout> layout_;
 	ComPtr<ID3D11PixelShader> ps_[16];
-	ComPtr<ID3D11ComputeShader> csExpand_, csReduce_, csDisplay_;
+	ComPtr<ID3D11ComputeShader> csExpand_, csReduce_, csDisplay_, csUpscale_;
 	ComPtr<ID3D11RasterizerState> raster_;
 	ComPtr<ID3D11DepthStencilState> noDepth_;
 	ComPtr<ID3D11Buffer> targetCB_, copyCB_;
@@ -333,6 +400,21 @@ private:
 	std::vector<DrawStateGpu> gpuStates_;
 	std::vector<u32> uploadBuf_;
 	std::vector<u8> rowTmp_, rowTmp2_;
+
+	// Presentation to the host window.
+	HWND window_ = nullptr;
+	bool presentFailed_ = false;
+	ComPtr<IDXGISwapChain1> swapChain_;
+	ComPtr<ID3D11RenderTargetView> backRtv_;
+	int backW_ = 0, backH_ = 0;
+	ComPtr<ID3D11VertexShader> presentVs_;
+	ComPtr<ID3D11PixelShader> presentPs_;
+	ComPtr<ID3D11Buffer> presentCB_;
+	ComPtr<ID3D11Texture2D> imageTex_, overlayTex_;  // CPU images (PresentImage), overlays
+	ComPtr<ID3D11ShaderResourceView> imageSrv_, overlaySrv_;
+	int imageW_ = 0, imageH_ = 0, overlayW_ = 0, overlayH_ = 0;
+	std::vector<u32> overlayBuf_;
+	int presents_ = 0;
 
 	ComPtr<ID3D11InfoQueue> infoQueue_;
 	std::recursive_mutex mu_;
@@ -521,7 +603,11 @@ ComPtr<ID3DBlob> D3D11Backend::Compile(ShaderKind kind, const char *entry, const
 }
 
 bool D3D11Backend::Init(const D3D11Options &o, std::string *err) {
-	scale_ = std::clamp(o.scale, 1, 4);
+	scale_ = std::clamp(o.scale, 1, MAX_SCALE);
+	maxSurfaceW_ = std::min(MAX_SURFACE_W, MAX_TEXTURE_SIDE / scale_);
+	texFilter_ = std::clamp(o.textureFilter, 0, 2);
+	texUpscale_ = std::clamp(o.textureUpscale, 1, 4);
+	window_ = (HWND)o.window;
 	printStats_ = getenv("PSPC_GPU_STATS") != nullptr;
 	g_vram = o.privateVram ? o.privateVram : VramPtr();
 	const char *syncMode = getenv("PSPC_D3D11_SYNC");
@@ -587,12 +673,20 @@ bool D3D11Backend::Init(const D3D11Options &o, std::string *err) {
 		*err = "CreateInputLayout failed";
 		return false;
 	}
-	struct { const char *entry; ComPtr<ID3D11ComputeShader> *cs; } computes[] = {
-		{ "CSExpand", &csExpand_ }, { "CSReduce", &csReduce_ }, { "CSDisplay", &csDisplay_ },
+	struct { ShaderKind kind; const char *entry; ComPtr<ID3D11ComputeShader> *cs; } computes[] = {
+		{ ShaderKind::Compute, "CSExpand", &csExpand_ }, { ShaderKind::Compute, "CSReduce", &csReduce_ },
+		{ ShaderKind::Compute, "CSDisplay", &csDisplay_ }, { ShaderKind::Upscale, "CSUpscale", &csUpscale_ },
 	};
 	for (auto &c : computes) {
-		ComPtr<ID3DBlob> code = Compile(ShaderKind::Compute, c.entry, "cs_5_0", nullptr, err);
+		ComPtr<ID3DBlob> code = Compile(c.kind, c.entry, "cs_5_0", nullptr, err);
 		if (!code || FAILED(dev_->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, c.cs->GetAddressOf())))
+			return false;
+	}
+	{
+		ComPtr<ID3DBlob> pvs = Compile(ShaderKind::Present, "VSPresent", "vs_5_0", nullptr, err);
+		ComPtr<ID3DBlob> pps = Compile(ShaderKind::Present, "PSPresent", "ps_5_0", nullptr, err);
+		if (!pvs || !pps || FAILED(dev_->CreateVertexShader(pvs->GetBufferPointer(), pvs->GetBufferSize(), nullptr, &presentVs_)) ||
+			FAILED(dev_->CreatePixelShader(pps->GetBufferPointer(), pps->GetBufferSize(), nullptr, &presentPs_)))
 			return false;
 	}
 	// Every pixel shader variant, compiled in parallel (so a compile error shows at startup).
@@ -637,18 +731,25 @@ bool D3D11Backend::Init(const D3D11Options &o, std::string *err) {
 	cbd.ByteWidth = 32;
 	cbd.Usage = D3D11_USAGE_DEFAULT;
 	cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	D3D11_BUFFER_DESC presentCbd = cbd;
+	presentCbd.ByteWidth = sizeof(PresentCB);
 	if (FAILED(dev_->CreateRasterizerState(&rd, &raster_)) || FAILED(dev_->CreateDepthStencilState(&dd, &noDepth_)) ||
 		FAILED(dev_->CreateBuffer(&cbd, nullptr, &targetCB_)) || FAILED(dev_->CreateBuffer(&cbd, nullptr, &copyCB_)) ||
+		FAILED(dev_->CreateBuffer(&presentCbd, nullptr, &presentCB_)) ||
 		!MakeTexture(1, 1, false, std::addressof(dummyTex_), std::addressof(dummyUav_), nullptr)) {
 		*err = "D3D11 state creation failed";
 		return false;
 	}
 	texCache_ = std::make_unique<TextureCache>(dev_.Get(), ctx_.Get());
+	if (texUpscale_ > 1 && !texCache_->SetUpscale(texUpscale_, csUpscale_.Get()))
+		texUpscale_ = 1;
 	if (guard_) {
 		g_guarded = this;
 		g_guardVeh = AddVectoredExceptionHandler(1, VramFaultHandler);
 	}
-	LOGI("d3d11", "D3D11 renderer on %s (feature level %x), render scale %d, %s", name.c_str(), (unsigned)fl, scale_,
+	static const char *const kFilters[] = { "as the game sets it", "nearest", "linear" };
+	LOGI("d3d11", "D3D11 renderer on %s (feature level %x), render scale %d (%d x %d), textures %s%s, %s", name.c_str(), (unsigned)fl,
+		scale_, 480 * scale_, 272 * scale_, kFilters[texFilter_], texUpscale_ > 1 ? (", upscaled " + std::to_string(texUpscale_) + "x").c_str() : "",
 		guard_ ? "rendering written back when guest memory is touched" : "rendering written back at list ends and syncs");
 	return true;
 }
@@ -724,8 +825,14 @@ bool D3D11Backend::ResizeSurface(Surface *s, int height) {
 	ComPtr<ID3D11Texture2D> tex;
 	ComPtr<ID3D11UnorderedAccessView> uav;
 	ComPtr<ID3D11ShaderResourceView> srv;
-	if (!MakeTexture(s->width * scale_, height * scale_, false, std::addressof(tex), std::addressof(uav), std::addressof(srv)))
+	if (!MakeTexture(s->width * scale_, height * scale_, false, std::addressof(tex), std::addressof(uav), std::addressof(srv))) {
+		if (!loggedAllocFailure_) {
+			loggedAllocFailure_ = true;
+			LOGE("d3d11", "a %d x %d surface could not be created (out of video memory at render scale %d?): drawing to it is skipped",
+				s->width * scale_, height * scale_, scale_);
+		}
 		return false;
+	}
 	if (s->tex) {
 		UnbindOM();
 		D3D11_BOX box{ 0, 0, 0, (UINT)(s->width * scale_), (UINT)(s->height * scale_), 1 };
@@ -762,7 +869,7 @@ Surface *D3D11Backend::GetSurface(u32 addr, int stride, int fmt, int rowsNeeded)
 		s->stride = stride;
 		s->fmt = fmt;
 		s->bpp = fmt == GE_FORMAT_8888 ? 4 : 2;
-		s->width = std::min(stride, MAX_SURFACE_W);
+		s->width = std::min(stride, maxSurfaceW_);
 	}
 	if (s->height < rowsNeeded) {
 		const int h = std::min(MAX_SURFACE_H, std::max((rowsNeeded + 15) & ~15, s->height == 0 ? 272 : 0));
@@ -1383,12 +1490,26 @@ void D3D11Backend::FillStates(const RasterState *states, size_t n) {
 			const SamplerState &ss = rs.samp;
 			d.texFunc = (u32)ss.texFunc | (ss.useTextureAlpha ? 0x10u : 0u) | (ss.useColorDoubling ? 0x20u : 0u);
 			d.texEnv = ss.texBlendColor;
-			d.texMode = (ss.clampS ? 1u : 0u) | (ss.clampT ? 2u : 0u) | (ss.minFilt ? 4u : 0u) | (ss.magFilt ? 8u : 0u) |
-				(ss.mipFilt ? 0x10u : 0u) | ((u32)(ss.maxLevel & 7) << 5) | ((u32)(ss.texLevelMode & 3) << 8);
+			// Texture filtering as the game sets it, or always nearest / linear.
+			u32 filt = (ss.minFilt ? 4u : 0u) | (ss.magFilt ? 8u : 0u);
+			if (texFilter_ == 1)
+				filt = 0;
+			else if (texFilter_ == 2)
+				filt = 12;
+			d.texMode = (ss.clampS ? 1u : 0u) | (ss.clampT ? 2u : 0u) | filt | (ss.mipFilt ? 0x10u : 0u) | ((u32)(ss.maxLevel & 7) << 5) |
+				((u32)(ss.texLevelMode & 3) << 8);
 			d.texLevelOffset = ss.texLevelOffset;
 			d.lodSlopeLog = GELog16(ss.lodSlope);
 			int aw, ah;
 			TextureAtlasLayout(ss, d.texLevels, &aw, &ah);
+			// The texture cache's textures are upscaled: sampled at their scale (render to texture replaces
+			// this below).
+			const int up = TextureUpscale(texUpscale_, aw, ah);
+			if (up > 1) {
+				for (u32 &lv : d.texLevels)
+					lv = (lv & 0xFFFF0000u) | ((lv & 0xFFFFu) * (u32)up);
+				d.rtt = (u32)up << 12;
+			}
 		}
 	}
 }
@@ -1445,7 +1566,7 @@ void D3D11Backend::ResolveRenderToTexture(const RasterState *states, size_t n) {
 		ValidateRows(s, y0, y0 + std::min<int>(st.samp.levels[0].h, 512) - 1);
 		rttSurf_[i] = s;
 		DrawStateGpu &d = gpuStates_[i];
-		d.rtt = (u32)s->fmt | ((u32)scale_ << 4) | 0x100;
+		d.rtt = (u32)s->fmt | 0x100 | ((u32)scale_ << 12);
 		d.texLevels[0] = (u32)(x0 * scale_) | (d.texLevels[0] & 0xFFFF0000u);
 		d.rttY = (u32)(y0 * scale_);
 	}
@@ -1631,24 +1752,19 @@ void D3D11Backend::DrawBatch(const BatchPrim *prims, size_t n, const RasterState
 		Protect(depth);
 }
 
-bool D3D11Backend::GetDisplayImage(u32 addr, int stride, int format, int width, int height, std::vector<u32> &out, int *outW, int *outH) {
-	std::lock_guard<std::recursive_mutex> lock(mu_);
+// The surface a displayed framebuffer is, when the GPU drew it; nullptr otherwise.
+Surface *D3D11Backend::DisplaySurface(u32 addr, int stride, int format, int width) {
 	const u32 a = FoldAddress(addr);
-	const int bpp = format == GE_FORMAT_8888 ? 4 : 2;
-	if (a < VRAM_BASE || a >= VRAM_BASE + VRAM_SIZE || stride <= 0) {
-		SyncRange(addr, (u32)(height * stride * bpp));
-		return false;
-	}
-	Surface *s = scale_ > 1 ? FindSurface(a - VRAM_BASE, stride, format & 3) : nullptr;
-	if (!s || !s->drawn || s->width < width) {
-		SyncRange(addr, (u32)(height * stride * bpp));
-		return false;
-	}
-	ScopedTimer timer(&stats_.seconds);
-	ScopedTimer td(&stats_.tDisplay);
-	height = std::min(height, s->height);
-	ValidateRows(s, 0, height - 1);
-	const int w = width * scale_, h = height * scale_;
+	if (a < VRAM_BASE || a >= VRAM_BASE + VRAM_SIZE || stride <= 0)
+		return nullptr;
+	Surface *s = FindSurface(a - VRAM_BASE, stride, format & 3);
+	return s && s->drawn && s->width >= width ? s : nullptr;
+}
+
+// The surface's top left width x height PSP pixels as RGBA8888 at outScale (at most the render scale),
+// read back.
+bool D3D11Backend::ReadDisplay(Surface *s, int width, int height, int format, int outScale, std::vector<u32> &out) {
+	const int w = width * outScale, h = height * outScale;
 	if (!EnsureScratch(displayTex_, std::addressof(displayUav_), nullptr, w, h, &displayW_, &displayH_, false) ||
 		!EnsureScratch(displayStaging_, nullptr, nullptr, w, h, &displayStagingW_, &displayStagingH_, true))
 		return false;
@@ -1657,6 +1773,7 @@ bool D3D11Backend::GetDisplayImage(u32 addr, int stride, int format, int width, 
 	cb.size[1] = (u32)height;
 	cb.scale = (u32)scale_;
 	cb.format = (u32)(format & 3);
+	cb.outScale = (u32)outScale;
 	RunCompute(csDisplay_.Get(), s->srv.Get(), displayUav_.Get(), cb, (UINT)(w + 7) / 8, (UINT)(h + 7) / 8);
 	const D3D11_BOX box{ 0, 0, 0, (UINT)w, (UINT)h, 1 };
 	ctx_->CopySubresourceRegion(displayStaging_.Get(), 0, 0, 0, 0, displayTex_.Get(), 0, &box);
@@ -1667,9 +1784,242 @@ bool D3D11Backend::GetDisplayImage(u32 addr, int stride, int format, int width, 
 	for (int y = 0; y < h; ++y)
 		memcpy(&out[(size_t)y * w], (const u8 *)m.pData + (size_t)y * m.RowPitch, (size_t)w * 4);
 	ctx_->Unmap(displayStaging_.Get(), 0);
-	*outW = w;
-	*outH = h;
 	return true;
+}
+
+bool D3D11Backend::GetDisplayImage(u32 addr, int stride, int format, int width, int height, std::vector<u32> &out, int *outW, int *outH,
+                                   int outScale) {
+	std::lock_guard<std::recursive_mutex> lock(mu_);
+	Surface *s = scale_ > 1 ? DisplaySurface(addr, stride, format, width) : nullptr;
+	if (!s) {
+		SyncRange(addr, (u32)(height * stride * (format == GE_FORMAT_8888 ? 4 : 2)));
+		return false;
+	}
+	ScopedTimer timer(&stats_.seconds);
+	ScopedTimer td(&stats_.tDisplay);
+	height = std::min(height, s->height);
+	ValidateRows(s, 0, height - 1);
+	const int k = outScale > 0 ? std::min(outScale, scale_) : scale_;
+	if (!ReadDisplay(s, width, height, format, k, out))
+		return false;
+	*outW = width * k;
+	*outH = height * k;
+	return true;
+}
+
+// --- Presentation ---
+
+// The swap chain on the host window, at the window's size.
+bool D3D11Backend::EnsureSwapChain() {
+	if (!window_ || presentFailed_)
+		return false;
+	RECT rc{};
+	GetClientRect(window_, &rc);
+	const int w = rc.right - rc.left, h = rc.bottom - rc.top;
+	if (!swapChain_) {
+		ComPtr<IDXGIDevice> dxgiDev;
+		ComPtr<IDXGIAdapter> adapter;
+		ComPtr<IDXGIFactory2> factory;
+		DXGI_SWAP_CHAIN_DESC1 sd{};
+		sd.Width = (UINT)std::max(w, 1);
+		sd.Height = (UINT)std::max(h, 1);
+		sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		sd.SampleDesc.Count = 1;
+		sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+		sd.BufferCount = 3;
+		sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+		if (FAILED(dev_.As(&dxgiDev)) || FAILED(dxgiDev->GetAdapter(&adapter)) || FAILED(adapter->GetParent(IID_PPV_ARGS(&factory))) ||
+			FAILED(factory->CreateSwapChainForHwnd(dev_.Get(), window_, &sd, nullptr, nullptr, &swapChain_))) {
+			LOGW("d3d11", "no swap chain on the window: frames are read back and presented by the host");
+			presentFailed_ = true;
+			swapChain_.Reset();
+			return false;
+		}
+		// The host toggles fullscreen (borderless) itself.
+		factory->MakeWindowAssociation(window_, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
+		backW_ = (int)sd.Width;
+		backH_ = (int)sd.Height;
+		LOGI("d3d11", "presenting to the window (%d x %d)", backW_, backH_);
+	} else if (w > 0 && h > 0 && (w != backW_ || h != backH_)) {
+		backRtv_.Reset();
+		ctx_->OMSetRenderTargets(0, nullptr, nullptr);
+		omDirty_ = true;
+		if (FAILED(swapChain_->ResizeBuffers(0, (UINT)w, (UINT)h, DXGI_FORMAT_UNKNOWN, 0))) {
+			LOGW("d3d11", "resizing the swap chain to %d x %d failed", w, h);
+			return false;
+		}
+		backW_ = w;
+		backH_ = h;
+	}
+	if (!backRtv_) {
+		ComPtr<ID3D11Texture2D> back;
+		if (FAILED(swapChain_->GetBuffer(0, IID_PPV_ARGS(&back))) || FAILED(dev_->CreateRenderTargetView(back.Get(), nullptr, &backRtv_)))
+			return false;
+	}
+	return true;
+}
+
+// Where the 480:272 picture goes in the back buffer: as large as fits, centered.
+void D3D11Backend::PictureRect(int *x, int *y, int *w, int *h) const {
+	int pw = backW_, ph = (int)((s64)backW_ * 272 / 480);
+	if (ph > backH_) {
+		ph = backH_;
+		pw = (int)((s64)backH_ * 480 / 272);
+	}
+	*w = std::max(pw, 1);
+	*h = std::max(ph, 1);
+	*x = (backW_ - *w) / 2;
+	*y = (backH_ - *h) / 2;
+}
+
+// Draws an image (raw pixels in `format`, srcW x srcH texels), and an overlay over it, into the back
+// buffer and presents it.
+void D3D11Backend::DrawPresent(ID3D11ShaderResourceView *src, int srcW, int srcH, int format, bool bilinear, ID3D11ShaderResourceView *overlay,
+                               int overlayW, int overlayH) {
+	int x, y, w, h;
+	PictureRect(&x, &y, &w, &h);
+	PresentCB cb{};
+	cb.dstOrigin[0] = (float)x;
+	cb.dstOrigin[1] = (float)y;
+	cb.dstScale[0] = (float)srcW / (float)w;
+	cb.dstScale[1] = (float)srcH / (float)h;
+	cb.srcSize[0] = srcW;
+	cb.srcSize[1] = srcH;
+	cb.srcFormat = (u32)(format & 3);
+	cb.magFilter = bilinear ? 1u : 0u;
+	cb.overlaySize[0] = overlay ? overlayW : 0;
+	cb.overlaySize[1] = overlay ? overlayH : 0;
+	UnbindOM();
+	ctx_->UpdateSubresource(presentCB_.Get(), 0, nullptr, &cb, 0, 0);
+	const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+	ctx_->ClearRenderTargetView(backRtv_.Get(), black);
+	const D3D11_VIEWPORT vp{ (float)x, (float)y, (float)w, (float)h, 0.0f, 1.0f };
+	const D3D11_RECT sc{ 0, 0, backW_, backH_ };
+	ctx_->RSSetViewports(1, &vp);
+	ctx_->RSSetScissorRects(1, &sc);
+	ctx_->RSSetState(raster_.Get());
+	ctx_->IASetInputLayout(nullptr);
+	ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	ctx_->VSSetShader(presentVs_.Get(), nullptr, 0);
+	ctx_->PSSetShader(presentPs_.Get(), nullptr, 0);
+	ctx_->PSSetConstantBuffers(0, 1, presentCB_.GetAddressOf());
+	ID3D11ShaderResourceView *srvs[2] = { src, overlay };
+	ctx_->PSSetShaderResources(0, 2, srvs);
+	ctx_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+	ctx_->OMSetDepthStencilState(noDepth_.Get(), 0);
+	ctx_->OMSetRenderTargets(1, backRtv_.GetAddressOf(), nullptr);
+	ctx_->Draw(3, 0);
+	ID3D11ShaderResourceView *nullSrvs[2] = {};
+	ctx_->PSSetShaderResources(0, 2, nullSrvs);
+	// Diagnostics: PSPC_HOST_SNAPSHOT=<file.bmp> saves the window's image of the 600th presented frame, or
+	// the PSPC_HOST_SNAPSHOT_AT=<n>th (screen captures fail while the desktop is locked).
+	static const char *snap = getenv("PSPC_HOST_SNAPSHOT");
+	static const int snapAt = [] {
+		const char *at = getenv("PSPC_HOST_SNAPSHOT_AT");
+		return at && atoi(at) > 0 ? atoi(at) : 600;
+	}();
+	if (snap && ++presents_ == snapAt) {
+		ComPtr<ID3D11Texture2D> back, staging;
+		D3D11_TEXTURE2D_DESC td{};
+		if (SUCCEEDED(swapChain_->GetBuffer(0, IID_PPV_ARGS(&back)))) {
+			back->GetDesc(&td);
+			td.Usage = D3D11_USAGE_STAGING;
+			td.BindFlags = 0;
+			td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+			td.MiscFlags = 0;
+			D3D11_MAPPED_SUBRESOURCE m{};
+			if (SUCCEEDED(dev_->CreateTexture2D(&td, nullptr, &staging))) {
+				ctx_->CopyResource(staging.Get(), back.Get());
+				if (SUCCEEDED(ctx_->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m))) {
+					WriteBmp(snap, (const u8 *)m.pData, (int)td.Width, (int)td.Height, m.RowPitch);
+					ctx_->Unmap(staging.Get(), 0);
+					LOGI("d3d11", "window snapshot (%u x %u) saved to %s", td.Width, td.Height, snap);
+				}
+			}
+		}
+	}
+	ctx_->OMSetRenderTargets(0, nullptr, nullptr);
+	omDirty_ = true;
+	// Never waits for the display: the newest frame is shown at its next refresh.
+	const HRESULT hr = swapChain_->Present(0, 0);
+	pendingDraws_ = false;
+	if (FAILED(hr) && hr != DXGI_STATUS_OCCLUDED)
+		LOGW("d3d11", "Present failed (0x%08x)", (unsigned)hr);
+}
+
+bool D3D11Backend::PresentDisplay(u32 addr, int stride, int format, int width, int height,
+                                  const std::function<void(u32 *, int, int)> &overlay, bool capture) {
+	std::lock_guard<std::recursive_mutex> lock(mu_);
+	if (!window_ || presentFailed_)
+		return false;
+	Surface *s = DisplaySurface(addr, stride, format, width);
+	if (!s || !EnsureSwapChain())
+		return false;
+	ScopedTimer timer(&stats_.seconds);
+	ScopedTimer td(&stats_.tDisplay);
+	height = std::min(height, s->height);
+	ValidateRows(s, 0, height - 1);
+	if (overlay) {
+		// Drawn at the smallest whole scale that covers the window's picture.
+		int x, y, w, h;
+		PictureRect(&x, &y, &w, &h);
+		const int k = std::clamp((w + width - 1) / width, 1, MAX_SCALE);
+		const int ow = width * k, oh = height * k;
+		if (capture) {
+			// Onto the picture, read back.
+			if (!ReadDisplay(s, width, height, format, std::min(k, scale_), overlayBuf_))
+				return false;
+			const int iw = width * std::min(k, scale_), ih = height * std::min(k, scale_);
+			overlay(overlayBuf_.data(), iw, ih);
+			return PresentImageLocked(overlayBuf_.data(), iw, ih, iw);
+		}
+		overlayBuf_.assign((size_t)ow * oh, 0);
+		overlay(overlayBuf_.data(), ow, oh);
+		if (!UploadImage(overlayBuf_.data(), ow, oh, ow, overlayTex_, overlaySrv_, &overlayW_, &overlayH_))
+			return false;
+		DrawPresent(s->srv.Get(), width * scale_, height * scale_, format, scale_ > 1, overlaySrv_.Get(), ow, oh);
+		return true;
+	}
+	DrawPresent(s->srv.Get(), width * scale_, height * scale_, format, scale_ > 1);
+	return true;
+}
+
+// A CPU image into a texture of the backend's (grown as needed).
+bool D3D11Backend::UploadImage(const u32 *rgba, int width, int height, int stride, ComPtr<ID3D11Texture2D> &tex,
+                               ComPtr<ID3D11ShaderResourceView> &srv, int *texW, int *texH) {
+	if (!tex || *texW < width || *texH < height) {
+		const int w = std::max(width, *texW), h = std::max(height, *texH);
+		if (!MakeTexture(w, h, false, std::addressof(tex), nullptr, std::addressof(srv)))
+			return false;
+		*texW = w;
+		*texH = h;
+	}
+	const D3D11_BOX box{ 0, 0, 0, (UINT)width, (UINT)height, 1 };
+	ctx_->UpdateSubresource(tex.Get(), 0, &box, rgba, (UINT)stride * 4, 0);
+	return true;
+}
+
+bool D3D11Backend::PresentImage(const u32 *rgba, int width, int height, int stride) {
+	std::lock_guard<std::recursive_mutex> lock(mu_);
+	return PresentImageLocked(rgba, width, height, stride);
+}
+
+bool D3D11Backend::PresentImageLocked(const u32 *rgba, int width, int height, int stride) {
+	if (!window_ || presentFailed_ || width <= 0 || height <= 0 || !EnsureSwapChain() ||
+		!UploadImage(rgba, width, height, stride, imageTex_, imageSrv_, &imageW_, &imageH_))
+		return false;
+	// A PSP-size image enlarged stays sharp, as the software renderer's always has.
+	DrawPresent(imageSrv_.Get(), width, height, GE_FORMAT_8888, width > 480);
+	return true;
+}
+
+void D3D11Backend::ReleaseWindow() {
+	std::lock_guard<std::recursive_mutex> lock(mu_);
+	if (ctx_)
+		ctx_->OMSetRenderTargets(0, nullptr, nullptr);
+	backRtv_.Reset();
+	swapChain_.Reset();
+	window_ = nullptr;
 }
 
 }  // namespace

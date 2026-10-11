@@ -48,10 +48,14 @@ struct Options {
 	std::string dumpFramesDir;  // write the displayed frame as BMP here every dumpEvery VBlanks
 	int dumpEvery = 60;
 	// GE renderer: "software" (the default, the accuracy reference), "d3d11" or "d3d11-warp" (the
-	// optional GPU backend, src/gpu/hw). Empty: $PSPC_RENDERER, else software. renderScale (1-4): the
-	// GPU backend's internal resolution; 0: $PSPC_RENDER_SCALE, else 1.
+	// optional GPU backend, src/gpu/hw). Empty: $PSPC_RENDERER, else software. renderScale (1-16): the
+	// GPU backend's internal resolution (8 = 4K, 16 = 8K); 0: $PSPC_RENDER_SCALE, else 1.
 	std::string renderer;
 	int renderScale = 0;
+	// The GPU backend's textures: filtering "auto" (as the game sets it), "nearest" or "linear"; upscaling
+	// 1 (off) - 4 times with xBR.
+	std::string textureFilter = "auto";
+	int textureUpscale = 1;
 	// Scripted input: hold `buttons` (PSP_CTRL_* bits) for `frames` VBlanks from VBlank `vblank`.
 	struct Press {
 		u32 vblank, buttons, frames;

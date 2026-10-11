@@ -80,7 +80,9 @@ static void Usage() {
 	        "  --test-display       report a display to pspautotests (default: none)\n"
 	        "  --dump-frames <dir>  save the displayed frame as BMP every --dump-every VBlanks (60)\n"
 	        "  --renderer <name>    GE renderer: software (default) or d3d11 (GPU; d3d11-warp: WARP device)\n"
-	        "  --render-scale <n>   d3d11 internal resolution, 1-4 times the PSP's (default 1)\n"
+	        "  --render-scale <n>   d3d11 internal resolution, 1-16 times the PSP's (default 1; 8 = 4K, 16 = 8K)\n"
+	        "  --texture-filter <f> d3d11 texture filtering: auto (as the game sets it), nearest or linear\n"
+	        "  --texture-upscale <n> d3d11 texture upscaling with xBR, 1 (off) - 4\n"
 	        "  --press <v>:<B>[:n]  hold buttons B (e.g. START, CROSS+UP) for n VBlanks (6) from VBlank v\n"
 	        "  --vsh                boot the firmware's XMB (tools/pspc_install_fw.py) instead of a file\n"
 	        "  --recovery           boot M33's recovery menu (also: hold R while the XMB boots)\n"
@@ -126,6 +128,8 @@ static void ApplySettings(const settings::Settings &s, runtime::Options &o) {
 	o.firmwareVersion = ParseFw(s.fw);
 	o.renderer = s.renderer;
 	o.renderScale = s.renderScale;
+	o.textureFilter = s.textureFilter;
+	o.textureUpscale = s.textureUpscale;
 	o.volume = s.mute ? 0 : s.volume;
 	o.keyBindings = s.keys;
 	o.padBindings = s.pads;
@@ -381,6 +385,8 @@ int main(int argc, char **argv) {
 		else if (a == "--dump-every") o.dumpEvery = atoi(next().c_str());
 		else if (a == "--renderer") o.renderer = next();
 		else if (a == "--render-scale") o.renderScale = atoi(next().c_str());
+		else if (a == "--texture-filter") o.textureFilter = ToLower(next());
+		else if (a == "--texture-upscale") o.textureUpscale = atoi(next().c_str());
 		else if (a == "--press") {
 			runtime::Options::Press p;
 			std::string spec = next();

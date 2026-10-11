@@ -120,7 +120,8 @@ std::string JoinList(const std::vector<std::string> &names) {
 
 std::vector<std::string> Keys() {
 	std::vector<std::string> k = {"scale",  "fullscreen", "vsync",  "aot",  "fw",
-	                              "renderer", "render_scale", "games_dir", "plugins", "plugins_dir", "volume", "mute",
+	                              "renderer", "render_scale", "texture_filter", "texture_upscale", "games_dir", "plugins",
+	                              "plugins_dir", "volume", "mute",
 	                              "network", "adhoc_server", "np_server", "np_online_id", "np_token", "infra_dns"};
 	for (size_t i = 0; i < kNumControls; i++) k.push_back(std::string("key.") + kControls[i].name);
 	k.push_back("pad.stick");
@@ -173,7 +174,16 @@ bool Set(Settings &s, const std::string &rawKey, const std::string &rawValue, st
 		if (!ParseBool(v, s.plugins)) return fail("want 0 or 1");
 	} else if (key == "render_scale") {
 		if (v.empty()) s.renderScale = 0;
-		else if (ParseInt(v, 1, 4, n)) s.renderScale = n;
+		else if (ParseInt(v, 1, 16, n)) s.renderScale = n;
+		else return fail("want 1-16");
+	} else if (key == "texture_filter") {
+		std::string l = ToLower(v);
+		if (l.empty()) l = "auto";
+		if (l != "auto" && l != "nearest" && l != "linear") return fail("want auto, nearest or linear");
+		s.textureFilter = l;
+	} else if (key == "texture_upscale") {
+		if (v.empty()) s.textureUpscale = 1;
+		else if (ParseInt(v, 1, 4, n)) s.textureUpscale = n;
 		else return fail("want 1-4");
 	} else if (key == "volume") {
 		if (ToLower(v) == "mute") s.mute = true;
@@ -213,6 +223,8 @@ std::string Get(const Settings &s, const std::string &key) {
 	if (key == "plugins") return B(s.plugins);
 	if (key == "plugins_dir") return s.pluginsDir;
 	if (key == "render_scale") return s.renderScale ? std::to_string(s.renderScale) : "";
+	if (key == "texture_filter") return s.textureFilter;
+	if (key == "texture_upscale") return std::to_string(s.textureUpscale);
 	if (key == "volume") return std::to_string(s.volume);
 	if (key == "mute") return B(s.mute);
 	if (key == "network") return B(s.network);
@@ -266,9 +278,14 @@ std::string Template(const Settings &s) {
 	t += "\n# Firmware version reported to games.\n";
 	put("fw");
 	t += "\n# Graphics: renderer software (default, the accuracy reference) or d3d11 (GPU; faster, and\n"
-	     "# render_scale 1-4 renders at that many times the PSP's resolution).\n";
+	     "# render_scale 1-16 renders at that many times the PSP's 480x272: 4 = 1920x1088, 8 = 3840x2176\n"
+	     "# (4K), 16 = 7680x4352 (8K); larger than the window, it is averaged down: supersampling).\n"
+	     "# d3d11 textures: texture_filter auto (as the game sets it), nearest or linear; texture_upscale\n"
+	     "# 1 (off) - 4 scales them up with xBR, smoothing their pixels' edges.\n";
 	put("renderer");
 	put("render_scale");
+	put("texture_filter");
+	put("texture_upscale");
 	t += "\n# Folder of game images (ISO/CSO) the XMB lists besides ms0:/ISO; empty = pspc's Games folder.\n";
 	put("games_dir");
 	t += "\n# M33 plugins: 1 = load the PRX files listed in seplugins/game.txt, vsh.txt and pops.txt (a\n"

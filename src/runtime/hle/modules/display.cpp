@@ -6,6 +6,7 @@
 // vblank does; the vblank lasts 0.77 ms and the hcount counts 286 lines a frame from 1.
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <vector>
 
 #include "common/log.h"
@@ -92,17 +93,30 @@ u64 EnterUs(u64 frame) { return (u64)std::llround(g_bootUs + kFrameUs - kVblankU
 void Present() {
 	const FrameBuf &fb = Shown();
 	if (host::IsHeadless() || !fb.addr) return;
+	const bool gameScreen = &fb == &g_current;
 #if PSPC_HAVE_GPU
-	// A GPU renderer: its own (upscaled) image of the framebuffer, or guest memory made current.
+	// A GPU renderer presenting to the window itself: its own (upscaled) image of the framebuffer goes
+	// there directly, the dialogs and the HOME menu laid over it; for a screenshot it is read back at
+	// about the window's size and they are drawn onto it.
+	const bool screenshot = host::ScreenshotRequested();
+	std::function<void(u32 *, int, int)> draw;
+	if (screenshot || (gameScreen && ppge::Visible(ppge::Layer::Dialog)) || ppge::Visible(ppge::Layer::System))
+		draw = [gameScreen, screenshot](u32 *px, int w, int h) {
+			ppge::Composite(px, w, h, gameScreen);
+			if (screenshot) host::SaveScreenshotIfRequested(px, w, h);
+		};
+	if (gpu::PresentBackendDisplay(fb.addr, fb.stride, fb.format, 480, 272, draw, screenshot)) return;
+	// Otherwise its image of the framebuffer, read back at about the window's size (or guest memory made
+	// current).
 	int w = 0, h = 0;
-	if (gpu::GetBackendDisplayImage(fb.addr, fb.stride, fb.format, 480, 272, g_rgba, &w, &h)) {
-		ppge::Composite(g_rgba.data(), w, h, &fb == &g_current);
+	if (gpu::GetBackendDisplayImage(fb.addr, fb.stride, fb.format, 480, 272, g_rgba, &w, &h, host::FitScale())) {
+		ppge::Composite(g_rgba.data(), w, h, gameScreen);
 		host::PresentFrame(g_rgba.data(), w, h, w);
 		return;
 	}
 #endif
 	ConvertFramebuffer(fb.addr, fb.stride, fb.format, 480, 272, g_rgba);
-	ppge::Composite(g_rgba.data(), 480, 272, &fb == &g_current);
+	ppge::Composite(g_rgba.data(), 480, 272, gameScreen);
 	host::PresentFrame(g_rgba.data(), 480, 272, 480);
 }
 

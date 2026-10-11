@@ -12,6 +12,7 @@
 // sceDisplay shows a framebuffer.
 #pragma once
 
+#include <functional>
 #include <vector>
 
 #include "common/common.h"
@@ -49,22 +50,49 @@ public:
 	// The end of a Run (the GE stalled or went idle): submit queued work.
 	virtual void EndRun() {}
 	// sceDisplay shows the framebuffer at addr (format 0-3 as GE_FORMAT_*). Makes guest memory current
-	// for it; returns true with the image (RGBA8888, alpha 255, at the backend's own resolution) when the
-	// backend has a better one than guest memory (upscaled rendering).
-	virtual bool GetDisplayImage(u32 addr, int stride, int format, int width, int height, std::vector<u32> &out, int *outW, int *outH) {
-		(void)addr; (void)stride; (void)format; (void)width; (void)height; (void)out; (void)outW; (void)outH;
+	// for it; returns true with the image (RGBA8888, alpha 255) when the backend has a better one than
+	// guest memory (upscaled rendering): at outScale times width x height (at most the backend's own
+	// scale; 0 = its own), reduced by averaging.
+	virtual bool GetDisplayImage(u32 addr, int stride, int format, int width, int height, std::vector<u32> &out, int *outW, int *outH,
+	                             int outScale) {
+		(void)addr; (void)stride; (void)format; (void)width; (void)height; (void)out; (void)outW; (void)outH; (void)outScale;
 		return false;
 	}
+	// A backend that presents to the host window itself (a GPU's swap chain): sceDisplay shows the
+	// framebuffer at addr. Presents the backend's own image of it, scaled to fit the window, and returns
+	// true. overlay(rgba, w, h), if given, draws over it at about the window's size (RGBA8888, w x h a
+	// multiple of 480x272): onto a transparent image that is laid over the picture (the dialogs and the HOME
+	// menu), or, with `capture`, onto the picture itself read back (screenshots). False without a window or
+	// an image of that framebuffer: the caller presents a CPU image instead.
+	virtual bool PresentDisplay(u32 addr, int stride, int format, int width, int height,
+	                            const std::function<void(u32 *rgba, int w, int h)> &overlay, bool capture) {
+		(void)addr; (void)stride; (void)format; (void)width; (void)height; (void)overlay; (void)capture;
+		return false;
+	}
+	// Presents a CPU image (RGBA8888, `stride` pixels a row) to the host window, scaled to fit; false when
+	// the backend doesn't present to a window.
+	virtual bool PresentImage(const u32 *rgba, int width, int height, int stride) {
+		(void)rgba; (void)width; (void)height; (void)stride;
+		return false;
+	}
+	// The host window is about to close: stop presenting to it.
+	virtual void ReleaseWindow() {}
 };
 
 // Installs a backend (not owned; nullptr = the software rasterizer). Flushes what's queued first.
 void SetRenderBackend(RenderBackend *backend);
 RenderBackend *GetRenderBackend();
 
-// sceDisplay's view of RenderBackend::GetDisplayImage (false without a backend).
-inline bool GetBackendDisplayImage(u32 addr, int stride, int format, int width, int height, std::vector<u32> &out, int *outW, int *outH) {
+// sceDisplay's view of RenderBackend::GetDisplayImage and PresentDisplay (false without a backend).
+inline bool GetBackendDisplayImage(u32 addr, int stride, int format, int width, int height, std::vector<u32> &out, int *outW, int *outH,
+                                   int outScale = 0) {
 	RenderBackend *b = GetRenderBackend();
-	return b && b->GetDisplayImage(addr, stride, format, width, height, out, outW, outH);
+	return b && b->GetDisplayImage(addr, stride, format, width, height, out, outW, outH, outScale);
+}
+inline bool PresentBackendDisplay(u32 addr, int stride, int format, int width, int height,
+                                  const std::function<void(u32 *rgba, int w, int h)> &overlay, bool capture) {
+	RenderBackend *b = GetRenderBackend();
+	return b && b->PresentDisplay(addr, stride, format, width, height, overlay, capture);
 }
 
 }  // namespace gpu
