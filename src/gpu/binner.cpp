@@ -169,6 +169,25 @@ std::vector<std::unique_ptr<u8[]>> clutPool;
 int clutCount = 0;
 bool clutInUse = false;  // the latest snapshot is referenced by a queued state
 
+// --- Texture cache ---
+//
+// The GE loads a texture into its 8 KB cache when a primitive first samples it and serves it from
+// there until TEXFLUSH. That only shows when a primitive textures from what the batch draws
+// (gpu/exact/pixel exp174): such a texture, if it fits, is drawn from a copy taken when it was first
+// sampled. Bigger ones, and textures elsewhere, are read from memory as they are drawn.
+constexpr u32 TEX_CACHE_BYTES = 8192;
+
+struct TexCacheEntry {
+	u32 addr[8] = {}, bytes[8] = {};
+	int levels = 0;
+	u32 flushGen = 0;
+	std::shared_ptr<std::vector<u8>> data;
+};
+
+u32 texFlushGen = 0;
+TexCacheEntry texCache;  // valid while data is set
+std::vector<std::shared_ptr<std::vector<u8>>> batchTexCopies;  // kept until the batch is drawn
+
 u8 *LatestClut() {
 	if (clutCount == 0) {
 		if (clutPool.empty())
@@ -178,11 +197,14 @@ u8 *LatestClut() {
 	return clutPool[clutCount - 1].get();
 }
 
+void UseTexCache(RasterState *st);
+
 void EnsureCurrent() {
 	if (!currentValid) {
 		ComputeRasterState(&current, LatestClut());
 		currentValid = true;
 		currentIndex = -1;
+		UseTexCache(&current);
 	}
 }
 
@@ -218,6 +240,91 @@ u32 PushCurrent() {
 			batchUsesDepth = true;
 	}
 	return (u32)currentIndex;
+}
+
+inline bool Overlaps(const AddrRange &a, const AddrRange &b);
+
+// The texture's bytes per level, as AddTextureReads counts them.
+u32 TextureLevelBytes(const SamplerState &ss, const TexLevel &lv) {
+	static const u8 bits[16] = { 16, 16, 16, 32, 4, 8, 16, 32, 4, 8, 8, 0, 0, 0, 0, 0 };
+	const u32 h = std::min<u32>(lv.h, 512);
+	const u32 rows = ss.swizzle ? ((h + 7) & ~7u) : h;
+	return std::min<u32>((u32)((u64)rows * lv.bufw * bits[ss.texfmt] / 8) + 16, lv.validBytes);
+}
+
+// Whether st textures from the color or depth buffer it draws to (rows up to the scissor).
+bool TexturesFromTarget(const RasterState &st) {
+	const PixelState &ps = st.pix;
+	const u32 rows = (u32)std::max(st.scissor.y2 / SUBPIX + 1, 0);
+	const u32 bpp = ps.fbFormat == GE_FORMAT_8888 ? 4 : 2;
+	const AddrRange color{ VRAM_BASE + ps.fbOffset, VRAM_BASE + ps.fbOffset + rows * ps.fbStride * bpp };
+	const bool depth = ps.depthWrite || ps.depthTestFunc != GE_COMP_ALWAYS;
+	const AddrRange zbuf{ VRAM_BASE + ps.zbOffset, VRAM_BASE + ps.zbOffset + rows * ps.zbStride * 2 };
+	const SamplerState &ss = st.samp;
+	for (int i = 0; i <= ss.maxLevel; ++i) {
+		const TexLevel &lv = ss.levels[i];
+		if (!lv.ptr)
+			continue;
+		const u32 start = FoldAddress(lv.addr);
+		const AddrRange r{ start, start + TextureLevelBytes(ss, lv) };
+		if (Overlaps(r, color) || (depth && Overlaps(r, zbuf)))
+			return true;
+	}
+	return false;
+}
+
+void UseTexCache(RasterState *st) {
+	// The D3D11 renderer keeps textures its own way.
+	if (g_backend)
+		return;
+	if (!st->enableTextures || !TexturesFromTarget(*st)) {
+		texCache.data.reset();
+		return;
+	}
+	SamplerState &ss = st->samp;
+	TexCacheEntry key;
+	key.levels = ss.maxLevel + 1;
+	u32 total = 0;
+	for (int i = 0; i < key.levels; ++i) {
+		const TexLevel &lv = ss.levels[i];
+		key.addr[i] = lv.addr;
+		key.bytes[i] = lv.ptr ? TextureLevelBytes(ss, lv) : 0;
+		total += key.bytes[i];
+	}
+	if (total > TEX_CACHE_BYTES) {
+		texCache.data.reset();
+		return;
+	}
+	const bool hit = texCache.data && texCache.flushGen == texFlushGen && texCache.levels == key.levels &&
+		std::equal(key.addr, key.addr + key.levels, texCache.addr) && std::equal(key.bytes, key.bytes + key.levels, texCache.bytes);
+	if (!hit) {
+		// The copy must see everything drawn before it.
+		if (!prims.empty()) {
+			binner::Flush();
+			currentValid = true;
+			currentIndex = -1;
+		}
+		key.flushGen = texFlushGen;
+		key.data = std::make_shared<std::vector<u8>>(total);
+		u32 off = 0;
+		for (int i = 0; i < key.levels; ++i) {
+			if (key.bytes[i])
+				memcpy(key.data->data() + off, ss.levels[i].ptr, key.bytes[i]);
+			off += key.bytes[i];
+		}
+		texCache = key;
+	}
+	batchTexCopies.push_back(texCache.data);
+	u32 off = 0;
+	for (int i = 0; i < key.levels; ++i) {
+		TexLevel &lv = ss.levels[i];
+		if (lv.ptr) {
+			lv.ptr = texCache.data->data() + off;
+			lv.validBytes = texCache.bytes[i];
+			lv.bounded = true;
+		}
+		off += texCache.bytes[i];
+	}
 }
 
 // The VRAM byte ranges the batch draws to.
@@ -328,6 +435,7 @@ void ResetBatch() {
 	prims.clear();
 	states.clear();
 	readRanges.clear();
+	batchTexCopies.clear();
 	currentIndex = -1;
 	batchUsesDepth = false;
 	batchSingleThread = false;
@@ -381,6 +489,11 @@ void DirtyState() {
 void TargetChanged() {
 	if (!prims.empty())
 		Flush();
+	currentValid = false;
+}
+
+void TexFlush() {
+	texFlushGen++;
 	currentValid = false;
 }
 

@@ -154,6 +154,8 @@ void DirtyState();
 void TargetChanged();
 // Copies the CLUT (1 KB) that later draws use.
 void UpdateClut(const u8 *src);
+// TEXFLUSH: the texture cache starts over.
+void TexFlush();
 const RasterState &CurrentState();
 void AddTriangle(const RVertex &v0, const RVertex &v1, const RVertex &v2);
 void AddRect(const RVertex &v0, const RVertex &v1);

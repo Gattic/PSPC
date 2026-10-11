@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "common/sha1.h"
+#include "runtime/core/dcache.h"
 #include "runtime/hle/hle_wrap.h"
 #include "runtime/hle/modules/modules.h"
 #include "runtime/hle/modules/rtc.h"
@@ -47,30 +48,36 @@ u32 sceKernelLibcGettimeofday(u32 tvPtr, u32 tzPtr) {
 }
 
 // ---------------------------------------------------------------- caches
-// Guest memory is coherent here, so these only validate and take their time.
+// Guest memory is coherent here, so these only validate and take their time, unless the data
+// cache is modelled (--dcache-model).
 
 int sceKernelDcacheInvalidateRange(u32 addr, int size) {
 	if (size < 0 || (int)addr + size < 0) return (int)SCE_KERNEL_ERROR_ILLEGAL_ADDR;
 	if (size > 0 && ((addr % 64) != 0 || (size % 64) != 0)) return (int)SCE_KERNEL_ERROR_CACHE_ALIGNMENT;
+	if (dcache::g_enabled) dcache::InvalidateRange(addr, (u32)size);
 	sched::ChargeCycles(190);
 	return 0;
 }
-int sceKernelDcacheWritebackRange(u32, int size) {
+int sceKernelDcacheWritebackRange(u32 addr, int size) {
 	if (size < 0) return (int)SCE_KERNEL_ERROR_INVALID_SIZE;
+	if (dcache::g_enabled) dcache::WritebackRange(addr, (u32)size, false);
 	sched::ChargeCycles(165);
 	return 0;
 }
-int sceKernelDcacheWritebackInvalidateRange(u32, int size) {
+int sceKernelDcacheWritebackInvalidateRange(u32 addr, int size) {
 	if (size < 0) return (int)SCE_KERNEL_ERROR_INVALID_SIZE;
+	if (dcache::g_enabled) dcache::WritebackRange(addr, (u32)size, true);
 	sched::ChargeCycles(165);
 	return 0;
 }
 int sceKernelDcacheWritebackAll() {
+	if (dcache::g_enabled) dcache::WritebackAll(false);
 	sched::ChargeCycles(3524);
 	sched::Reschedule();
 	return 0;
 }
 int sceKernelDcacheWritebackInvalidateAll() {
+	if (dcache::g_enabled) dcache::WritebackAll(true);
 	sched::ChargeCycles(1165);
 	sched::Reschedule();
 	return 0;

@@ -22,6 +22,7 @@
 #include "runtime/core/cpu.h"
 #include "runtime/core/dispatch.h"
 #include "runtime/core/interp.h"
+#include "runtime/core/dcache.h"
 #include "runtime/core/memory.h"
 #include "runtime/hle/display.h"
 #include "runtime/hle/hle.h"
@@ -363,6 +364,9 @@ int RunOnce(const Options &o, BootTarget bt) {
 		io::Mount("kemulator", io::MakeEmulatorDevice(o.hasDisplayForTests));
 	}
 	io::SetTestOutput(o.testOutput);
+	mem::g_edramMirrors = o.edramMirrors;
+	dcache::g_enabled = o.dcacheModel;
+	dcache::Reset();
 	kernel::SetAotCacheDir(o.aotDir);
 	kernel::SetAotEnabled(o.aot);
 	g_aotDirForHints = o.aotDir;

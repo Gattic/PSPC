@@ -38,6 +38,16 @@ std::string ReadString(u32 addr, u32 maxLen = 0x10000);
 
 void Memset(u32 addr, u8 value, u32 size);
 void Memcpy(u32 dst, u32 src, u32 size);
+
+// VRAM's mirrors as the CPU sees them (--edram-mirrors, interpreter only): at 0x04200000 and
+// 0x04600000 an access goes where the GE keeps a 16-bit and a 32-bit depth buffer pixel
+// (gpu/ge/edramswizzle); 0x04000000 and 0x04400000 are linear. Off, every mirror is linear.
+extern bool g_edramMirrors;
+// sceGeEdramSetAddrTranslation's value picks the layout.
+void SetEdramTranslation(u32 translation);
+// The address an access to `addr` reaches (addr itself unless it is in mirror 1 or 3).
+u32 EdramMirrorAddress(u32 addr);
+inline bool InSwizzledEdramMirror(u32 addr) { return (addr & 0x0FA00000) == 0x04200000; }
 void WriteBytes(u32 dst, const void *src, u32 size);
 void ReadBytes(void *dst, u32 src, u32 size);
 

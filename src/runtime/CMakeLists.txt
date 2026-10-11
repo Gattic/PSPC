@@ -19,6 +19,7 @@ add_library(pspc_runtime STATIC
 	vsh.cpp
 	core/backtrace.cpp
 	core/cpu.cpp
+	core/dcache.cpp
 	core/dispatch.cpp
 	core/interp.cpp
 	core/memory.cpp

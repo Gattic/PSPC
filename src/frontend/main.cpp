@@ -83,6 +83,8 @@ static void Usage() {
 	        "  --test-display       report a display to pspautotests (default: none)\n"
 	        "  --test-output <path> pspautotests' host0:/__testoutput.txt (.err, .finish) is <path>\n"
 	        "  --test-as-psp        no emulator devices: pspautotests run as on a PSP (output: host0)\n"
+	        "  --edram-mirrors      VRAM mirrors 1 and 3 swizzled as the GE's depth layouts (implies --interp)\n"
+	        "  --dcache-model       model the data cache, write-back as on hardware (implies --interp)\n"
 	        "  --dump-frames <dir>  save the displayed frame as BMP every --dump-every VBlanks (60)\n"
 	        "  --renderer <name>    GE renderer: software (default) or d3d11 (GPU; d3d11-warp: WARP device)\n"
 	        "  --render-scale <n>   d3d11 internal resolution, 1-16 times the PSP's (default 1; 8 = 4K, 16 = 8K)\n"
@@ -392,6 +394,14 @@ int main(int argc, char **argv) {
 		else if (a == "--test-display") o.hasDisplayForTests = true;
 		else if (a == "--test-output") o.testOutput = next();
 		else if (a == "--test-as-psp") o.testAsPsp = true;
+		else if (a == "--edram-mirrors") {
+			// Native code doesn't go through the transform.
+			o.edramMirrors = true;
+			o.aot = false;
+		} else if (a == "--dcache-model") {
+			o.dcacheModel = true;
+			o.aot = false;
+		}
 		else if (a == "--dump-frames") o.dumpFramesDir = next();
 		else if (a == "--dump-every") o.dumpEvery = atoi(next().c_str());
 		else if (a == "--renderer") o.renderer = next();

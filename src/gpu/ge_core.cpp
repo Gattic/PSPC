@@ -971,6 +971,8 @@ void ExecuteOp(u32 op, u32 diff) {
 		LoadClut();
 		break;
 	case GE_CMD_TEXFLUSH:
+		binner::TexFlush();
+		break;
 	case GE_CMD_TEXSYNC:
 		break;
 	case GE_CMD_TRANSFERSTART:

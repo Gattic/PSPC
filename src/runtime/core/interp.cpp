@@ -11,6 +11,7 @@
 #include "allegrex/sem_tables.h"
 #include "common/log.h"
 #include "runtime/core/cpu.h"
+#include "runtime/core/dcache.h"
 #include "runtime/core/dispatch.h"
 #include "runtime/core/memory.h"
 #include "runtime/hle/hle.h"
@@ -66,6 +67,59 @@ static void TracePc(Ctx *c, u32 pc) {
 	Fatal("Guest jumped to invalid address %08x (from %08x, ra=%08x sp=%08x)", pc, from, c->r[31], c->r[29]);
 }
 
+// An ALU instruction. The hardware models that are off for games act on loads and stores here:
+// with --edram-mirrors one into VRAM's swizzled mirrors reaches where the mirror maps it (the base
+// register is moved there for the one instruction), and with --dcache-model it goes through the
+// data cache, as does the CACHE instruction.
+static void ExecMemModels(Ctx *c, Op op, u32 w) {
+	const auto exec = [&] { ag::g_semTable[(size_t)op](c, w); };
+	const u32 opcode = w >> 26;
+	const u32 rs = (w >> 21) & 31;
+	if (opcode == 0x2F) {  // cache
+		if (dcache::g_enabled) dcache::CacheOp((w >> 16) & 31, c->r[rs] + (u32)(s32)(s16)(w & 0xFFFF));
+		return;
+	}
+	const bool integerMem = (opcode >= 0x20 && opcode <= 0x2E) || opcode == 0x30 || opcode == 0x31 || opcode == 0x38 ||
+	                        opcode == 0x39;
+	const bool vfpuMem = opcode == 0x32 || opcode == 0x35 || opcode == 0x36 || opcode == 0x3A || opcode == 0x3D || opcode == 0x3E;
+	if (!integerMem && !vfpuMem) {
+		exec();
+		return;
+	}
+	const s32 offset = integerMem ? (s32)(s16)(w & 0xFFFF) : (s32)(s16)(w & 0xFFFC);
+	const u32 addr = c->r[rs] + (u32)offset;
+	if (mem::g_edramMirrors && rs != 0 && mem::InSwizzledEdramMirror(addr)) {
+		const u32 base = c->r[rs];
+		c->r[rs] = base + (mem::EdramMirrorAddress(addr) - addr);
+		exec();
+		// A load into the base register keeps what it loaded.
+		const bool loadsIntoBase = (opcode <= 0x26 || opcode == 0x30 || opcode == 0x38) && ((w >> 16) & 31) == rs;
+		if (!loadsIntoBase) c->r[rs] = base;
+		return;
+	}
+	if (dcache::g_enabled) {
+		const bool store = (opcode >= 0x28 && opcode <= 0x2E) || opcode == 0x38 || opcode == 0x39 || opcode == 0x3A ||
+		                   opcode == 0x3D || opcode == 0x3E;
+		if (dcache::IsCached(addr)) {
+			dcache::Access(addr, store);
+			exec();
+			return;
+		}
+		if (dcache::IsUncachedRam(addr)) {
+			dcache::UncachedAccess(addr, exec);
+			return;
+		}
+	}
+	exec();
+}
+
+static void ExecAlu(Ctx *c, Op op, u32 w) {
+	if (PSPC_UNLIKELY(mem::g_edramMirrors || dcache::g_enabled))
+		ExecMemModels(c, op, w);
+	else
+		ag::g_semTable[(size_t)op](c, w);
+}
+
 static void ExecDelaySlot(Ctx *c, u32 pc) {
 	u32 w = GRead32(pc);
 	Op op = ag::Decode(w);
@@ -73,7 +127,7 @@ static void ExecDelaySlot(Ctx *c, u32 pc) {
 	g_icount++;
 	c->budget--;
 	switch (k) {
-	case Kind::ALU: ag::g_semTable[(size_t)op](c, w); return;
+	case Kind::ALU: ExecAlu(c, op, w); return;
 	case Kind::SYSCALL:
 		c->pc = pc;
 		hle::Syscall(c, w, pc);
@@ -109,7 +163,7 @@ static bool StaleCond(Ctx *c, Op op, u32 w) {
 void ExecOne(Ctx *c, u32 pc, u32 w) {
 	Op op = ag::Decode(w);
 	if (ag::OpKind(op) == Kind::ALU) {
-		ag::g_semTable[(size_t)op](c, w);
+		ExecAlu(c, op, w);
 	} else {
 		cpu::InvalidInstruction(c, w, pc);
 	}
@@ -171,7 +225,7 @@ void Run(Ctx *c, u32 pc, u32 ra0, u32 sp0) {
 		switch (k) {
 		case Kind::ALU:
 			if (PSPC_UNLIKELY(op == Op::MFVC) && SeesStale(op, pc, w)) sem_MFVC_PREV(c, w);
-			else ag::g_semTable[(size_t)op](c, w);
+			else ExecAlu(c, op, w);
 			pc += 4;
 			continue;
 

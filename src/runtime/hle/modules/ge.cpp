@@ -198,7 +198,9 @@ u32 sceGeEdramGetSize() {
 }
 
 int sceGeEdramSetAddrTranslation(u32 value) {
-	return gpu::SetEdramAddrTranslation(value);
+	const int old = gpu::SetEdramAddrTranslation(value);
+	if (old >= 0) mem::SetEdramTranslation(value);
+	return old;
 }
 
 int sceGeListEnQueue(u32 listAddr, u32 stallAddr, int callbackId, u32 optParamAddr) {

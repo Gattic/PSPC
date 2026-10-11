@@ -18,6 +18,64 @@ u8 *g_membase = nullptr;
 
 namespace mem {
 
+bool g_edramMirrors = false;
+
+namespace {
+
+// Ported from PPSSPP (GPU/Common/DepthSwizzle.h), Copyright (c) 2012- PPSSPP Project,
+// GPL-2.0-or-later. With a 32-bit color buffer, address bits 5 to log2(T) - 1 rotate left by one
+// (bits 9 and 10 swap at T 0), then (T << 3) | 0x40 is XORed in (0x600 at T 0); bits 0-4 never
+// change.
+struct EdramLayout {
+	u32 rotMask = 0;
+	int rotShift = 0;
+	u32 xorBits = 0;
+	u32 Stored(u32 offset) const {
+		const u32 f = offset & rotMask;
+		return ((offset & ~rotMask) | (((f << 1) | (f >> rotShift)) & rotMask)) ^ xorBits;
+	}
+};
+
+EdramLayout LayoutFor(u32 translation, bool color32) {
+	EdramLayout layout;
+	if (translation == 0) {
+		layout.xorBits = 0x600;
+		if (color32) {
+			layout.rotMask = 0x600;
+			layout.rotShift = 1;
+		}
+		return layout;
+	}
+	layout.xorBits = (translation << 3) | 0x40;
+	int top = 0;
+	while ((2u << top) <= translation)
+		top++;
+	if (color32 && top - 5 > 1) {
+		layout.rotMask = ((1u << (top - 5)) - 1) << 5;
+		layout.rotShift = top - 5 - 1;
+	}
+	return layout;
+}
+
+EdramLayout g_layout16 = LayoutFor(0x400, false), g_layout32 = LayoutFor(0x400, true);
+
+}  // namespace
+
+void SetEdramTranslation(u32 translation) {
+	g_layout16 = LayoutFor(translation, false);
+	g_layout32 = LayoutFor(translation, true);
+}
+
+u32 EdramMirrorAddress(u32 addr) {
+	if (!InSwizzledEdramMirror(addr)) return addr;
+	const EdramLayout &layout = (addr & 0x00400000) ? g_layout32 : g_layout16;
+	return (addr & ~0x003FFFFFu) | (layout.Stored(addr & 0x001FFFFF) & 0x001FFFFF);
+}
+
+}  // namespace mem
+
+namespace mem {
+
 u32 g_ramSize = 0;
 
 namespace {

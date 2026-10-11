@@ -20,13 +20,16 @@ pspautotests (hardware-recorded expectations), run with `tools/run_autotests.py`
 
 | Run | Passed |
 |---|---|
-| Interpreter | 533 / 559 |
-| AOT (native) | 533 / 559, identical to the interpreter test by test |
+| Interpreter | 536 / 559 |
+| AOT (native) | 536 / 559, identical to the interpreter test by test |
 
 The expected output was recorded on PSPs, some with a screen and with psplink's host0:. Where a
 test's recording differs from what pspc gives a test by default, `run_autotests.py` reproduces it
 (its ENVIRONMENT table: the screen path for `gpu/simple/simple`, `io/open/tty0` and
 `font/fonttest`, a generated disc for the `umd/` tests, the file date `io/file/file` expects).
+Two hardware details that games must not see are modelled only on request, in the interpreter:
+VRAM's swizzled mirrors (`--edram-mirrors`, for `gpu/ge/edramswizzle`) and the data cache
+(`--dcache-model`, for `cpu/lsu/cacheop`).
 Font tests need the firmware fonts: run it with `--flash0` pointing at an installed flash0. The
 remaining failures and the plan for them: [autotests-plan.md](autotests-plan.md).
 
