@@ -3,10 +3,12 @@
 // pspc-launcher: a game library window for the Games folder.
 //   * lists UMD images (ISO/CSO/ZSO/DAX), EBOOT.PBP folders and PBP/PRX/ELF files,
 //     with ICON0, the PARAM.SFO title and whether the game's native (AOT) code is built;
-//   * the selected game is shown on the right over its PIC1 backdrop;
+//   * a sidebar (the library, Boot XMB, Plugins, Settings; the PSPC Network account at the
+//     bottom), a header with search, the games as cards, and the selected game on the right over
+//     its PIC1 backdrop with its actions (ui_theme.* has the look);
 //   * Enter/double-click plays the game with pspc.exe, offering to build its native code first;
-//   * the toolbar and the context menu build native code (tools/pspc_build.py), play
-//     interpreted, and open the Settings dialog (pspc.ini);
+//     the panel and the context menu also build native code (tools/pspc_build.py) and play in the
+//     interpreter;
 //   * "Boot XMB" starts the firmware's XMB (pspc --vsh) once tools/pspc_install_fw.py installed it.
 //
 //   pspc-launcher [games dir] [--list]   (--list prints the library to the console and exits)
@@ -24,6 +26,7 @@ using std::max;
 using std::min;
 #include <gdiplus.h>
 #include <shellapi.h>
+#include <uxtheme.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -37,6 +40,7 @@ using std::min;
 #include "frontend/network_dialog.h"
 #include "frontend/plugins_dialog.h"
 #include "frontend/settings_dialog.h"
+#include "frontend/ui_theme.h"
 #include "fs/vfs.h"
 #include "pspc_sem_version.h"
 
@@ -47,10 +51,9 @@ using std::min;
 
 namespace {
 
-constexpr int kIconW = 144, kIconH = 80;
-constexpr int kToolbarH = 44;
 enum : int {
 	ID_LIST = 100,
+	ID_SEARCH,
 	ID_PLAY = 200,
 	ID_PLAY_INTERP,
 	ID_BUILD,
@@ -60,9 +63,10 @@ enum : int {
 	ID_BOOT_XMB,
 	ID_PLUGINS,
 	ID_NETWORK,
+	ID_LIBRARY,
+	ID_SHOW_FILE,
 	ID_TIMER_JOBS = 300,
 };
-const COLORREF kBackground = RGB(24, 24, 30), kToolbar = RGB(34, 34, 43), kText = RGB(230, 230, 235);
 
 // ---------------------------------------------------------------------------------------------
 // A minimal JSON reader (for games.json).
@@ -243,9 +247,7 @@ struct BuildJob {
 };
 
 HWND g_main = nullptr, g_list = nullptr, g_detail = nullptr;
-std::vector<HWND> g_tools;
 HIMAGELIST g_images = nullptr;
-HFONT g_uiFont = nullptr;
 std::vector<Game> g_games;
 std::vector<BuildJob> g_jobs;
 fs::path g_gamesDir, g_exeDir;
@@ -457,33 +459,25 @@ void LoadImages(Game &g) {
 	}
 }
 
-// The list icon: ICON0 with a tag when native code is built (green) or needs work (amber).
-HBITMAP IconBitmap(const Game &g) {
-	using namespace Gdiplus;
-	HBITMAP out = nullptr;
-	Bitmap canvas(kIconW, kIconH, PixelFormat32bppARGB);
-	Graphics gfx(&canvas);
-	gfx.Clear(Color(255, 32, 32, 40));
-	if (std::unique_ptr<Bitmap> icon = Decode(g.icon)) gfx.DrawImage(icon.get(), 0, 0, kIconW, kIconH);
-	if (g.native.state != Native::None) {
-		const wchar_t *tag = g.native.state == Native::Built ? L"NATIVE" : g.native.state == Native::Stale ? L"REBUILD" : L"PARTIAL";
-		Color color = g.native.state == Native::Built ? Color(235, 38, 150, 72) : Color(235, 196, 128, 24);
-		gfx.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
-		FontFamily family(L"Segoe UI");
-		Font font(&family, 9, FontStyleBold, UnitPixel);
-		RectF box;
-		gfx.MeasureString(tag, -1, &font, PointF(0, 0), &box);
-		RectF r(kIconW - box.Width - 8, kIconH - box.Height - 4, box.Width + 6, box.Height + 1);
-		SolidBrush fill(color), text(Color(255, 255, 255, 255));
-		gfx.FillRectangle(&fill, r);
-		gfx.DrawString(tag, -1, &font, PointF(r.X + 3, r.Y + 0.5f), &text);
-	}
-	canvas.GetHBITMAP(Color(0, 0, 0, 0), &out);
-	return out;
-}
-
 // ---------------------------------------------------------------------------------------------
-// Main window.
+// Main window: a sidebar (sections and the account), a header (title, search), the game grid
+// (a ListView drawn as cards) and the selected game's panel on the right.
+
+// Layout, in pixels at 96 DPI (scaled with D()).
+constexpr int kSidebarW = 220, kHeaderH = 76, kCardW = 164, kCardImageH = 91, kCardTextH = 64, kCardGap = 16,
+              kGridPad = 24;
+
+int g_dpi = 96;
+HWND g_search = nullptr, g_account = nullptr, g_refreshButton = nullptr, g_folderButton = nullptr;
+HWND g_playButton = nullptr, g_buildButton = nullptr, g_interpButton = nullptr, g_showButton = nullptr,
+     g_emptyButton = nullptr;
+std::vector<HWND> g_nav;
+int g_hot = -1;  // the card under the mouse
+std::wstring g_filter;
+RECT g_searchBox{};
+
+int D(int v) { return ui::Px(v, g_dpi); }
+float Df(float v) { return ui::Pxf(v, g_dpi); }
 
 int Selected() {
 	int i = g_list ? ListView_GetNextItem(g_list, -1, LVNI_SELECTED) : -1;
@@ -506,55 +500,49 @@ int FindGame(const fs::path &p) {
 	return -1;
 }
 
-void UpdateUi() {
-	bool sel = Selected() >= 0;
-	for (HWND b : g_tools) {
-		int id = GetDlgCtrlID(b);
-		if (id == ID_PLAY || id == ID_BUILD) EnableWindow(b, sel);
-	}
-	if (g_detail) InvalidateRect(g_detail, nullptr, FALSE);
+std::wstring Lower(std::wstring s) {
+	CharLowerBuffW(s.data(), (DWORD)s.size());
+	return s;
 }
 
-// Refills the list, keeping `keep` selected (else the first game).
-void Populate(const fs::path &keep) {
-	SendMessageW(g_list, WM_SETREDRAW, FALSE, 0);
-	ListView_DeleteAllItems(g_list);
-	ImageList_RemoveAll(g_images);
-	int select = g_games.empty() ? -1 : 0;
-	for (size_t i = 0; i < g_games.size(); i++) {
-		HBITMAP bmp = IconBitmap(g_games[i]);
-		int img = ImageList_Add(g_images, bmp, nullptr);
-		DeleteObject(bmp);
-		std::wstring label = g_games[i].title + (g_games[i].id.empty() ? L"" : L" [" + g_games[i].id + L"]");
-		LVITEMW item{};
-		item.mask = LVIF_TEXT | LVIF_IMAGE | LVIF_PARAM;
-		item.iItem = (int)i;
-		item.pszText = label.data();
-		item.iImage = img;
-		item.lParam = (LPARAM)i;
-		ListView_InsertItem(g_list, &item);
-		if (!keep.empty() && g_games[i].path == keep) select = (int)i;
-	}
-	if (select >= 0) {
-		ListView_SetItemState(g_list, select, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
-		ListView_EnsureVisible(g_list, select, FALSE);
-	}
-	SendMessageW(g_list, WM_SETREDRAW, TRUE, 0);
-	InvalidateRect(g_list, nullptr, TRUE);
-	UpdateUi();
+bool Matches(const Game &g) {
+	if (g_filter.empty()) return true;
+	std::wstring f = Lower(g_filter);
+	return Lower(g.title).find(f) != std::wstring::npos || Lower(g.id).find(f) != std::wstring::npos ||
+	       Lower(g.path.filename().wstring()).find(f) != std::wstring::npos;
 }
 
-void Rescan() {
-	fs::path keep = SelectedPath();
-	Scan();
-	RefreshNative();
-	Populate(keep);
+std::wstring SizeText(u64 bytes) {
+	wchar_t buf[32];
+	if (bytes >= (1ull << 30)) swprintf_s(buf, L"%.1f GB", bytes / 1073741824.0);
+	else swprintf_s(buf, L"%.0f MB", bytes / 1048576.0 + 0.5);
+	return buf;
 }
 
-void ReloadSettings() {
-	g_settings = settings::Settings();
-	settings::Load(settings::DefaultPath(), g_settings);
+std::wstring FormatText(const Game &g) {
+	std::wstring ext = g.path.extension().wstring();
+	for (wchar_t &c : ext) c = (wchar_t)towupper(c);
+	if (!ext.empty() && ext[0] == L'.') ext.erase(0, 1);
+	if (g.path.filename() == "EBOOT.PBP") ext = L"EBOOT";
+	return ext;
 }
+
+// The account line at the bottom of the sidebar.
+void UpdateAccount() {
+	if (!g_account) return;
+	std::wstring id = Widen(g_settings.npOnlineId);
+	std::wstring detail = g_settings.npServer.empty() ? L"Local sign-in" : g_settings.npToken.empty()
+	                                                                           ? L"PSPC Network: not signed in"
+	                                                                           : L"PSPC Network";
+	SetWindowTextW(g_account, id.empty() ? L"Network" : id.c_str());
+	ui::SetDetail(g_account, detail.c_str());
+}
+
+void UpdateUi();
+void Populate(const fs::path &keep);
+void ReloadSettings();
+
+// ---- actions
 
 fs::path FindUp(const fs::path &start, const fs::path &rel) {
 	for (fs::path p = start; !p.empty(); p = p.parent_path()) {
@@ -728,7 +716,128 @@ void OpenNetwork() {
 	SetFocus(g_list);
 }
 
-// The panel for the selected game: PIC1 as the backdrop, ICON0, title, disc ID, native code status.
+// ---- the selected game's panel
+
+struct DetailRects {
+	Gdiplus::RectF hero, icon, title, chips, status, play, build, interp, path, show;
+	std::wstring statusText, statusNote;
+	COLORREF statusColor = ui::kTextDim;
+	std::wstring buildLabel;
+	bool buildEnabled = true;
+};
+
+void Status(const Game &game, DetailRects &d) {
+	const NativeInfo &n = game.native;
+	d.buildLabel = L"Build native code";
+	if (Building(game.path)) {
+		d.statusText = L"Building native code…";
+		d.statusNote = L"The game starts on its own if you pressed Play.";
+		d.statusColor = ui::kInfo;
+		d.buildLabel = L"Building…";
+		d.buildEnabled = false;
+	} else if (!g_settings.aot) {
+		d.statusText = L"Interpreter only";
+		d.statusNote = L"Native code is turned off in Settings.";
+	} else if (n.state == Native::Built) {
+		d.statusText = L"Native code built";
+		d.statusNote = n.total > 1 ? std::to_wstring(n.total) + L" modules run as Windows code." : L"Runs as Windows code.";
+		d.statusColor = ui::kGreen;
+		d.buildLabel = L"Rebuild";
+	} else if (n.state == Native::Partial) {
+		d.statusText = L"Native code partly built";
+		d.statusNote = std::to_wstring(n.built) + L" of " + std::to_wstring(n.total) + L" modules. Build again to finish.";
+		d.statusColor = ui::kAmber;
+		d.buildLabel = L"Finish build";
+	} else if (n.state == Native::Stale) {
+		d.statusText = L"Native code out of date";
+		d.statusNote = L"PSPC changed since it was built. Play offers to rebuild it.";
+		d.statusColor = ui::kAmber;
+		d.buildLabel = L"Rebuild";
+	} else {
+		d.statusText = L"Not built yet";
+		d.statusNote = L"Runs in the interpreter (slower). Play offers to build it, about a minute.";
+	}
+	if (n.failed > 0 && g_settings.aot)
+		d.statusNote += L" " + std::to_wstring(n.failed) + (n.failed == 1 ? L" module" : L" modules") +
+		                L" couldn't be built and run in the interpreter.";
+}
+
+// Where everything in the panel goes for the selected game (also places the panel's buttons).
+DetailRects ComputeDetail(Gdiplus::Graphics &g, int w, int h, const Game &game) {
+	using Gdiplus::RectF;
+	DetailRects d;
+	Status(game, d);
+	const float pad = Df(24), tw = (float)w - 2 * pad;
+	float heroH = std::min((float)w * 272.0f / 480.0f, (float)h * 0.42f);
+	d.hero = RectF(0, 0, (float)w, heroH);
+	float iconW = std::min(Df(144), tw * 0.5f), iconH = iconW * 80.0f / 144.0f;
+	d.icon = RectF(pad, heroH - iconH * 0.55f, iconW, iconH);
+	float y = d.icon.GetBottom() + Df(16);
+	float titleH = std::min(ui::Measure(g, game.title.c_str(), Df(22), true, tw).Height, Df(60));
+	d.title = RectF(pad, y, tw, titleH);
+	y += titleH + Df(10);
+	d.chips = RectF(pad, y, tw, Df(24));
+	y += Df(24) + Df(18);
+	float statusH = Df(20) + ui::Measure(g, d.statusNote.c_str(), Df(12.5f), false, tw - Df(18)).Height;
+	d.status = RectF(pad, y, tw, statusH);
+	y += statusH + Df(20);
+	d.play = RectF(pad, y, tw, Df(44));
+	y += Df(44) + Df(10);
+	float half = (tw - Df(10)) / 2;
+	d.build = RectF(pad, y, half, Df(36));
+	d.interp = RectF(pad + half + Df(10), y, half, Df(36));
+	float pathY = std::max(y + Df(36) + Df(20), (float)h - pad - Df(30));
+	d.show = RectF((float)w - pad - Df(32), pathY, Df(32), Df(30));
+	d.path = RectF(pad, pathY, tw - Df(40), Df(30));
+	return d;
+}
+
+void PlaceButton(HWND b, const Gdiplus::RectF &r, bool show = true) {
+	if (!show) {
+		ShowWindow(b, SW_HIDE);
+		return;
+	}
+	SetWindowPos(b, nullptr, (int)r.X, (int)r.Y, (int)r.Width, (int)r.Height, SWP_NOZORDER | SWP_NOACTIVATE);
+	ShowWindow(b, SW_SHOWNA);
+}
+
+void PlaceDetailButtons() {
+	if (!g_detail) return;
+	RECT rc;
+	GetClientRect(g_detail, &rc);
+	int sel = Selected();
+	bool has = sel >= 0 && rc.right > 0;
+	if (has) {
+		Gdiplus::Bitmap probe(1, 1);
+		Gdiplus::Graphics g(&probe);
+		DetailRects d = ComputeDetail(g, rc.right, rc.bottom, g_games[sel]);
+		SetWindowTextW(g_buildButton, d.buildLabel.c_str());
+		EnableWindow(g_buildButton, d.buildEnabled && !BuildScript().empty());
+		PlaceButton(g_playButton, d.play);
+		PlaceButton(g_buildButton, d.build);
+		PlaceButton(g_interpButton, d.interp);
+		PlaceButton(g_showButton, d.show);
+	} else {
+		for (HWND b : {g_playButton, g_buildButton, g_interpButton, g_showButton}) ShowWindow(b, SW_HIDE);
+	}
+	bool empty = g_games.empty() && rc.right > 0;
+	if (empty) {
+		float bw = Df(200);
+		PlaceButton(g_emptyButton, Gdiplus::RectF(((float)rc.right - bw) / 2, (float)rc.bottom / 2 + Df(56), bw, Df(40)));
+	} else {
+		ShowWindow(g_emptyButton, SW_HIDE);
+	}
+}
+
+void Chip(Gdiplus::Graphics &g, float &x, float y, float h, const std::wstring &text) {
+	if (text.empty()) return;
+	float px = Df(12);
+	float w = ui::Measure(g, text.c_str(), px).Width + Df(18);
+	ui::FillRound(g, Gdiplus::RectF(x, y, w, h), h / 2, ui::C(ui::kSurfaceHot));
+	ui::Text(g, text.c_str(), Gdiplus::RectF(x, y, w, h), px, ui::C(ui::kTextDim), false, 1);
+	x += w + Df(8);
+}
+
 void PaintDetail(HDC hdc, int w, int h) {
 	using namespace Gdiplus;
 	if (w <= 0 || h <= 0) return;
@@ -737,99 +846,73 @@ void PaintDetail(HDC hdc, int w, int h) {
 	g.SetSmoothingMode(SmoothingModeAntiAlias);
 	g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
 	g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
-	g.Clear(Color(255, 20, 20, 26));
-	FontFamily family(L"Segoe UI");
-	StringFormat wrap;
-	wrap.SetTrimming(StringTrimmingEllipsisCharacter);
-	const REAL pad = 22, tw = (REAL)w - 2 * pad;
+	g.Clear(ui::C(ui::kSidebar));
 	int sel = Selected();
 	if (sel < 0) {
-		Font font(&family, 15, FontStyleRegular, UnitPixel);
-		SolidBrush gray(Color(255, 150, 150, 160));
-		StringFormat center;
-		center.SetAlignment(StringAlignmentCenter);
-		center.SetLineAlignment(StringAlignmentCenter);
-		std::wstring msg = g_games.empty() ? L"No games found.\n\nPut ISO/CSO images or EBOOT.PBP folders in\n" +
-		                                         g_gamesDir.wstring() + L"\nand press F5."
-		                                   : L"Select a game.";
-		g.DrawString(msg.c_str(), -1, &font, RectF(pad, 0, tw, (REAL)h), &center, &gray);
+		float cy = (float)h / 2;
+		if (g_games.empty()) {
+			ui::Text(g, ui::kIconGames, RectF(0, cy - Df(110), (float)w, Df(60)), Df(44), ui::C(ui::kTextFaint), false, 1,
+			         true, false, true);
+			ui::Text(g, L"Your library is empty", RectF(0, cy - Df(40), (float)w, Df(28)), Df(18), ui::C(ui::kText), true, 1);
+			std::wstring msg = L"Put ISO, CSO or EBOOT.PBP games in\n" + g_gamesDir.wstring() + L"\nand they show up here.";
+			ui::Text(g, msg.c_str(), RectF(Df(24), cy - Df(6), (float)w - Df(48), Df(60)), Df(12.5f), ui::C(ui::kTextDim),
+			         false, 1, false, true);
+		} else {
+			ui::Text(g, L"Select a game", RectF(0, 0, (float)w, (float)h), Df(15), ui::C(ui::kTextFaint), false, 1);
+		}
 	} else {
 		Game &game = g_games[sel];
 		LoadImages(game);
+		DetailRects d = ComputeDetail(g, w, h, game);
 		if (game.pic1) {
-			// Cover the panel, centred, keeping the aspect ratio.
 			REAL iw = (REAL)game.pic1->GetWidth(), ih = (REAL)game.pic1->GetHeight();
-			REAL scale = std::max((REAL)w / iw, (REAL)h / ih);
-			g.DrawImage(game.pic1.get(), RectF(((REAL)w - iw * scale) / 2, ((REAL)h - ih * scale) / 2, iw * scale, ih * scale));
+			REAL scale = std::max(d.hero.Width / iw, d.hero.Height / ih);
+			g.SetClip(d.hero);
+			g.DrawImage(game.pic1.get(), RectF((d.hero.Width - iw * scale) / 2, (d.hero.Height - ih * scale) / 2, iw * scale, ih * scale));
+			g.ResetClip();
+		} else if (game.iconImage) {
+			// No backdrop: the icon, blown up and dimmed.
+			g.SetClip(d.hero);
+			REAL ih = d.hero.Width * 80.0f / 144.0f;
+			g.DrawImage(game.iconImage.get(), RectF(0, (d.hero.Height - ih) / 2, d.hero.Width, ih));
+			g.ResetClip();
+			SolidBrush dim(ui::C(ui::kSidebar, 170));
+			g.FillRectangle(&dim, d.hero);
 		}
-		// Shade so the text reads on any picture: light at the top, nearly opaque at the bottom.
-		LinearGradientBrush shade(Point(0, 0), Point(0, h + 1), Color(40, 20, 20, 26), Color(250, 20, 20, 26));
-		Color stops[] = {Color(30, 20, 20, 26), Color(90, 20, 20, 26), Color(230, 20, 20, 26), Color(250, 20, 20, 26)};
-		REAL at[] = {0.0f, 0.3f, 0.62f, 1.0f};
-		shade.SetInterpolationColors(stops, at, 4);
-		g.FillRectangle(&shade, 0, 0, w, h);
+		// Fade the backdrop into the panel.
+		LinearGradientBrush fade(PointF(0, 0), PointF(0, d.hero.Height + 1), ui::C(ui::kSidebar, 0), ui::C(ui::kSidebar, 255));
+		Color stops[] = {ui::C(ui::kSidebar, 20), ui::C(ui::kSidebar, 60), ui::C(ui::kSidebar, 200), ui::C(ui::kSidebar, 255)};
+		REAL at[] = {0.0f, 0.45f, 0.82f, 1.0f};
+		fade.SetInterpolationColors(stops, at, 4);
+		g.FillRectangle(&fade, d.hero);
 
-		Font titleFont(&family, 24, FontStyleBold, UnitPixel), infoFont(&family, 14, FontStyleRegular, UnitPixel),
-		    smallFont(&family, 12, FontStyleRegular, UnitPixel);
-		std::wstring sub = game.id.empty() ? game.path.filename().wstring() : game.id + L"  \u00B7  " + game.path.filename().wstring();
-		std::wstring status;
-		Color statusColor(255, 160, 160, 172);
-		const NativeInfo &n = game.native;
-		if (Building(game.path)) {
-			status = L"Building native code...";
-			statusColor = Color(255, 110, 175, 255);
-		} else if (!g_settings.aot) {
-			status = L"Native code is turned off in Settings: the game runs in the interpreter.";
-		} else if (n.state == Native::Built) {
-			status = L"Native code built" + (n.total > 1 ? L" (" + std::to_wstring(n.total) + L" modules)" : std::wstring());
-			statusColor = Color(255, 92, 204, 120);
-		} else if (n.state == Native::Partial) {
-			status = L"Native code partly built (" + std::to_wstring(n.built) + L" of " + std::to_wstring(n.total) +
-			         L" modules): build it again to finish.";
-			statusColor = Color(255, 238, 178, 70);
-		} else if (n.state == Native::Stale) {
-			status = L"Native code out of date: PSPC changed since it was built. Play offers to rebuild it.";
-			statusColor = Color(255, 238, 178, 70);
-		} else {
-			status = L"No native code yet: the game runs in the interpreter (slower). Play offers to build it.";
-		}
-		if (n.failed > 0 && g_settings.aot)
-			status += L"\n" + std::to_wstring(n.failed) + (n.failed == 1 ? L" module" : L" modules") +
-			          L" could not be built and run in the interpreter.";
-		std::wstring where = game.path.wstring();
-		std::wstring hint = L"Enter or double-click: play     Right-click: more     F5: refresh";
-
-		struct Line {
-			const std::wstring *text;
-			Font *font;
-			Color color;
-			REAL gapAfter;
-			REAL height = 0;
-		};
-		Line lines[] = {{&game.title, &titleFont, Color(255, 245, 245, 250), 4},
-		                {&sub, &infoFont, Color(255, 185, 185, 196), 14},
-		                {&status, &infoFont, statusColor, 12},
-		                {&where, &smallFont, Color(255, 130, 130, 142), 18},
-		                {&hint, &smallFont, Color(255, 110, 110, 122), 0}};
-		REAL total = 0;
-		for (Line &l : lines) {
-			RectF box;
-			g.MeasureString(l.text->c_str(), -1, l.font, RectF(0, 0, tw, 400), &wrap, &box);
-			l.height = std::min(box.Height, (REAL)h / 3);
-			total += l.height + l.gapAfter;
-		}
-		REAL iconH = game.iconImage ? std::min((REAL)kIconH, tw * kIconH / kIconW) : 0;
-		REAL y = std::max(pad + (iconH ? iconH + 14 : 0), (REAL)h - pad - total);
 		if (game.iconImage) {
-			REAL iconW = iconH * kIconW / kIconH;
-			g.DrawImage(game.iconImage.get(), RectF(pad, y - iconH - 14, iconW, iconH));
+			float r = Df(8);
+			ui::FillRound(g, RectF(d.icon.X + Df(1), d.icon.Y + Df(4), d.icon.Width, d.icon.Height), r, Color(110, 0, 0, 0));
+			GraphicsPath clip;
+			ui::AddRoundRect(clip, d.icon, r);
+			g.SetClip(&clip);
+			g.DrawImage(game.iconImage.get(), d.icon);
+			g.ResetClip();
+			ui::StrokeRound(g, d.icon, r, Color(70, 255, 255, 255), 1);
 		}
-		for (Line &l : lines) {
-			SolidBrush brush(l.color);
-			g.DrawString(l.text->c_str(), -1, l.font, RectF(pad, y, tw, l.height + 1), &wrap, &brush);
-			y += l.height + l.gapAfter;
-		}
+		ui::Text(g, game.title.c_str(), d.title, Df(22), ui::C(ui::kText), true, 0, false, true);
+		float x = d.chips.X;
+		Chip(g, x, d.chips.Y, d.chips.Height, game.id);
+		Chip(g, x, d.chips.Y, d.chips.Height, FormatText(game) + (game.size ? L"  ·  " + SizeText(game.size) : L""));
+		float dot = Df(8);
+		SolidBrush dotBrush(ui::C(d.statusColor));
+		g.FillEllipse(&dotBrush, RectF(d.status.X, d.status.Y + Df(6), dot, dot));
+		ui::Text(g, d.statusText.c_str(), RectF(d.status.X + Df(16), d.status.Y, d.status.Width - Df(16), Df(20)), Df(14),
+		         ui::C(d.statusColor == ui::kTextDim ? ui::kText : d.statusColor), true, 0, true);
+		ui::Text(g, d.statusNote.c_str(), RectF(d.status.X + Df(16), d.status.Y + Df(22), d.status.Width - Df(18), d.status.Height),
+		         Df(12.5f), ui::C(ui::kTextDim), false, 0, false, true);
+		Pen line(ui::C(ui::kBorder), 1);
+		g.DrawLine(&line, d.path.X, d.path.Y - Df(10), (float)w - d.path.X, d.path.Y - Df(10));
+		ui::Text(g, game.path.wstring().c_str(), d.path, Df(11.5f), ui::C(ui::kTextFaint), false, 0, true);
 	}
+	Pen divider(ui::C(RGB(10, 10, 14)), 1);
+	g.DrawLine(&divider, 0.0f, 0.0f, 0.0f, (float)h);
 	Graphics screen(hdc);
 	screen.DrawImage(&buffer, 0, 0);
 }
@@ -846,60 +929,291 @@ LRESULT CALLBACK DetailProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		EndPaint(hwnd, &ps);
 		return 0;
 	}
+	case WM_SIZE: PlaceDetailButtons(); return 0;
 	case WM_LBUTTONDBLCLK: Play(Selected(), false); return 0;
+	case WM_DRAWITEM: ui::DrawOwnerButton((const DRAWITEMSTRUCT *)lp, ui::kSidebar); return TRUE;
+	case WM_COMMAND: return SendMessageW(g_main, msg, wp, lp);  // the panel's buttons
 	}
 	return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-void DrawToolButton(const DRAWITEMSTRUCT *di) {
-	bool pressed = di->itemState & ODS_SELECTED, disabled = di->itemState & ODS_DISABLED;
-	bool accent = di->CtlID == ID_PLAY;
-	COLORREF bg = accent ? (pressed ? RGB(0, 90, 180) : RGB(0, 110, 215)) : (pressed ? RGB(70, 70, 86) : RGB(50, 50, 62));
-	if (disabled) bg = RGB(42, 42, 52);
-	HBRUSH bar = CreateSolidBrush(kToolbar), brush = CreateSolidBrush(bg);
-	FillRect(di->hDC, &di->rcItem, bar);
-	DeleteObject(bar);
-	HPEN pen = CreatePen(PS_SOLID, 1, bg);
-	HGDIOBJ oldBrush = SelectObject(di->hDC, brush), oldPen = SelectObject(di->hDC, pen);
-	RoundRect(di->hDC, di->rcItem.left, di->rcItem.top, di->rcItem.right, di->rcItem.bottom, 7, 7);
-	SelectObject(di->hDC, oldBrush);
-	SelectObject(di->hDC, oldPen);
-	DeleteObject(brush);
-	DeleteObject(pen);
-	wchar_t text[64];
-	GetWindowTextW(di->hwndItem, text, 64);
-	SetBkMode(di->hDC, TRANSPARENT);
-	SetTextColor(di->hDC, disabled ? RGB(110, 110, 120) : RGB(240, 240, 245));
-	HGDIOBJ oldFont = SelectObject(di->hDC, g_uiFont);
-	RECT r = di->rcItem;
-	DrawTextW(di->hDC, text, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-	SelectObject(di->hDC, oldFont);
-	if (di->itemState & ODS_FOCUS) {
-		RECT f = di->rcItem;
-		InflateRect(&f, -3, -3);
-		DrawFocusRect(di->hDC, &f);
+// ---- the game grid
+
+// A card: ICON0 on top, the title and disc ID below, a tag when native code is built or needs work.
+void DrawCard(HDC hdc, const RECT &rc, Game &game, bool selected, bool hot, bool focused) {
+	using namespace Gdiplus;
+	Graphics g(hdc);
+	g.SetSmoothingMode(SmoothingModeAntiAlias);
+	g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+	g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+	RectF card((REAL)rc.left, (REAL)rc.top, (REAL)(rc.right - rc.left), (REAL)(rc.bottom - rc.top));
+	float r = Df(10), imageH = (float)D(kCardImageH);
+	ui::FillRound(g, card, r, ui::C(selected || hot ? ui::kSurfaceHot : ui::kSurface));
+	GraphicsPath clip;
+	ui::AddRoundRect(clip, card, r);
+	g.SetClip(&clip);
+	if (!game.iconImage && !game.icon.empty()) game.iconImage = Decode(game.icon);
+	RectF image(card.X, card.Y, card.Width, imageH);
+	if (game.iconImage) {
+		g.DrawImage(game.iconImage.get(), image);
+	} else {
+		SolidBrush fill(ui::C(ui::kSurfaceDown));
+		g.FillRectangle(&fill, image);
+		ui::Text(g, ui::kIconGames, image, Df(30), ui::C(ui::kTextFaint), false, 1, true, false, true);
 	}
+	if (hot && !selected) {
+		SolidBrush lift(Color(18, 255, 255, 255));
+		g.FillRectangle(&lift, image);
+	}
+	g.ResetClip();
+
+	// Native code tag.
+	const wchar_t *tag = nullptr;
+	COLORREF tagColor = ui::kGreen;
+	if (Building(game.path)) tag = L"BUILDING", tagColor = ui::kInfo;
+	else if (g_settings.aot && game.native.state == Native::Built) tag = L"NATIVE";
+	else if (g_settings.aot && game.native.state == Native::Stale) tag = L"REBUILD", tagColor = ui::kAmber;
+	else if (g_settings.aot && game.native.state == Native::Partial) tag = L"PARTIAL", tagColor = ui::kAmber;
+	if (tag) {
+		float px = Df(9.5f), th = Df(18);
+		float tw = ui::Measure(g, tag, px, true).Width + Df(20);
+		RectF pill(image.GetRight() - tw - Df(8), image.GetBottom() - th - Df(8), tw, th);
+		ui::FillRound(g, pill, th / 2, Color(215, 12, 12, 16));
+		SolidBrush dot(ui::C(tagColor));
+		g.FillEllipse(&dot, RectF(pill.X + Df(7), pill.Y + th / 2 - Df(3), Df(6), Df(6)));
+		ui::Text(g, tag, RectF(pill.X + Df(15), pill.Y, tw - Df(17), th), px, ui::C(ui::kText), true, 0);
+	}
+
+	float pad = Df(10);
+	RectF title(card.X + pad, image.GetBottom() + Df(8), card.Width - 2 * pad, Df(34));
+	ui::Text(g, game.title.c_str(), title, Df(12.5f), ui::C(ui::kText), true, 0, false, true);
+	if (!game.id.empty())
+		ui::Text(g, game.id.c_str(), RectF(card.X + pad, card.GetBottom() - Df(20), card.Width - 2 * pad, Df(15)), Df(11),
+		         ui::C(ui::kTextFaint), false, 0, true);
+	if (selected)
+		ui::StrokeRound(g, card, r, focused ? ui::C(ui::kAccent) : ui::C(ui::kAccent, 140), Df(2));
+}
+
+LRESULT CustomDrawList(NMLVCUSTOMDRAW *cd) {
+	if (cd->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+	if (cd->nmcd.dwDrawStage != CDDS_ITEMPREPAINT) return CDRF_DODEFAULT;
+	int item = (int)cd->nmcd.dwItemSpec;
+	LVITEMW lvi{};
+	lvi.mask = LVIF_PARAM | LVIF_STATE;
+	lvi.iItem = item;
+	lvi.stateMask = LVIS_SELECTED;
+	ListView_GetItem(g_list, &lvi);
+	if (lvi.lParam < 0 || (size_t)lvi.lParam >= g_games.size()) return CDRF_SKIPDEFAULT;
+	RECT cell;
+	ListView_GetItemRect(g_list, item, &cell, LVIR_ICON);
+	// The icon rect spans the grid cell; the card sits in its middle, the rest is the gutter.
+	int cw = D(kCardW), ch = D(kCardImageH + kCardTextH);
+	RECT rc{cell.left + (cell.right - cell.left - cw) / 2, cell.top, 0, 0};
+	rc.right = rc.left + cw;
+	rc.bottom = rc.top + ch;
+	DrawCard(cd->nmcd.hdc, rc, g_games[lvi.lParam], (lvi.state & LVIS_SELECTED) != 0, item == g_hot, GetFocus() == g_list);
+	return CDRF_SKIPDEFAULT;
+}
+
+void InvalidateItem(int item) {
+	RECT r;
+	if (item >= 0 && ListView_GetItemRect(g_list, item, &r, LVIR_BOUNDS)) InvalidateRect(g_list, &r, FALSE);
+}
+
+LRESULT CALLBACK ListSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+	switch (msg) {
+	case WM_MOUSEMOVE: {
+		LVHITTESTINFO hit{};
+		hit.pt = {(short)LOWORD(lp), (short)HIWORD(lp)};
+		int item = ListView_HitTest(hwnd, &hit);
+		if (item != g_hot) {
+			InvalidateItem(g_hot);
+			g_hot = item;
+			InvalidateItem(g_hot);
+			TRACKMOUSEEVENT t{sizeof(t), TME_LEAVE, hwnd, 0};
+			TrackMouseEvent(&t);
+		}
+		break;
+	}
+	case WM_MOUSELEAVE:
+		InvalidateItem(g_hot);
+		g_hot = -1;
+		break;
+	case WM_SETFOCUS:
+	case WM_KILLFOCUS: InvalidateItem(ListView_GetNextItem(hwnd, -1, LVNI_SELECTED)); break;
+	}
+	return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
+// The search box: Down moves to the games (Enter and Escape arrive as IDOK / IDCANCEL); its frame
+// lights up while it has the focus.
+LRESULT CALLBACK SearchSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+	if (msg == WM_KEYDOWN && wp == VK_DOWN) {
+		SetFocus(g_list);
+		return 0;
+	}
+	if (msg == WM_SETFOCUS || msg == WM_KILLFOCUS) InvalidateRect(g_main, &g_searchBox, FALSE);
+	return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
+void ListMetrics() {
+	HIMAGELIST old = g_images;
+	g_images = ImageList_Create(D(kCardW), D(kCardImageH + kCardTextH), ILC_COLOR32, 1, 1);
+	ListView_SetImageList(g_list, g_images, LVSIL_NORMAL);
+	if (old) ImageList_Destroy(old);
+	ListView_SetIconSpacing(g_list, D(kCardW + kCardGap), D(kCardImageH + kCardTextH + kCardGap));
+}
+
+void UpdateUi() {
+	bool sel = Selected() >= 0;
+	EnableWindow(g_playButton, sel);
+	if (g_detail) {
+		PlaceDetailButtons();
+		InvalidateRect(g_detail, nullptr, FALSE);
+	}
+	for (HWND b : g_nav)
+		if (GetDlgCtrlID(b) == ID_BOOT_XMB) ui::SetDetail(b, XmbInstalled() ? L"PSP firmware menu" : L"Firmware not installed");
+	UpdateAccount();
+	InvalidateRect(g_main, nullptr, FALSE);
+}
+
+// Refills the list with the games matching the search, keeping `keep` selected (else the first).
+void Populate(const fs::path &keep) {
+	SendMessageW(g_list, WM_SETREDRAW, FALSE, 0);
+	ListView_DeleteAllItems(g_list);
+	g_hot = -1;
+	int select = -1, row = 0;
+	for (size_t i = 0; i < g_games.size(); i++) {
+		if (!Matches(g_games[i])) continue;
+		// The text is for keyboard search and screen readers; the cards draw their own.
+		std::wstring label = g_games[i].title;
+		LVITEMW item{};
+		item.mask = LVIF_TEXT | LVIF_IMAGE | LVIF_PARAM;
+		item.iItem = row;
+		item.pszText = label.data();
+		item.iImage = 0;
+		item.lParam = (LPARAM)i;
+		ListView_InsertItem(g_list, &item);
+		if (select < 0 || (!keep.empty() && g_games[i].path == keep)) select = row;
+		row++;
+	}
+	if (select >= 0) {
+		ListView_SetItemState(g_list, select, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+		ListView_EnsureVisible(g_list, select, FALSE);
+	}
+	SendMessageW(g_list, WM_SETREDRAW, TRUE, 0);
+	InvalidateRect(g_list, nullptr, TRUE);
+	UpdateUi();
+}
+
+void Rescan() {
+	fs::path keep = SelectedPath();
+	Scan();
+	RefreshNative();
+	Populate(keep);
+}
+
+void ReloadSettings() {
+	g_settings = settings::Settings();
+	settings::Load(settings::DefaultPath(), g_settings);
+}
+
+// ---- painting the window itself: sidebar, header
+
+void PaintMain(HDC hdc, int w, int h) {
+	using namespace Gdiplus;
+	int sw = D(kSidebarW);
+	Bitmap buffer(w, h, PixelFormat32bppPARGB);
+	Graphics g(&buffer);
+	g.SetSmoothingMode(SmoothingModeAntiAlias);
+	g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+	g.Clear(ui::C(ui::kBg));
+	SolidBrush side(ui::C(ui::kSidebar));
+	g.FillRectangle(&side, 0, 0, sw, h);
+	Pen divider(ui::C(RGB(10, 10, 14)), 1);
+	g.DrawLine(&divider, (REAL)sw - 0.5f, 0.0f, (REAL)sw - 0.5f, (REAL)h);
+
+	// Brand.
+	RectF logo(Df(20), Df(22), Df(34), Df(34));
+	LinearGradientBrush grad(PointF(logo.X, logo.Y), PointF(logo.GetRight(), logo.GetBottom()), ui::C(RGB(72, 146, 255)),
+	                         ui::C(RGB(136, 92, 255)));
+	GraphicsPath logoPath;
+	ui::AddRoundRect(logoPath, logo, Df(9));
+	g.FillPath(&grad, &logoPath);
+	ui::Text(g, ui::kIconGames, logo, Df(18), ui::C(RGB(255, 255, 255)), false, 1, true, false, true);
+	ui::Text(g, L"PSPC", RectF(logo.GetRight() + Df(12), logo.Y - Df(2), Df(140), Df(22)), Df(19), ui::C(ui::kText), true, 0);
+	ui::Text(g, L"PSP games on Windows", RectF(logo.GetRight() + Df(12), logo.Y + Df(19), Df(150), Df(16)), Df(11.5f),
+	         ui::C(ui::kTextFaint), false, 0);
+
+	// Section labels over the nav buttons.
+	for (HWND b : g_nav) {
+		int id = GetDlgCtrlID(b);
+		const wchar_t *label = id == ID_LIBRARY ? L"LIBRARY" : id == ID_BOOT_XMB ? L"SYSTEM" : nullptr;
+		if (!label) continue;
+		RECT br;
+		GetWindowRect(b, &br);
+		MapWindowPoints(nullptr, g_main, (POINT *)&br, 2);
+		ui::Text(g, label, RectF(Df(24), (REAL)br.top - Df(24), Df(160), Df(18)), Df(10.5f), ui::C(ui::kTextFaint), true, 0);
+	}
+
+	// The account, set apart at the bottom.
+	if (g_account) {
+		RECT ar;
+		GetWindowRect(g_account, &ar);
+		MapWindowPoints(nullptr, g_main, (POINT *)&ar, 2);
+		Pen sep(ui::C(ui::kBorder), 1);
+		g.DrawLine(&sep, Df(20), (REAL)ar.top - Df(10), (REAL)sw - Df(20), (REAL)ar.top - Df(10));
+	}
+
+	// Header: title, count, search box.
+	float hx = (float)sw + Df(kGridPad);
+	size_t shown = (size_t)std::max(0, ListView_GetItemCount(g_list));
+	std::wstring sub = g_filter.empty() ? std::to_wstring(g_games.size()) + (g_games.size() == 1 ? L" game" : L" games")
+	                                    : std::to_wstring(shown) + L" of " + std::to_wstring(g_games.size()) + L" games";
+	int native = 0;
+	for (const Game &game : g_games) native += game.native.state == Native::Built;
+	if (g_settings.aot && !g_games.empty()) sub += L"  ·  " + std::to_wstring(native) + L" built as native code";
+	ui::Text(g, L"Games", RectF(hx, Df(18), Df(300), Df(30)), Df(22), ui::C(ui::kText), true, 0);
+	ui::Text(g, sub.c_str(), RectF(hx, Df(48), (float)(g_searchBox.left) - hx - Df(12), Df(18)), Df(12.5f),
+	         ui::C(ui::kTextFaint), false, 0);
+	if (g_search) {
+		RectF box((REAL)g_searchBox.left, (REAL)g_searchBox.top, (REAL)(g_searchBox.right - g_searchBox.left),
+		          (REAL)(g_searchBox.bottom - g_searchBox.top));
+		bool focus = GetFocus() == g_search;
+		ui::FillRound(g, box, Df(8), ui::C(ui::kSurface));
+		ui::StrokeRound(g, box, Df(8), ui::C(focus ? ui::kAccent : ui::kBorder), focus ? Df(1.5f) : 1);
+		ui::Text(g, ui::kIconSearch, RectF(box.X + Df(10), box.Y, Df(20), box.Height), Df(14), ui::C(ui::kTextFaint), false,
+		         0, true, false, true);
+	}
+	Graphics screen(hdc);
+	screen.DrawImage(&buffer, 0, 0);
 }
 
 void Layout(int w, int h) {
-	HDC dc = GetDC(g_main);
-	HGDIOBJ old = SelectObject(dc, g_uiFont);
-	int x = 10;
-	for (HWND b : g_tools) {
-		wchar_t text[64];
-		GetWindowTextW(b, text, 64);
-		SIZE sz{};
-		GetTextExtentPoint32W(dc, text, (int)wcslen(text), &sz);
-		int bw = sz.cx + 30;
-		MoveWindow(b, x, 7, bw, kToolbarH - 14, TRUE);
-		x += bw + 8;
+	int sw = D(kSidebarW);
+	// Sidebar: Library, then System; the account at the bottom.
+	int y = D(104);
+	for (HWND b : g_nav) {
+		int id = GetDlgCtrlID(b);
+		if (id == ID_BOOT_XMB) y += D(34);
+		MoveWindow(b, D(12), y, sw - D(24), D(44), TRUE);
+		y += D(48);
 	}
-	SelectObject(dc, old);
-	ReleaseDC(g_main, dc);
-	int detailW = std::clamp(w * 2 / 5, 300, 560);
-	if (w - detailW < 200) detailW = std::max(0, w - 200);
-	MoveWindow(g_list, 0, kToolbarH, w - detailW, std::max(0, h - kToolbarH), TRUE);
-	MoveWindow(g_detail, w - detailW, kToolbarH, detailW, std::max(0, h - kToolbarH), TRUE);
+	MoveWindow(g_account, D(12), h - D(68), sw - D(24), D(52), TRUE);
+
+	int detailW = std::clamp(w * 34 / 100, D(330), D(440));
+	if (w - sw - detailW < D(kCardW + 2 * kGridPad)) detailW = std::max(0, w - sw - D(kCardW + 2 * kGridPad));
+	int contentR = w - detailW;
+	int bh = D(36), by = D(20);
+	MoveWindow(g_folderButton, contentR - D(kGridPad) - bh, by, bh, bh, TRUE);
+	MoveWindow(g_refreshButton, contentR - D(kGridPad) - 2 * bh - D(6), by, bh, bh, TRUE);
+	int searchW = std::clamp((contentR - sw) * 40 / 100, D(160), D(300));
+	g_searchBox = {contentR - D(kGridPad) - 2 * bh - D(18) - searchW, by, contentR - D(kGridPad) - 2 * bh - D(18), by + bh};
+	int editH = D(20);
+	MoveWindow(g_search, g_searchBox.left + D(34), by + (bh - editH) / 2, searchW - D(44), editH, TRUE);
+	MoveWindow(g_list, sw + D(kGridPad) - D(8), D(kHeaderH), contentR - sw - D(kGridPad) + D(8), std::max(0, h - D(kHeaderH)), TRUE);
+	MoveWindow(g_detail, contentR, 0, detailW, h, TRUE);
+	InvalidateRect(g_main, nullptr, FALSE);
 }
 
 void ContextMenu(HWND hwnd, LPARAM lp) {
@@ -907,21 +1221,17 @@ void ContextMenu(HWND hwnd, LPARAM lp) {
 	HMENU m = CreatePopupMenu();
 	UINT on = sel >= 0 ? 0 : MF_GRAYED;
 	AppendMenuW(m, on, ID_PLAY, L"&Play\tEnter");
-	AppendMenuW(m, on, ID_PLAY_INTERP, L"Play (&interpreter only)");
-	AppendMenuW(m, on, ID_BUILD, L"&Build native code (AOT)");
+	AppendMenuW(m, on, ID_PLAY_INTERP, L"Play in the &interpreter");
+	AppendMenuW(m, on, ID_BUILD, L"&Build native code");
+	AppendMenuW(m, on, ID_SHOW_FILE, L"&Show in folder");
 	AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
 	AppendMenuW(m, 0, ID_REFRESH, L"&Refresh\tF5");
 	AppendMenuW(m, 0, ID_OPEN_FOLDER, L"&Open Games folder");
-	AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-	AppendMenuW(m, XmbInstalled() ? 0 : MF_GRAYED, ID_BOOT_XMB, L"Boot &XMB (PSP firmware)");
-	AppendMenuW(m, 0, ID_PLUGINS, L"P&lugins (M33)...");
-	AppendMenuW(m, 0, ID_NETWORK, L"&Network (PSPC Network account)...");
-	AppendMenuW(m, 0, ID_SETTINGS, L"&Settings...");
 	POINT pt{(short)LOWORD(lp), (short)HIWORD(lp)};
 	if (lp == -1) {  // from the keyboard: at the selected item
 		RECT r{};
 		if (sel >= 0 && ListView_GetItemRect(g_list, ListView_GetNextItem(g_list, -1, LVNI_SELECTED), &r, LVIR_ICON)) {
-			pt = {r.left + 8, r.bottom};
+			pt = {r.left + D(12), r.top + D(kCardImageH)};
 			ClientToScreen(g_list, &pt);
 		} else {
 			GetCursorPos(&pt);
@@ -931,32 +1241,60 @@ void ContextMenu(HWND hwnd, LPARAM lp) {
 	DestroyMenu(m);
 }
 
+HWND MakeButton(HWND parent, int id, const wchar_t *text, ui::Look look, const wchar_t *glyph = nullptr,
+                const wchar_t *detail = nullptr) {
+	HWND b = CreateWindowExW(0, L"BUTTON", text, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, parent,
+	                         (HMENU)(INT_PTR)id, nullptr, nullptr);
+	ui::SetLook(b, look, glyph, detail);
+	return b;
+}
+
+void ApplyFonts() {
+	SendMessageW(g_search, WM_SETFONT, (WPARAM)ui::Font(14, g_dpi), TRUE);
+	ListMetrics();
+}
+
+void ShowInFolder(int idx) {
+	if (idx < 0) return;
+	std::wstring args = L"/select,\"" + g_games[idx].path.wstring() + L"\"";
+	ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOW);
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 	switch (msg) {
 	case WM_CREATE: {
 		g_main = hwnd;
-		NONCLIENTMETRICSW ncm{sizeof(ncm)};
-		SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0);
-		ncm.lfMessageFont.lfHeight = -15;
-		g_uiFont = CreateFontIndirectW(&ncm.lfMessageFont);
-		const std::pair<int, const wchar_t *> tools[] = {
-			{ID_PLAY, L"Play"}, {ID_BUILD, L"Build native code"}, {ID_BOOT_XMB, L"Boot XMB"},
-			{ID_PLUGINS, L"Plugins"}, {ID_NETWORK, L"Network"}, {ID_SETTINGS, L"Settings"}, {ID_REFRESH, L"Refresh"},
-			{ID_OPEN_FOLDER, L"Games folder"}};
-		for (const auto &t : tools)
-			g_tools.push_back(CreateWindowExW(0, L"BUTTON", t.second, WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0,
-			                                  0, hwnd, (HMENU)(INT_PTR)t.first, nullptr, nullptr));
-		g_list = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_ICON | LVS_SINGLESEL | LVS_AUTOARRANGE | LVS_SHOWSELALWAYS,
-		                         0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)ID_LIST, nullptr, nullptr);
-		ListView_SetExtendedListViewStyle(g_list, LVS_EX_DOUBLEBUFFER);
-		ListView_SetBkColor(g_list, kBackground);
-		ListView_SetTextBkColor(g_list, kBackground);
-		ListView_SetTextColor(g_list, kText);
-		g_images = ImageList_Create(kIconW, kIconH, ILC_COLOR32, 16, 16);
-		ListView_SetImageList(g_list, g_images, LVSIL_NORMAL);
-		ListView_SetIconSpacing(g_list, kIconW + 24, kIconH + 48);
-		g_detail = CreateWindowExW(0, L"PspcDetail", L"", WS_CHILD | WS_VISIBLE, 0, 0, 0, 0, hwnd, nullptr, nullptr, nullptr);
+		g_dpi = ui::DpiOf(hwnd);
+		ui::DarkTitleBar(hwnd);
 		ReloadSettings();
+		g_nav.push_back(MakeButton(hwnd, ID_LIBRARY, L"Games", ui::Look::NavActive, ui::kIconGames));
+		g_nav.push_back(MakeButton(hwnd, ID_BOOT_XMB, L"Boot XMB", ui::Look::Nav, ui::kIconXmb, L""));
+		g_nav.push_back(MakeButton(hwnd, ID_PLUGINS, L"Plugins", ui::Look::Nav, ui::kIconPlugins, L"M33 plugins"));
+		g_nav.push_back(MakeButton(hwnd, ID_SETTINGS, L"Settings", ui::Look::Nav, ui::kIconSettings, L"Video, audio, controls"));
+		g_account = MakeButton(hwnd, ID_NETWORK, L"Network", ui::Look::Nav, ui::kIconPerson, L"");
+		g_refreshButton = MakeButton(hwnd, ID_REFRESH, L"Refresh", ui::Look::Icon, ui::kIconRefresh);
+		g_folderButton = MakeButton(hwnd, ID_OPEN_FOLDER, L"Open the Games folder", ui::Look::Icon, ui::kIconFolder);
+		g_search = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 0, 0, hwnd,
+		                           (HMENU)(INT_PTR)ID_SEARCH, nullptr, nullptr);
+		SendMessageW(g_search, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search games");
+		SetWindowSubclass(g_search, SearchSubclass, 0, 0);
+		g_list = CreateWindowExW(0, WC_LISTVIEWW, L"Games",
+		                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_ICON | LVS_SINGLESEL | LVS_AUTOARRANGE | LVS_SHOWSELALWAYS,
+		                         0, 0, 0, 0, hwnd, (HMENU)(INT_PTR)ID_LIST, nullptr, nullptr);
+		ListView_SetExtendedListViewStyle(g_list, LVS_EX_DOUBLEBUFFER | LVS_EX_HIDELABELS);
+		SetWindowTheme(g_list, L"DarkMode_Explorer", nullptr);  // dark scrollbar where Windows has one
+		ListView_SetBkColor(g_list, ui::kBg);
+		ListView_SetTextBkColor(g_list, ui::kBg);
+		ListView_SetTextColor(g_list, ui::kText);
+		SetWindowSubclass(g_list, ListSubclass, 0, 0);
+		g_detail = CreateWindowExW(WS_EX_CONTROLPARENT, L"PspcDetail", L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN, 0, 0, 0, 0, hwnd, nullptr,
+		                           nullptr, nullptr);
+		g_playButton = MakeButton(g_detail, ID_PLAY, L"Play", ui::Look::Primary, ui::kIconPlay);
+		g_buildButton = MakeButton(g_detail, ID_BUILD, L"Build native code", ui::Look::Secondary, ui::kIconBuild);
+		g_interpButton = MakeButton(g_detail, ID_PLAY_INTERP, L"Interpreter", ui::Look::Secondary, ui::kIconCode);
+		g_showButton = MakeButton(g_detail, ID_SHOW_FILE, L"Show in folder", ui::Look::Icon, ui::kIconOpenFile);
+		g_emptyButton = MakeButton(g_detail, ID_OPEN_FOLDER, L"Open Games folder", ui::Look::Primary, ui::kIconFolder);
+		ApplyFonts();
 		Scan();
 		RefreshNative();
 		Populate({});
@@ -964,18 +1302,33 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		return 0;
 	}
 	case WM_SIZE: Layout(LOWORD(lp), HIWORD(lp)); return 0;
+	case WM_DPICHANGED: {
+		g_dpi = HIWORD(wp);
+		const RECT *r = (const RECT *)lp;
+		ApplyFonts();
+		SetWindowPos(hwnd, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
+		Populate(SelectedPath());
+		return 0;
+	}
 	case WM_SETFOCUS: SetFocus(g_list); return 0;
-	case WM_GETMINMAXINFO: ((MINMAXINFO *)lp)->ptMinTrackSize = {720, 420}; return 0;
-	case WM_ERASEBKGND: {
+	case WM_GETMINMAXINFO: ((MINMAXINFO *)lp)->ptMinTrackSize = {D(960), D(600)}; return 0;
+	case WM_ERASEBKGND: return 1;
+	case WM_PAINT: {
+		PAINTSTRUCT ps;
+		HDC hdc = BeginPaint(hwnd, &ps);
 		RECT r;
 		GetClientRect(hwnd, &r);
-		r.bottom = kToolbarH;
-		HBRUSH b = CreateSolidBrush(kToolbar);
-		FillRect((HDC)wp, &r, b);
-		DeleteObject(b);
-		return 1;
+		PaintMain(hdc, r.right, r.bottom);
+		EndPaint(hwnd, &ps);
+		return 0;
 	}
-	case WM_DRAWITEM: DrawToolButton((const DRAWITEMSTRUCT *)lp); return TRUE;
+	case WM_CTLCOLOREDIT: {
+		static HBRUSH surface = CreateSolidBrush(ui::kSurface);
+		SetTextColor((HDC)wp, ui::kText);
+		SetBkColor((HDC)wp, ui::kSurface);
+		return (LRESULT)surface;
+	}
+	case WM_DRAWITEM: ui::DrawOwnerButton((const DRAWITEMSTRUCT *)lp, ui::kSidebar); return TRUE;
 	case WM_ACTIVATEAPP:
 		// Back from a game, a build or an editor: pick up new native code and settings.
 		if (wp) {
@@ -990,8 +1343,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 	case WM_NOTIFY: {
 		auto *nm = (NMHDR *)lp;
 		if (nm->idFrom != ID_LIST) return 0;
+		if (nm->code == NM_CUSTOMDRAW) return CustomDrawList((NMLVCUSTOMDRAW *)lp);
 		if (nm->code == NM_DBLCLK && ((NMITEMACTIVATE *)lp)->iItem >= 0) Play(Selected(), false);
 		if (nm->code == LVN_ITEMCHANGED && (((NMLISTVIEW *)lp)->uChanged & LVIF_STATE)) UpdateUi();
+		if (nm->code == LVN_GETEMPTYMARKUP) {
+			auto *em = (NMLVEMPTYMARKUP *)lp;
+			em->dwFlags = EMF_CENTERED;
+			std::wstring text = g_games.empty() ? L"No games yet." : L"No games match “" + g_filter + L"”.";
+			wcsncpy_s(em->szMarkup, text.c_str(), _TRUNCATE);
+			return TRUE;
+		}
 		if (nm->code == LVN_KEYDOWN) {
 			WORD vk = ((NMLVKEYDOWN *)lp)->wVKey;
 			if (vk == VK_RETURN) Play(Selected(), false);
@@ -999,20 +1360,46 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		}
 		return 0;
 	}
-	case WM_CONTEXTMENU: ContextMenu(hwnd, lp); return 0;
+	case WM_CONTEXTMENU:
+		if ((HWND)wp == g_list || (HWND)wp == g_detail) ContextMenu(hwnd, lp);
+		return 0;
 	case WM_COMMAND:
 		switch (LOWORD(wp)) {
+		case IDOK: {  // Enter, from IsDialogMessage
+			HWND focus = GetFocus();
+			if (focus == g_search) SetFocus(g_list);
+			else if (focus == g_list) Play(Selected(), false);
+			else if (focus && GetParent(focus) && (GetParent(focus) == hwnd || GetParent(focus) == g_detail))
+				SendMessageW(focus, BM_CLICK, 0, 0);
+			return 0;
+		}
+		case IDCANCEL:  // Escape
+			if (GetFocus() == g_search) {
+				SetWindowTextW(g_search, L"");
+				SetFocus(g_list);
+			}
+			return 0;
 		case ID_PLAY: Play(Selected(), false); break;
 		case ID_PLAY_INTERP: Play(Selected(), true); break;
 		case ID_BUILD: Build(Selected(), false); break;
+		case ID_SHOW_FILE: ShowInFolder(Selected()); break;
 		case ID_REFRESH: Rescan(); break;
 		case ID_OPEN_FOLDER: ShellExecuteW(nullptr, L"open", g_gamesDir.wstring().c_str(), nullptr, nullptr, SW_SHOW); break;
 		case ID_SETTINGS: OpenSettings(); break;
 		case ID_PLUGINS: OpenPlugins(); break;
 		case ID_NETWORK: OpenNetwork(); break;
 		case ID_BOOT_XMB: BootXmb(); break;
+		case ID_LIBRARY: SetFocus(g_list); break;
+		case ID_SEARCH:
+			if (HIWORD(wp) == EN_CHANGE) {
+				wchar_t text[128];
+				GetWindowTextW(g_search, text, 128);
+				g_filter = text;
+				Populate(SelectedPath());
+			}
+			return 0;
 		}
-		// Toolbar buttons hand the keyboard back to the list.
+		// Buttons hand the keyboard back to the list.
 		if ((HWND)lp && GetFocus() == (HWND)lp) SetFocus(g_list);
 		return 0;
 	case WM_DESTROY:
@@ -1023,9 +1410,58 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 	return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
+// PSPC_LAUNCHER_SNAPSHOT=<file.png>: render the window (off screen) to a PNG and exit; with
+// PSPC_LAUNCHER_SNAPSHOT_DIALOG=settings|plugins|network, the dialog instead, and with
+// PSPC_LAUNCHER_SNAPSHOT_SEARCH=<text>, the library filtered (for checking the look of changes
+// without a desktop session).
+bool SavePng(HWND hwnd, const fs::path &file) {
+	RECT r;
+	GetWindowRect(hwnd, &r);
+	int w = r.right - r.left, h = r.bottom - r.top;
+	HDC screen = GetDC(nullptr), dc = CreateCompatibleDC(screen);
+	HBITMAP bmp = CreateCompatibleBitmap(screen, w, h);
+	HGDIOBJ old = SelectObject(dc, bmp);
+	PrintWindow(hwnd, dc, 2 /* PW_RENDERFULLCONTENT */);
+	SelectObject(dc, old);
+	bool ok = false;
+	{
+		Gdiplus::Bitmap image(bmp, nullptr);
+		CLSID png{};
+		UINT n = 0, size = 0;
+		Gdiplus::GetImageEncodersSize(&n, &size);
+		std::vector<u8> buf(size);
+		auto *enc = (Gdiplus::ImageCodecInfo *)buf.data();
+		Gdiplus::GetImageEncoders(n, size, enc);
+		for (UINT i = 0; i < n; i++)
+			if (wcscmp(enc[i].MimeType, L"image/png") == 0) png = enc[i].Clsid;
+		ok = image.Save(file.wstring().c_str(), &png, nullptr) == Gdiplus::Ok;
+	}
+	DeleteObject(bmp);
+	DeleteDC(dc);
+	ReleaseDC(nullptr, screen);
+	return ok;
+}
+
+fs::path g_snapshot;
+std::wstring g_snapshotDialog;
+
+void CALLBACK SnapshotTimer(HWND hwnd, UINT, UINT_PTR id, DWORD) {
+	KillTimer(hwnd, id);
+	HWND target = hwnd;
+	if (!g_snapshotDialog.empty()) {
+		HWND popup = GetLastActivePopup(hwnd);
+		if (popup == hwnd) return;  // the dialog isn't up yet
+		target = popup;
+	}
+	SavePng(target, g_snapshot);
+	if (target != hwnd) PostMessageW(target, WM_COMMAND, IDCANCEL, 0);
+	PostMessageW(hwnd, WM_CLOSE, 0, 0);
+}
+
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int show) {
+	ui::EnableDpiAwareness();
 	g_exeDir = ExecutableDir();
 	int argc = 0;
 	wchar_t **argv = cmdLine && *cmdLine ? CommandLineToArgvW(cmdLine, &argc) : nullptr;
@@ -1074,14 +1510,38 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int show) {
 	wc.hInstance = inst;
 	wc.lpszClassName = L"PspcLauncher";
 	wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-	wc.hbrBackground = CreateSolidBrush(kBackground);
 	RegisterClassW(&wc);
-	std::wstring title = L"PSPC - " + g_gamesDir.wstring();
-	HWND hwnd = CreateWindowW(wc.lpszClassName, title.c_str(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT,
-	                          CW_USEDEFAULT, 1120, 680, nullptr, nullptr, inst, nullptr);
-	ShowWindow(hwnd, show);
+	std::wstring title = L"PSPC";
+	wchar_t snap[MAX_PATH] = {}, snapDialog[32] = {};
+	if (GetEnvironmentVariableW(L"PSPC_LAUNCHER_SNAPSHOT", snap, MAX_PATH)) g_snapshot = snap;
+	if (GetEnvironmentVariableW(L"PSPC_LAUNCHER_SNAPSHOT_DIALOG", snapDialog, 32)) g_snapshotDialog = snapDialog;
+	wchar_t snapSearch[64] = {};
+	GetEnvironmentVariableW(L"PSPC_LAUNCHER_SNAPSHOT_SEARCH", snapSearch, 64);
+	int x = g_snapshot.empty() ? CW_USEDEFAULT : -6000;
+	int dpi = ui::DpiOf(nullptr);
+	HWND hwnd = CreateWindowW(wc.lpszClassName, title.c_str(), WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, x, CW_USEDEFAULT,
+	                          ui::Px(1280, dpi), ui::Px(780, dpi), nullptr, nullptr, inst, nullptr);
+	ShowWindow(hwnd, g_snapshot.empty() ? show : SW_SHOWNOACTIVATE);
+	if (!g_snapshot.empty()) {
+		SetTimer(hwnd, 1, 1500, SnapshotTimer);
+		if (snapSearch[0]) SetWindowTextW(g_search, snapSearch);
+		if (g_snapshotDialog == L"settings") OpenSettings();
+		else if (g_snapshotDialog == L"plugins") OpenPlugins();
+		else if (g_snapshotDialog == L"network") OpenNetwork();
+	}
 	MSG m;
 	while (GetMessageW(&m, nullptr, 0, 0) > 0) {
+		// Ctrl+F: search; F5: refresh; Tab moves between the controls (as in a dialog).
+		if (m.message == WM_KEYDOWN && m.wParam == 'F' && GetKeyState(VK_CONTROL) < 0 && GetActiveWindow() == hwnd) {
+			SetFocus(g_search);
+			SendMessageW(g_search, EM_SETSEL, 0, -1);
+			continue;
+		}
+		if (m.message == WM_KEYDOWN && m.wParam == VK_F5 && GetActiveWindow() == hwnd) {
+			Rescan();
+			continue;
+		}
+		if (IsDialogMessageW(hwnd, &m)) continue;
 		TranslateMessage(&m);
 		DispatchMessageW(&m);
 	}

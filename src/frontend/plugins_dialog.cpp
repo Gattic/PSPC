@@ -7,6 +7,7 @@
 // seplugins/ and list it, "Remove" to unlist one (the file stays).
 #undef WIN32_LEAN_AND_MEAN
 #include "frontend/plugins_dialog.h"
+#include "frontend/ui_theme.h"
 
 #include <commctrl.h>
 #include <commdlg.h>
@@ -232,6 +233,7 @@ INT_PTR CALLBACK DialogProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
 	switch (msg) {
 	case WM_INITDIALOG:
 		Init(dlg, *d);
+		ui::ThemeDialog(dlg);
 		SetFocus(d->list);
 		return FALSE;
 	case WM_COMMAND:

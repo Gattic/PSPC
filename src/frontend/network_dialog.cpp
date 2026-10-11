@@ -4,6 +4,7 @@
 // at most, with the wait cursor): signing in is a single round trip.
 #undef WIN32_LEAN_AND_MEAN
 #include "frontend/network_dialog.h"
+#include "frontend/ui_theme.h"
 
 #include <commctrl.h>
 
@@ -272,6 +273,7 @@ INT_PTR CALLBACK DialogProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
 	switch (msg) {
 	case WM_INITDIALOG:
 		Init(dlg, *d);
+		ui::ThemeDialog(dlg);
 		return TRUE;
 	case WM_COMMAND:
 		switch (LOWORD(wp)) {

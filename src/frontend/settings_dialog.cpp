@@ -5,6 +5,7 @@
 // Rebinding a key: click an entry (or press Enter on it), then press the key.
 #undef WIN32_LEAN_AND_MEAN
 #include "frontend/settings_dialog.h"
+#include "frontend/ui_theme.h"
 
 #include <commctrl.h>
 
@@ -336,6 +337,7 @@ INT_PTR CALLBACK DialogProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
 	switch (msg) {
 	case WM_INITDIALOG:
 		Init(dlg, *d);
+		ui::ThemeDialog(dlg);
 		SetFocus(GetDlgItem(dlg, IDC_SCALE));
 		return FALSE;  // focus set
 	case WM_HSCROLL:

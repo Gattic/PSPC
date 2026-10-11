@@ -53,8 +53,10 @@ Put your game dumps (ISO/CSO, or EBOOT.PBP folders) in `Games\` and start the li
 build\RelWithDebInfo\bin\pspc-launcher.exe
 ```
 
-Double-click (or Enter) plays a game; right-click > *Build native code* compiles it ahead of time
-(about a minute per disc; otherwise it runs in the interpreter, which is slower but complete).
+Double-click (or Enter) plays a game. The panel on the right shows the selected game with *Play*,
+*Build native code* (compiles it ahead of time, about a minute per disc; otherwise it runs in the
+interpreter, which is slower but complete) and *Interpreter*; Ctrl+F searches the library, and the
+sidebar has Boot XMB, Plugins, Settings and your PSPC Network account.
 From the command line:
 
 ```bat
@@ -144,8 +146,8 @@ It speaks PPSSPP's protocol, so PPSSPP players and public PPSSPP servers work to
 
 **PlayStation Network.** Games that sign in to PSN (Syphon Filter: Combat Ops) sign in to
 *PSPC Network* instead: accounts, signed tickets and friend lists on a server anyone can run
-([server/README.md](server/README.md)). Press the launcher's **Network** button, enter the server's
-address, and create an account or sign in; the same dialog manages friends. Without a server,
+([server/README.md](server/README.md)). Click the account at the bottom of the launcher's sidebar
+(**Network**), enter the server's address, and create an account or sign in; the same dialog manages friends. Without a server,
 games sign in locally under the name you choose. Games' old server names can be pointed at
 community revival servers with an `infrastructure.json` (PPSSPP's `infra-dns.json` format works
 too). See [docs/pspc-network.md](docs/pspc-network.md). Combat Ops has a server of its own in this
@@ -162,7 +164,7 @@ M33 plugins (cheat devices such as DarkFrost or CWCheat, screenshot and button-r
 on a PSP with 4.01 M33. The `plugins` folder is laid over the memory stick, so put them there as you
 would in `ms0:/` and list them in `plugins\seplugins\game.txt` (games), `vsh.txt` (XMB) or
 `pops.txt` (PS1). Listed plugins load when the game starts: no Pandora battery or recovery menu.
-The launcher's **Plugins** button turns them on and off and adds new ones. See
+**Plugins** in the launcher's sidebar turns them on and off and adds new ones. See
 [plugins/README.md](plugins/README.md) and [docs/plugins.md](docs/plugins.md).
 
 **Game files:** use dumps of discs and downloads you own. Encrypted executables are decrypted by

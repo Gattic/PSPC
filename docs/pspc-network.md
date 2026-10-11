@@ -22,9 +22,9 @@ game's ticket and ask the PSPC Network server whether it's valid.
 
 ## Using it
 
-**Hosted.** Open the launcher's **Network** button, choose *PSPC Network server*, enter the
-server's address, your online ID and password, and press *Create account* (first time) or
-*Sign in*. The same dialog shows your friends and adds or removes them. From the command line:
+**Hosted.** In the launcher, click the account at the bottom of the sidebar (**Network**), choose
+*PSPC Network server*, enter the server's address, your online ID and password, and press
+*Create account* (first time) or *Sign in*. The same dialog shows your friends and adds or removes them. From the command line:
 
 ```bat
 pspc.exe --np register --server https://np.example.org --id Gabe_Logan   :: asks for a password
