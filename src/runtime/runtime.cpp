@@ -339,7 +339,7 @@ int RunOnce(const Options &o, BootTarget bt) {
 	const bool xmb = o.vsh && o.bootPath.empty() && o.netSelftest.empty();
 	const bool largeMemory = o.largeUserMemory >= 0 ? o.largeUserMemory != 0 : xmb || bt.largeMemory;
 	if (bt.largeMemory && o.largeUserMemory < 0) LOGI("BOOT", "PARAM.SFO MEMSIZE=1: extra user memory");
-	kernel::InitMemoryPartitions(mem::g_ramSize, largeMemory);
+	kernel::InitMemoryPartitions(mem::g_ramSize, largeMemory, o.userMemEnd);
 	kernel::g_firmwareVersion = o.firmwareVersion;
 	cpu::Init();
 	cpu::SetStrictMemory(o.strictMemory);
@@ -364,6 +364,7 @@ int RunOnce(const Options &o, BootTarget bt) {
 		io::Mount("kemulator", io::MakeEmulatorDevice(o.hasDisplayForTests));
 	}
 	io::SetTestOutput(o.testOutput);
+	io::SetHost0RawNames(o.host0RawNames);
 	mem::g_edramMirrors = o.edramMirrors;
 	dcache::g_enabled = o.dcacheModel;
 	dcache::Reset();
@@ -376,6 +377,8 @@ int RunOnce(const Options &o, BootTarget bt) {
 
 	// Re-mount host0/disc0 for this run (PrepareBoot mounted them before io::Init cleared them).
 	io::Mount("host0", io::MakeHostDevice(Host0Root(o).string(), false));
+	if (!o.host0Extra.empty() && !io::AddHostFallback("host0", o.host0Extra))
+		LOGW("BOOT", "--host0-extra %s: not a folder", o.host0Extra.c_str());
 	media::RemountDiscIfAny();
 	io::SetCwd(bt.cwd);
 

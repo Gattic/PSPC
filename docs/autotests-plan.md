@@ -1,5 +1,31 @@
 # pspautotests: plan for the 42 failing tests
 
+## Status (2026-10-11)
+
+Done: 539 of 559 pass, in the interpreter and as AOT code alike, and the other 20 are the runner's
+KNOWN_DIFFERENCES (0 unexpected failures). By phase: 521, 526, 533, 536, 537, then 539 with the
+decisions (io/io and vregs; threads/create and raw_access stay known differences).
+
+Where the work differs from the plan below:
+
+- **3.2 (async I/O):** a helper thread per fd made `threads/scheduling/dispatch` pass but broke
+  `intr/waits`, which needs the operation to finish on time while the caller holds the CPU. The
+  timer completion stays; an async close now takes as long as a sync one (100 us), which is what
+  dispatch needed.
+- **3.5 (console output):** each printf of a test is one ~1.3 ms write that keeps the CPU (a
+  wait would let same-priority threads run, which `threads/threads/change` rules out). Its pieces
+  are logged together and the time spent when the thread makes its next other call.
+- **3.4 (vblank):** as planned, plus the flag and hcount follow the clock, interrupts pending
+  together run in number order, and the first vblank comes 500 us after boot (the window all the
+  phase-sensitive recordings agree with). The message dialog's start-up is 549.8 ms.
+- **5.4 (sceMpeg):** the small items are in; GetAvcAu's real AU parsing (the L part) is not, so
+  the mpeg/pmf tests stay known differences with smaller diffs.
+- **5.5 (psmfplayer):** not done. Neither item makes a test pass, and both change what games see.
+- **6.3:** the extended memory fixes every line of `threads/threads/create` but the priority one,
+  which needs a 1 us wait timeout and sceKernelCreateThread's cost to disagree with the other
+  tests that calibrate them.
+- **6.4:** not done; it needs march33's ISO driver binary.
+
 PSPC passes 517 of the 559 pspautotests, with the same results in the interpreter and as AOT code.
 None of the 42 failures is a crash, and none comes from the recompiler. Each test runs to the end
 and differs from the output recorded on a real PSP in some detail.

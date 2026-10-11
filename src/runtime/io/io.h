@@ -155,6 +155,9 @@ std::shared_ptr<Device> MakeEmulatorDevice(bool hasDisplay);
 // path.err and path.finish (--test-output), so tests running in parallel each have their own.
 // Before host0: is mounted.
 void SetTestOutput(const std::string &path);
+// host0: shows names as the PC has them (psplink's view, pspautotests io/io) instead of as the
+// memory stick's FAT driver would (io/directory, the default). Before host0 is mounted.
+void SetHost0RawNames(bool raw);
 // The memory stick's raw partition ("msstor0p1:") the XMB queries.
 std::shared_ptr<Device> MakeMsStorDevice();
 

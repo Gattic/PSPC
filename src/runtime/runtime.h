@@ -22,6 +22,7 @@ struct Options {
 	// model for the XMB, whose browser and other plugins use the PSP-2000's extra RAM, and for games
 	// whose PARAM.SFO has MEMSIZE = 1.
 	int largeUserMemory = -1;
+	u32 userMemEnd = 0;  // --user-mem-end: with large memory, where user memory stops (0 = end of RAM)
 	bool strictMemory = false;
 	int timeoutSec = 0;        // stop after this many wall-clock seconds (0 = never)
 	std::string memstickDir;
@@ -49,6 +50,8 @@ struct Options {
 	// pspautotests' host0:/__testoutput.txt (and .err, .finish) are this file (io::SetTestOutput).
 	std::string testOutput;
 	bool testAsPsp = false;  // no emulator devices: pspautotests take the path they take on a PSP
+	bool host0RawNames = false;  // io::SetHost0RawNames
+	std::string host0Extra;      // a folder laid under host0: (io::AddHostFallback)
 	bool edramMirrors = false;  // mem::g_edramMirrors (interpreter only)
 	bool dcacheModel = false;   // dcache::g_enabled (interpreter only)
 	std::string dumpFramesDir;  // write the displayed frame as BMP here every dumpEvery VBlanks

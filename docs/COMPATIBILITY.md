@@ -20,18 +20,27 @@ pspautotests (hardware-recorded expectations), run with `tools/run_autotests.py`
 
 | Run | Passed |
 |---|---|
-| Interpreter | 537 / 559 |
-| AOT (native) | 537 / 559, identical to the interpreter test by test |
+| Interpreter | 539 / 559, the other 20 known differences |
+| AOT (native) | 539 / 559, identical to the interpreter test by test |
+
+The runner's gate is "0 unexpected failures": the 20 tests whose recording pspc can't reproduce
+(hardware jitter, the recording PSP's uptime and memory map, modules the suite doesn't ship,
+behaviour the tests don't pin down) are listed with their reasons in its KNOWN_DIFFERENCES and
+reported apart. A known difference that starts passing is reported so it can come off the list.
 
 The expected output was recorded on PSPs, some with a screen and with psplink's host0:. Where a
 test's recording differs from what pspc gives a test by default, `run_autotests.py` reproduces it
-(its ENVIRONMENT table: the screen path for `gpu/simple/simple`, `io/open/tty0` and
-`font/fonttest`, a generated disc for the `umd/` tests, the file date `io/file/file` expects).
+(its ENVIRONMENT table: the screen path for `gpu/simple/simple`, `io/open/tty0`, `font/fonttest`
+and `jpeg/mjpegcsc`, a generated disc for the `umd/` tests, the file date `io/file/file`
+expects, psplink's host0: names and the recording folder's build products for `io/io/io`, the
+recording PSP's extended user memory for `threads/threads/create`).
 Two hardware details that games must not see are modelled only on request, in the interpreter:
 VRAM's swizzled mirrors (`--edram-mirrors`, for `gpu/ge/edramswizzle`) and the data cache
 (`--dcache-model`, for `cpu/lsu/cacheop`).
-Font tests need the firmware fonts: run it with `--flash0` pointing at an installed flash0. The
-remaining failures and the plan for them: [autotests-plan.md](autotests-plan.md).
+`cpu/vfpu/vregs` ships a .prx older than its .expected: `tools/rebuild_autotests.sh` rebuilds it
+with pspdev (under Linux or WSL) into `build/autotest-rebuilt`, and the runner uses that one (it
+skips the test until then). Font tests need the firmware fonts: run it with `--flash0` pointing
+at an installed flash0. The investigation behind all of this: [autotests-plan.md](autotests-plan.md).
 
 ## Reporting a problem
 

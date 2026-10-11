@@ -115,13 +115,14 @@ void BlockAllocator::Dump() const {
 		LOGI("MEM", "  %08x-%08x %s %s", b.start, b.start + b.size, b.taken ? "used" : "free", b.tag.c_str());
 }
 
-void InitMemoryPartitions(u32 ramSize, bool largeUserMemory) {
+void InitMemoryPartitions(u32 ramSize, bool largeUserMemory, u32 userMemEnd) {
 	// Kernel partition (runtime-internal structures, interrupt stacks, module stubs).
 	// The first 0x4000 bytes are reserved for the magic return stub and friends.
 	g_kernelMem.Init(0x08000000 + 0x4000, 0x00400000 - 0x4000, 0x100);
 	g_volatileMem.Init(0x08400000, 0x00400000, 0x100);
 	u32 userEnd = 0x0A000000;
 	if (largeUserMemory && ramSize > 0x02000000) userEnd = 0x08000000 + ramSize;
+	if (largeUserMemory && userMemEnd > 0x0A000000 && userMemEnd < userEnd) userEnd = userMemEnd & ~0xFFu;
 	g_userMem.Init(0x08800000, userEnd - 0x08800000, 0x100);
 	// The firmware keeps usersystemlib's work area at the bottom of user memory, so the first
 	// module loads at 0x08804000 (cpu/cpu_alu/cpu_branch prints addresses relative to that).

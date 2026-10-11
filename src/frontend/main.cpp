@@ -65,6 +65,7 @@ static void Usage() {
 	        "  --large-mem          let user code use RAM beyond 24 MB (default: for the XMB and\n"
 	        "                       games with MEMSIZE=1 in PARAM.SFO)\n"
 	        "  --no-large-mem       keep user memory at 24 MB, also for the XMB\n"
+	        "  --user-mem-end <addr> with large memory, end user memory there (e.g. 0x0BB00000)\n"
 	        "  --strict-mem         treat bad guest memory accesses as fatal\n"
 	        "  --memstick <dir>     memory stick root (default: <exe>/ms0)\n"
 	        "  --plugins <dir>      M33 plugins folder laid over ms0: (default: the nearest plugins\\)\n"
@@ -83,6 +84,8 @@ static void Usage() {
 	        "  --test-display       report a display to pspautotests (default: none)\n"
 	        "  --test-output <path> pspautotests' host0:/__testoutput.txt (.err, .finish) is <path>\n"
 	        "  --test-as-psp        no emulator devices: pspautotests run as on a PSP (output: host0)\n"
+	        "  --host0-raw-names    host0: names as the PC has them (psplink), not as FAT shows them\n"
+	        "  --host0-extra <dir>  lay another folder under host0: (paths missing from host0 come from it)\n"
 	        "  --edram-mirrors      VRAM mirrors 1 and 3 swizzled as the GE's depth layouts (implies --interp)\n"
 	        "  --dcache-model       model the data cache, write-back as on hardware (implies --interp)\n"
 	        "  --dump-frames <dir>  save the displayed frame as BMP every --dump-every VBlanks (60)\n"
@@ -377,6 +380,7 @@ int main(int argc, char **argv) {
 		else if (a == "--ram") o.ramMB = atoi(next().c_str()) == 32 ? 32 : 64;
 		else if (a == "--large-mem") o.largeUserMemory = 1;
 		else if (a == "--no-large-mem") o.largeUserMemory = 0;
+		else if (a == "--user-mem-end") o.userMemEnd = (u32)strtoul(next().c_str(), nullptr, 0);
 		else if (a == "--strict-mem") o.strictMemory = true;
 		else if (a == "--memstick") o.memstickDir = next();
 		else if (a == "--flash0") o.flash0Dir = next();
@@ -394,6 +398,8 @@ int main(int argc, char **argv) {
 		else if (a == "--test-display") o.hasDisplayForTests = true;
 		else if (a == "--test-output") o.testOutput = next();
 		else if (a == "--test-as-psp") o.testAsPsp = true;
+		else if (a == "--host0-raw-names") o.host0RawNames = true;
+		else if (a == "--host0-extra") o.host0Extra = next();
 		else if (a == "--edram-mirrors") {
 			// Native code doesn't go through the transform.
 			o.edramMirrors = true;

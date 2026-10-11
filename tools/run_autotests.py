@@ -34,7 +34,11 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 #       a file of the test's own. Tests that load modules the suite doesn't ship can't use it.
 #   args: more pspc arguments.
 #   disc: a generated disc (DISCS) inserted as the UMD instead of the one next to the test.
+#   host0_extra: a generated folder (HOST0_EXTRAS) laid under host0: (--host0-extra), for files
+#       the recording folder had and a checkout doesn't.
 #   needs: files the test needs in pspc's flash0 (without them it is skipped).
+#   rebuilt: the shipped .prx predates the .expected; run the one tools/rebuild_autotests.sh
+#       builds in build/autotest-rebuilt instead (without it the test is skipped).
 ENVIRONMENT = {
     # Recorded with a screen: the expected pixels are the top-left of the debug font's "R" that
     # common.c printed into the framebuffer (sceGuClear leaves alpha, so FF000000 stays).
@@ -52,15 +56,59 @@ ENVIRONMENT = {
     'gpu/ge/edramswizzle': {'args': ['--edram-mirrors']},
     'cpu/lsu/cacheop': {'args': ['--dcache-model']},
     'umd/raw_access/raw_access': {'disc': 'umd-test'},
+    # Recorded through psplink, which shows host0: names as the PC has them (io/directory's
+    # recording shows FAT's view, pspc's default), in the author's build folder: io.elf and io.o
+    # sat next to io.c.
+    'io/io/io': {'args': ['--host0-raw-names'], 'host0_extra': 'io-io'},
+    # Recorded on a PSP whose user memory ended at 0x0BB00000, so thread stacks went above
+    # 0x0A000000 and print as "UNKNOWN" (the pmf tests' T_Reader address shows the same end).
+    'threads/threads/create': {'args': ['--large-mem', '--user-mem-end', '0x0BB00000']},
+    # The shipped vregs.prx has 1e+07 in its value table where the source has 100.0, and lacks
+    # three sections the .expected has.
+    'cpu/vfpu/vregs': {'rebuilt': True},
 }
 
 # Generated discs (autotest_fixtures), made once per run in build/autotest-discs.
 DISCS = {'umd-test': 'umd-test.iso'}
 
+# Generated host0: overlays: empty stand-ins for files of the recording folder, in
+# build/autotest-host0/<name>.
+HOST0_EXTRAS = {'io-io': ['tests/io/io/io.elf', 'tests/io/io/io.o']}
+HOST0_EXTRA_DIR = ROOT / 'build' / 'autotest-host0'
+REBUILT_DIR = ROOT / 'build' / 'autotest-rebuilt'
+
 # Tests whose expected output pspc can't reproduce, with why (docs/autotests-plan.md, "What
 # stays different"). They are reported apart from failures; one that starts passing is reported
 # so it can come off the list.
-KNOWN_DIFFERENCES = {}
+KNOWN_DIFFERENCES = {
+    'threads/scheduling/delaylen':
+        'hardware jitter: 210us needs at least 25us of overhead, 500us at most 24us',
+    'threads/scheduling/preemptuser':
+        'hardware jitter: the delay must be <=1024 here and >=1025 in delaylen',
+    'threads/scheduling/scheduling':
+        'one cost in a chain of five is off; which one needs timed hardware data',
+    'display/hcountwrap': 'prints the phase samples of one hardware run',
+    'threads/threads/profiler': "prints the recording PSP's uptime and cache warm-up",
+    'audio/sceaudio/output': 'block 4 differs from blocks 1-3 under identical conditions (jitter)',
+    'sysmem/partition': 'depends on what was resident on the recording PSP',
+    'threads/vpl/memory': 'about 16 KB more was resident on the recording PSP',
+    'threads/threads/create':
+        "one scheduling line: whether a 1us-timeout wait ends inside sceKernelCreateThread's "
+        '~185us (pspc: 235us); the other costs are calibrated by other tests',
+    'video/psmfplayer/basic': "prints addresses inside libpsmfplayer.prx, which the suite doesn't ship",
+    'video/psmfplayer/playmode': "slow motion, step frame and warm-up follow libpsmfplayer's rules",
+    'video/psmfplayer/configplayer':
+        'looping stalls ~100 calls on hardware (re-buffering from host0 over USB, not calibrated)',
+    'video/mpeg/basic': "real AU sizes from the demuxer (sceMpegGetAvcAu) and the ringbuffer's pack count",
+    'video/pmf/pmf': 'same as video/mpeg/basic',
+    'video/pmf_simple/pmf_simple': 'same as video/mpeg/basic',
+    'jpeg/decodeycbcr': 'where hardware writes into the frame buffer with a NULL output is unknown',
+    'jpeg/csc': '"extra bits": not determinable from the test',
+    'jpeg/mjpegcsc': 'heights under 16, strides -4 and 1, height 479: not determinable from the test',
+    'io/iodrv/iodrv': 'line 2 came from an emulator that turned flags 0x202 into 7',
+    'umd/raw_access/raw_access':
+        "a 33-character sce_lbn path and byte offsets on umd0:, which Sony's isofs refuses (an M33 ISO driver)",
+}
 
 
 def prepare_fixtures(tests_dir):
@@ -72,6 +120,11 @@ def prepare_fixtures(tests_dir):
     discs.mkdir(parents=True, exist_ok=True)
     sfo = autotest_fixtures.raw_access_sfo(tests_dir / 'umd' / 'raw_access' / 'raw_access.c')
     autotest_fixtures.build_umd_test_disc(discs / DISCS['umd-test'], sfo)
+    for name, files in HOST0_EXTRAS.items():
+        for rel in files:
+            p = HOST0_EXTRA_DIR / name / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.touch()
     return discs
 
 
@@ -99,8 +152,13 @@ def run_one(args, rel, prx, exp):
     env = ENVIRONMENT.get(rel, {})
     flash0 = pathlib.Path(args.flash0) if args.flash0 else pathlib.Path(args.pspc).parent / 'flash0'
     missing = [n for n in env.get('needs', []) if not (flash0 / n).exists()]
-    if missing:
-        return {'test': rel, 'pass': False, 'skipped': 'needs %s in flash0' % ', '.join(missing), 'exit': None,
+    skip = 'needs %s in flash0' % ', '.join(missing) if missing else None
+    if env.get('rebuilt'):
+        prx = REBUILT_DIR / (rel + '.prx')
+        if not prx.exists():
+            skip = 'needs the rebuilt prx (tools/rebuild_autotests.sh)'
+    if skip:
+        return {'test': rel, 'pass': False, 'skipped': skip, 'exit': None,
                 'seconds': 0, 'expected_lines': 0, 'got_lines': 0, 'first_diff': None, 'stderr_tail': []}
     cmd = [args.pspc, '--config', 'none', '--no-plugins', '--headless', '--fast-time', '--timeout', str(args.timeout), '--log', 'warn']
     if not args.aot:
@@ -125,6 +183,8 @@ def run_one(args, rel, prx, exp):
     elif mode == 'psp':
         cmd.append('--test-as-psp')
     cmd += env.get('args', [])
+    if 'host0_extra' in env:
+        cmd += ['--host0-extra', str(HOST0_EXTRA_DIR / env['host0_extra'])]
     # A disc image shipped next to the test is inserted as the UMD (or a generated one).
     if 'disc' in env:
         cmd += ['--umd', str(args.discs / DISCS[env['disc']])]
@@ -202,6 +262,8 @@ def main():
             if args.verbose or not r['pass']:
                 status = 'PASS' if r['pass'] else ('KNOWN' if r['test'] in KNOWN_DIFFERENCES else 'FAIL')
                 print('%s %-50s exit=%s %.1fs' % (status, r['test'], r['exit'], r['seconds']))
+                if status == 'KNOWN' and args.verbose:
+                    print('    known: %s' % KNOWN_DIFFERENCES[r['test']])
                 if not r['pass'] and r['first_diff'] and args.verbose:
                     d = r['first_diff']
                     print('    line %d: expected %r' % (d['line'], d['expected']))

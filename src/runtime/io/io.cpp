@@ -43,6 +43,7 @@ u32 g_msStickWords[4] = {};
 // as a user would (ChangeMemoryStick, defined after HostDevice).
 std::string g_otherStick;
 std::string g_testOutput;  // SetTestOutput
+bool g_host0RawNames = false;  // SetHost0RawNames
 bool g_msChangeArmed = false;  // a copy between sticks is under way
 bool g_otherStickIn = false;   // the second stick is in ms0:
 void ChangeMemoryStick();
@@ -205,7 +206,7 @@ private:
 			// (io/directory).
 			cls_ = DevClass::Host;
 			o.fat = false;
-			o.upperCase83 = true;
+			o.upperCase83 = !(name == "host0" && g_host0RawNames);
 			if (name == "host0" && !g_testOutput.empty()) {
 				const std::filesystem::path out = std::filesystem::u8path(g_testOutput);
 				o.redirects = {{"__testoutput.txt", out},
@@ -585,6 +586,7 @@ std::shared_ptr<Device> MakeVfsDevice(std::shared_ptr<vfs::FileSystem> fs, DevCl
 std::shared_ptr<Device> MakeEmulatorDevice(bool hasDisplay) { return std::make_shared<EmulatorDevice>(hasDisplay); }
 
 void SetTestOutput(const std::string &path) { g_testOutput = path; }
+void SetHost0RawNames(bool raw) { g_host0RawNames = raw; }
 
 std::shared_ptr<Device> MakeMsStorDevice() { return std::make_shared<MsStorDevice>(); }
 

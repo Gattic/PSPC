@@ -40,7 +40,8 @@ extern BlockAllocator g_kernelMem;
 extern BlockAllocator g_userMem;
 extern BlockAllocator g_volatileMem;
 
-void InitMemoryPartitions(u32 ramSize, bool largeUserMemory);
+// userMemEnd (with largeUserMemory): where user memory stops, if before the end of RAM.
+void InitMemoryPartitions(u32 ramSize, bool largeUserMemory, u32 userMemEnd = 0);
 BlockAllocator *AllocatorForPartition(int partition);
 BlockAllocator *AllocatorForAddress(u32 addr);
 // Convenience allocations for runtime-internal structures. Fatal on failure.
