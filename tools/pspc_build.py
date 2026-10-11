@@ -79,11 +79,13 @@ def vs_env():
                          stdout=subprocess.PIPE, text=True).stdout.strip()
     vcvars = pathlib.Path(out) / 'VC' / 'Auxiliary' / 'Build' / 'vcvars64.bat'
     env_out = subprocess.run('call "%s" >nul && set' % vcvars, shell=True, stdout=subprocess.PIPE, text=True).stdout
-    env = dict(os.environ)
+    # Variable names are case-insensitive: os.environ has PATH, but `set` prints the spelling the
+    # process got (Path when started from Explorer), and a second key would lose VS's PATH.
+    env = {k.upper(): v for k, v in os.environ.items()}
     for line in env_out.splitlines():
         if '=' in line:
             k, v = line.split('=', 1)
-            env[k] = v
+            env[k.upper()] = v
     links = pathlib.Path(os.environ.get('LOCALAPPDATA', '')) / 'Microsoft' / 'WinGet' / 'Links'
     env['PATH'] = env.get('PATH', '') + os.pathsep + str(links) + os.pathsep + r'C:\Program Files\LLVM\bin'
     return env
