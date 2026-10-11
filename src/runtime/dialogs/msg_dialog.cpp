@@ -16,9 +16,11 @@ namespace utility {
 
 namespace {
 
-// On a PSP this takes 534-550 ms in utility/msgdialog/dialog, and 625-675 ms when the access and
-// graphics threads share one priority and take turns (utility/msgdialog/workshare).
-constexpr int MSG_INIT_DELAY_US = 549000;
+// On a PSP this takes ~550 ms: in utility/msgdialog/dialog the first dialog is running 34 frames
+// after it starts and the later ones after 35, which, given where in its frame each starts, puts it
+// at 549.5-550.6 ms. 625-675 ms when the access and graphics threads share one priority and take
+// turns (utility/msgdialog/workshare).
+constexpr int MSG_INIT_DELAY_US = 549800;
 constexpr int MSG_INIT_SHARED_DELAY_US = 640000;
 constexpr int MSG_SHUTDOWN_DELAY_US = 26000;
 

@@ -21,6 +21,8 @@ namespace sched {
 using kernel::PspThread;
 
 constexpr u64 kCpuHz = 222000000;
+// QueueInterrupt's default: after every numbered interrupt.
+constexpr int kLastInterrupt = 0x7FFF;
 
 void Init(bool fastTime);
 void Shutdown();
@@ -44,6 +46,12 @@ void BusyDelayCycles(s64 cycles);
 // (worse threads run). In real time all of it is a wait. Does nothing where a thread can't wait
 // (no thread, an interrupt, dispatch off).
 void SpendUs(u64 busyUs, u64 waitUs);
+// The next thread to get the CPU (even the one that had it) spends `cycles` getting there in place
+// of the usual switch: the latency of an interrupt that woke threads. Fast-time mode only.
+void SetDispatchLatency(s64 cycles);
+// Deterministic jitter, 0..maxCycles: what varies from run to run on hardware (the same sequence
+// every run).
+s64 JitterCycles(s64 maxCycles);
 u64 ScheduleEvent(u64 atUs, std::function<void()> fn);
 void CancelEvent(u64 id);
 // Run fn on the emulation thread as soon as possible (thread-safe; for host threads).
@@ -119,6 +127,8 @@ bool InInterrupt();
 u32 RunInterruptHandler(u32 func, u32 gp, std::initializer_list<u32> args, u32 stackReserve = 0);
 u32 InterruptStackTop();
 // Queue an interrupt-context action to run at the next scheduling point.
-void QueueInterrupt(std::function<void()> fn);
+// intrNo orders interrupts pending together (interrupts were off): the lowest number first, as
+// the interrupt controller takes them; those of one number in the order queued.
+void QueueInterrupt(std::function<void()> fn, int intrNo = kLastInterrupt);
 
 }  // namespace sched

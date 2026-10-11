@@ -29,13 +29,14 @@ struct SubIntr {
 std::map<int, std::map<int, SubIntr>> g_subIntrs;
 }  // namespace
 
-void TriggerAll(int intrNo) {
+void TriggerAll(int intrNo, s64 extraCycles) {
 	auto it = g_subIntrs.find(intrNo);
 	if (it == g_subIntrs.end()) return;
 	for (auto &kv : it->second) {
 		const SubIntr &s = kv.second;
 		if (!s.enabled || !s.handler) continue;
 		sched::RunInterruptHandler(s.handler, s.gp, {(u32)kv.first, s.arg});
+		if (extraCycles) sched::ChargeCycles(extraCycles);
 	}
 }
 

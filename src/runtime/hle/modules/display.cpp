@@ -2,8 +2,10 @@
 // Portions derived from PPSSPP (https://github.com/hrydgard/ppsspp), Copyright (c) 2012- PPSSPP Project, GPL-2.0-or-later.
 //
 // sceDisplay: framebuffer selection, VBlank timing and presentation of the selected framebuffer to the
-// host window at each VBlank, with the sceUtility dialogs and the HOME menu drawn over it (ppge). Timing as PPSSPP measured it: a frame is 1001/60 ms, starting when the
-// vblank does; the vblank lasts 0.77 ms and the hcount counts 286 lines a frame from 1.
+// host window at each VBlank, with the sceUtility dialogs and the HOME menu drawn over it (ppge). A
+// frame is 1001/60 ms of 286 lines, starting with the vblank interrupt at the end of the last line
+// (pspautotests display/vblankphase: the vblank flag is on from there for ~818 us, the hcount wraps
+// to 0 in the interrupt).
 #include <algorithm>
 #include <cmath>
 #include <functional>
@@ -33,14 +35,26 @@ namespace display {
 namespace {
 
 constexpr double kFrameUs = 1001000.0 / 60.0;
-// tests/display/vblanklen: 730-770us from sceDisplayWaitVblankStart returning until the vblank ends.
-constexpr double kVblankUs = 770.0;
+// How long the vblank flag stays on after the interrupt: line 14 just starts in it (the hcount is
+// seen at 13 or 14 last: display/hcount, vblanklen) and a waiter sees 730-740us of it.
+constexpr double kVblankUs = 816.0;
+// Where the first vblank falls after boot. On hardware a test starts anywhere in a frame; the
+// recordings that depend on it agree with 0-1000us (ctrl/vblank, threads/fpl/tryallocate,
+// threads/msgpipe/delete, threads/scheduling/callcosts).
+constexpr double kFirstVblankUs = 500.0;
+// The vblank interrupt's own time (display/vblankphase, threads/scheduling/vblankwake): ~28us
+// before the handlers, ~12us for each (9 on top of what the handler's own calls cost), ~36us after. The first thread it woke then gets the CPU
+// ~11us later (~1.5us more for each other one woken), give or take a few us, and returning from
+// sceDisplayWaitVblankStart takes ~6us: a lone waiter runs ~81us after the interrupt, more waiting
+// at a better priority than the running thread follow ~12us apart.
+constexpr s64 kIntrEntryCycles = 28 * 222, kIntrHandlerCycles = 9 * 222, kIntrExitCycles = 36 * 222;
+constexpr s64 kWakeLatencyCycles = 11 * 222, kWakeEachCycles = 333, kWakeJitterCycles = 4 * 222;
+constexpr s64 kWaitReturnCycles = 6 * 222;
 // sceDisplayIsVsync's window into the frame (guesses from tests).
 constexpr double kVsyncStartUs = 592.5;
 constexpr double kVsyncEndUs = 726.5;
 constexpr int kLinesPerFrame = 286;
-constexpr u64 kCyclesPerLine = sched::kCpuHz / 60 / kLinesPerFrame;
-constexpr u64 kCyclesPerUs = sched::kCpuHz / 1000000;
+constexpr double kLineUs = kFrameUs / kLinesPerFrame;
 
 struct FrameBuf {
 	u32 addr = 0x04000000;
@@ -78,7 +92,6 @@ bool g_hasSetMode = false;
 int g_mode = 0, g_width = 480, g_height = 272;
 u32 g_vcount = 0;
 u32 g_hcountBase = 0;  // the accumulated hcount at the start of this frame
-bool g_inVblank = false;
 double g_bootUs = 0;
 double g_frameStartUs = 0;  // when the last vblank started
 u64 g_frames = 0;           // vblanks so far
@@ -88,7 +101,7 @@ WaitQueue g_vblankWaiters;
 std::vector<u32> g_rgba;
 std::function<void()> g_vblankHook;
 
-u64 EnterUs(u64 frame) { return (u64)std::llround(g_bootUs + kFrameUs - kVblankUs + (double)frame * kFrameUs); }
+u64 EnterUs(u64 frame) { return (u64)std::llround(g_bootUs + kFirstVblankUs + (double)frame * kFrameUs); }
 
 void Present() {
 	const FrameBuf &fb = Shown();
@@ -120,18 +133,12 @@ void Present() {
 	host::PresentFrame(g_rgba.data(), 480, 272, 480);
 }
 
-void OnLeaveVblank() {
-	g_inVblank = false;
-}
-
 void OnEnterVblank() {
 	g_frameStartUs = (double)EnterUs(g_frames);
 	g_frames++;
-	g_inVblank = true;
 	g_vcount++;
 	g_hcountBase += kLinesPerFrame;
 	if (g_hcountBase > 0x7FFFFFFF) g_hcountBase -= 0x80000000;
-	sched::ScheduleEvent((u64)std::llround(g_frameStartUs + kVblankUs), OnLeaveVblank);
 
 	if (g_latchPending) {
 		g_current = g_latched;
@@ -141,8 +148,7 @@ void OnEnterVblank() {
 	Present();
 	if (g_vblankHook) g_vblankHook();
 
-	// The waiters for this vblank are released ~48us after it, plus ~9us for each one beyond the first
-	// (pspautotests threads/scheduling/vblankwake). Which vblank a wait is for is decided now.
+	// Which vblank a wait is for is decided now; the interrupt releases the waiters at its end.
 	g_vblankWaiters.Cleanup(WAITTYPE_VBLANK, 0);
 	std::vector<SceUID> waiters = g_vblankWaiters.threads, release;
 	g_vblankWaiters.threads.clear();
@@ -156,17 +162,23 @@ void OnEnterVblank() {
 		}
 		release.push_back(id);
 	}
-	if (!release.empty()) {
-		const double at = g_frameStartUs + 48.0 + 9.0 * (double)(release.size() - 1);
-		sched::ScheduleEvent((u64)std::llround(at), [release]() {
-			for (SceUID id : release) {
-				PspThread *t = Get<PspThread>(id);
-				if (WaitQueue::IsWaitingOn(t, WAITTYPE_VBLANK, 0)) sched::Wake(t, 0);
-			}
-		});
-	}
 
-	sched::QueueInterrupt([]() { intr::TriggerAll(intr::PSP_VBLANK_INT); });
+	sched::QueueInterrupt([release]() {
+		sched::ChargeCycles(kIntrEntryCycles);
+		intr::TriggerAll(intr::PSP_VBLANK_INT, kIntrHandlerCycles);
+		sched::ChargeCycles(kIntrExitCycles);
+		int woken = 0;
+		for (SceUID id : release) {
+			PspThread *t = Get<PspThread>(id);
+			if (!WaitQueue::IsWaitingOn(t, WAITTYPE_VBLANK, 0)) continue;
+			sched::Wake(t, 0);
+			woken++;
+		}
+		if (woken) {
+			sched::SetDispatchLatency(kWakeLatencyCycles + kWakeEachCycles * (woken - 1) +
+			                          sched::JitterCycles(kWakeJitterCycles));
+		}
+	}, intr::PSP_VBLANK_INT);
 	sched::ScheduleEvent(EnterUs(g_frames), OnEnterVblank);
 }
 
@@ -187,7 +199,6 @@ void Init() {
 	g_height = 272;
 	g_vcount = 0;
 	g_hcountBase = 0;
-	g_inVblank = false;
 	g_frames = 0;
 	g_vblankWaiters.threads.clear();
 	g_bootUs = (double)sched::NowUs();
@@ -243,12 +254,28 @@ void CurrentFramebuffer(u32 &addr, int &stride, int &format) {
 
 u32 Vcount() { return g_vcount; }
 
-bool InVblank() { return g_inVblank; }
+// How far into its frame the clock is. The flag and the hcount are the display's counters, so they
+// follow the clock even where an HLE call's time has run past a vblank the scheduler hasn't
+// processed yet.
+// Before the first vblank, the time since boot (not in a vblank).
+double IntoFrameUs(bool *beforeFirst = nullptr) {
+	const double now = (double)sched::NowUs();
+	double start = g_frameStartUs;
+	const bool next = now >= (double)EnterUs(g_frames);
+	if (next) start = (double)EnterUs(g_frames);
+	if (beforeFirst) *beforeFirst = !g_frames && !next;
+	return std::max(0.0, now - start);
+}
+
+bool InVblank() {
+	bool beforeFirst;
+	const double into = IntoFrameUs(&beforeFirst);
+	return !beforeFirst && into < kVblankUs;
+}
 
 u32 CurrentHcount() {
-	const double into = std::max(0.0, (double)sched::NowUs() - g_frameStartUs);
-	// Can't seem to produce a 0 on real hardware, offsetting by 1 makes things look right (PPSSPP).
-	return 1 + (u32)((u64)(into * (double)kCyclesPerUs) / kCyclesPerLine);
+	// 0 from the interrupt, which takes most of line 0 (a thread first reads 1).
+	return std::min<u32>((u32)(IntoFrameUs() / kLineUs), kLinesPerFrame - 1);
 }
 
 void ConvertFramebuffer(u32 addr, int stride, int format, int width, int height, std::vector<u32> &out) {
@@ -310,7 +337,9 @@ int WaitVblankStart(int count, bool cb) {
 	if (untilNext <= 115.0) count++;
 	t->waitValue[0] = (u32)std::max(count, 1);
 	g_vblankWaiters.Add(t->uid);
-	return sched::Wait(WAITTYPE_VBLANK, 0, 0, cb);
+	const int result = sched::Wait(WAITTYPE_VBLANK, 0, 0, cb);
+	sched::ChargeCycles(kWaitReturnCycles);
+	return result;
 }
 
 }  // namespace display

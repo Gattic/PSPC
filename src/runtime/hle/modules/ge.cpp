@@ -15,6 +15,7 @@
 #include "runtime/hle/hle_wrap.h"
 #include "runtime/hle/modules/modules.h"
 #include "runtime/kernel/errors.h"
+#include "runtime/kernel/interrupts.h"
 #include "runtime/kernel/scheduler.h"
 #include "runtime/kernel/waitqueue.h"
 
@@ -149,7 +150,7 @@ void DeliverInterrupt() {
 
 void OnInterruptPending(void *, u64 at) {
 	g_intrQueued = true;
-	AtTicks(at, [] { sched::QueueInterrupt(&DeliverInterrupt); });
+	AtTicks(at, [] { sched::QueueInterrupt(&DeliverInterrupt, intr::PSP_GE_INT); });
 }
 
 void WakeListWaiters(int listId) {

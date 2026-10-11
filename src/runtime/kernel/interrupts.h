@@ -21,12 +21,14 @@ enum : int {
 	PSP_VBLANK_INT = 30,
 	PSP_MECODEC_INT = 31,
 	PSP_HPREMOTE_INT = 36,
+	PSP_THREAD0_INT = 66,  // threadman's timer: alarms and vtimers
 	PSP_NUMBER_INTERRUPTS = 67,
 };
 
 // Runs every enabled sub-handler of `intrNo` (in interrupt context, from the scheduler).
-// Handlers receive (subIntrNo, arg).
-void TriggerAll(int intrNo);
+// Handlers receive (subIntrNo, arg); each also costs extraCycles of the interrupt's own time
+// after it returns.
+void TriggerAll(int intrNo, s64 extraCycles = 0);
 // Runs a specific sub handler with an explicit second argument (GE signal/finish).
 void TriggerSub(int intrNo, int subIntrNo, u32 arg);
 bool HasEnabledHandler(int intrNo, int subIntrNo);

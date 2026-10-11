@@ -9,6 +9,7 @@
 #include "common/log.h"
 #include "runtime/hle/hle_wrap.h"
 #include "runtime/kernel/errors.h"
+#include "runtime/kernel/interrupts.h"
 #include "runtime/kernel/kernel_hle.h"
 #include "runtime/kernel/scheduler.h"
 
@@ -55,7 +56,7 @@ void FireAlarm(SceUID id) {
 		} else {
 			Destroy(id);
 		}
-	});
+	}, intr::PSP_THREAD0_INT);
 }
 
 void ArmAlarm(SceUID id, u64 atUs) {
@@ -155,7 +156,7 @@ void FireVTimer(SceUID id) {
 		} else {
 			ScheduleVTimer(v, v->schedule + result);
 		}
-	});
+	}, intr::PSP_THREAD0_INT);
 }
 
 void ScheduleVTimer(VTimer *vt, u64 schedule) {

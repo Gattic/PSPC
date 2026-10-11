@@ -102,7 +102,7 @@ HANDLE g_timer = nullptr;
 
 bool g_dispatchEnabled = true;
 bool g_inInterrupt = false;
-std::deque<std::function<void()>> g_interrupts;
+std::deque<std::pair<int, std::function<void()>>> g_interrupts;
 alignas(64) Ctx g_intrCtx;
 u32 g_intrStackTop = 0;
 
@@ -220,8 +220,12 @@ void DrainHostPosts() {
 
 void RunInterrupts() {
 	while (!g_interrupts.empty() && *g_intrEnabled) {
-		auto fn = std::move(g_interrupts.front());
-		g_interrupts.pop_front();
+		auto best = g_interrupts.begin();
+		for (auto it = g_interrupts.begin(); it != g_interrupts.end(); ++it) {
+			if (it->first < best->first) best = it;
+		}
+		auto fn = std::move(best->second);
+		g_interrupts.erase(best);
 		fn();
 	}
 }
@@ -236,9 +240,15 @@ void FreeDeadFibers() {
 	g_pendingDelete.clear();
 }
 
+s64 g_dispatchLatency = -1;  // SetDispatchLatency, for the next RunThread
+u32 g_jitterState = 0x9E3779B9;
+
 void RunThread(PspThread *t) {
 	if (t->inReadyQueue) RemoveFromReady(t);
-	if (g_lastRun != t && g_lastRun != nullptr) {
+	if (g_dispatchLatency >= 0) {
+		ChargeCycles(g_dispatchLatency);
+		g_dispatchLatency = -1;
+	} else if (g_lastRun != t && g_lastRun != nullptr) {
 		const bool preempts = g_lastRun->busy || (g_lastRun->status & (THREADSTATUS_READY | THREADSTATUS_RUNNING)) != 0;
 		ChargeCycles(kSwitchCycles + (t->timerWoken && preempts ? kTimerDispatchCycles : 0));
 	}
@@ -323,6 +333,8 @@ bool RunBusy() {
 	if (!busy) return false;
 	PspThread *ready = PeekBestReady();
 	if (ready && ready->currentPriority < busy->currentPriority) return false;
+	// The interrupt returns to the busy call, not to a thread it woke.
+	g_dispatchLatency = -1;
 	// Getting back to the busy thread after another one ran costs a switch, as for any thread.
 	if (g_lastRun != busy) {
 		if (g_lastRun != nullptr) ChargeCycles(kSwitchCycles);
@@ -589,6 +601,8 @@ void Init(bool fastTime) {
 	u32 stack = kernel::AllocKernelMemory(0x4000, "interrupt stack");
 	g_intrStackTop = stack + 0x4000 - 0x10;
 	g_chanceAccumulator = 50;
+	g_dispatchLatency = -1;
+	g_jitterState = 0x9E3779B9;
 	g_dispatchEnabled = true;
 }
 
@@ -640,6 +654,20 @@ void BusyDelayCycles(s64 cycles) {
 	g_busy.push_back(t->uid);
 	DoWait(t, WAITTYPE_HLEDELAY, 2, 0, 0, 0, false, 0, nullptr);
 	t->busy = false;
+}
+
+void SetDispatchLatency(s64 cycles) {
+	if (g_fastTime) g_dispatchLatency = std::max<s64>(cycles, 0);
+}
+
+s64 JitterCycles(s64 maxCycles) {
+	if (maxCycles <= 0) return 0;
+	u32 x = g_jitterState;
+	x ^= x << 13;
+	x ^= x >> 17;
+	x ^= x << 5;
+	g_jitterState = x;
+	return (s64)(x % (u32)(maxCycles + 1));
 }
 
 void SpendUs(u64 busyUs, u64 waitUs) {
@@ -1107,6 +1135,6 @@ u32 RunInterruptHandler(u32 func, u32 gp, std::initializer_list<u32> args, u32 s
 	return result;
 }
 
-void QueueInterrupt(std::function<void()> fn) { g_interrupts.push_back(std::move(fn)); }
+void QueueInterrupt(std::function<void()> fn, int intrNo) { g_interrupts.emplace_back(intrNo, std::move(fn)); }
 
 }  // namespace sched
