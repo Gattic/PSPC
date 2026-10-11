@@ -23,9 +23,12 @@ pspautotests (hardware-recorded expectations), run with `tools/run_autotests.py`
 | Interpreter | 517 / 559 |
 | AOT (native) | 517 / 559, identical to the interpreter test by test |
 
-Known not-passable tests include `cpu/vfpu/vregs` (the shipped `.prx` predates its `.expected`),
-`cpu/cacheop` (needs a data-cache model), `gpu/simple/simple` (depends on the PSP data cache), and
-several timing tests whose expected output records hardware jitter.
+The expected output was recorded on PSPs, some with a screen and with psplink's host0:. Where a
+test's recording differs from what pspc gives a test by default, `run_autotests.py` reproduces it
+(its ENVIRONMENT table: the screen path for `gpu/simple/simple`, `io/open/tty0` and
+`font/fonttest`, a generated disc for the `umd/` tests, the file date `io/file/file` expects).
+Font tests need the firmware fonts: run it with `--flash0` pointing at an installed flash0. The
+remaining failures and the plan for them: [autotests-plan.md](autotests-plan.md).
 
 ## Reporting a problem
 

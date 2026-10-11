@@ -24,6 +24,9 @@ struct HostFsOptions {
 	// so a "save.dat" written by Windows appears as "SAVE.DAT" on hardware (host0: shows the same
 	// in io/directory).
 	bool upperCase83 = false;
+	// Names in the volume's root that are other host files (lower case, no '/'): pspautotests'
+	// host0:/__testoutput.txt goes to a file of each test's own when tests run in parallel.
+	std::vector<std::pair<std::string, std::filesystem::path>> redirects;
 };
 
 class HostFileSystem : public FileSystem {

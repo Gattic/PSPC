@@ -356,8 +356,13 @@ int RunOnce(const Options &o, BootTarget bt) {
 		LOGI("M33", "Plugins folder %s overlays ms0:", o.pluginsDir.c_str());
 	io::Mount("flash0", io::MakeHostDevice(o.flash0Dir, true));
 	io::Mount("flash1", io::MakeHostDevice(o.flash1Dir, false));
-	io::Mount("emulator", io::MakeEmulatorDevice(o.hasDisplayForTests));
-	io::Mount("kemulator", io::MakeEmulatorDevice(o.hasDisplayForTests));
+	// --test-as-psp: no emulator devices, as on a PSP. pspautotests then show their output on the
+	// screen, write it to host0:/__testoutput.txt only, and start the threads they start there.
+	if (!o.testAsPsp) {
+		io::Mount("emulator", io::MakeEmulatorDevice(o.hasDisplayForTests));
+		io::Mount("kemulator", io::MakeEmulatorDevice(o.hasDisplayForTests));
+	}
+	io::SetTestOutput(o.testOutput);
 	kernel::SetAotCacheDir(o.aotDir);
 	kernel::SetAotEnabled(o.aot);
 	g_aotDirForHints = o.aotDir;

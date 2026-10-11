@@ -318,6 +318,21 @@ u32 HostFileSystem::Caps() const {
 }
 
 s32 HostFileSystem::Resolve(std::string_view path, bool allowMissingLast, std::wstring *hostPath, std::vector<std::string> *comps) {
+	if (!opt_.redirects.empty()) {
+		std::string_view name = path;
+		while (!name.empty() && (name.front() == '/' || name.front() == '\\')) name.remove_prefix(1);
+		if (!name.empty() && name.find_first_of("/\\") == std::string_view::npos) {
+			std::string lower(name);
+			for (char &c : lower) c = (char)tolower((unsigned char)c);
+			for (const auto &r : opt_.redirects) {
+				if (r.first != lower) continue;
+				*hostPath = r.second.wstring();
+				if (comps) *comps = {std::string(name)};
+				std::error_code ec;
+				return std::filesystem::exists(r.second, ec) ? 1 : 0;
+			}
+		}
+	}
 	s32 r = ResolveIn(rootW_, path, allowMissingLast, hostPath, comps);
 	if (r == 1 || fallbackW_.empty()) {
 		return r;

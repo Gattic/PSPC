@@ -145,6 +145,10 @@ void OnDirectoryOpen(const std::string &device, const std::string &path);
 std::shared_ptr<Device> MakeVfsDevice(std::shared_ptr<vfs::FileSystem> fs, DevClass cls);
 // "emulator:" device pspautotests send their output through.
 std::shared_ptr<Device> MakeEmulatorDevice(bool hasDisplay);
+// pspautotests' host0:/__testoutput.txt, __testerror.txt and __testfinish.txt are `path`,
+// path.err and path.finish (--test-output), so tests running in parallel each have their own.
+// Before host0: is mounted.
+void SetTestOutput(const std::string &path);
 // The memory stick's raw partition ("msstor0p1:") the XMB queries.
 std::shared_ptr<Device> MakeMsStorDevice();
 

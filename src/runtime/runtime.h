@@ -46,6 +46,9 @@ struct Options {
 	std::string padStick = "left";
 	std::string screenshotDir;  // F12 (default: <exe>/screenshots)
 	bool hasDisplayForTests = false;
+	// pspautotests' host0:/__testoutput.txt (and .err, .finish) are this file (io::SetTestOutput).
+	std::string testOutput;
+	bool testAsPsp = false;  // no emulator devices: pspautotests take the path they take on a PSP
 	std::string dumpFramesDir;  // write the displayed frame as BMP here every dumpEvery VBlanks
 	int dumpEvery = 60;
 	// GE renderer: "software" (the default, the accuracy reference), "d3d11" or "d3d11-warp" (the

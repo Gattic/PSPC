@@ -81,6 +81,8 @@ static void Usage() {
 	        "  --log <level>        trace|debug|info|warn|error (default info)\n"
 	        "  --log-file <path>    write the log to a file\n"
 	        "  --test-display       report a display to pspautotests (default: none)\n"
+	        "  --test-output <path> pspautotests' host0:/__testoutput.txt (.err, .finish) is <path>\n"
+	        "  --test-as-psp        no emulator devices: pspautotests run as on a PSP (output: host0)\n"
 	        "  --dump-frames <dir>  save the displayed frame as BMP every --dump-every VBlanks (60)\n"
 	        "  --renderer <name>    GE renderer: software (default) or d3d11 (GPU; d3d11-warp: WARP device)\n"
 	        "  --render-scale <n>   d3d11 internal resolution, 1-16 times the PSP's (default 1; 8 = 4K, 16 = 8K)\n"
@@ -388,6 +390,8 @@ int main(int argc, char **argv) {
 		else if (a == "--fw") o.firmwareVersion = ParseFw(next());
 		else if (a == "--scale") o.windowScale = atoi(next().c_str());
 		else if (a == "--test-display") o.hasDisplayForTests = true;
+		else if (a == "--test-output") o.testOutput = next();
+		else if (a == "--test-as-psp") o.testAsPsp = true;
 		else if (a == "--dump-frames") o.dumpFramesDir = next();
 		else if (a == "--dump-every") o.dumpEvery = atoi(next().c_str());
 		else if (a == "--renderer") o.renderer = next();

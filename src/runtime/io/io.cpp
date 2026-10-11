@@ -40,6 +40,7 @@ u32 g_msStickWords[4] = {};
 // The other memory stick (a host folder): when the XMB asks for another stick, PSPC swaps them
 // as a user would (ChangeMemoryStick, defined after HostDevice).
 std::string g_otherStick;
+std::string g_testOutput;  // SetTestOutput
 bool g_msChangeArmed = false;  // a copy between sticks is under way
 bool g_otherStickIn = false;   // the second stick is in ms0:
 void ChangeMemoryStick();
@@ -203,6 +204,12 @@ private:
 			cls_ = DevClass::Host;
 			o.fat = false;
 			o.upperCase83 = true;
+			if (name == "host0" && !g_testOutput.empty()) {
+				const std::filesystem::path out = std::filesystem::u8path(g_testOutput);
+				o.redirects = {{"__testoutput.txt", out},
+				               {"__testerror.txt", std::filesystem::path(out).concat(".err")},
+				               {"__testfinish.txt", std::filesystem::path(out).concat(".finish")}};
+			}
 		}
 		fs_ = std::make_shared<vfs::HostFileSystem>(root, o);
 	}
@@ -531,6 +538,8 @@ std::shared_ptr<Device> MakeVfsDevice(std::shared_ptr<vfs::FileSystem> fs, DevCl
 }
 
 std::shared_ptr<Device> MakeEmulatorDevice(bool hasDisplay) { return std::make_shared<EmulatorDevice>(hasDisplay); }
+
+void SetTestOutput(const std::string &path) { g_testOutput = path; }
 
 std::shared_ptr<Device> MakeMsStorDevice() { return std::make_shared<MsStorDevice>(); }
 
