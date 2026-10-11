@@ -288,6 +288,12 @@ bool IsDisc(const fs::path &p) {
 	return ext == ".iso" || ext == ".cso" || ext == ".zso" || ext == ".dax";
 }
 
+// A PBP's PARAM.SFO, ICON0 or PIC1, unless its offsets make it implausibly big.
+bool GetPbpMetadata(const vfs::PbpFile &pbp, vfs::PbpSection which, std::vector<u8> &out) {
+	out.clear();
+	return pbp.SectionSize(which) <= vfs::kMaxMetadataBytes && pbp.GetSection(which, out);
+}
+
 bool Describe(const fs::path &p, Game &g) {
 	g.path = p;
 	g.title = p.stem().wstring();
@@ -301,16 +307,16 @@ bool Describe(const fs::path &p, Game &g) {
 		vfs::IsoFileSystem iso(std::shared_ptr<vfs::BlockDevice>(std::move(bd)));
 		if (!iso.IsValid()) return false;
 		std::vector<u8> sfo;
-		if (iso.ReadWholeFile("/PSP_GAME/PARAM.SFO", sfo) == 0) ReadSfo(sfo, g);
-		iso.ReadWholeFile("/PSP_GAME/ICON0.PNG", g.icon);
+		if (iso.ReadWholeFile("/PSP_GAME/PARAM.SFO", sfo, vfs::kMaxMetadataBytes) == 0) ReadSfo(sfo, g);
+		iso.ReadWholeFile("/PSP_GAME/ICON0.PNG", g.icon, vfs::kMaxMetadataBytes);
 		return true;
 	}
 	if (ext == ".pbp") {
 		vfs::PbpFile pbp;
 		if (!pbp.Open(p)) return false;
 		std::vector<u8> sfo;
-		if (pbp.GetSection(vfs::PbpSection::ParamSfo, sfo)) ReadSfo(sfo, g);
-		pbp.GetSection(vfs::PbpSection::Icon0Png, g.icon);
+		if (GetPbpMetadata(pbp, vfs::PbpSection::ParamSfo, sfo)) ReadSfo(sfo, g);
+		GetPbpMetadata(pbp, vfs::PbpSection::Icon0Png, g.icon);
 		if (p.filename() == "EBOOT.PBP" && g.title.empty()) g.title = p.parent_path().filename().wstring();
 		return true;
 	}
@@ -323,11 +329,11 @@ std::vector<u8> ReadPic1(const fs::path &p) {
 		std::string err;
 		if (auto bd = vfs::OpenBlockDevice(p, &err)) {
 			vfs::IsoFileSystem iso(std::shared_ptr<vfs::BlockDevice>(std::move(bd)));
-			if (iso.IsValid() && iso.ReadWholeFile("/PSP_GAME/PIC1.PNG", png) != 0) png.clear();
+			if (iso.IsValid() && iso.ReadWholeFile("/PSP_GAME/PIC1.PNG", png, vfs::kMaxMetadataBytes) != 0) png.clear();
 		}
 	} else if (ToLower(p.extension().string()) == ".pbp") {
 		vfs::PbpFile pbp;
-		if (pbp.Open(p)) pbp.GetSection(vfs::PbpSection::Pic1Png, png);
+		if (pbp.Open(p)) GetPbpMetadata(pbp, vfs::PbpSection::Pic1Png, png);
 	}
 	return png;
 }
@@ -847,8 +853,8 @@ void ChooseGamesFolder() {
 // ---- the selected game's panel
 
 struct DetailRects {
-	Gdiplus::RectF hero, icon, title, chips, status, play, build, interp, path, show;
-	std::wstring statusText, statusNote;
+	Gdiplus::RectF hero, icon, title, chips, sizeNote, status, play, build, interp, path, show;
+	std::wstring statusText, statusNote, sizeText;
 	COLORREF statusColor = ui::kTextDim;
 	std::wstring buildLabel;
 	bool buildEnabled = true;
@@ -909,7 +915,15 @@ DetailRects ComputeDetail(Gdiplus::Graphics &g, int w, int h, const Game &game) 
 	d.title = RectF(pad, y, tw, titleH);
 	y += titleH + Df(10);
 	d.chips = RectF(pad, y, tw, Df(24));
-	y += Df(24) + Df(18);
+	y += Df(24);
+	// A FAT32 memory stick can't hold a file of 4 GB, and PPSSPP reads past 4 GB of an image wrong.
+	if (IsDisc(game.path) && game.size > 0xFFFFFFFFull) {
+		d.sizeText = L"Larger than 4 GB: this image runs here, but not on a PSP or in PPSSPP.";
+		float noteH = ui::Measure(g, d.sizeText.c_str(), Df(12), false, tw).Height;
+		d.sizeNote = RectF(pad, y + Df(8), tw, noteH);
+		y += Df(8) + noteH;
+	}
+	y += Df(18);
 	float statusH = Df(20) + ui::Measure(g, d.statusNote.c_str(), Df(12.5f), false, tw - Df(18)).Height;
 	d.status = RectF(pad, y, tw, statusH);
 	y += statusH + Df(20);
@@ -1043,6 +1057,7 @@ void PaintDetail(HDC hdc, int w, int h) {
 		float x = d.chips.X;
 		Chip(g, x, d.chips.Y, d.chips.Height, game.id);
 		Chip(g, x, d.chips.Y, d.chips.Height, FormatText(game) + (game.size ? L"  ·  " + SizeText(game.size) : L""));
+		if (!d.sizeText.empty()) ui::Text(g, d.sizeText.c_str(), d.sizeNote, Df(12), ui::C(ui::kTextDim), false, 0, false, true);
 		float dot = Df(8);
 		SolidBrush dotBrush(ui::C(d.statusColor));
 		g.FillEllipse(&dotBrush, RectF(d.status.X, d.status.Y + Df(6), dot, dot));

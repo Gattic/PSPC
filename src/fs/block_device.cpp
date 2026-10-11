@@ -291,12 +291,24 @@ public:
 		for (u32 i = 0; i <= numFrames_; i++) {
 			index_[i] = LE32(raw.data() + (size_t)i * 4);
 			if (i > 0 && (index_[i] & 0x7FFFFFFF) < (index_[i - 1] & 0x7FFFFFFF)) {
-				*error = "CSO index not monotonic at frame " + std::to_string(i - 1);
+				// An index entry holds 31 bits of position << shift: a writer that kept the shift too
+				// small for a big file wrapped around (or into the flag bit) past 2 GB << shift.
+				if (fileSize > (0x80000000ull << shift_)) {
+					*error = "CSO index overflows at " + std::to_string((0x80000000ull << shift_) >> 20) +
+					         " MB: recompress with a larger index shift (maxcso and tools/mkcso.py pick one)";
+				} else {
+					*error = "CSO index not monotonic at frame " + std::to_string(i - 1);
+				}
 				return false;
 			}
 		}
-		if (((u64)(index_[numFrames_] & 0x7FFFFFFF) << shift_) > fileSize) {
+		const u64 dataEnd = (u64)(index_[numFrames_] & 0x7FFFFFFF) << shift_;
+		if (dataEnd > fileSize) {
 			*error = "CSO image truncated";
+			return false;
+		}
+		if (numFrames_ && dataEnd < indexStart + indexBytes) {
+			*error = "CSO index is empty or corrupt";  // the data comes after the index
 			return false;
 		}
 		maxStored_ = (size_t)frameSize * 2 + ((size_t)1 << shift_) + 64;

@@ -4,6 +4,7 @@
 // Engine). Ported from PPSSPP's Core/HLE/scePsmf.cpp (https://github.com/hrydgard/ppsspp,
 // Copyright (c) 2012- PPSSPP Project, GPL-2.0-or-later), itself based on JPCSP.
 #include <algorithm>
+#include <climits>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -862,7 +863,8 @@ int PsmfPlayerSetPsmfOffset(u32 psmfPlayer, const char *filename, int offset) {
 		io::PspIoStat st{};
 		s64 fileSize = 0;
 		if (r.dev->GetStat(r.path, st) >= 0) fileSize = st.size;
-		player->streamSize = (int)(fileSize - offset - mpegoffset);
+		// (Capped: a PMF over 2 GB can't come from a UMD, but an image can hold one.)
+		player->streamSize = (int)std::min<s64>(fileSize - offset - mpegoffset, INT_MAX);
 	}
 	player->fileoffset = (u32)(offset + mpegoffset);
 	player->mediaengine->loadStream(buf, 2048, std::max(2048 * 500, (int)player->tempbuf.size()));

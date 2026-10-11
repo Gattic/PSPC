@@ -7,6 +7,7 @@
 #pragma once
 
 #include <string_view>
+#include <vector>
 
 #include "common/common.h"
 #include "fs/psp_io_types.h"
@@ -76,5 +77,10 @@ public:
 		return false;
 	}
 };
+
+// Reads from a handle's position to its end into `out` and puts the position back
+// (sceKernelLoadModuleByID loads from an open descriptor this way). False on an error, and for
+// sector-mode handles (umd0:), whose size and reads count sectors rather than bytes.
+bool ReadRest(FileSystem &fs, s32 handle, std::vector<u8> &out);
 
 }  // namespace vfs

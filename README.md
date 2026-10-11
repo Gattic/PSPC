@@ -244,6 +244,13 @@ python -I tools\run_autotests.py --aot              :: the same with AOT-compile
 Comparing the two runs is a differential test of the recompiler. On a fatal error or a host crash
 pspc prints a symbolized backtrace (frames in AOT DLLs are named by guest function).
 
+Disc images past 1.8 GB (see [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md#large-disc-images)):
+
+```bat
+python -I tools\test_mkcso.py                       :: the CSO/ZSO/DAX writer's index shift and limits
+python -I tools\large_image_test.py                 :: boots an 8.75 GB sparse image (needs tools/build_guest_tests.sh)
+```
+
 ## License
 
 PSPC's own code is GPL-2.0-or-later. Code ported from PPSSPP (GPL-2.0-or-later) is marked as such.

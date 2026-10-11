@@ -127,7 +127,8 @@ void SetThreadCwd(SceUID thread, const std::string &dir);
 // Whole-file read through the PSP namespace (used by the module loader).
 bool ReadFile(const std::string &pspPath, std::vector<u8> &out);
 // Reads an open guest descriptor from its current position to the end, leaving the position
-// unchanged (sceKernelLoadModuleByID). Implemented in iofilemgr.cpp.
+// unchanged (sceKernelLoadModuleByID). False for sector-mode descriptors (umd0:). Implemented in
+// iofilemgr.cpp.
 bool ReadRestOfFd(int fd, std::vector<u8> &out, std::string *path);
 // Host-side path of a file on a host-directory device, or "" (savedata, fonts...).
 std::string HostPathFor(const std::string &pspPath);

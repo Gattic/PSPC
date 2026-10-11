@@ -382,7 +382,11 @@ s64 DoSeek(FileNode *f, s64 offset, int whence) {
 	return f->Fs()->Seek(f->handle, offset, whence);
 }
 
-u32 RwDelayUs(int size) { return size / 100 > 100 ? (u32)(size / 100) : 100; }
+// What a read or write of `size` units costs: bytes, or sectors on a sector-mode handle (umd0:).
+u32 RwDelayUs(const FileNode *f, int size) {
+	const u64 bytes = (u64)std::max(size, 0) * (f->sectorMode ? vfs::kSectorSize : 1);
+	return bytes / 100 > 100 ? (u32)std::min<u64>(bytes / 100, 0xFFFFFFFF) : 100;
+}
 
 int sceIoRead(int fd, u32 buf, int size) {
 	if (fd == kStdin) return 0;
@@ -393,7 +397,7 @@ int sceIoRead(int fd, u32 buf, int size) {
 	if (sched::InInterrupt()) return (int)SCE_KERNEL_ERROR_ILLEGAL_CONTEXT;
 	int r = DoRead(f, buf, size);
 	if (r >= 0 && IsMemoryStick(f) && !f->sectorMode) return Spend(r, MsReadBusyUs((u32)r), MsReadWaitUs((u32)r));
-	return r >= 0 ? Delay(r, RwDelayUs(size)) : r;
+	return r >= 0 ? Delay(r, RwDelayUs(f, size)) : r;
 }
 
 int sceIoWrite(int fd, u32 buf, int size) {
@@ -408,7 +412,7 @@ int sceIoWrite(int fd, u32 buf, int size) {
 	if (!sched::DispatchEnabled()) return DispatchDisabledError(f->device);
 	if (sched::InInterrupt()) return (int)SCE_KERNEL_ERROR_ILLEGAL_CONTEXT;
 	int r = DoWrite(f, buf, size);
-	return r >= 0 ? Delay(r, RwDelayUs(size)) : r;
+	return r >= 0 ? Delay(r, RwDelayUs(f, size)) : r;
 }
 
 s64 sceIoLseek(int fd, s64 offset, int whence) {
@@ -439,7 +443,7 @@ int sceIoReadAsync(int fd, u32 buf, int size) {
 	FileNode *f = GetFd(fd);
 	if (!f) return (int)SCE_KERNEL_ERROR_BADF;
 	if (f->Busy()) return (int)SCE_KERNEL_ERROR_ASYNC_BUSY;
-	StartAsync(fd, DoRead(f, buf, size), RwDelayUs(size));
+	StartAsync(fd, DoRead(f, buf, size), RwDelayUs(f, size));
 	return 0;
 }
 
@@ -447,7 +451,7 @@ int sceIoWriteAsync(int fd, u32 buf, int size) {
 	FileNode *f = GetFd(fd);
 	if (!f) return (int)SCE_KERNEL_ERROR_BADF;
 	if (f->Busy()) return (int)SCE_KERNEL_ERROR_ASYNC_BUSY;
-	StartAsync(fd, DoWrite(f, buf, size), RwDelayUs(size));
+	StartAsync(fd, DoWrite(f, buf, size), RwDelayUs(f, size));
 	return 0;
 }
 
@@ -551,10 +555,10 @@ int DoIoctl(FileNode *f, u32 cmd, u32 in, u32 inLen, u32 out, u32 outLen, u32 *u
 	}
 	case 0x04100002:  // PGD offset
 		return 0;
-	case 0x04100010: {  // PGD data size: the plain size here
+	case 0x04100010: {  // PGD data size: the plain size here (clamped; the result is an int)
 		vfs::HandleInfo info;
 		fs->GetHandleInfo(f->handle, &info);
-		return (int)info.size;
+		return (int)std::min<u64>(info.size, 0x7FFFFFFF);
 	}
 	case 0x01F100A6:
 		*us += 15000;  // sector seek; Pangya Portable needs the time
@@ -918,16 +922,8 @@ namespace io {
 bool ReadRestOfFd(int fd, std::vector<u8> &out, std::string *path) {
 	FileNode *f = fd >= 0 && fd < kMaxFds ? GetFd(fd) : nullptr;
 	if (!f || f->isDir || f->isTty || !f->Fs()) return false;
-	vfs::FileSystem *fs = f->Fs();
-	s64 pos = fs->Seek(f->handle, 0, 1);
-	s64 end = fs->Seek(f->handle, 0, 2);
-	fs->Seek(f->handle, pos, 0);
-	if (pos < 0 || end < pos) return false;
-	out.resize((size_t)(end - pos));
-	s64 n = out.empty() ? 0 : fs->Read(f->handle, out.data(), out.size());
-	fs->Seek(f->handle, pos, 0);
-	if (n < 0) return false;
-	out.resize((size_t)n);
+	// Not from a sector-mode handle (umd0:), whose positions and reads count sectors.
+	if (!vfs::ReadRest(*f->Fs(), f->handle, out)) return false;
 	if (path) *path = f->path;
 	return true;
 }

@@ -1,5 +1,38 @@
 # Disc images larger than 1.8 GB: plan
 
+## Status (2026-10-12)
+
+Done: Phases 1 to 4, and Phase 5 as recommended. 5.1: the first extent only, with a warning, and
+the further records of the same name are hidden. 5.2: left as is, and documented. 5.3: a note in
+the details pane. The user-facing summary is in `docs/COMPATIBILITY.md` (Large disc images).
+
+Where the work differs from the plan, or adds to it:
+
+- **1.1:** sector-mode handles are refused (`sceKernelLoadModuleByID` returns BADF). The logic
+  moved into `vfs::ReadRest` (pspc_fs), so the unit tests cover it.
+- **1.3:** an index left zeroed is refused too ("CSO index is empty or corrupt"). That is what the
+  old mkcso left when it failed past 4 GB.
+- **1.4:** the PMF stream size is capped at `INT_MAX` (negative values are unchanged); the PGD
+  size ioctl is clamped.
+- **1.5:** kept; it passed the timing gate (pspautotests unchanged in the interpreter and as AOT,
+  and the smoke test).
+- **2.1/2.2:** `tests/unit/test_fs_large.cpp`: `fs_large_iso_files`, `fs_large_iso_multi_extent`
+  and `fs_large_cso_index`, on an 8 GB + 4 MB image held in memory as patches over zeros.
+- **2.3:** `tools/test_mkcso.py`. mkcso's DAX writer also stopped keeping every frame in memory;
+  it spools them to a temporary file.
+- **2.4:**
+  - The guest program reads its commands from `disc0:/PROBES.TXT`, which the runner writes into
+    the image. One list therefore drives both the program and the expected lines, and the
+    expected lines are computed by reading the image file.
+  - `tools/large_image_test.py` matches 47 of 47 lines, in the interpreter and as AOT.
+  - The launcher lists the 8.75 GB image ("ISO · 8.8 GB") and shows the 5.3 note.
+- **Sparse files on Windows:** Python's `truncate()` extends a file by writing zeros (the CRT's
+  `_chsize`), and that filled the disk once. `make_big_iso.py` extends by writing one byte at
+  the end instead, then checks how much disk the file really takes and removes it if it isn't
+  sparse.
+- **3.3:** `pspc_fs` already compiled cleanly with C4244 and C4267 as errors. A test file
+  confirmed that the target's `/we` overrides the global `/wd`.
+
 ## Summary
 
 - **1.8 GB is a property of the disc, not the image.** A dual-layer UMD holds about 1.8 GB (a
@@ -163,8 +196,8 @@ an image.
   - pspautotests with 539 passing and 20 known differences, identical in the interpreter and as AOT;
   - the 6-game smoke test.
 - **Large-image tests cost no disk.** Unit tests use an in-memory sparse `ByteSource`. On-disk
-  fixtures are sparse files: `FSCTL_SET_SPARSE` on NTFS, a plain truncate elsewhere. They check
-  free space first and skip where sparse files aren't supported.
+  fixtures are sparse files: `FSCTL_SET_SPARSE` on NTFS, a hole past the end elsewhere. They are
+  refused where sparse files aren't supported, and removed if they take real disk space.
 - **Expected results come from the fixture, never from PSPC.** Each test writes known markers at
   known offsets and checks that it reads them back.
 

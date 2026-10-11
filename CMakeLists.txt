@@ -6,6 +6,12 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
 
+# 64-bit only: disc images and files past 4 GB become buffer lengths and offsets in size_t, and
+# the recompiler emits x64 code.
+if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+	message(FATAL_ERROR "PSPC builds for 64-bit targets only (use the x64 compiler, e.g. vcvars64)")
+endif()
+
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 	set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "" FORCE)
 endif()

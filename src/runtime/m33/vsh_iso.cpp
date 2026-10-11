@@ -618,7 +618,7 @@ private:
 		vfs::IsoFileSystem iso(std::shared_ptr<vfs::BlockDevice>(std::move(bd)));
 		std::vector<u8> sfoData;
 		vfs::ParamSfo sfo;
-		if (!iso.IsValid() || iso.ReadWholeFile("/PSP_GAME/PARAM.SFO", sfoData) != 0 || !sfo.Parse(sfoData)) {
+		if (!iso.IsValid() || iso.ReadWholeFile("/PSP_GAME/PARAM.SFO", sfoData, vfs::kMaxMetadataBytes) != 0 || !sfo.Parse(sfoData)) {
 			LOGW("M33", "ISO %s: no /PSP_GAME/PARAM.SFO", img.name.c_str());
 			return false;
 		}
@@ -628,7 +628,7 @@ private:
 		const char *const files[] = {"/PSP_GAME/ICON0.PNG", "/PSP_GAME/ICON1.PMF", "/PSP_GAME/PIC0.PNG",
 		                             "/PSP_GAME/PIC1.PNG", "/PSP_GAME/SND0.AT3"};
 		for (int i = 0; i < 5; i++) {
-			if (iso.ReadWholeFile(files[i], parts[1 + i]) != 0) parts[1 + i].clear();
+			if (iso.ReadWholeFile(files[i], parts[1 + i], vfs::kMaxMetadataBytes) != 0) parts[1 + i].clear();
 		}
 		std::vector<u8> &pbp = img.pbp;
 		pbp.assign(0x28, 0);

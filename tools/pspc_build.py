@@ -92,11 +92,17 @@ def vs_env():
 
 
 def plain_elf(path, work, decrypt_tool):
-    data = path.read_bytes()
-    if data[:4] == b'\0PBP':
-        offs = struct.unpack_from('<8I', data, 8)
-        end = offs[7] if offs[7] > offs[6] else len(data)
-        data = data[offs[6]:end]
+    with open(path, 'rb') as f:
+        data = f.read(40)
+        if data[:4] == b'\0PBP' and len(data) == 40:
+            # Only DATA.PSP: DATA.PSAR can be most of a PSN game.
+            offs = struct.unpack_from('<8I', data, 8)
+            size = os.fstat(f.fileno()).st_size
+            end = offs[7] if offs[7] > offs[6] else size
+            f.seek(offs[6])
+            data = f.read(max(0, end - offs[6]))
+        else:
+            data += f.read()
     if data[:4] == b'\x7fELF':
         return data
     if data[:4] == b'~PSP':

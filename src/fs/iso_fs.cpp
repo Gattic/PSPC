@@ -163,6 +163,10 @@ void IsoFileSystem::LoadDir(Node *dir) {
 	const u32 dirBytes = std::min(dir->size, kMaxDirBytes);
 	const u32 numSectors = (dirBytes + kSectorSize - 1) / kSectorSize;
 	std::vector<u8> sec(kSectorSize);
+	// A file of 4 GB or more is written as several records with the same name, all but the last
+	// flagged multi-extent (ISO 9660 level 3). Only the first extent is used; this is the name
+	// whose further records are skipped.
+	std::string continued;
 	for (u32 s = 0; s < numSectors; s++) {
 		if (!device_->ReadBlock(dir->lba + s, sec.data())) {
 			LOGW("fs", "ISO: can't read directory sector %u", dir->lba + s);
@@ -195,6 +199,17 @@ void IsoFileSystem::LoadDir(Node *dir) {
 				}
 			}
 			node->name = std::string(n);
+			const bool moreExtents = (r[kRecFlags] & 0x80) != 0;
+			if (!continued.empty() && node->name == continued) {
+				if (!moreExtents) continued.clear();
+				continue;
+			}
+			continued.clear();
+			if (moreExtents) {
+				LOGW("fs", "ISO: '%s' continues in more extents (a file of 4 GB or more); only its first %u bytes can be read",
+				     node->name.c_str(), LE32(r + kRecSize));
+				continued = node->name;
+			}
 			node->lba = LE32(r + kRecLba);
 			node->size = LE32(r + kRecSize);
 			node->isDir = (r[kRecFlags] & 2) != 0;
@@ -259,13 +274,20 @@ bool IsoFileSystem::GetExtent(std::string_view path, u32 *lba, u64 *size) {
 	return true;
 }
 
-s32 IsoFileSystem::ReadWholeFile(std::string_view path, std::vector<u8> &out) {
+s32 IsoFileSystem::ReadWholeFile(std::string_view path, std::vector<u8> &out, u64 maxBytes) {
+	out.clear();
 	s32 fd = Open(path, PSP_O_RDONLY, 0);
 	if (fd < 0) {
 		return fd;
 	}
 	HandleInfo info;
 	GetHandleInfo(fd, &info);
+	if (info.size > maxBytes || info.size > SIZE_MAX / 2) {
+		Close(fd);
+		LOGW("fs", "ISO: %.*s is %llu bytes, more than is read whole (%llu)", (int)path.size(), path.data(),
+		     (unsigned long long)info.size, (unsigned long long)std::min<u64>(maxBytes, SIZE_MAX / 2));
+		return SCE_ERRNO_EFBIG;
+	}
 	out.resize((size_t)info.size);
 	s64 n = out.empty() ? 0 : Read(fd, out.data(), out.size());
 	Close(fd);

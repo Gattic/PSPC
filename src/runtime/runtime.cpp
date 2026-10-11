@@ -13,6 +13,8 @@
 
 #include "common/fileutil.h"
 #include "common/log.h"
+#include "fs/block_device.h"
+#include "fs/iso_fs.h"
 #include "fs/param_sfo.h"
 #include "runtime/boot.h"
 #include "runtime/core/backtrace.h"
@@ -169,25 +171,35 @@ bool PrepareBoot(const Options &o, BootTarget &bt) {
 		}
 		return !bt.image.empty();
 	}
+	// A PBP: only DATA.PSP and PARAM.SFO are read (DATA.PSAR can be most of a PSN game).
+	u8 pbp[40];
+	auto src = vfs::OpenFileSource(file);
+	if (src && src->Size() >= sizeof(pbp) && src->ReadAt(0, pbp, sizeof(pbp)) == sizeof(pbp) && memcmp(pbp, "\0PBP", 4) == 0) {
+		const u64 size = src->Size();
+		const u64 dataPsp = Rd32(&pbp[8 + 6 * 4]), dataPsar = Rd32(&pbp[8 + 7 * 4]);
+		const u64 end = dataPsar > dataPsp ? dataPsar : size;
+		if (dataPsp >= size || end > size || end - dataPsp > SIZE_MAX / 2) {
+			LOGE("BOOT", "Malformed PBP");
+			return false;
+		}
+		bt.image.resize((size_t)(end - dataPsp));
+		if (src->ReadAt(dataPsp, bt.image.data(), bt.image.size()) != bt.image.size()) {
+			LOGE("BOOT", "Cannot read %s", o.file.c_str());
+			return false;
+		}
+		const u64 sfoOff = Rd32(&pbp[8]), sfoEnd = Rd32(&pbp[12]);
+		if (sfoOff < sfoEnd && sfoEnd <= size && sfoEnd - sfoOff <= vfs::kMaxMetadataBytes) {
+			std::vector<u8> sfo((size_t)(sfoEnd - sfoOff));
+			if (src->ReadAt(sfoOff, sfo.data(), sfo.size()) == sfo.size()) bt.largeMemory = SfoWantsLargeMemory(sfo.data(), sfo.size());
+		}
+		bt.pspPath = "ms0:/PSP/GAME/" + PathToUtf8(file.parent_path().filename()) + "/EBOOT.PBP";
+		bt.cwd = "host0:/";
+		return true;
+	}
 	std::vector<u8> data;
 	if (!ReadWholeFile(file, data)) {
 		LOGE("BOOT", "Cannot read %s", o.file.c_str());
 		return false;
-	}
-	if (data.size() >= 40 && memcmp(data.data(), "\0PBP", 4) == 0) {
-		u32 dataPsp = Rd32(&data[8 + 6 * 4]), dataPsar = Rd32(&data[8 + 7 * 4]);
-		u32 end = dataPsar > dataPsp ? dataPsar : (u32)data.size();
-		if (dataPsp >= data.size() || end > data.size()) {
-			LOGE("BOOT", "Malformed PBP");
-			return false;
-		}
-		bt.image.assign(data.begin() + dataPsp, data.begin() + end);
-		u32 sfoOff = Rd32(&data[8]), sfoEnd = Rd32(&data[12]);
-		if (sfoOff < sfoEnd && sfoEnd <= data.size())
-			bt.largeMemory = SfoWantsLargeMemory(&data[sfoOff], sfoEnd - sfoOff);
-		bt.pspPath = "ms0:/PSP/GAME/" + PathToUtf8(file.parent_path().filename()) + "/EBOOT.PBP";
-		bt.cwd = "host0:/";
-		return true;
 	}
 	bt.image = std::move(data);
 	bt.pspPath = Host0PathOf(o, file);

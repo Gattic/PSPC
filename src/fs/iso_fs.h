@@ -3,6 +3,7 @@
 // Read-only ISO9660 volume (PSP UMD images) over a BlockDevice: disc0:, and with sector mode umd0:.
 #pragma once
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -31,6 +32,10 @@ enum : u32 {
 	UMD_IOCTL_SECTOR_READ = 0x01F30003,    // in: u32 count; out: data. Same as Read
 };
 
+// The most the launcher, the XMB and the boot code read whole of a metadata file (PARAM.SFO,
+// ICON0, PIC1, SND0...), so a damaged record on a big image can't make them allocate gigabytes.
+constexpr u64 kMaxMetadataBytes = 16u << 20;
+
 // Parses "/sce_lbn<hex start>_size<hex size>" ("0x" prefixes optional), the raw-sector file names
 // the PSP accepts on disc0:/umd0:. False if `path` isn't one.
 bool ParseSceLbnPath(std::string_view path, u32 *startLba, u32 *size);
@@ -48,8 +53,9 @@ public:
 	std::string VolumeId() const;
 	// First sector and byte size of a file or directory, without opening it.
 	bool GetExtent(std::string_view path, u32 *lba, u64 *size);
-	// Convenience for loaders (PARAM.SFO, EBOOT.BIN). Returns 0 or an error.
-	s32 ReadWholeFile(std::string_view path, std::vector<u8> &out);
+	// Convenience for loaders (PARAM.SFO, EBOOT.BIN). Returns 0 or an error; a file bigger than
+	// `maxBytes` gives SCE_ERRNO_EFBIG without anything being allocated.
+	s32 ReadWholeFile(std::string_view path, std::vector<u8> &out, u64 maxBytes = UINT64_MAX);
 
 	u32 Caps() const override { return FS_CAP_READ_ONLY | FS_CAP_BLOCK_DEVICE | FS_CAP_CASE_INSENSITIVE; }
 	// Paths: "" is the device (sector mode), "/sce_lbn..." a raw extent, anything else a file or

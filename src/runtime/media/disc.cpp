@@ -49,14 +49,14 @@ bool MountDisc(const std::string &hostPath) {
 	}
 	if (!g_discType) g_discType = 0x10;
 	std::vector<u8> sfo;
-	if (iso->ReadWholeFile("/UMD_VIDEO/PARAM.SFO", sfo) == 0 && !(g_discType & 0x10)) {
+	if (iso->ReadWholeFile("/UMD_VIDEO/PARAM.SFO", sfo, vfs::kMaxMetadataBytes) == 0 && !(g_discType & 0x10)) {
 		vfs::ParamSfo p;
 		if (p.Parse(sfo.data(), sfo.size())) {
 			g_discId = p.GetString("DISC_ID");
 			LOGI("UMD", "UMD Video %s: %s", g_discId.c_str(), p.GetString("TITLE").c_str());
 		}
 	}
-	if (iso->ReadWholeFile("/PSP_GAME/PARAM.SFO", sfo) == 0) {
+	if (iso->ReadWholeFile("/PSP_GAME/PARAM.SFO", sfo, vfs::kMaxMetadataBytes) == 0) {
 		vfs::ParamSfo p;
 		if (p.Parse(sfo.data(), sfo.size())) {
 			g_discId = p.GetString("DISC_ID");
