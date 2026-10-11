@@ -13,6 +13,7 @@
 
 #include "common/fileutil.h"
 #include "common/log.h"
+#include "fs/param_sfo.h"
 #include "runtime/boot.h"
 #include "runtime/core/backtrace.h"
 #include "runtime/dialogs/home_menu.h"
@@ -101,9 +102,17 @@ struct BootTarget {
 	std::vector<u8> image;
 	std::string pspPath;
 	std::string cwd;
+	// PARAM.SFO MEMSIZE = 1: the game asks for the PSP-2000's extra user memory, which the
+	// firmware grants on a 64 MB model.
+	bool largeMemory = false;
 };
 
 u32 Rd32(const u8 *p) { u32 v; memcpy(&v, p, 4); return v; }
+
+bool SfoWantsLargeMemory(const u8 *data, size_t size) {
+	vfs::ParamSfo sfo;
+	return sfo.Parse(data, size) && sfo.GetInt("MEMSIZE") == 1;
+}
 
 fs::path Host0Root(const Options &o) {
 	if (!o.host0Dir.empty()) return fs::u8path(o.host0Dir);
@@ -148,6 +157,8 @@ bool PrepareBoot(const Options &o, BootTarget &bt) {
 		}
 		bt.pspPath = "disc0:/PSP_GAME/SYSDIR/EBOOT.BIN";
 		bt.cwd = "disc0:/PSP_GAME/USRDIR";
+		std::vector<u8> sfo;
+		if (io::ReadFile("disc0:/PSP_GAME/PARAM.SFO", sfo)) bt.largeMemory = SfoWantsLargeMemory(sfo.data(), sfo.size());
 		if (!io::ReadFile(bt.pspPath, bt.image) || bt.image.empty() || bt.image[0] == 0) {
 			// Some discs ship a plain BOOT.BIN alongside the encrypted EBOOT.BIN.
 			std::vector<u8> boot;
@@ -170,6 +181,9 @@ bool PrepareBoot(const Options &o, BootTarget &bt) {
 			return false;
 		}
 		bt.image.assign(data.begin() + dataPsp, data.begin() + end);
+		u32 sfoOff = Rd32(&data[8]), sfoEnd = Rd32(&data[12]);
+		if (sfoOff < sfoEnd && sfoEnd <= data.size())
+			bt.largeMemory = SfoWantsLargeMemory(&data[sfoOff], sfoEnd - sfoOff);
 		bt.pspPath = "ms0:/PSP/GAME/" + PathToUtf8(file.parent_path().filename()) + "/EBOOT.PBP";
 		bt.cwd = "host0:/";
 		return true;
@@ -322,7 +336,9 @@ int RunOnce(const Options &o, BootTarget bt) {
 	backtrace::InstallFatalHook();
 	if (!mem::Init((u32)o.ramMB << 20)) Fatal("Cannot reserve guest memory");
 	const bool xmb = o.vsh && o.bootPath.empty() && o.netSelftest.empty();
-	kernel::InitMemoryPartitions(mem::g_ramSize, o.largeUserMemory >= 0 ? o.largeUserMemory != 0 : xmb);
+	const bool largeMemory = o.largeUserMemory >= 0 ? o.largeUserMemory != 0 : xmb || bt.largeMemory;
+	if (bt.largeMemory && o.largeUserMemory < 0) LOGI("BOOT", "PARAM.SFO MEMSIZE=1: extra user memory");
+	kernel::InitMemoryPartitions(mem::g_ramSize, largeMemory);
 	kernel::g_firmwareVersion = o.firmwareVersion;
 	cpu::Init();
 	cpu::SetStrictMemory(o.strictMemory);

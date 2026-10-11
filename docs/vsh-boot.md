@@ -34,7 +34,7 @@ starts M33's recovery menu.
 The XMB gets the user memory of a PSP-2000 (all of the 64 MB above the kernel, not 24 MB): its
 plugins, the browser's in particular, don't fit otherwise, since PSPC places firmware modules at
 their native-code addresses. `--no-large-mem` keeps it at 24 MB; games still get 24 MB unless
-`--large-mem` is given.
+their PARAM.SFO has `MEMSIZE` = 1 (as on a real PSP-2000) or `--large-mem` is given.
 
 Headless check, as used during development:
 

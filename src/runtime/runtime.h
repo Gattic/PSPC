@@ -18,8 +18,9 @@ struct Options {
 	std::string aotDir;        // directory with <sha1>.dll module builds
 	bool fastTime = false;     // skip idle time (tests)
 	int ramMB = 64;
-	// User memory beyond 24 MB: 1 (--large-mem) or 0 (--no-large-mem); -1 (default): only for the
-	// XMB on a 64 MB model, whose browser and other plugins use the PSP-2000's extra RAM.
+	// User memory beyond 24 MB: 1 (--large-mem) or 0 (--no-large-mem); -1 (default): on a 64 MB
+	// model for the XMB, whose browser and other plugins use the PSP-2000's extra RAM, and for games
+	// whose PARAM.SFO has MEMSIZE = 1.
 	int largeUserMemory = -1;
 	bool strictMemory = false;
 	int timeoutSec = 0;        // stop after this many wall-clock seconds (0 = never)
