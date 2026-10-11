@@ -14,6 +14,7 @@
 #include "common/log.h"
 #include "common/settings.h"
 #include "net/adhoc_server.h"
+#include "pspc_version.h"
 #include "net/np_client.h"
 #include "runtime/runtime.h"
 
@@ -73,6 +74,7 @@ static void Usage() {
 	        "  --osk-text <text>    headless: what the on-screen keyboard returns\n"
 	        "  --fw <ver>           firmware version reported to games, e.g. 6.60 or 4.01\n"
 	        "  --scale <n>          window scale (default 2)\n"
+	        "  --version            print PSPC's version\n"
 	        "  --config <file>      settings file (default: <exe>/pspc.ini; \"none\": built-in defaults)\n"
 	        "  --set <key>=<value>  override one setting of that file, e.g. --set fullscreen=1\n"
 	        "  --log <level>        trace|debug|info|warn|error (default info)\n"
@@ -304,6 +306,10 @@ static int RunNpCommand(int argc, char **argv) {
 
 int main(int argc, char **argv) {
 	for (int i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "--version")) {
+			printf("PSPC %s\n", PSPC_VERSION);
+			return 0;
+		}
 		if (!strcmp(argv[i], "--adhoc-server")) return RunAdhocServer(argc, argv);
 		if (!strcmp(argv[i], "--np")) return RunNpCommand(argc, argv);
 	}

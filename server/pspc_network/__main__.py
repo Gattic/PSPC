@@ -3,6 +3,7 @@
 
 import argparse
 import getpass
+import json
 import ssl
 import sys
 import time
@@ -43,6 +44,7 @@ def serve(args):
 def main(argv=None):
     ap = argparse.ArgumentParser(prog='python -m pspc_network', description=__doc__)
     ap.add_argument('--db', default='pspc_network.sqlite', help='database file (default: %(default)s)')
+    ap.add_argument('--json', action='store_true', help='accounts: one JSON array (for the launcher)')
     sub = ap.add_subparsers(dest='command', required=True)
     s = sub.add_parser('serve', help='run the server')
     s.add_argument('--listen', default='0.0.0.0:8423', help='address:port (default: %(default)s)')
@@ -56,6 +58,8 @@ def main(argv=None):
     for name in ('ban', 'unban', 'passwd'):
         p = sub.add_parser(name, help='%s an account' % name if name != 'passwd' else "set an account's password")
         p.add_argument('online_id')
+        if name == 'passwd':
+            p.add_argument('--password-stdin', action='store_true', help='read the new password from standard input')
     args = ap.parse_args(argv)
     if args.command == 'serve':
         if bool(args.tls_cert) != bool(args.tls_key):
@@ -63,7 +67,10 @@ def main(argv=None):
         return serve(args)
     store = Store(args.db)
     try:
-        if args.command == 'accounts':
+        if args.command == 'accounts' and args.json:
+            print(json.dumps([{k: a[k] for k in ('online_id', 'account_id', 'country', 'created')} | {'banned': bool(a['banned'])}
+                              for a in store.list_accounts()]))
+        elif args.command == 'accounts':
             for a in store.list_accounts():
                 print('%-16s %20d %s %s%s' % (a['online_id'], a['account_id'], a['country'],
                                                time.strftime('%Y-%m-%d', time.gmtime(a['created'])),
@@ -75,7 +82,8 @@ def main(argv=None):
             account = store.account_by_online_id(args.online_id)
             if not account:
                 raise StoreError(404, 'no_such_account', 'No account with that online ID.')
-            store.set_password(account, getpass.getpass('New password: '))
+            password = sys.stdin.readline().rstrip('\r\n') if args.password_stdin else getpass.getpass('New password: ')
+            store.set_password(account, password)
             print('Password changed; existing sign-ins ended.')
     except StoreError as e:
         print(e.message, file=sys.stderr)

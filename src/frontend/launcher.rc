@@ -1,0 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// pspc-launcher.exe's icon and version information.
+#define PSPC_FILE_DESCRIPTION "PSPC launcher"
+#define PSPC_ORIGINAL_FILENAME "pspc-launcher.exe"
+#include "pspc_common.rc2"

@@ -15,6 +15,7 @@
 
 #include "common/settings.h"
 #include "frontend/dialog_util.h"
+#include "pspc_version.h"
 
 namespace {
 
@@ -325,8 +326,7 @@ void Init(HWND dlg, Dialog &d) {
 	CheckDlgButton(dlg, IDC_MUTE, d.s.mute ? BST_CHECKED : BST_UNCHECKED);
 
 	Control(dlg, L"STATIC",
-	        L"Saved to pspc.ini next to pspc.exe. A game picks the settings up when it starts; command-line "
-	        L"options override them.",
+	        L"PSPC " PSPC_VERSION L". Saved to pspc.ini next to pspc.exe; a game picks the settings up when it starts.",
 	        SS_LEFT, 9, 283, 168, 30, -1);
 
 	// Right column: the input mapping.

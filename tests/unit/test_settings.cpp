@@ -71,6 +71,14 @@ TEST(settings_set_validates) {
 	CHECK(settings::Set(s, "texture_upscale", "4") && s.textureUpscale == 4);
 	CHECK(!settings::Set(s, "texture_upscale", "5") && s.textureUpscale == 4);
 	CHECK(settings::Get(s, "texture_upscale") == "4" && settings::Get(s, "texture_filter") == "linear");
+	// The servers the launcher runs.
+	CHECK(!s.hostNetwork && s.hostNetworkPort == 8423 && s.hostNetworkLan && s.hostSfcoAllowLocal);
+	CHECK(settings::Set(s, "host_network", "1") && s.hostNetwork);
+	CHECK(settings::Set(s, "host_network_port", "9000") && s.hostNetworkPort == 9000);
+	CHECK(!settings::Set(s, "host_network_port", "70000") && s.hostNetworkPort == 9000);
+	CHECK(settings::Set(s, "host_sfco_address", "203.0.113.7") && s.hostSfcoAddress == "203.0.113.7");
+	CHECK(!settings::Set(s, "host_sfco_address", "http://x/") && s.hostSfcoAddress == "203.0.113.7");
+	CHECK(settings::Set(s, "host_adhoc", "1") && settings::Get(s, "host_adhoc") == "1");
 }
 
 TEST(settings_lists) {

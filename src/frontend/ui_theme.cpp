@@ -81,6 +81,7 @@ struct ButtonInfo {
 	Look look = Look::Secondary;
 	std::wstring glyph, detail;
 	bool hot = false;
+	bool on = false;  // Toggle
 };
 std::map<HWND, ButtonInfo> g_buttons;
 
@@ -210,6 +211,18 @@ void SetDetail(HWND button, const wchar_t *detail) {
 	InvalidateRect(button, nullptr, FALSE);
 }
 
+void SetChecked(HWND button, bool on) {
+	auto it = g_buttons.find(button);
+	if (it == g_buttons.end() || it->second.on == on) return;
+	it->second.on = on;
+	InvalidateRect(button, nullptr, FALSE);
+}
+
+bool Checked(HWND button) {
+	auto it = g_buttons.find(button);
+	return it != g_buttons.end() && it->second.on;
+}
+
 bool IsHot(HWND button) {
 	auto it = g_buttons.find(button);
 	return it != g_buttons.end() && it->second.hot;
@@ -259,6 +272,23 @@ void DrawOwnerButton(const DRAWITEMSTRUCT *di, COLORREF background) {
 		float bh = (float)h * 0.5f;
 		g.FillRectangle(&bar, RectF(0, ((float)h - bh) / 2, Pxf(3, dpi), bh));
 		break;
+	}
+	case Look::Toggle: {
+		// A switch on the left, the label after it.
+		float sh = Pxf(18, dpi), sw = Pxf(32, dpi), sy = ((float)h - sh) / 2;
+		RectF track(Pxf(2, dpi), sy, sw, sh);
+		COLORREF fill = info.on ? (disabled ? kSurfaceDown : hot ? kAccentHot : kAccent) : (hot ? kSurfaceDown : kSurfaceHot);
+		FillRound(g, track, sh / 2, C(fill));
+		if (!info.on) StrokeRound(g, track, sh / 2, C(kBorder), 1);
+		float knob = sh - Pxf(6, dpi);
+		SolidBrush k(C(info.on ? RGB(255, 255, 255) : kTextDim));
+		g.FillEllipse(&k, RectF(info.on ? track.GetRight() - knob - Pxf(3, dpi) : track.X + Pxf(3, dpi), sy + Pxf(3, dpi), knob, knob));
+		float textPx = Pxf(13, dpi), x = track.GetRight() + Pxf(10, dpi);
+		Text(g, label, RectF(x, 0, (REAL)w - x, (REAL)h), textPx, C(disabled ? kTextFaint : info.on ? kText : kTextDim));
+		if (focus) StrokeRound(g, RectF(1, 1, (REAL)w - 2, (REAL)h - 2), radius, C(kAccentHot), Pxf(1.5f, dpi));
+		Graphics screen(di->hDC);
+		screen.DrawImage(&buffer, (INT)di->rcItem.left, (INT)di->rcItem.top);
+		return;
 	}
 	}
 

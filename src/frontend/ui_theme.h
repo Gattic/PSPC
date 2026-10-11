@@ -38,6 +38,10 @@ constexpr const wchar_t *kIconGames = L"", *kIconXmb = L"", *kIconPlugins 
                         *kIconFolder = L"", *kIconSearch = L"", *kIconPlay = L"",
                         *kIconBuild = L"", *kIconCode = L"", *kIconOpenFile = L"",
                         *kIconPerson = L"";
+// More glyphs, by code point.
+constexpr const wchar_t *kIconGlobe = L"", *kIconStop = L"", *kIconDocument = L"", *kIconCopy = L"",
+                        *kIconPeople = L"", *kIconWifi = L"", *kIconGamepad = L"", *kIconEdit = L"",
+                        *kIconDownload = L"", *kIconInfo = L"";
 
 inline Gdiplus::Color C(COLORREF c, BYTE a = 255) { return Gdiplus::Color(a, GetRValue(c), GetGValue(c), GetBValue(c)); }
 inline int Px(int v, int dpi) { return MulDiv(v, dpi, 96); }
@@ -66,9 +70,12 @@ void Text(Gdiplus::Graphics &g, const wchar_t *s, const Gdiplus::RectF &r, float
 Gdiplus::SizeF Measure(Gdiplus::Graphics &g, const wchar_t *s, float px, bool bold = false, float maxWidth = 10000);
 
 // Owner-drawn buttons (BS_OWNERDRAW). Style and glyph are set once per button; hover is tracked.
-enum class Look { Primary, Secondary, Ghost, Nav, NavActive, Icon };
+// Toggle: a switch and its label (SetChecked / Checked hold the state; the owner flips it on click).
+enum class Look { Primary, Secondary, Ghost, Nav, NavActive, Icon, Toggle };
 void SetLook(HWND button, Look look, const wchar_t *glyph = nullptr, const wchar_t *detail = nullptr);
 void SetDetail(HWND button, const wchar_t *detail);  // a second, dimmer line (Nav look)
+void SetChecked(HWND button, bool on);
+bool Checked(HWND button);
 void DrawOwnerButton(const DRAWITEMSTRUCT *di, COLORREF background);
 bool IsHot(HWND button);
 

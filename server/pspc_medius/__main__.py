@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import json
 import logging
 import sys
 import time
@@ -47,6 +48,13 @@ def serve(args):
 
 
 def missions(store, args):
+    if args.action == 'list' and args.json:
+        rows = store.q('SELECT m.*, a.name AS uploader FROM missions m LEFT JOIN accounts a ON a.account_id = m.account_id '
+                       'ORDER BY m.mission_id')
+        print(json.dumps([{'id': r['mission_id'], 'name': r['name'], 'author': r['author'] or r['uploader'] or '',
+                           'downloads': r['downloads'], 'plays': r['plays'], 'official': bool(r['official']),
+                           'hidden': bool(r['hidden'])} for r in rows]))
+        return 0
     if args.action == 'list':
         for r in store.q('SELECT m.*, a.name AS uploader FROM missions m LEFT JOIN accounts a ON a.account_id = m.account_id '
                          'ORDER BY m.mission_id'):
@@ -81,7 +89,9 @@ def missions(store, args):
 
 
 def news(store, args):
-    if args.action == 'list':
+    if args.action == 'list' and args.json:
+        print(json.dumps([{'id': r['news_id'], 'created': r['created'], 'text': r['text']} for r in store.news(100)]))
+    elif args.action == 'list':
         for r in store.news(100):
             print('%5d %s  %s' % (r['news_id'], time.strftime('%Y-%m-%d', time.gmtime(r['created'])), r['text']))
     elif args.action == 'add':
@@ -102,6 +112,11 @@ def news(store, args):
 def board(store, args):
     if args.action == 'list':
         rows = store.q('SELECT * FROM board_posts ORDER BY post_id DESC LIMIT 50')
+        if args.json:
+            print(json.dumps([{'id': r['post_id'], 'board': r['board'], 'author': r['author'], 'reply_to': r['reply_to'],
+                               'subject': r['subject'] or '', 'body': r['body'], 'created': r['created'],
+                               'hidden': bool(r['hidden'])} for r in rows]))
+            return 0
         for r in rows:
             print('%5d %-10s %-16s %s%s%s' % (r['post_id'], r['board'], r['author'], 're %d: ' % r['reply_to'] if r['reply_to'] else '',
                                              r['subject'] or r['body'][:40], '  (hidden)' if r['hidden'] else ''))
@@ -119,6 +134,7 @@ def main(argv=None):
     ap.add_argument('--db', default='pspc_medius.sqlite', help='database file (default: %(default)s)')
     ap.add_argument('--log', default='info', choices=('debug', 'info', 'warning'), help='log level')
     ap.add_argument('--log-file', help='also write the log here')
+    ap.add_argument('--json', action='store_true', help='accounts and the list actions: one JSON array (for the launcher)')
     sub = ap.add_subparsers(dest='command', required=True)
     s = sub.add_parser('serve', help='run the game server')
     s.add_argument('--game', default='sfco', choices=sorted(GAMES), help='which game (default: %(default)s)')
@@ -163,7 +179,10 @@ def main(argv=None):
         if args.command == 'board':
             return board(store, args)
         app_id = GAMES[args.game].app_ids[0]
-        if args.command == 'accounts':
+        if args.command == 'accounts' and args.json:
+            print(json.dumps([{'id': a['account_id'], 'name': a['name'], 'created': a['created'], 'banned': bool(a['banned'])}
+                              for a in store.q('SELECT * FROM accounts WHERE app_id = ? ORDER BY account_id', (app_id,))]))
+        elif args.command == 'accounts':
             for a in store.q('SELECT * FROM accounts WHERE app_id = ? ORDER BY account_id', (app_id,)):
                 print('%6d %-16s %s %s' % (a['account_id'], a['name'], time.strftime('%Y-%m-%d', time.gmtime(a['created'])),
                                            'BANNED' if a['banned'] else ''))

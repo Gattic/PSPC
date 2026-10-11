@@ -3,15 +3,22 @@
 // pspc-launcher: a game library window for the Games folder.
 //   * lists UMD images (ISO/CSO/ZSO/DAX), EBOOT.PBP folders and PBP/PRX/ELF files,
 //     with ICON0, the PARAM.SFO title and whether the game's native (AOT) code is built;
-//   * a sidebar (the library, Boot XMB, Plugins, Settings; the PSPC Network account at the
-//     bottom), a header with search, the games as cards, and the selected game on the right over
-//     its PIC1 backdrop with its actions (ui_theme.* has the look);
+//   * a sidebar (the library, Boot XMB, Plugins, Settings, Online; the PSPC Network account at
+//     the bottom), a header with search, the games as cards, and the selected game on the right
+//     over its PIC1 backdrop with its actions (ui_theme.* has the look);
+//   * the Online page (online_page.*): PSPC Network sign-in, and the servers this PC can run for
+//     its player and their friends (servers.*);
 //   * Enter/double-click plays the game with pspc.exe, offering to build its native code first;
 //     the panel and the context menu also build native code (tools/pspc_build.py) and play in the
 //     interpreter;
-//   * "Boot XMB" starts the firmware's XMB (pspc --vsh) once tools/pspc_install_fw.py installed it.
+//   * "Boot XMB" starts the firmware's XMB (pspc --vsh), and offers to install the firmware from
+//     Sony's 4.01 update (pspc-decrypt psar, then tools/pspc_install_fw.py) when it isn't yet.
+//   * Native code builds need PSPC's developer tools (tools/pspc_build.py, a compiler and the build
+//     tree); without them (an installed PSPC) games run in the interpreter and the build actions
+//     don't show.
 //
 //   pspc-launcher [games dir] [--list]   (--list prints the library to the console and exits)
+//   pspc-launcher --write-icon <file.ico>  (the app icon, from the sidebar's logo: src/frontend/pspc.ico)
 //
 // Native code status comes from cache\aot\games.json, which pspc_build.py writes: the modules
 // each game was built from, by SHA-1; a module is current when <sha1>.dll exists and its
@@ -26,6 +33,7 @@ using std::max;
 using std::min;
 #include <gdiplus.h>
 #include <shellapi.h>
+#include <shobjidl.h>
 #include <uxtheme.h>
 
 #include <cstdio>
@@ -38,7 +46,10 @@ using std::min;
 #include "common/fileutil.h"
 #include "common/settings.h"
 #include "frontend/network_dialog.h"
+#include "frontend/online_page.h"
 #include "frontend/plugins_dialog.h"
+#include "frontend/server_dialogs.h"
+#include "frontend/servers.h"
 #include "frontend/settings_dialog.h"
 #include "frontend/ui_theme.h"
 #include "fs/vfs.h"
@@ -65,6 +76,8 @@ enum : int {
 	ID_NETWORK,
 	ID_LIBRARY,
 	ID_SHOW_FILE,
+	ID_ONLINE,
+	ID_CHOOSE_GAMES,
 	ID_TIMER_JOBS = 300,
 };
 
@@ -244,6 +257,7 @@ struct BuildJob {
 	HANDLE process;
 	fs::path game;
 	bool playAfter;
+	bool firmware = false;  // installing the PSP firmware, not building a game
 };
 
 HWND g_main = nullptr, g_list = nullptr, g_detail = nullptr;
@@ -470,7 +484,9 @@ constexpr int kSidebarW = 220, kHeaderH = 76, kCardW = 164, kCardImageH = 91, kC
 int g_dpi = 96;
 HWND g_search = nullptr, g_account = nullptr, g_refreshButton = nullptr, g_folderButton = nullptr;
 HWND g_playButton = nullptr, g_buildButton = nullptr, g_interpButton = nullptr, g_showButton = nullptr,
-     g_emptyButton = nullptr;
+     g_emptyButton = nullptr, g_chooseButton = nullptr;
+HWND g_online = nullptr;  // the Online page
+bool g_onlineShown = false;
 std::vector<HWND> g_nav;
 int g_hot = -1;  // the card under the mouse
 std::wstring g_filter;
@@ -540,6 +556,7 @@ void UpdateAccount() {
 
 void UpdateUi();
 void Populate(const fs::path &keep);
+void Rescan();
 void ReloadSettings();
 
 // ---- actions
@@ -606,10 +623,13 @@ void Build(int idx, bool playAfter) {
 	UpdateUi();
 }
 
+// Whether this copy of PSPC can build native code (a source tree with its tools).
+bool CanBuild() { return !BuildScript().empty(); }
+
 void Play(int idx, bool interp, bool offerBuild = true) {
 	if (idx < 0) return;
 	const Game &g = g_games[idx];
-	if (!interp && offerBuild && g_settings.aot && !BuildScript().empty()) {
+	if (!interp && offerBuild && g_settings.aot && CanBuild()) {
 		if (Building(g.path)) {
 			int r = MessageBoxW(g_main,
 			                    (L"The native code of \"" + g.title +
@@ -648,12 +668,80 @@ bool XmbInstalled() {
 	return fs::exists(g_exeDir / "flash0" / "vsh" / "module" / "vshmain.prx", ec);
 }
 
+// A file chosen with the Windows file dialog ("" if cancelled). filter: pairs of name, pattern.
+fs::path PickFile(const wchar_t *title, const std::vector<COMDLG_FILTERSPEC> &filter, bool folder) {
+	fs::path out;
+	IFileOpenDialog *dlg = nullptr;
+	if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return out;
+	DWORD opts = 0;
+	dlg->GetOptions(&opts);
+	dlg->SetOptions(opts | FOS_FORCEFILESYSTEM | (folder ? FOS_PICKFOLDERS : FOS_FILEMUSTEXIST));
+	dlg->SetTitle(title);
+	if (!filter.empty()) dlg->SetFileTypes((UINT)filter.size(), filter.data());
+	if (SUCCEEDED(dlg->Show(g_main))) {
+		IShellItem *item = nullptr;
+		if (SUCCEEDED(dlg->GetResult(&item))) {
+			PWSTR path = nullptr;
+			if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+				out = path;
+				CoTaskMemFree(path);
+			}
+			item->Release();
+		}
+	}
+	dlg->Release();
+	return out;
+}
+
+// Installs the PSP firmware from Sony's 4.01 update (its EBOOT.PBP): decrypted with pspc-decrypt into a
+// temporary folder, then tools\pspc_install_fw.py copies what the XMB needs next to pspc.exe (and builds
+// its native code when this copy of PSPC can). Runs in a console window, which shows the progress.
+void InstallFirmware() {
+	fs::path script = FindUp(g_exeDir, fs::path("tools") / "pspc_install_fw.py");
+	std::wstring python = servers::PythonCommand();
+	std::error_code ec;
+	if (script.empty() || python.empty() || !fs::exists(g_exeDir / "pspc-decrypt.exe", ec)) {
+		MessageBoxW(g_main,
+		            L"This copy of PSPC can't install the firmware: it needs pspc-decrypt.exe, tools\\pspc_install_fw.py and "
+		            L"Python (an installed PSPC has them all).",
+		            L"PSPC", MB_ICONWARNING);
+		return;
+	}
+	fs::path pbp = PickFile(L"Sony's PSP system software update 4.01 (EBOOT.PBP)", {{L"PSP update (EBOOT.PBP)", L"*.PBP"}, {L"All files", L"*.*"}},
+	                        false);
+	if (pbp.empty()) return;
+	wchar_t temp[MAX_PATH] = {};
+	GetTempPathW(MAX_PATH, temp);
+	fs::path work = fs::path(temp) / ("pspc_firmware_" + std::to_string(GetCurrentProcessId()));
+	std::wstring args = L"--fw \"" + work.wstring() + L"\" --pspc-dir \"" + g_exeDir.wstring() + L"\"";
+	fs::path tree = g_exeDir.parent_path();
+	if (CanBuild() && fs::exists(tree / "lib" / "pspc_sem.lib", ec)) args += L" --build-dir \"" + tree.wstring() + L"\" --aot-core";
+	else args += L" --no-aot";
+	std::wstring steps = L"title Installing the PSP firmware for PSPC && echo Decrypting the update... && \"" + (g_exeDir / "pspc-decrypt.exe").wstring() +
+	                     L"\" psar \"" + pbp.wstring() + L"\" \"" + work.wstring() + L"\" --model 02g && echo. && echo Installing... && " + python +
+	                     L" -I -B -X utf8 \"" + script.wstring() + L"\" " + args;
+	std::wstring tail = L" & set \"rc=!errorlevel!\" & rmdir /s /q \"" + work.wstring() + L"\" 2>nul & if !rc! neq 0 (echo. & echo The install failed. & pause) & exit !rc!";
+	HANDLE process = nullptr;
+	if (!Launch(L"C:\\Windows\\System32\\cmd.exe", L"/v:on /c \"" + steps + tail + L"\"", true, &process)) return;
+	g_jobs.push_back({process, fs::path(), false, true});
+	SetTimer(g_main, ID_TIMER_JOBS, 500, nullptr);
+	UpdateUi();
+}
+
 void BootXmb() {
 	if (!XmbInstalled()) {
-		MessageBoxW(g_main,
-		            L"The PSP firmware isn't installed.\n\nDecrypt Sony's 4.01 update with pspc-decrypt psar, then run "
-		            L"tools\\pspc_install_fw.py (see docs\\vsh-boot.md).",
-		            L"PSPC", MB_ICONINFORMATION);
+		for (const BuildJob &j : g_jobs)
+			if (j.firmware) {
+				MessageBoxW(g_main, L"The PSP firmware is being installed (see its window).", L"PSPC", MB_ICONINFORMATION);
+				return;
+			}
+		int r = MessageBoxW(g_main,
+		                    L"The PSP's own menu (the XMB) needs Sony's PSP firmware, which PSPC can't come with. Games play "
+		                    L"without it, though the ones that use the PSP's system fonts show their text only with it.\n\n"
+		                    L"If you have Sony's PSP system software update 4.01 (its EBOOT.PBP), PSPC can install the "
+		                    L"firmware from it now.\n\nChoose the update file?",
+		                    L"PSPC", MB_YESNO | MB_ICONINFORMATION);
+		if (r == IDYES) InstallFirmware();
 		return;
 	}
 	Launch((g_exeDir / "pspc.exe").wstring(), L"--vsh", false);
@@ -671,6 +759,12 @@ void PollJobs() {
 		CloseHandle(g_jobs[i].process);
 		BuildJob job = g_jobs[i];
 		g_jobs.erase(g_jobs.begin() + i);
+		if (job.firmware) {
+			UpdateUi();
+			if (code == 0 && XmbInstalled())
+				MessageBoxW(g_main, L"The PSP firmware is installed. Boot XMB starts the PSP's menu.", L"PSPC", MB_ICONINFORMATION);
+			continue;
+		}
 		RefreshNative();
 		Populate(SelectedPath());
 		int idx = FindGame(job.game);
@@ -713,7 +807,41 @@ void OpenPlugins() {
 
 void OpenNetwork() {
 	if (ShowNetworkDialog(g_main, settings::DefaultPath())) ReloadSettings();
-	SetFocus(g_list);
+	online::Refresh();
+	UpdateUi();
+	if (!g_onlineShown) SetFocus(g_list);
+}
+
+// The library or the Online page.
+void ShowPage(bool online) {
+	g_onlineShown = online;
+	for (HWND h : {g_list, g_detail, g_search, g_refreshButton, g_folderButton}) ShowWindow(h, online ? SW_HIDE : SW_SHOW);
+	ShowWindow(g_online, online ? SW_SHOW : SW_HIDE);
+	for (HWND b : g_nav) {
+		int id = GetDlgCtrlID(b);
+		if (id == ID_LIBRARY || id == ID_ONLINE) {
+			bool active = (id == ID_ONLINE) == online;
+			ui::SetLook(b, active ? ui::Look::NavActive : ui::Look::Nav, id == ID_ONLINE ? ui::kIconGlobe : ui::kIconGames);
+		}
+	}
+	SetFocus(online ? g_online : g_list);
+	InvalidateRect(g_main, nullptr, FALSE);
+}
+
+// Where the games are: pspc.ini games_dir (pspc.exe lists the same folder in the XMB), chosen here.
+void ChooseGamesFolder() {
+	fs::path dir = PickFile(L"The folder with your PSP games (ISO, CSO, EBOOT.PBP)", {}, true);
+	if (dir.empty()) return;
+	settings::Settings s;
+	settings::Load(settings::DefaultPath(), s);
+	s.gamesDir = PathToUtf8(dir);
+	if (!settings::Save(settings::DefaultPath(), s)) {
+		MessageBoxW(g_main, (L"Couldn't write " + settings::DefaultPath().wstring()).c_str(), L"PSPC", MB_ICONERROR);
+		return;
+	}
+	ReloadSettings();
+	g_gamesDir = dir;
+	Rescan();
 }
 
 // ---- the selected game's panel
@@ -738,6 +866,10 @@ void Status(const Game &game, DetailRects &d) {
 	} else if (!g_settings.aot) {
 		d.statusText = L"Interpreter only";
 		d.statusNote = L"Native code is turned off in Settings.";
+	} else if (!CanBuild() && n.state != Native::Built) {
+		d.statusText = L"Ready to play";
+		d.statusNote = L"Runs in PSPC's interpreter.";
+		d.statusColor = ui::kGreen;
 	} else if (n.state == Native::Built) {
 		d.statusText = L"Native code built";
 		d.statusNote = n.total > 1 ? std::to_wstring(n.total) + L" modules run as Windows code." : L"Runs as Windows code.";
@@ -812,20 +944,28 @@ void PlaceDetailButtons() {
 		Gdiplus::Graphics g(&probe);
 		DetailRects d = ComputeDetail(g, rc.right, rc.bottom, g_games[sel]);
 		SetWindowTextW(g_buildButton, d.buildLabel.c_str());
-		EnableWindow(g_buildButton, d.buildEnabled && !BuildScript().empty());
+		EnableWindow(g_buildButton, d.buildEnabled);
 		PlaceButton(g_playButton, d.play);
-		PlaceButton(g_buildButton, d.build);
-		PlaceButton(g_interpButton, d.interp);
+		if (CanBuild()) {
+			PlaceButton(g_buildButton, d.build);
+			PlaceButton(g_interpButton, d.interp);
+		} else {
+			// The interpreter is all this copy has: Play does that; the second button shows the file.
+			ShowWindow(g_buildButton, SW_HIDE);
+			ShowWindow(g_interpButton, SW_HIDE);
+		}
 		PlaceButton(g_showButton, d.show);
 	} else {
 		for (HWND b : {g_playButton, g_buildButton, g_interpButton, g_showButton}) ShowWindow(b, SW_HIDE);
 	}
 	bool empty = g_games.empty() && rc.right > 0;
 	if (empty) {
-		float bw = Df(200);
-		PlaceButton(g_emptyButton, Gdiplus::RectF(((float)rc.right - bw) / 2, (float)rc.bottom / 2 + Df(56), bw, Df(40)));
+		float bw = Df(220);
+		PlaceButton(g_emptyButton, Gdiplus::RectF(((float)rc.right - bw) / 2, (float)rc.bottom / 2 + Df(90), bw, Df(40)));
+		PlaceButton(g_chooseButton, Gdiplus::RectF(((float)rc.right - bw) / 2, (float)rc.bottom / 2 + Df(138), bw, Df(36)));
 	} else {
 		ShowWindow(g_emptyButton, SW_HIDE);
+		ShowWindow(g_chooseButton, SW_HIDE);
 	}
 }
 
@@ -854,8 +994,9 @@ void PaintDetail(HDC hdc, int w, int h) {
 			ui::Text(g, ui::kIconGames, RectF(0, cy - Df(110), (float)w, Df(60)), Df(44), ui::C(ui::kTextFaint), false, 1,
 			         true, false, true);
 			ui::Text(g, L"Your library is empty", RectF(0, cy - Df(40), (float)w, Df(28)), Df(18), ui::C(ui::kText), true, 1);
-			std::wstring msg = L"Put ISO, CSO or EBOOT.PBP games in\n" + g_gamesDir.wstring() + L"\nand they show up here.";
-			ui::Text(g, msg.c_str(), RectF(Df(24), cy - Df(6), (float)w - Df(48), Df(60)), Df(12.5f), ui::C(ui::kTextDim),
+			std::wstring msg = L"Put your ISO, CSO or EBOOT.PBP games in\n" + g_gamesDir.wstring() +
+			                   L"\nand they show up here, or choose the folder where they already are.";
+			ui::Text(g, msg.c_str(), RectF(Df(24), cy - Df(6), (float)w - Df(48), Df(84)), Df(12.5f), ui::C(ui::kTextDim),
 			         false, 1, false, true);
 		} else {
 			ui::Text(g, L"Select a game", RectF(0, 0, (float)w, (float)h), Df(15), ui::C(ui::kTextFaint), false, 1);
@@ -1071,8 +1212,10 @@ void UpdateUi() {
 		PlaceDetailButtons();
 		InvalidateRect(g_detail, nullptr, FALSE);
 	}
-	for (HWND b : g_nav)
+	for (HWND b : g_nav) {
 		if (GetDlgCtrlID(b) == ID_BOOT_XMB) ui::SetDetail(b, XmbInstalled() ? L"PSP firmware menu" : L"Firmware not installed");
+		if (GetDlgCtrlID(b) == ID_ONLINE) ui::SetDetail(b, online::Summary().c_str());
+	}
 	UpdateAccount();
 	InvalidateRect(g_main, nullptr, FALSE);
 }
@@ -1148,7 +1291,7 @@ void PaintMain(HDC hdc, int w, int h) {
 	// Section labels over the nav buttons.
 	for (HWND b : g_nav) {
 		int id = GetDlgCtrlID(b);
-		const wchar_t *label = id == ID_LIBRARY ? L"LIBRARY" : id == ID_BOOT_XMB ? L"SYSTEM" : nullptr;
+		const wchar_t *label = id == ID_LIBRARY ? L"LIBRARY" : id == ID_BOOT_XMB ? L"SYSTEM" : id == ID_ONLINE ? L"ONLINE" : nullptr;
 		if (!label) continue;
 		RECT br;
 		GetWindowRect(b, &br);
@@ -1165,14 +1308,20 @@ void PaintMain(HDC hdc, int w, int h) {
 		g.DrawLine(&sep, Df(20), (REAL)ar.top - Df(10), (REAL)sw - Df(20), (REAL)ar.top - Df(10));
 	}
 
-	// Header: title, count, search box.
+	// Header: title, count, search box (the Online page covers it).
+	if (g_onlineShown) {
+		Graphics screen(hdc);
+		screen.DrawImage(&buffer, 0, 0);
+		return;
+	}
 	float hx = (float)sw + Df(kGridPad);
 	size_t shown = (size_t)std::max(0, ListView_GetItemCount(g_list));
 	std::wstring sub = g_filter.empty() ? std::to_wstring(g_games.size()) + (g_games.size() == 1 ? L" game" : L" games")
 	                                    : std::to_wstring(shown) + L" of " + std::to_wstring(g_games.size()) + L" games";
 	int native = 0;
 	for (const Game &game : g_games) native += game.native.state == Native::Built;
-	if (g_settings.aot && !g_games.empty()) sub += L"  ·  " + std::to_wstring(native) + L" built as native code";
+	if (g_settings.aot && !g_games.empty() && (CanBuild() || native > 0))
+		sub += L"  ·  " + std::to_wstring(native) + L" built as native code";
 	ui::Text(g, L"Games", RectF(hx, Df(18), Df(300), Df(30)), Df(22), ui::C(ui::kText), true, 0);
 	ui::Text(g, sub.c_str(), RectF(hx, Df(48), (float)(g_searchBox.left) - hx - Df(12), Df(18)), Df(12.5f),
 	         ui::C(ui::kTextFaint), false, 0);
@@ -1195,10 +1344,11 @@ void Layout(int w, int h) {
 	int y = D(104);
 	for (HWND b : g_nav) {
 		int id = GetDlgCtrlID(b);
-		if (id == ID_BOOT_XMB) y += D(34);
+		if (id == ID_BOOT_XMB || id == ID_ONLINE) y += D(34);
 		MoveWindow(b, D(12), y, sw - D(24), D(44), TRUE);
 		y += D(48);
 	}
+	MoveWindow(g_online, sw, 0, std::max(0, w - sw), h, TRUE);
 	MoveWindow(g_account, D(12), h - D(68), sw - D(24), D(52), TRUE);
 
 	int detailW = std::clamp(w * 34 / 100, D(330), D(440));
@@ -1222,11 +1372,12 @@ void ContextMenu(HWND hwnd, LPARAM lp) {
 	UINT on = sel >= 0 ? 0 : MF_GRAYED;
 	AppendMenuW(m, on, ID_PLAY, L"&Play\tEnter");
 	AppendMenuW(m, on, ID_PLAY_INTERP, L"Play in the &interpreter");
-	AppendMenuW(m, on, ID_BUILD, L"&Build native code");
+	if (CanBuild()) AppendMenuW(m, on, ID_BUILD, L"&Build native code");
 	AppendMenuW(m, on, ID_SHOW_FILE, L"&Show in folder");
 	AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
 	AppendMenuW(m, 0, ID_REFRESH, L"&Refresh\tF5");
 	AppendMenuW(m, 0, ID_OPEN_FOLDER, L"&Open Games folder");
+	AppendMenuW(m, 0, ID_CHOOSE_GAMES, L"&Choose the games folder...");
 	POINT pt{(short)LOWORD(lp), (short)HIWORD(lp)};
 	if (lp == -1) {  // from the keyboard: at the selected item
 		RECT r{};
@@ -1271,6 +1422,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		g_nav.push_back(MakeButton(hwnd, ID_BOOT_XMB, L"Boot XMB", ui::Look::Nav, ui::kIconXmb, L""));
 		g_nav.push_back(MakeButton(hwnd, ID_PLUGINS, L"Plugins", ui::Look::Nav, ui::kIconPlugins, L"M33 plugins"));
 		g_nav.push_back(MakeButton(hwnd, ID_SETTINGS, L"Settings", ui::Look::Nav, ui::kIconSettings, L"Video, audio, controls"));
+		g_nav.push_back(MakeButton(hwnd, ID_ONLINE, L"Online", ui::Look::Nav, ui::kIconGlobe, L"Servers and sign-in"));
 		g_account = MakeButton(hwnd, ID_NETWORK, L"Network", ui::Look::Nav, ui::kIconPerson, L"");
 		g_refreshButton = MakeButton(hwnd, ID_REFRESH, L"Refresh", ui::Look::Icon, ui::kIconRefresh);
 		g_folderButton = MakeButton(hwnd, ID_OPEN_FOLDER, L"Open the Games folder", ui::Look::Icon, ui::kIconFolder);
@@ -1294,11 +1446,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		g_interpButton = MakeButton(g_detail, ID_PLAY_INTERP, L"Interpreter", ui::Look::Secondary, ui::kIconCode);
 		g_showButton = MakeButton(g_detail, ID_SHOW_FILE, L"Show in folder", ui::Look::Icon, ui::kIconOpenFile);
 		g_emptyButton = MakeButton(g_detail, ID_OPEN_FOLDER, L"Open Games folder", ui::Look::Primary, ui::kIconFolder);
+		g_chooseButton = MakeButton(g_detail, ID_CHOOSE_GAMES, L"Choose a folder...", ui::Look::Secondary, ui::kIconSearch);
+		servers::Init(g_exeDir);
+		online::Hooks hooks;
+		hooks.findGame = [](const char *discId) {
+			std::wstring id = Widen(discId);
+			for (const Game &g : g_games)
+				if (g.id == id) return g.path.wstring();
+			return std::wstring();
+		};
+		hooks.openAccount = [] { OpenNetwork(); };
+		g_online = online::Create(hwnd, hooks);
 		ApplyFonts();
 		Scan();
 		RefreshNative();
 		Populate({});
 		SetFocus(g_list);
+		// After the library: the Combat Ops server serves the missions of the disc found in it.
+		online::StartAutomatic();
 		return 0;
 	}
 	case WM_SIZE: Layout(LOWORD(lp), HIWORD(lp)); return 0;
@@ -1310,7 +1475,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		Populate(SelectedPath());
 		return 0;
 	}
-	case WM_SETFOCUS: SetFocus(g_list); return 0;
+	case WM_SETFOCUS: SetFocus(g_onlineShown ? g_online : g_list); return 0;
+	case WM_CLOSE:
+		if (online::ConfirmClose(hwnd)) DestroyWindow(hwnd);
+		return 0;
+	case online::WM_ONLINE_CHANGED: UpdateUi(); return 0;
 	case WM_GETMINMAXINFO: ((MINMAXINFO *)lp)->ptMinTrackSize = {D(960), D(600)}; return 0;
 	case WM_ERASEBKGND: return 1;
 	case WM_PAINT: {
@@ -1333,6 +1502,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		// Back from a game, a build or an editor: pick up new native code and settings.
 		if (wp) {
 			ReloadSettings();
+			if (g_onlineShown) online::Refresh();
 			if (RefreshNative()) Populate(SelectedPath());
 			else UpdateUi();
 		}
@@ -1389,7 +1559,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		case ID_PLUGINS: OpenPlugins(); break;
 		case ID_NETWORK: OpenNetwork(); break;
 		case ID_BOOT_XMB: BootXmb(); break;
-		case ID_LIBRARY: SetFocus(g_list); break;
+		case ID_LIBRARY: ShowPage(false); return 0;
+		case ID_ONLINE: ShowPage(true); return 0;
+		case ID_CHOOSE_GAMES: ChooseGamesFolder(); break;
 		case ID_SEARCH:
 			if (HIWORD(wp) == EN_CHANGE) {
 				wchar_t text[128];
@@ -1400,7 +1572,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 			return 0;
 		}
 		// Buttons hand the keyboard back to the list.
-		if ((HWND)lp && GetFocus() == (HWND)lp) SetFocus(g_list);
+		if ((HWND)lp && GetFocus() == (HWND)lp && !g_onlineShown) SetFocus(g_list);
 		return 0;
 	case WM_DESTROY:
 		KillTimer(hwnd, ID_TIMER_JOBS);
@@ -1411,8 +1583,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 // PSPC_LAUNCHER_SNAPSHOT=<file.png>: render the window (off screen) to a PNG and exit; with
-// PSPC_LAUNCHER_SNAPSHOT_DIALOG=settings|plugins|network, the dialog instead, and with
-// PSPC_LAUNCHER_SNAPSHOT_SEARCH=<text>, the library filtered (for checking the look of changes
+// PSPC_LAUNCHER_SNAPSHOT_DIALOG=settings|plugins|network, the dialog instead, with
+// PSPC_LAUNCHER_SNAPSHOT_PAGE=online the Online page, with PSPC_LAUNCHER_SNAPSHOT_DELAY=<ms> later than
+// 1.5 s, and with PSPC_LAUNCHER_SNAPSHOT_SEARCH=<text>, the library filtered (for checking the look of changes
 // without a desktop session).
 bool SavePng(HWND hwnd, const fs::path &file) {
 	RECT r;
@@ -1442,6 +1615,72 @@ bool SavePng(HWND hwnd, const fs::path &file) {
 	return ok;
 }
 
+// The app icon: the sidebar's logo (the gamepad on the blue-violet tile) at the sizes Windows uses,
+// as PNG images in an .ico.
+bool WriteIcon(const fs::path &file) {
+	CLSID png{};
+	UINT n = 0, size = 0;
+	Gdiplus::GetImageEncodersSize(&n, &size);
+	std::vector<u8> encoders(size);
+	auto *enc = (Gdiplus::ImageCodecInfo *)encoders.data();
+	Gdiplus::GetImageEncoders(n, size, enc);
+	for (UINT i = 0; i < n; i++)
+		if (wcscmp(enc[i].MimeType, L"image/png") == 0) png = enc[i].Clsid;
+	const int sizes[] = {16, 20, 24, 32, 40, 48, 64, 96, 128, 256};
+	std::vector<std::vector<u8>> images;
+	for (int s : sizes) {
+		using namespace Gdiplus;
+		Bitmap bmp(s, s, PixelFormat32bppPARGB);
+		{
+			Graphics g(&bmp);
+			g.SetSmoothingMode(SmoothingModeAntiAlias);
+			g.SetTextRenderingHint(TextRenderingHintAntiAlias);
+			g.Clear(Color(0, 0, 0, 0));
+			float inset = s <= 24 ? 0.0f : (float)s * 0.04f;
+			RectF tile(inset, inset, (float)s - 2 * inset, (float)s - 2 * inset);
+			LinearGradientBrush grad(PointF(tile.X, tile.Y), PointF(tile.GetRight(), tile.GetBottom()), ui::C(RGB(72, 146, 255)),
+			                         ui::C(RGB(136, 92, 255)));
+			GraphicsPath path;
+			ui::AddRoundRect(path, tile, tile.Width * 0.24f);
+			g.FillPath(&grad, &path);
+			ui::Text(g, ui::kIconGames, tile, tile.Width * 0.56f, ui::C(RGB(255, 255, 255)), false, 1, true, false, true);
+		}
+		IStream *stream = nullptr;
+		if (CreateStreamOnHGlobal(nullptr, TRUE, &stream) != S_OK) return false;
+		bool ok = bmp.Save(stream, &png, nullptr) == Gdiplus::Ok;
+		STATSTG st{};
+		stream->Stat(&st, STATFLAG_NONAME);
+		std::vector<u8> data((size_t)st.cbSize.QuadPart);
+		LARGE_INTEGER zero{};
+		stream->Seek(zero, STREAM_SEEK_SET, nullptr);
+		ULONG got = 0;
+		stream->Read(data.data(), (ULONG)data.size(), &got);
+		stream->Release();
+		if (!ok || got != data.size()) return false;
+		images.push_back(std::move(data));
+	}
+	std::vector<u8> ico;
+	auto put16 = [&](unsigned v) { ico.push_back((u8)v); ico.push_back((u8)(v >> 8)); };
+	auto put32 = [&](u32 v) { put16(v & 0xFFFF); put16(v >> 16); };
+	put16(0);
+	put16(1);
+	put16((unsigned)images.size());
+	u32 offset = 6 + 16 * (u32)images.size();
+	for (size_t i = 0; i < images.size(); i++) {
+		ico.push_back((u8)(sizes[i] >= 256 ? 0 : sizes[i]));
+		ico.push_back((u8)(sizes[i] >= 256 ? 0 : sizes[i]));
+		ico.push_back(0);
+		ico.push_back(0);
+		put16(1);
+		put16(32);
+		put32((u32)images[i].size());
+		put32(offset);
+		offset += (u32)images[i].size();
+	}
+	for (const auto &img : images) ico.insert(ico.end(), img.begin(), img.end());
+	return WriteWholeFile(file, ico.data(), ico.size());
+}
+
 fs::path g_snapshot;
 std::wstring g_snapshotDialog;
 
@@ -1455,6 +1694,7 @@ void CALLBACK SnapshotTimer(HWND hwnd, UINT, UINT_PTR id, DWORD) {
 	}
 	SavePng(target, g_snapshot);
 	if (target != hwnd) PostMessageW(target, WM_COMMAND, IDCANCEL, 0);
+	servers::StopAll();  // (no question on closing)
 	PostMessageW(hwnd, WM_CLOSE, 0, 0);
 }
 
@@ -1466,15 +1706,31 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int show) {
 	int argc = 0;
 	wchar_t **argv = cmdLine && *cmdLine ? CommandLineToArgvW(cmdLine, &argc) : nullptr;
 	bool list = false;
+	fs::path writeIcon;
 	for (int i = 0; i < argc; i++) {
 		if (std::wstring(argv[i]) == L"--list") list = true;
+		else if (std::wstring(argv[i]) == L"--write-icon" && i + 1 < argc) writeIcon = argv[++i];
 		else g_gamesDir = argv[i];
 	}
+	if (!writeIcon.empty()) {
+		Gdiplus::GdiplusStartupInput gin;
+		ULONG_PTR token;
+		Gdiplus::GdiplusStartup(&token, &gin, nullptr);
+		bool ok = WriteIcon(writeIcon);
+		Gdiplus::GdiplusShutdown(token);
+		return ok ? 0 : 1;
+	}
 	if (argv) LocalFree(argv);
+	if (g_gamesDir.empty()) {
+		settings::Settings s;
+		settings::Load(settings::DefaultPath(), s);
+		if (!s.gamesDir.empty()) g_gamesDir = fs::u8path(s.gamesDir);
+	}
 	if (g_gamesDir.empty()) {
 		fs::path found = FindUp(g_exeDir, "Games");
 		g_gamesDir = found.empty() ? g_exeDir / "Games" : found;
 	}
+	CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);  // the file dialogs
 	if (list) {
 		// Redirected output (a pipe or file) is already stdout; otherwise borrow the parent's console.
 		HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -1508,6 +1764,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int show) {
 	WNDCLASSW wc{};
 	wc.lpfnWndProc = WndProc;
 	wc.hInstance = inst;
+	wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
 	wc.lpszClassName = L"PspcLauncher";
 	wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
 	RegisterClassW(&wc);
@@ -1523,11 +1780,27 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int show) {
 	                          ui::Px(1280, dpi), ui::Px(780, dpi), nullptr, nullptr, inst, nullptr);
 	ShowWindow(hwnd, g_snapshot.empty() ? show : SW_SHOWNOACTIVATE);
 	if (!g_snapshot.empty()) {
-		SetTimer(hwnd, 1, 1500, SnapshotTimer);
+		wchar_t delay[16] = {};
+		int ms = GetEnvironmentVariableW(L"PSPC_LAUNCHER_SNAPSHOT_DELAY", delay, 16) ? _wtoi(delay) : 0;
+		SetTimer(hwnd, 1, ms > 0 ? ms : 1500, SnapshotTimer);
 		if (snapSearch[0]) SetWindowTextW(g_search, snapSearch);
 		if (g_snapshotDialog == L"settings") OpenSettings();
 		else if (g_snapshotDialog == L"plugins") OpenPlugins();
 		else if (g_snapshotDialog == L"network") OpenNetwork();
+		else if (g_snapshotDialog == L"accounts") serverdlg::NetworkAccounts(hwnd);
+		else if (g_snapshotDialog == L"log") serverdlg::ShowLog(hwnd, servers::Kind::Sfco, L"Syphon Filter: Combat Ops: log");
+		else if (g_snapshotDialog == L"manage") {
+			settings::Settings s;
+			settings::Load(settings::DefaultPath(), s);
+			serverdlg::ManageSfco(hwnd, s);
+		} else if (g_snapshotDialog == L"choose") {
+			serverdlg::Target t = serverdlg::Target::Other;
+			std::wstring address = L"192.168.1.20";
+			serverdlg::ChooseServer(hwnd, L"Combat Ops online", L"Where should Syphon Filter: Combat Ops go when you choose online play?",
+			                        true, &t, &address);
+		}
+		wchar_t snapPage[32] = {};
+		if (GetEnvironmentVariableW(L"PSPC_LAUNCHER_SNAPSHOT_PAGE", snapPage, 32) && std::wstring(snapPage) == L"online") ShowPage(true);
 	}
 	MSG m;
 	while (GetMessageW(&m, nullptr, 0, 0) > 0) {

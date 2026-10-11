@@ -14,7 +14,18 @@ they rate the mission and return to the lobby. Cells, buddy invitations, chat an
 pages (leaderboards, profiles, cell standings, message board) work in the game. Play across the
 internet hasn't been tried yet (see [Hosting on the internet](#hosting-on-the-internet)).
 
-## Quick start (one PC)
+## From the launcher
+
+The launcher's *Online* page runs this server: *Start* on the Syphon Filter: Combat Ops card starts
+it with the missions of the Combat Ops disc in your library, checks sign-ins with the PSPC Network
+server on the same page when that runs (also letting in players without an account, unless
+*Manage...* says otherwise), and points your own game at it. *Change...* points the game at
+another server; *Manage...* sets the address players reach it at and lists players (ban, unban),
+shared missions (hide, delete), news and the message board; *Log* shows what it does. Its database
+and log are in the `servers` folder next to pspc.exe. Friends on other PCs choose *Change...* and
+enter your address.
+
+## Quick start (one PC, command line)
 
 ```sh
 cd server

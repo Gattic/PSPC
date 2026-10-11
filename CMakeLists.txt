@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
-project(PSPC C CXX)
+# The release version: the installer (tools/make_installer.py), the launcher and pspc --version show it.
+project(PSPC VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

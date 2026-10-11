@@ -55,6 +55,14 @@ struct Settings {
 	std::string npOnlineId;  // the online ID: the account's (set by the launcher) or the local one
 	std::string npToken;     // the server's sign-in token for that account (the launcher's Network dialog)
 	std::string infraDns;    // DNS server for every game's online services ("" = per-game table)
+	// Servers the launcher runs on this PC (its Online page): start them when it opens.
+	bool hostNetwork = false;       // the PSPC Network server
+	int hostNetworkPort = 8423;
+	bool hostNetworkLan = true;     // other PCs may connect (else this PC only)
+	bool hostSfco = false;          // the Syphon Filter: Combat Ops server
+	std::string hostSfcoAddress;    // the address players reach it at ("" = this PC's LAN address)
+	bool hostSfcoAllowLocal = true; // also let in players without a PSPC Network account
+	bool hostAdhoc = false;         // the ad hoc server (pspc --adhoc-server)
 	// One comma-separated binding list per kControls entry ("" = unbound).
 	std::vector<std::string> keys, pads;
 	Settings();

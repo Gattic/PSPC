@@ -7,6 +7,11 @@ How the pieces fit together, the API and the ticket format: [docs/pspc-network.m
 
 Python 3.9 or later, standard library only. One file of state (SQLite).
 
+**On a player's PC, the launcher runs it:** the *Online* page's PSPC Network card starts and stops it,
+lists and bans accounts and resets passwords, and shows its log (an installed PSPC brings its own
+Python). Its database and log are in the `servers` folder next to pspc.exe. The rest of this page is
+for running it yourself, for example on a server for a community.
+
 ## Running it
 
 ```sh

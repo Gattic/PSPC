@@ -52,8 +52,10 @@ system's sign-in screen appears briefly ("PSPC Network: Signing in.") and return
 If the server can't be reached or the token was revoked, the sign-in fails the way PSN's did and
 the game shows its own error; sign in again from the launcher.
 
-**Running a server** for friends or a community: see [server/README.md](../server/README.md). For
-a quick test on one PC:
+**Running a server** for friends: the launcher's *Online* page starts one on your PC (*Start* on the
+PSPC Network card, then *Sign in here* to create your own account on it); friends enter the address
+it shows under *Account...* in their launcher. For a community server: see
+[server/README.md](../server/README.md). For a quick test on one PC from the command line:
 
 ```bat
 cd server

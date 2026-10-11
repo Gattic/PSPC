@@ -906,5 +906,38 @@ class RecordsTests(unittest.TestCase):
         self.assertEqual((board[0][1]['clan']['name'], board[0][1]['wins']), ('Shadows', 1))
 
 
+class CommandTests(unittest.TestCase):
+    """The admin commands the launcher's Online page runs, with --json."""
+
+    def run_main(self, args):
+        import contextlib
+        import io
+        import json
+        from pspc_medius.__main__ import main
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = main(['--db', self.db] + args)
+        logging.getLogger().handlers.clear()
+        text = out.getvalue()
+        return rc, json.loads(text) if args and args[0] == '--json' else text
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.db = os.path.join(self.dir, 'sfco.sqlite')
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_json_lists(self):
+        self.assertEqual(self.run_main(['--json', 'accounts']), (0, []))
+        self.assertEqual(self.run_main(['--json', 'missions', 'list']), (0, []))
+        self.assertEqual(self.run_main(['news', 'add', 'Tournament on Saturday'])[0], 0)
+        rc, news = self.run_main(['--json', 'news', 'list'])
+        self.assertEqual((rc, [n['text'] for n in news]), (0, ['Tournament on Saturday']))
+        self.assertEqual(self.run_main(['news', 'delete', str(news[0]['id'])])[0], 0)
+        self.assertEqual(self.run_main(['--json', 'news', 'list']), (0, []))
+        self.assertEqual(self.run_main(['--json', 'board', 'list']), (0, []))
+
+
 if __name__ == '__main__':
     unittest.main()

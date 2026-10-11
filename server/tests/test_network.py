@@ -211,5 +211,47 @@ class RateLimitTests(unittest.TestCase):
         self.assertEqual(self.attempt(server, '2.2.2.2'), 429)
 
 
+class CommandTests(unittest.TestCase):
+    """The admin commands the launcher's Online page runs: JSON lists, a password from stdin."""
+
+    def run_main(self, args, stdin=''):
+        import contextlib
+        import io
+        from pspc_network.__main__ import main
+        out = io.StringIO()
+        old = sys.stdin
+        sys.stdin = io.StringIO(stdin)
+        try:
+            with contextlib.redirect_stdout(out):
+                rc = main(['--db', self.db] + args)
+        finally:
+            sys.stdin = old
+        return rc, out.getvalue()
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.db = os.path.join(self.dir, 'np.sqlite')
+        store = Store(self.db)
+        store.create_account('Gabe_Logan', 'password1', 'us')
+        store.close()
+
+    def test_json_accounts_and_password(self):
+        rc, out = self.run_main(['--json', 'accounts'])
+        self.assertEqual(rc, 0)
+        accounts = json.loads(out)
+        self.assertEqual([(a['online_id'], a['banned']) for a in accounts], [('Gabe_Logan', False)])
+        rc, _ = self.run_main(['passwd', 'Gabe_Logan', '--password-stdin'], 'new password 2\n')
+        self.assertEqual(rc, 0)
+        store = Store(self.db)
+        try:
+            self.assertTrue(store.check_password('Gabe_Logan', 'new password 2'))
+        finally:
+            store.close()
+        # Too short: refused, nothing changes.
+        self.assertEqual(self.run_main(['passwd', 'Gabe_Logan', '--password-stdin'], 'short\n')[0], 1)
+        self.assertEqual(self.run_main(['ban', 'Gabe_Logan'])[0], 0)
+        self.assertTrue(json.loads(self.run_main(['--json', 'accounts'])[1])[0]['banned'])
+
+
 if __name__ == '__main__':
     unittest.main()

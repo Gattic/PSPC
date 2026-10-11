@@ -8,6 +8,33 @@ interpreter as a fallback. The PSP OS, as of firmware 4.01 with the M33 custom f
 Read [PLAN.md](PLAN.md) for the goals and phases, and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 and [docs/RECOMPILER.md](docs/RECOMPILER.md) for how it works.
 
+## Installing
+
+1. Download `PSPC-<version>-x64.msi` from the [Releases page](https://github.com/Gattic/PSPC/releases)
+   and open it. PSPC installs for your Windows account in `%LOCALAPPDATA%\Programs\PSPC`, without
+   administrator rights, and adds **PSPC** to the Start menu and the desktop. (The installer isn't
+   signed yet, so Windows may say it's from an unknown publisher: choose *More info*, then *Run
+   anyway*.)
+2. Start PSPC. Put your games (ISO, CSO or EBOOT.PBP dumps of games you own) in its Games folder,
+   or click *Choose a folder...* where they already are.
+3. Double-click a game to play it. Keyboard and controller controls are under *Settings*, and so
+   are the renderer, the resolution (up to 8K with Direct3D 11) and texture upscaling.
+4. **Online:** the sidebar's *Online* page runs PSPC Network (sign-in and friends, PSPC's
+   PlayStation Network stand-in), the Syphon Filter: Combat Ops server and the ad hoc server on
+   your PC with one click, for you and your friends, or points your games at someone else's.
+   Everything they need comes with PSPC.
+5. Optional: the PSP's own menu (the XMB) needs Sony's firmware, which PSPC can't include. With
+   Sony's PSP system software update 4.01 (its `EBOOT.PBP`), *Boot XMB* installs it. That also
+   brings the PSP's system fonts, which some games draw their text with (without them that text
+   doesn't show).
+
+Updating: open a newer MSI; it replaces the old version and keeps your settings, saves and server
+accounts. Uninstalling (Windows Settings > Apps > PSPC) removes PSPC's programs and leaves what
+PSPC created in its folder (settings, saves, firmware, server databases).
+
+The installed PSPC runs games in its interpreter. Native (AOT) code needs a source build with
+LLVM and Visual Studio (below), which adds *Build native code* to the launcher.
+
 ## Status
 
 Retail games boot and play natively (AOT) and in the interpreter: Daxter (intro movie and
@@ -45,6 +72,10 @@ build.cmd                       :: configure + build into build\RelWithDebInfo
 build\RelWithDebInfo\bin\pspc_unittests.exe
 ```
 
+The installer: `python -I tools\make_installer.py` (Python 3.12: it uses `msilib`, gone in 3.13)
+packages `build\RelWithDebInfo` with a private Python runtime for the servers into
+`build\installer\PSPC-<version>-x64.msi`. The version is the one in `CMakeLists.txt`.
+
 ## Playing
 
 Put your game dumps (ISO/CSO, or EBOOT.PBP folders) in `Games\` and start the library window:
@@ -56,7 +87,8 @@ build\RelWithDebInfo\bin\pspc-launcher.exe
 Double-click (or Enter) plays a game. The panel on the right shows the selected game with *Play*,
 *Build native code* (compiles it ahead of time, about a minute per disc; otherwise it runs in the
 interpreter, which is slower but complete) and *Interpreter*; Ctrl+F searches the library, and the
-sidebar has Boot XMB, Plugins, Settings and your PSPC Network account.
+sidebar has Boot XMB, Plugins, Settings, the Online page (servers and sign-in) and your PSPC
+Network account.
 From the command line:
 
 ```bat

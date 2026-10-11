@@ -42,8 +42,15 @@ if(TARGET pspc_gpu_hw)
 	target_compile_definitions(pspc_runtime PUBLIC PSPC_HAVE_GPU_HW=1)
 endif()
 
-add_executable(pspc ${CMAKE_SOURCE_DIR}/src/frontend/main.cpp)
+# pspc_version.h: the version in CMakeLists.txt, for the programs and their resources.
+file(WRITE ${CMAKE_BINARY_DIR}/generated/pspc_version.h.tmp
+	"#pragma once\n#define PSPC_VERSION \"${PROJECT_VERSION}\"\n#define PSPC_VERSION_MAJOR ${PROJECT_VERSION_MAJOR}\n"
+	"#define PSPC_VERSION_MINOR ${PROJECT_VERSION_MINOR}\n#define PSPC_VERSION_PATCH ${PROJECT_VERSION_PATCH}\n")
+file(COPY_FILE ${CMAKE_BINARY_DIR}/generated/pspc_version.h.tmp ${CMAKE_BINARY_DIR}/generated/pspc_version.h ONLY_IF_DIFFERENT)
+
+add_executable(pspc ${CMAKE_SOURCE_DIR}/src/frontend/main.cpp ${CMAKE_SOURCE_DIR}/src/frontend/pspc.rc)
 target_link_libraries(pspc PRIVATE pspc_runtime)
+target_include_directories(pspc PRIVATE ${CMAKE_BINARY_DIR}/generated)
 add_custom_command(TARGET pspc POST_BUILD
 	COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SDL2_ROOT}/lib/x64/SDL2.dll $<TARGET_FILE_DIR:pspc>
 )
@@ -54,14 +61,18 @@ target_link_libraries(pspc-iso PRIVATE pspc_fs pspc_common)
 add_executable(pspc-launcher WIN32
 	${CMAKE_SOURCE_DIR}/src/frontend/launcher.cpp
 	${CMAKE_SOURCE_DIR}/src/frontend/network_dialog.cpp
+	${CMAKE_SOURCE_DIR}/src/frontend/online_page.cpp
 	${CMAKE_SOURCE_DIR}/src/frontend/plugins_dialog.cpp
+	${CMAKE_SOURCE_DIR}/src/frontend/server_dialogs.cpp
+	${CMAKE_SOURCE_DIR}/src/frontend/servers.cpp
 	${CMAKE_SOURCE_DIR}/src/frontend/settings_dialog.cpp
 	${CMAKE_SOURCE_DIR}/src/frontend/ui_theme.cpp
+	${CMAKE_SOURCE_DIR}/src/frontend/launcher.rc
 )
 target_link_libraries(pspc-launcher PRIVATE pspc_fs pspc_net pspc_common comctl32 gdiplus dwmapi uxtheme)
 # Wide-character Win32 macros (ListView_InsertItem & co. take LVITEMW).
 target_compile_definitions(pspc-launcher PRIVATE UNICODE _UNICODE)
-# PSPC_SEM_VERSION: the launcher tells current AOT DLLs from stale ones.
+# PSPC_SEM_VERSION: the launcher tells current AOT DLLs from stale ones; pspc_version.h.
 target_include_directories(pspc-launcher PRIVATE ${CMAKE_BINARY_DIR}/generated)
 
 # sceUtility dialogs (src/runtime/dialogs/).
