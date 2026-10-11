@@ -180,7 +180,8 @@ Texts TextsOf(const Card &c) {
 			t.host = L"Running: " + std::to_wstring(online) + (online == 1 ? L" player" : L" players") + L" online, " + std::to_wstring(games) +
 			         (games == 1 ? L" game" : L" games") + L" hosted. Other PCs use " + GameSpyAddress() + L".";
 		}
-		t.note = L"Players make their GameSpy accounts in the game: Create New GameSpy ID.";
+		// The game's Join screen lists dedicated servers (there are none any more) until R is pressed.
+		t.note = L"In the game, Create New GameSpy ID the first time. To join a friend's game: Join, then R for Player-Hosted Servers.";
 		break;
 	}
 	case Kind::Adhoc: {

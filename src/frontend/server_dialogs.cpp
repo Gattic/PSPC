@@ -136,6 +136,10 @@ HWND MakeList(HWND dlg, int x, int y, int w, int h) {
 	return list;
 }
 
+// An admin command's JSON list. (By value: a loop over Parse(out).Array() would outlive the parsed
+// value it belongs to.)
+std::vector<json::Value> ParseList(const std::string &out) { return json::Value::Parse(out).Array(); }
+
 // Runs an admin command; shows its error. Returns its output in *out (when given).
 bool AdminOrSay(HWND dlg, servers::Kind k, const std::vector<std::wstring> &args, std::string *out = nullptr, const std::string &input = {}) {
 	std::string text;
@@ -304,7 +308,7 @@ void LoadAccounts(HWND dlg, AccountsState &st) {
 	st.ids.clear();
 	std::string out;
 	if (!AdminOrSay(dlg, servers::Kind::Network, {L"--json", L"accounts"}, &out)) return;
-	for (const json::Value &a : json::Value::Parse(out).Array()) {
+	for (const json::Value &a : ParseList(out)) {
 		std::wstring id = Widen(a["online_id"].String(""));
 		Row(st.list, {id, Widen(a["country"].String("")), Date(a["created"].Number()), a["banned"].Bool() ? L"Banned" : L""}, (LPARAM)st.ids.size());
 		st.ids.push_back(id);
@@ -383,7 +387,7 @@ void LoadView(HWND dlg, SfcoState &st) {
 	case kPlayers:
 		Columns(st.list, {{L"Player", 45}, {L"First seen", 30}, {L"Status", 25}});
 		if (!AdminOrSay(dlg, servers::Kind::Sfco, {L"--json", L"accounts"}, &out)) return;
-		for (const json::Value &a : json::Value::Parse(out).Array()) {
+		for (const json::Value &a : ParseList(out)) {
 			std::wstring name = Widen(a["name"].String(""));
 			Row(st.list, {name, Date(a["created"].Number()), a["banned"].Bool() ? L"Banned" : L""}, (LPARAM)st.ids.size());
 			st.ids.push_back(name);
@@ -392,7 +396,7 @@ void LoadView(HWND dlg, SfcoState &st) {
 	case kMissions:
 		Columns(st.list, {{L"Mission", 34}, {L"By", 22}, {L"Plays", 11}, {L"Downloads", 15}, {L"", 18}});
 		if (!AdminOrSay(dlg, servers::Kind::Sfco, {L"--json", L"missions", L"list"}, &out)) return;
-		for (const json::Value &m : json::Value::Parse(out).Array()) {
+		for (const json::Value &m : ParseList(out)) {
 			std::wstring flags = m["official"].Bool() ? L"Official" : L"";
 			if (m["hidden"].Bool()) flags += flags.empty() ? L"Hidden" : L", hidden";
 			Row(st.list,
@@ -405,7 +409,7 @@ void LoadView(HWND dlg, SfcoState &st) {
 	case kNews:
 		Columns(st.list, {{L"Date", 22}, {L"News", 78}});
 		if (!AdminOrSay(dlg, servers::Kind::Sfco, {L"--json", L"news", L"list"}, &out)) return;
-		for (const json::Value &n : json::Value::Parse(out).Array()) {
+		for (const json::Value &n : ParseList(out)) {
 			Row(st.list, {Date(n["created"].Number()), Widen(n["text"].String(""))}, (LPARAM)st.ids.size());
 			st.ids.push_back(std::to_wstring((long long)n["id"].Number()));
 		}
@@ -413,7 +417,7 @@ void LoadView(HWND dlg, SfcoState &st) {
 	case kBoard:
 		Columns(st.list, {{L"Board", 18}, {L"Author", 20}, {L"Post", 47}, {L"", 15}});
 		if (!AdminOrSay(dlg, servers::Kind::Sfco, {L"--json", L"board", L"list"}, &out)) return;
-		for (const json::Value &p : json::Value::Parse(out).Array()) {
+		for (const json::Value &p : ParseList(out)) {
 			std::string text = p["subject"].String("");
 			if (text.empty()) text = p["body"].String("");
 			if (p["reply_to"].Number() > 0) text = "Re: " + text;
@@ -555,7 +559,7 @@ void LoadGameSpy(HWND dlg, GameSpyState &st) {
 	case kGsPlayers:
 		Columns(st.list, {{L"Player", 30}, {L"E-mail", 32}, {L"Last seen", 22}, {L"Status", 16}});
 		if (!AdminOrSay(dlg, servers::Kind::GameSpy, {L"--json", L"accounts"}, &out)) return;
-		for (const json::Value &a : json::Value::Parse(out).Array()) {
+		for (const json::Value &a : ParseList(out)) {
 			std::wstring name = Widen(a["uniquenick"].String(""));
 			if (name.empty()) name = Widen(a["name"].String(""));
 			double seen = a["last_login"].Number();
@@ -567,7 +571,7 @@ void LoadGameSpy(HWND dlg, GameSpyState &st) {
 	case kGsCareers:
 		Columns(st.list, {{L"Player", 28}, {L"Games", 12}, {L"Kills", 12}, {L"Deaths", 12}, {L"Won", 12}, {L"Lost", 12}, {L"Online", 12}});
 		if (!AdminOrSay(dlg, servers::Kind::GameSpy, {L"--json", L"stats"}, &out)) return;
-		for (const json::Value &p : json::Value::Parse(out).Array()) {
+		for (const json::Value &p : ParseList(out)) {
 			const json::Value &t = p["stats"];
 			Row(st.list,
 			    {Widen(p["name"].String("")), Num(t["games"].Number()), Num(t["kills"].Number()), Num(t["deaths"].Number()), Num(t["wins"].Number()),
@@ -578,7 +582,7 @@ void LoadGameSpy(HWND dlg, GameSpyState &st) {
 	case kGsGames:
 		Columns(st.list, {{L"Started", 22}, {L"Host", 24}, {L"Map", 36}, {L"", 18}});
 		if (!AdminOrSay(dlg, servers::Kind::GameSpy, {L"--json", L"games"}, &out)) return;
-		for (const json::Value &g : json::Value::Parse(out).Array())
+		for (const json::Value &g : ParseList(out))
 			Row(st.list, {Date(g["started"].Number()), Widen(g["host_name"].String("")), Widen(g["map"].String("")),
 			              g["finished"].Number() > 0 ? L"Finished" : L""},
 			    0);
