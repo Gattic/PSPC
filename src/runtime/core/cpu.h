@@ -31,6 +31,8 @@ void RunFunction(Ctx *c, u32 func);
 // Host->guest call that preserves every register of `c` except the result. Used for callbacks
 // and interrupt handlers that run on an existing thread context. Returns $v0.
 u32 CallGuest(Ctx *c, u32 func, std::initializer_list<u32> args);
+// The same for a function that returns 64 bits (v0:v1).
+u64 CallGuest64(Ctx *c, u32 func, std::initializer_list<u32> args);
 
 void YieldCheck(Ctx *c);
 void Break(Ctx *c, u32 insn, u32 pc);

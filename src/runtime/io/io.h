@@ -52,6 +52,7 @@ enum class DevClass {
 	UmdFiles,     // disc0: (ISO9660 files)
 	UmdBlock,     // umd0:/umd1:/umd: (the whole disc in sectors)
 	Emulator,     // emulator:/kemulator: (pspautotests output)
+	GuestDriver,  // a driver the game added (sceIoAddDrv)
 };
 
 class Device {
@@ -92,6 +93,11 @@ public:
 
 void Init();
 void Shutdown();
+// sceIoAddDrv / sceIoDelDrv (guest_driver.cpp): a device whose driver is the game's own, the
+// PspIoDrv at drvAddr; its functions run on the calling thread. 0 or a PSP error.
+int AddGuestDriver(u32 drvAddr);
+int DelGuestDriver(const std::string &name);
+void ResetGuestDrivers();
 // `device` without the colon; aliases are folded ("fatms0" and "memstick" are ms0, "umd1",
 // "umd" and "umd00" are umd0, device names compare case-insensitively).
 void Mount(const std::string &device, std::shared_ptr<Device> dev);

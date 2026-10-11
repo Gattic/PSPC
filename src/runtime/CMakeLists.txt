@@ -25,6 +25,7 @@ add_library(pspc_runtime STATIC
 	core/memory.cpp
 	hle/hle.cpp
 	host/sdl_host.cpp
+	io/guest_driver.cpp
 	io/io.cpp
 	media/disc.cpp
 	m33/m33.cpp

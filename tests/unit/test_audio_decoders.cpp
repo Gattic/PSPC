@@ -8,6 +8,7 @@
 #include <fstream>
 #include <vector>
 
+#include "audio/aac_frame.h"
 #include "audio/atrac_track.h"
 #include "audio/decoder.h"
 #include "audio/guest_memory.h"
@@ -60,6 +61,33 @@ TEST(audio_mp3_header) {
 	CHECK_EQ(info.samplesPerFrame, 576);
 	const u8 bad[4] = {0xFF, 0xEB, 0x90, 0x64};  // reserved version
 	CHECK(!audio::ParseMp3Header(bad, &info));
+}
+
+// Every raw AU of the ADTS streams in audio/audiocodec walks to exactly the length its header
+// gives, at three bitrates.
+TEST(audio_aac_raw_block_lengths) {
+	const char *files[] = {"audiocodec/aac_64k.aac", "audiocodec/aac_128k.aac", "audiocodec/aac_192k.aac"};
+	for (const char *name : files) {
+		std::vector<u8> file = LoadRef(name);
+		if (file.empty()) {
+			printf("  (skipped: reference/pspautotests not present)\n");
+			return;
+		}
+		size_t pos = 0;
+		int frames = 0;
+		while (pos + 7 <= file.size()) {
+			const u8 *h = file.data() + pos;
+			CHECK(h[0] == 0xFF && (h[1] & 0xF6) == 0xF0);
+			const int len = ((h[3] & 3) << 11) | (h[4] << 3) | (h[5] >> 5);
+			const int rate = ((h[2] >> 2) & 0xF);
+			if (len <= 7 || pos + len > file.size()) break;
+			CHECK_EQ(audio::AacRawDataBlockBytes(h + 7, len - 7, rate), len - 7);
+			pos += len;
+			frames++;
+		}
+		printf("  %s: %d frames\n", name, frames);
+		CHECK(frames > 10);
+	}
 }
 
 TEST(audio_mp3_decode_sample) {

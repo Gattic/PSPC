@@ -40,17 +40,22 @@ u32 Delay(u32 result, int us) { return audiohle::DelayResult(result, us); }
 
 int getWidthHeight(int width, int height) { return (width << 16) | height; }
 
-// TODO: sceJpegCsc and sceJpegMJpegCsc use different factors.
-u32 convertYCbCrToABGR(int y, int cb, int cr) {
-	cb = cb - 128;
-	cr = cr - 128;
-	int r = y + cr + (cr >> 2) + (cr >> 3) + (cr >> 5);
-	int g = y - ((cb >> 2) + (cb >> 4) + (cb >> 5)) - ((cr >> 1) + (cr >> 3) + (cr >> 4) + (cr >> 5));
-	int b = y + cb + (cb >> 1) + (cb >> 2) + (cb >> 6);
-	r = std::min(255, std::max(0, r));
-	g = std::min(255, std::max(0, g));
-	b = std::min(255, std::max(0, b));
-	return (u32)((b << 16) | (g << 8) | (r << 0));
+// sceJpegMJpegCsc: chroma below 1 counts as 1, then BT.601 in 8-bit fixed point, rounded
+// (jpeg/mjpegcsc "Bits", and 00008600 for an all-zero input).
+u32 MJpegYCbCrToABGR(int y, int cb, int cr) {
+	const int d = std::max(cb, 1) - 128, e = std::max(cr, 1) - 128;
+	const int r = std::clamp(y + ((359 * e + 128) >> 8), 0, 255);
+	const int g = std::clamp(y + ((-88 * d - 182 * e + 128) >> 8), 0, 255);
+	const int b = std::clamp(y + ((454 * d + 128) >> 8), 0, 255);
+	return (u32)((b << 16) | (g << 8) | r);
+}
+
+// The converter reads its planes 8 bytes at a time: from a plane that starts 4 bytes into an
+// 8-byte block, the second half of each block comes from the block before (jpeg/mjpegcsc's
+// patterns).
+u8 MJpegPlaneByte(u32 base, u32 i) {
+	const u32 addr = base + i - ((base & 7) == 4 && (i & 4) ? 8 : 0);
+	return GRead8(addr);
 }
 
 // sceJpegCsc: JFIF (full range BT.601), rounded (jpeg/csc "Bits").
@@ -137,9 +142,7 @@ int JpegMJpegCsc(u32 imageAddr, u32 yCbCrAddr, int widthHeight, int bufferWidth,
 	if (!mem::IsValidRange(imageAddr, destSize)) return (int)SCE_KERNEL_ERROR_INVALID_POINTER;
 
 	u32 *imageBuffer = (u32 *)GPtr(imageAddr);
-	const u8 *Y = GPtr(yCbCrAddr);
-	const u8 *Cb = Y + sizeY;
-	const u8 *Cr = Cb + sizeCb;
+	const u32 yAddr = yCbCrAddr, cbAddr = yAddr + (u32)sizeY, crAddr = cbAddr + (u32)sizeCb;
 
 	// The PSP behaves strangely for heights below 16, not rescheduling and writing fewer bytes.
 	if (height >= 16) usec += 9 * height;
@@ -147,30 +150,14 @@ int JpegMJpegCsc(u32 imageAddr, u32 yCbCrAddr, int widthHeight, int bufferWidth,
 	if (!mem::IsValidRange(yCbCrAddr, (u32)(sizeY + sizeCb + sizeCb))) {
 		// Seems to write based on zeros.
 		for (int y = 0; y < height; ++y) {
-			for (int x = 0; x < width; ++x) imageBuffer[bufferWidth * y + x] = convertYCbCrToABGR(0, 0, 0);
-		}
-	} else if ((widthHeight & 0x00010001) == 0 && height > 1) {
-		for (int y = 0; y < height; y += 2) {
-			for (int x = 0; x < width; x += 2) {
-				const u8 y0 = Y[width * y + x];
-				const u8 y1 = Y[width * y + x + 1];
-				const u8 y2 = Y[width * (y + 1) + x];
-				const u8 y3 = Y[width * (y + 1) + x + 1];
-				const u8 cb = Cb[(width >> 1) * (y >> 1) + (x >> 1)];
-				const u8 cr = Cr[(width >> 1) * (y >> 1) + (x >> 1)];
-				imageBuffer[bufferWidth * y + x] = convertYCbCrToABGR(y0, cb, cr);
-				imageBuffer[bufferWidth * y + x + 1] = convertYCbCrToABGR(y1, cb, cr);
-				imageBuffer[bufferWidth * (y + 1) + x] = convertYCbCrToABGR(y2, cb, cr);
-				imageBuffer[bufferWidth * (y + 1) + x + 1] = convertYCbCrToABGR(y3, cb, cr);
-			}
+			for (int x = 0; x < width; ++x) imageBuffer[bufferWidth * y + x] = MJpegYCbCrToABGR(0, 0, 0);
 		}
 	} else {
 		for (int y = 0; y < height; ++y) {
 			for (int x = 0; x < width; ++x) {
-				const u8 yy = Y[width * y + x];
-				const u8 cb = Cb[(width >> 1) * (y >> 1) + (x >> 1)];
-				const u8 cr = Cr[(width >> 1) * (y >> 1) + (x >> 1)];
-				imageBuffer[bufferWidth * y + x] = convertYCbCrToABGR(yy, cb, cr);
+				const u32 c = (u32)((width >> 1) * (y >> 1) + (x >> 1));
+				imageBuffer[bufferWidth * y + x] = MJpegYCbCrToABGR(MJpegPlaneByte(yAddr, (u32)(width * y + x)),
+				                                                    MJpegPlaneByte(cbAddr, c), MJpegPlaneByte(crAddr, c));
 			}
 		}
 	}

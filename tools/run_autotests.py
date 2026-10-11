@@ -45,6 +45,8 @@ ENVIRONMENT = {
     # Same freopen: its heap blocks (Font_Free addresses) are 0x20 higher. Opens jpn0.pgf.
     'font/fonttest': {'mode': 'display', 'needs': ['font/jpn0.pgf']},
     'umd/io/umd_io': {'disc': 'umd-test'},
+    # Same heap shift: the pattern lines read bytes just before the test's buffers.
+    'jpeg/mjpegcsc': {'mode': 'display'},
     # Hardware details games don't see, modelled only in the interpreter on request: VRAM's
     # swizzled mirrors, and the data cache seen through the uncached segment.
     'gpu/ge/edramswizzle': {'args': ['--edram-mirrors']},

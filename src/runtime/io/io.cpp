@@ -451,6 +451,7 @@ std::string CanonicalDevice(std::string_view device) {
 }
 
 void Init() {
+	ResetGuestDrivers();
 	g_mounts.clear();
 	g_threadCwd.clear();
 	g_cwd = "ms0:/";

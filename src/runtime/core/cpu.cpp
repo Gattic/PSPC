@@ -67,7 +67,7 @@ void RunFunction(Ctx *c, u32 func) {
 	}
 }
 
-u32 CallGuest(Ctx *c, u32 func, std::initializer_list<u32> args) {
+u64 CallGuest64(Ctx *c, u32 func, std::initializer_list<u32> args) {
 	// Save everything a guest function may clobber, including VFPU state. This lives on the
 	// current fiber's stack: guest threads are fibers sharing one host thread, so thread_local
 	// storage would be shared between them.
@@ -80,14 +80,17 @@ u32 CallGuest(Ctx *c, u32 func, std::initializer_list<u32> args) {
 		i++;
 	}
 	c->r[2] = 0;
+	c->r[3] = 0;
 	RunFunction(c, func);
-	u32 result = c->r[2];
+	const u64 result = c->r[2] | ((u64)c->r[3] << 32);
 
 	void *thread = c->thread;
 	memcpy(c, &s, sizeof(Ctx));
 	c->thread = thread;
 	return result;
 }
+
+u32 CallGuest(Ctx *c, u32 func, std::initializer_list<u32> args) { return (u32)CallGuest64(c, func, args); }
 
 void YieldCheck(Ctx *c) { sched::YieldCheck(c); }
 

@@ -502,6 +502,9 @@ int sceIoGetAsyncStat(int fd, int poll, u32 resultAddr) {
 	return (int)SCE_KERNEL_ERROR_NOASYNC;
 }
 
+int sceIoAddDrv(u32 drv) { return io::AddGuestDriver(drv); }
+int sceIoDelDrv(const char *name) { return name ? io::DelGuestDriver(name) : (int)SCE_KERNEL_ERROR_ILLEGAL_ADDR; }
+
 int sceIoChangeAsyncPriority(int fd, int prio) {
 	if (prio != -1 && (prio < 0x08 || prio > 0x77)) return (int)SCE_KERNEL_ERROR_ILLEGAL_PRIORITY;
 	if (fd == -1) {
@@ -976,6 +979,8 @@ void Register_IoFileMgrForUser() {
 	hle::RegisterModule("IoFileMgrForUser", funcs);
 
 	static const hle::HleFunction kernelFuncs[] = {
+		HLEFN(0x8E982A74, sceIoAddDrv),
+		HLEFN(0xC7F35804, sceIoDelDrv),
 		HLEFN(0xB29DDF9C, sceIoDopen),
 		HLEFN(0xE3EB004C, sceIoDread),
 		HLEFN(0xEB092469, sceIoDclose),

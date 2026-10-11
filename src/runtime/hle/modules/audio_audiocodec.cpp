@@ -11,6 +11,7 @@
 #include <memory>
 #include <vector>
 
+#include "audio/aac_frame.h"
 #include "audio/decoder.h"
 #include "common/log.h"
 #include "runtime/core/memory.h"
@@ -298,11 +299,22 @@ int sceAudiocodecDecode(u32 ctxPtr, int codec) {
 		break;
 	case PSP_CODEC_AAC: {
 		bytesPerFrame = ctx->fmt.aac.unk2c ? 0x609 : 0x600;
-		// The ME's decoder delimits the raw access unit itself; ours needs its exact length.
-		// When the AUs sit in an ADTS stream (the header just before inBuf) take it from there.
+		// The ME's decoder delimits the raw access unit itself and reports what it used; ours
+		// needs its exact length. When the AUs sit in an ADTS stream (the header just before
+		// inBuf) take it from there, otherwise walk the AU's syntax (audio/audiocodec/context).
+		bool delimited = false;
 		if (const u8 *h = mem::GetPointer(ctx->inBuf - 7, 7)) {
 			const int len = ((h[3] & 3) << 11) | (h[4] << 3) | (h[5] >> 5);
-			if (h[0] == 0xFF && (h[1] & 0xF6) == 0xF0 && len > 7 && len - 7 <= bytesPerFrame) bytesPerFrame = len - 7;
+			if (h[0] == 0xFF && (h[1] & 0xF6) == 0xF0 && len > 7 && len - 7 <= bytesPerFrame) {
+				bytesPerFrame = len - 7;
+				delimited = true;
+			}
+		}
+		if (!delimited) {
+			const u32 span = ClampValidSize(ctx->inBuf, (u32)bytesPerFrame);
+			const int len = audio::AacRawDataBlockBytes(mem::GetPointer(ctx->inBuf, span), (int)span,
+			                                            audio::AacSamplingIndex((int)ctx->fmt.aac.sampleRate));
+			if (len > 0) bytesPerFrame = len;
 		}
 		break;
 	}

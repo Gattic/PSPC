@@ -87,8 +87,8 @@ constexpr int MPEG_DATA_ES_BUFFERS = 2;
 struct SceMpegAu {
 	s64 pts;  // presentation time stamp
 	s64 dts;  // decode time stamp
-	u32 esBuffer;  // we abuse this to keep track of the stream number
-	u32 esSize;
+	u32 esBuffer;  // the es buffer sceMpegInitAu was given
+	u32 esSize;    // what the last Get*Au put there, 0 once decoded
 
 	void read(u32 addr) {
 		memset(this, 0, sizeof(*this));
@@ -212,6 +212,8 @@ struct MpegContext {
 
 	std::map<u32, StreamInfo> streamMap;
 	std::map<u32, bool> streamIgnoreMap;
+	// The stream each AU (by address) was last filled from, for the decode calls.
+	std::map<u32, int> auStream;
 	std::unique_ptr<MediaEngine> mediaengine;
 	u32 handle = 0;
 	int registeredStreams = 0;
@@ -796,8 +798,7 @@ u32 sceMpegAvcDecode(u32 mpeg, u32 auAddr, u32 frameWidth, u32 bufferAddr, u32 i
 	}
 
 	const s32 beforeAvail = ring->packets - ctx->mediaengine->getRemainSize() / 2048;
-	// We stored the video stream number here in sceMpegGetAvcAu().
-	ctx->mediaengine->setVideoStream((int)avcAu.esBuffer);
+	ctx->mediaengine->setVideoStream(ctx->auStream[auAddr]);
 
 	if (ctx->mediaengine->stepVideo(ctx->videoPixelMode)) {
 		ctx->mediaengine->writeVideoImage(buffer, (int)frameWidth, ctx->videoPixelMode);
@@ -808,7 +809,8 @@ u32 sceMpegAvcDecode(u32 mpeg, u32 auAddr, u32 frameWidth, u32 bufferAddr, u32 i
 	}
 	UpdateAvail(ctx, ring, beforeAvail);
 
-	avcAu.pts = ctx->mediaengine->getVideoTimeStamp() + ctx->mpegFirstTimestamp;
+	// The AU keeps its pts; its data is used up (video/mpeg/basic).
+	avcAu.esSize = 0;
 	avcAu.write(auAddr);
 
 	if (g_mpegLibVersion >= 0x0105 && g_mpegLibVersion < 0x010a) {
@@ -897,7 +899,7 @@ int sceMpegAvcDecodeYCbCr(u32 mpeg, u32 auAddr, u32 bufferAddr, u32 initAddr) {
 	}
 
 	const s32 beforeAvail = ring->packets - ctx->mediaengine->getRemainSize() / 2048;
-	ctx->mediaengine->setVideoStream((int)avcAu.esBuffer);
+	ctx->mediaengine->setVideoStream(ctx->auStream[auAddr]);
 
 	if (!mem::IsValidRange(bufferAddr, 4) || !mem::IsValidRange(initAddr, 4)) return -1;
 
@@ -910,7 +912,7 @@ int sceMpegAvcDecodeYCbCr(u32 mpeg, u32 auAddr, u32 bufferAddr, u32 initAddr) {
 	}
 	UpdateAvail(ctx, ring, beforeAvail);
 
-	avcAu.pts = ctx->mediaengine->getVideoTimeStamp() + ctx->mpegFirstTimestamp;
+	avcAu.esSize = 0;
 	avcAu.write(auAddr);
 
 	if (g_mpegLibVersion >= 0x010A) {
@@ -946,16 +948,13 @@ int sceMpegInitAu(u32 mpeg, u32 bufferAddr, u32 auPointer) {
 	if (!ctx) return -1;
 	SceMpegAu sceAu;
 	sceAu.read(auPointer);
+	// The AU keeps its es buffer and starts empty (video/mpeg/basic).
+	sceAu.esBuffer = bufferAddr;
+	sceAu.esSize = 0;
 	if (bufferAddr >= 1 && bufferAddr <= (u32)MPEG_DATA_ES_BUFFERS && ctx->esBuffers[bufferAddr - 1]) {
-		// This esbuffer has been allocated for Avc. We stuff the stream id in esBuffer.
-		sceAu.esBuffer = 0;
-		sceAu.esSize = MPEG_AVC_ES_SIZE;
 		sceAu.dts = 0;
 		sceAu.pts = 0;
 	} else {
-		// This esbuffer has been left as Atrac.
-		sceAu.esBuffer = 0;
-		sceAu.esSize = MPEG_ATRAC_ES_SIZE;
 		sceAu.pts = 0;
 		sceAu.dts = UNKNOWN_TIMESTAMP;
 	}
@@ -1115,7 +1114,7 @@ int sceMpegGetAvcAu(u32 mpeg, u32 streamId, u32 auAddr, u32 attrAddr) {
 	if (ctx->streamIgnoreMap[streamId]) {
 		avcAu.pts = ctx->mediaengine->getVideoTimeStamp() + ctx->mpegFirstTimestamp;
 		avcAu.dts = avcAu.pts - videoTimestampStep;
-		avcAu.esBuffer = (u32)streamInfo->second.num;
+		ctx->auStream[auAddr] = streamInfo->second.num;
 		avcAu.write(auAddr);
 		if (IsValid4Aligned(attrAddr)) GWrite32(attrAddr, 1);
 		return (int)Delay(0, 100);
@@ -1126,9 +1125,9 @@ int sceMpegGetAvcAu(u32 mpeg, u32 streamId, u32 auAddr, u32 attrAddr) {
 		streamInfo->second.needsReset = false;
 	}
 
-	// esBuffer is where this AU's data goes. We don't write the data; we use it to keep track of
-	// the stream number.
-	avcAu.esBuffer = (u32)streamInfo->second.num;
+	// The data isn't copied to the es buffer; the decode reads the stream itself.
+	ctx->auStream[auAddr] = streamInfo->second.num;
+	avcAu.esSize = MPEG_AVC_ES_SIZE;
 
 	int result = 0;
 	avcAu.pts = ctx->mediaengine->getVideoTimeStamp() + ctx->mpegFirstTimestamp;
@@ -1171,40 +1170,37 @@ int sceMpegGetAtracAu(u32 mpeg, u32 streamId, u32 auAddr, u32 attrAddr) {
 	if (streamInfo != ctx->streamMap.end() && ctx->streamIgnoreMap[streamId]) {
 		atracAu.pts = ctx->mediaengine->getAudioTimeStamp() + ctx->mpegFirstTimestamp;
 		atracAu.dts = atracAu.pts;
-		atracAu.esBuffer = (u32)streamInfo->second.num;
+		ctx->auStream[auAddr] = streamInfo->second.num;
 		atracAu.write(auAddr);
 		if (IsValid4Aligned(attrAddr)) GWrite32(attrAddr, 0);
 		return (int)Delay(0, 100);
 	}
 
-	// The audio can end earlier than the video does.
-	if (ring->packetsAvail == 0) {
+	// No audio (yet, or any more: it can end before the video): an empty AU at 0/0, at once
+	// (video/mpeg/basic).
+	const bool noData = ring->packetsAvail == 0 || ctx->mediaengine->IsNoAudioData();
+	if (noData) {
+		if (ctx->atracRegistered && ring->packetsAvail != 0 && !ctx->endOfAudioReached) ctx->endOfAudioReached = true;
 		atracAu.pts = 0;
 		atracAu.dts = 0;
+		atracAu.esSize = 0;
 		atracAu.write(auAddr);
-		return (int)Delay(SCE_MPEG_ERROR_NO_DATA, mpegDecodeErrorDelayUs);
+		return (int)SCE_MPEG_ERROR_NO_DATA;
 	}
 
 	if (streamInfo != ctx->streamMap.end()) {
-		atracAu.esBuffer = (u32)streamInfo->second.num;
+		ctx->auStream[auAddr] = streamInfo->second.num;
 		ctx->mediaengine->setAudioStream(streamInfo->second.num);
 	}
 
-	int result = 0;
 	atracAu.pts = ctx->mediaengine->getAudioTimeStamp() + ctx->mpegFirstTimestamp;
 	atracAu.dts = atracAu.pts;
-	if (ctx->mediaengine->IsNoAudioData()) {
-		atracAu.dts = -1;
-		result = (int)SCE_MPEG_ERROR_NO_DATA;
-	}
-	if (ctx->atracRegistered && ctx->mediaengine->IsNoAudioData() && !ctx->endOfAudioReached) {
-		ctx->endOfAudioReached = true;
-	}
+	atracAu.esSize = MPEG_ATRAC_ES_SIZE;
 	atracAu.write(auAddr);
 
 	// The 3rd Birthday passes 0 as attrAddr.
-	if (result == 0 && IsValid4Aligned(attrAddr)) GWrite32(attrAddr, 0);
-	return (int)Delay((u32)result, 100);
+	if (IsValid4Aligned(attrAddr)) GWrite32(attrAddr, 0);
+	return (int)Delay(0, 100);
 }
 
 int sceMpegQueryPcmEsSize(u32 mpeg, u32 esSizeAddr, u32 outSizeAddr) {
@@ -1284,12 +1280,13 @@ u32 sceMpegAtracDecode(u32 mpeg, u32 auAddr, u32 bufferAddr, int init) {
 	(void)init;
 	MpegContext *ctx = getMpegCtx(mpeg);
 	if (!ctx) return (u32)-1;
-	if (!mem::IsValidAddress(bufferAddr)) return (u32)-1;
-
 	SceMpegAu atracAu;
 	atracAu.read(auAddr);
-	// We kept track of the stream number here in sceMpegGetAtracAu().
-	ctx->mediaengine->setAudioStream((int)atracAu.esBuffer);
+	// Nothing in the AU (sceMpegGetAtracAu found no data): 807f00fd, after the wait
+	// (video/mpeg/basic).
+	if (atracAu.esSize == 0) return MEDelay(SCE_MPEG_ERROR_ATRAC_AU_EMPTY, atracDecodeDelayUs);
+	if (!mem::IsValidAddress(bufferAddr)) return (u32)-1;
+	ctx->mediaengine->setAudioStream(ctx->auStream[auAddr]);
 
 	mem::Memset(bufferAddr, 0, audiohle::ClampValidSize(bufferAddr, MPEG_ATRAC_ES_OUTPUT_SIZE));
 	ctx->mediaengine->getAudioSamples(bufferAddr);
