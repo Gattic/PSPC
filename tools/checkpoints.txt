@@ -1,44 +1,63 @@
 # Checkpoints for tools/smoke_games.py: <disc id or file stem> <vblank>[~<percent>] <what the frame shows>
 # A run of the game stops at its last checkpoint (pspc --exit-vblank; 60 VBlanks = 1 second), with
-# the scripted input of tools/smoke_inputs.txt. Each checkpoint's frame is compared with this
-# machine's reference (build/checkpoints, written by --record): it must be identical, or with ~N,
-# have at most N% of its pixels different (a screen that animates differently from run to run).
-# The last checkpoint is the furthest the scripted input gets today; docs/games-plan.md has what
-# stops each game there.
+# the scripted input of tools/smoke_inputs.txt, networking off, a fresh memory stick and a fixed
+# guest clock. Each checkpoint's frame is compared with this machine's reference (build/checkpoints,
+# written by --record): it must be identical, or with ~N, have at most N% of its pixels different.
+# The last checkpoint is the furthest the scripted path goes today; docs/games-plan.md has what's
+# beyond it for each game.
 
-# Daxter: logos, title, New Game, the first level
+# Daxter: logos, title, the first level, at the light beacon (which doesn't trigger yet)
 NPUG80329 600 Ready at Dawn logo
 NPUG80329 1200 title menu
 NPUG80329 2400 first level, movement hint
-NPUG80329 4500 first level
+NPUG80329 3000 running toward the light beacon
+NPUG80329 3300 beside the beacon
 
-# Monster Hunter Freedom Unite: language, title, game menu
-ULUS10391 1200 language menu
-ULUS10391 2400 title screen
-ULUS10391 3000 game menu
-
-# Syphon Filter: Combat Ops: intro, save-data notice, profile keyboard
+# Syphon Filter: Combat Ops: profile, main menu, Mission Modifier, the 3D spawn editor
 NPUG80114 1200 intro globe
-NPUG80114 1800 save-data notice
-NPUG80114 3000 profile name keyboard
+NPUG80114 2700 profile keyboard, "qw" typed
+NPUG80114 3900 main menu, profile qwe
+NPUG80114 5400 Mission Modifier: Fortress
+NPUG80114 8400 Combat Modifier loading Fortress
+NPUG80114 9900 Spawn Locations editor, 3D Fortress
 
-# Syphon Filter: Logan's Shadow: intro, save-data notice, profile keyboard
+# Syphon Filter: Logan's Shadow: profile, main menu, briefing, the first mission
 UCUS98606 900 intro logo
 UCUS98606 1500 save-data notice
-UCUS98606 3000 profile name keyboard
+UCUS98606 2700 profile keyboard, "11"
+UCUS98606 3300 main menu
+UCUS98606 4800 Episode 1 Part 1 briefing
+UCUS98606 6300 first mission, on the ship
 
-# Star Wars Battlefront II: logos, title (no scripted input yet)
-ULUS10053 1200 Pandemic logo
-ULUS10053 2400~5 title, press start (the background animates differently from run to run)
+# Monster Hunter Freedom Unite: character creation, saved, the village, a quest in the field
+ULUS10391 1200 language menu
+ULUS10391 4500 character creation, beginner question
+ULUS10391 19200 game menu after saving
+ULUS10391 21600 Pokke Village
+ULUS10391 31500 loading the quest
+ULUS10391 36600 Snowy Mountains, area 2
 
-# Star Wars Battlefront: Elite Squadron: logos, title, profile prompt
-ULUS10390 900 GameSpy logo
-ULUS10390 1800 title, press start
-ULUS10390 3000 load canceled (no profile)
-ULUS10390 4500 profile prompt
+# Star Wars Battlefront II: profile, menus, a battle on Dagobah
+ULUS10053 1200 Savage Entertainment logo
+ULUS10053 2400 title, press start
+ULUS10053 3000 profile name keyboard
+ULUS10053 4500 Singleplayer menu
+ULUS10053 6300 playlist, Dagobah
+ULUS10053 7800 Dagobah battle
 
-# Star Wars Battlefront: Renegade Squadron: logo, title, profile, new profile
+# Star Wars Battlefront: Elite Squadron: profile, menus, a ground battle on Bespin
+ULUS10390 3000 profile prompt
+ULUS10390 4500 profile name "Tester"
+ULUS10390 6600 main menu
+ULUS10390 9600 Instant Action playlist, Bespin
+ULUS10390 11400 spawn selection
+ULUS10390 14400 Bespin battle
+
+# Star Wars Battlefront: Renegade Squadron: profile, menus, a battle on Boz Pity
 ULUS10292 300 Rebellion logo
 ULUS10292 1200 title, press start
 ULUS10292 3300 load canceled (no profile)
-ULUS10292 4500 new profile screen
+ULUS10292 4200 New Profile, Accept
+ULUS10292 5400 main menu
+ULUS10292 7200 playlist, Boz Pity
+ULUS10292 9000 Boz Pity battle

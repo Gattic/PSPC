@@ -58,6 +58,10 @@ u32 g_timerGen = 0;
 std::vector<SceUID> g_waiting;
 
 // Buttons held by --press (headless runs, scripted tests): [vblank, vblank + frames).
+// --press's stick directions (AUP, ADOWN, ALEFT, ARIGHT) use bits no PSP button has; they become a
+// fully tilted analog stick and never show as buttons.
+constexpr u32 kScriptStickUp = 0x10000000, kScriptStickDown = 0x20000000, kScriptStickLeft = 0x40000000,
+              kScriptStickRight = 0x80000000, kScriptStick = 0xF0000000;
 struct ScriptedPress {
 	u32 vblank, frames, buttons;
 };
@@ -116,7 +120,12 @@ void ResetState() {
 
 void UpdateLatch() {
 	host::CtrlState s = host::GetCtrl();
-	const u32 raw = s.buttons | ScriptedButtons();
+	const u32 scripted = ScriptedButtons();
+	const u32 raw = s.buttons | (scripted & ~kScriptStick);
+	if (scripted & kScriptStickLeft) s.lx = 0;
+	if (scripted & kScriptStickRight) s.lx = 255;
+	if (scripted & kScriptStickUp) s.ly = 0;
+	if (scripted & kScriptStickDown) s.ly = 255;
 	if ((raw & ~g_oldRaw & kHomeButton) && g_homeHandler) sched::ScheduleEvent(sched::NowUs(), g_homeHandler);
 	g_oldRaw = raw;
 	// While the HOME menu is up the game sees nothing.
@@ -351,7 +360,7 @@ void OnVblank() {
 void AddScriptedPress(u32 vblank, u32 buttons, u32 frames) { g_script.push_back({vblank, frames, buttons}); }
 void SetHomeHandler(void (*fn)()) { g_homeHandler = fn; }
 // What the controller has now, --press included, before the HOME menu's filter.
-u32 RawButtons() { return host::GetCtrl().buttons | ScriptedButtons(); }
+u32 RawButtons() { return host::GetCtrl().buttons | (ScriptedButtons() & ~kScriptStick); }
 // sceCtrlReadBufferPositive for a kernel-mode caller (sceVshBridge): nothing masked.
 int ReadBufferPositiveKernel(u32 ptr, u32 n) { return Read(ptr, n, false, true); }
 }  // namespace ctrl

@@ -7,12 +7,13 @@ furthest screen confirmed by a frame dump.
 
 | Game | Disc ID | Firmware req. | Native | Interpreter | Notes |
 |---|---|---|---|---|---|
-| Daxter | NPUG80329 | 5.50 | Gameplay (first level) | Gameplay | Intro movie plays with sound (sceMpeg, H.264 via Media Foundation). Renderer runs ~1.6x real time headless. Its task scheduler switches stacks; freshly compiled native code crashed on entering the first level until 2026-10-12 (docs/RECOMPILER.md, stack switches). |
-| Syphon Filter: Combat Ops | NPUG80114 | 3.71 | Online match (two instances) | Menus | Intro, save-data notice, keyboard and menus render correctly. Audio plays. Infrastructure: connects to the access point ("PSPC 1"), signs in to PSN through PSPC Network (hosted account or local), and with PSPC's Combat Ops server (`server/pspc_medius`, docs/combat-ops-server.md) enters the lobby, lists and downloads missions, hosts and joins games; two instances on one PC go through staging, the briefing and setup, play a full deathmatch together, rate the mission and return to the lobby; four play a ranked deathmatch whose results and stats reach the server. Cells, the Community pages (leaderboards, message board) and the game's own profile screens work. Ad hoc: two PSPC instances host and join a game through `pspc --adhoc-server` (staging area, 2/8 players). |
-| Syphon Filter: Logan's Shadow | UCUS98606 | 3.52 | Gameplay (training, story episode 1) | Same | Main code lives in USRDIR PRX modules, loaded and run natively. Story cutscenes use sceMpeg (now implemented). |
-| Monster Hunter Freedom Unite | ULUS10391 | 5.03 | Game menu, character creation | Same | Loads its font library through `sceKernelLoadModuleByID`; needs system fonts (`flash0/font`). Naming the character uses the keyboard dialog (windowed: a text box; headless: `--osk-text`). |
-| Star Wars Battlefront: Elite Squadron | ULUS10390 | 5.03 | Online match (two instances) | Profile prompt | Title, in-engine space intro and menus render. Infrastructure, with PSPC's GameSpy server (`server/pspc_gamespy`, docs/gamespy-server.md): creates a GameSpy account and logs in, hosts a Conquest match that a second instance finds and joins (team selection), adds a friend, shows Player Rankings. Joining needs both instances in real time (not `--fast-time`). |
-| Star Wars Battlefront: Renegade Squadron | ULUS10292 | 3.51 | New-profile screen | Same | Menus render. |
+| Daxter | NPUG80329 | 5.50 | Gameplay (first level, to the light beacon) | Same | Intro movie plays with sound (sceMpeg, H.264 via Media Foundation). Walking into the first light beacon doesn't trigger it yet (docs/games-plan.md 1.1). Its task scheduler switches stacks; freshly compiled native code crashed on entering the first level until 2026-10-12 (docs/RECOMPILER.md, stack switches). |
+| Syphon Filter: Combat Ops | NPUG80114 | 3.71 | Online match (two instances); offline: Mission Modifier (3D editor) | Mission Modifier (3D editor) | Offline the game needs two players for a match; the Mission Modifier (missions save and load), profiles, options and credits work. Infrastructure: connects to the access point ("PSPC 1"), signs in to PSN through PSPC Network (hosted account or local), and with PSPC's Combat Ops server (`server/pspc_medius`, docs/combat-ops-server.md) enters the lobby, lists and downloads missions, hosts and joins games; two instances on one PC go through staging, the briefing and setup, play a full deathmatch together, rate the mission and return to the lobby; four play a ranked deathmatch whose results and stats reach the server. Cells, the Community pages (leaderboards, message board) and the game's own profile screens work. Ad hoc: two PSPC instances host and join a game through `pspc --adhoc-server` (staging area, 2/8 players). |
+| Syphon Filter: Logan's Shadow | UCUS98606 | 3.52 | Gameplay (training, story episode 1) | Same | Main code lives in USRDIR PRX modules, loaded and run natively. Story cutscenes use sceMpeg. Missions run at about half real time: GE vertex work (docs/games-plan.md 2.1). |
+| Monster Hunter Freedom Unite | ULUS10391 | 5.03 | Gameplay (village, first quest) | Same | Loads its font library through `sceKernelLoadModuleByID`; needs system fonts (`flash0/font`). Naming the character uses the keyboard dialog (windowed: a text box; headless: `--osk-text`). Saves, Continue and Data Install work. |
+| Star Wars Battlefront: Elite Squadron | ULUS10390 | 5.03 | Online match (two instances); offline: Instant Action, campaign | Gameplay (Instant Action) | Offline: Instant Action ground and space battles, the campaign tutorial, Galactic Conquest, tutorial videos; profiles save and load. Infrastructure, with PSPC's GameSpy server (`server/pspc_gamespy`, docs/gamespy-server.md): creates a GameSpy account and logs in, hosts a Conquest match that a second instance finds and joins (team selection), adds a friend, shows Player Rankings. Joining needs both instances in real time (not `--fast-time`). |
+| Star Wars Battlefront: Renegade Squadron | ULUS10292 | 3.51 | Gameplay (Instant Action, campaign, space) | Same | Profiles save and load. |
+| Star Wars Battlefront II | ULUS10053 | 2.00 | Not built yet | Gameplay (Instant Action, space, challenges) | Battles run at about 30% of real time interpreted: no native code yet, and GE vertex work (docs/games-plan.md 1.5). Profiles save and load. |
 
 ## Test suite
 
@@ -48,15 +49,17 @@ at an installed flash0. The investigation behind all of this: [autotests-plan.md
 (`tools/smoke_inputs.txt`). Games listed in `tools/checkpoints.txt` run to a fixed point in game
 time (`pspc --exit-vblank`), and their frames at the checkpoints must match references recorded on
 the same machine (`--record`, kept in `build/checkpoints`, outside the repository), so a change
-that alters how far a game gets, or what it shows on the way, fails the run. Runs are
-deterministic: the same build gives the same frames whatever the machine's load, except where a
-checkpoint allows a share of pixels to differ (Battlefront II's title screen, whose background
-animates differently from run to run). The firmware flash0 is passed explicitly: games take other
-paths without one.
+that alters how far a game gets, or what it shows on the way, fails the run. The paths go into
+gameplay in all seven games, and runs are exactly repeatable: networking off (a game that starts
+it makes PSPC keep real time), a fixed guest clock (`--rtc-base`; games seed their random numbers
+from it), a fresh memory stick, `--no-plugins`, and the firmware flash0 passed explicitly (games
+take other paths without one). A checkpoint can allow a share of its pixels to differ (`~N`);
+none needs to.
 
 PSPC's own guest programs (`tests/guest`, built with pspdev by `tools/build_guest_tests.sh`) run
 with `tools/guest_tests.py`, in the interpreter and as native code compiled fresh for the run, the
 way a player's first build is: `coroutines` switches stacks the way Daxter's scheduler does.
+Where each game stops and what is planned for it: [games-plan.md](games-plan.md).
 
 ## Large disc images
 

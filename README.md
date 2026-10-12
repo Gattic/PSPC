@@ -40,7 +40,7 @@ LLVM and Visual Studio (below), which adds *Build native code* to the launcher.
 
 Retail games boot and play natively (AOT) and in the interpreter: Daxter (intro movie and
 gameplay), Syphon Filter: Logan's Shadow (story mode), Syphon Filter: Combat Ops, Monster Hunter
-Freedom Unite, Star Wars Battlefront: Elite Squadron and Renegade Squadron - see
+Freedom Unite, Star Wars Battlefront II, Elite Squadron and Renegade Squadron - see
 [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md). pspautotests: 539 of 559 pass (the other 20 are
 recorded hardware differences), with identical results in the interpreter and as native code.
 

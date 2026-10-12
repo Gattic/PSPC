@@ -731,6 +731,11 @@ int sceRtcUnregisterCallback(SceUID cb) {
 
 namespace rtc {
 
+void SetBootTime(u64 unixSeconds) {
+	g_baseUnixUs = unixSeconds * 1000000ULL;
+	g_baseSet = true;
+}
+
 u64 NowUnixUs() {
 	LoadClock();
 	return (u64)((s64)BaseUnixUs() + g_clockOffsetUs) + sched::NowUs();

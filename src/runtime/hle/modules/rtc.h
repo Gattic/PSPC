@@ -10,5 +10,8 @@ namespace rtc {
 u64 NowUnixUs();
 // The host's standard (non-DST) offset from UTC, in microseconds.
 s64 StandardOffsetUs();
+// --rtc-base: boot at this time (seconds since 1970 UTC) instead of the host clock's, so runs with
+// the same input repeat exactly (games seed their random numbers from the clock).
+void SetBootTime(u64 unixSeconds);
 
 }  // namespace rtc

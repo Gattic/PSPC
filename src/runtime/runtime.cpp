@@ -31,6 +31,7 @@
 #include "runtime/hle/modules/modules.h"
 #include "runtime/hle/modules/net_hle.h"
 #include "runtime/hle/modules/net_selftest.h"
+#include "runtime/hle/modules/rtc.h"
 #include "runtime/host/host.h"
 #include "runtime/io/io.h"
 #include "runtime/kernel/module.h"
@@ -365,7 +366,8 @@ int RunOnce(const Options &o, BootTarget bt) {
 	sched::Init(o.fastTime);
 	io::Init();
 	io::Mount("ms0", io::MakeHostDevice(o.memstickDir, false));
-	if (!o.pluginsDir.empty() && io::AddHostFallback("ms0", o.pluginsDir))
+	// Not with --no-plugins: test runs must neither see nor write into the player's plugins folder.
+	if (o.plugins && !o.pluginsDir.empty() && io::AddHostFallback("ms0", o.pluginsDir))
 		LOGI("M33", "Plugins folder %s overlays ms0:", o.pluginsDir.c_str());
 	io::Mount("flash0", io::MakeHostDevice(o.flash0Dir, true));
 	io::Mount("flash1", io::MakeHostDevice(o.flash1Dir, false));
@@ -406,6 +408,7 @@ int RunOnce(const Options &o, BootTarget bt) {
 	netConfig.infraDns = o.infraDns;
 	netConfig.dataDir = o.dataDir;
 	net::Configure(netConfig);
+	if (o.rtcBase) rtc::SetBootTime(o.rtcBase);
 	std::string dumpDir;
 	if (!o.dumpFramesDir.empty()) {
 		std::error_code ec;

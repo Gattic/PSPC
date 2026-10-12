@@ -6,7 +6,7 @@ Usage: smoke_games.py [--pspc PATH] [--flash0 DIR] [--aot-dir DIR] [--games DIR]
                       [--jobs N] [--out DIR] [--refs DIR] [--record] [--seconds N] [filter ...]
 
 Each game runs with --fast-time and --dump-frames, with its scripted input from
-tools/smoke_inputs.txt ("<disc id or file stem> <vblank>:<BUTTONS>[:<frames>] ...").
+tools/smoke_inputs.txt ("<disc id or file stem> <vblank>:<BUTTONS>[:<frames>] ... [osk=<text>]").
 
 Games with checkpoints in tools/checkpoints.txt run until their last checkpoint's VBlank (pspc
 --exit-vblank), so a run ends at the same point in game time however busy the machine is, and the
@@ -36,11 +36,13 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import zlib
 from functools import reduce
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 GAME_EXTS = {'.iso', '.cso', '.zso', '.dax', '.pbp'}
+RTC_BASE = 1767225600  # 2026-01-01 00:00:00 UTC
 
 
 def load_inputs(path):
@@ -142,8 +144,13 @@ def run_one(args, game, presses, points, flash0):
     out.mkdir(parents=True, exist_ok=True)
     for f in out.glob('frame_*.bmp'):
         f.unlink()
-    cmd = [args.pspc, '--config', 'none', '--no-plugins', '--headless', '--fast-time', '--log', 'warn',
-           '--dump-frames', str(out)]
+    # Networking off (a game that starts it makes PSPC keep real time) and a fixed boot time (games
+    # seed their random numbers from the clock): the same input then gives the same frames.
+    # A fresh memory stick: no saves from earlier runs or from playing (which would change the
+    # path), and the run's own saves don't land in pspc's ms0.
+    ms = tempfile.mkdtemp(prefix='pspc_smoke_ms_')
+    cmd = [args.pspc, '--config', 'none', '--set', 'network=0', '--rtc-base', str(RTC_BASE), '--no-plugins',
+           '--headless', '--fast-time', '--log', 'warn', '--memstick', ms, '--dump-frames', str(out)]
     if points:
         # Every checkpoint gets a dump; the run ends at the last one.
         every = reduce(math.gcd, [vb for vb, _, _ in points])
@@ -160,13 +167,16 @@ def run_one(args, game, presses, points, flash0):
     if args.interp:
         cmd.append('--interp')
     for p in presses:
-        cmd += ['--press', p]
+        # osk=<text>: what the system keyboard returns (a|b|c for successive keyboards).
+        cmd += ['--osk-text', p[4:]] if p.startswith('osk=') else ['--press', p]
     cmd.append(str(game))
     try:
         r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=seconds + 30)
         code, err = r.returncode, r.stderr.decode('utf-8', 'replace')
     except subprocess.TimeoutExpired:
         code, err = None, 'host timeout'
+    finally:
+        shutil.rmtree(ms, ignore_errors=True)
     frames = sorted(out.glob('frame_*.bmp'))
     distinct = len({hashlib.sha1(f.read_bytes()).hexdigest() for f in frames})
     if code == 124:

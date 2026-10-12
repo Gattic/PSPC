@@ -27,7 +27,9 @@ static bool ParsePress(const std::string &spec, runtime::Options::Press &out) {
 	                {"DOWN", 0x40},      {"LEFT", 0x80},     {"L", 0x100},       {"R", 0x200},
 	                {"TRIANGLE", 0x1000}, {"CIRCLE", 0x2000}, {"CROSS", 0x4000}, {"SQUARE", 0x8000},
 	                {"HOME", 0x10000},   {"NOTE", 0x800000}, {"SCREEN", 0x400000}, {"VOLUP", 0x100000},
-	                {"VOLDOWN", 0x200000}};
+	                {"VOLDOWN", 0x200000},
+	                // The analog stick, tilted all the way (see ctrl.cpp's kScriptStick).
+	                {"AUP", 0x10000000}, {"ADOWN", 0x20000000}, {"ALEFT", 0x40000000}, {"ARIGHT", 0x80000000}};
 	size_t c1 = spec.find(':');
 	if (c1 == std::string::npos) return false;
 	size_t c2 = spec.find(':', c1 + 1);
@@ -62,6 +64,8 @@ static void Usage() {
 	        "  --fast-time          skip idle time instead of sleeping\n"
 	        "  --timeout <sec>      stop after this many seconds\n"
 	        "  --exit-vblank <n>    stop after VBlank n (game time, unlike --timeout; exit code 124)\n"
+	        "  --rtc-base <sec>     boot the guest clock at this time (seconds since 1970 UTC), not the host's:\n"
+	        "                       runs with the same input then repeat exactly\n"
 	        "  --ram <32|64>        guest RAM size in MB (default 64)\n"
 	        "  --large-mem          let user code use RAM beyond 24 MB (default: for the XMB and\n"
 	        "                       games with MEMSIZE=1 in PARAM.SFO)\n"
@@ -70,7 +74,7 @@ static void Usage() {
 	        "  --strict-mem         treat bad guest memory accesses as fatal\n"
 	        "  --memstick <dir>     memory stick root (default: <exe>/ms0)\n"
 	        "  --plugins <dir>      M33 plugins folder laid over ms0: (default: the nearest plugins\\)\n"
-	        "  --no-plugins         don't load M33 plugins\n"
+	        "  --no-plugins         don't load M33 plugins, nor lay their folder over ms0:\n"
 	        "  --flash0 <dir>       flash0 root (default: <exe>/flash0)\n"
 	        "  --host0 <dir>        host0: root (default: the program's folder)\n"
 	        "  --umd <image>        insert a disc image while running a .prx/.elf/.pbp\n"
@@ -94,7 +98,8 @@ static void Usage() {
 	        "  --render-scale <n>   d3d11 internal resolution, 1-16 times the PSP's (default 1; 8 = 4K, 16 = 8K)\n"
 	        "  --texture-filter <f> d3d11 texture filtering: auto (as the game sets it), nearest or linear\n"
 	        "  --texture-upscale <n> d3d11 texture upscaling with xBR, 1 (off) - 4\n"
-	        "  --press <v>:<B>[:n]  hold buttons B (e.g. START, CROSS+UP) for n VBlanks (6) from VBlank v\n"
+	        "  --press <v>:<B>[:n]  hold buttons B (e.g. START, CROSS+UP) for n VBlanks (6) from VBlank v;\n"
+	        "                       AUP, ADOWN, ALEFT, ARIGHT tilt the analog stick\n"
 	        "  --vsh                boot the firmware's XMB (tools/pspc_install_fw.py) instead of a file\n"
 	        "  --recovery           boot M33's recovery menu (also: hold R while the XMB boots)\n"
 	        "  --net-selftest <s>   run network test scenario <s> instead of a file (tools/net_selftest.py)\n"
@@ -379,6 +384,7 @@ int main(int argc, char **argv) {
 		else if (a == "--fast-time") o.fastTime = true;
 		else if (a == "--timeout") o.timeoutSec = atoi(next().c_str());
 		else if (a == "--exit-vblank") o.exitVblank = (u32)strtoul(next().c_str(), nullptr, 0);
+		else if (a == "--rtc-base") o.rtcBase = strtoull(next().c_str(), nullptr, 0);
 		else if (a == "--ram") o.ramMB = atoi(next().c_str()) == 32 ? 32 : 64;
 		else if (a == "--large-mem") o.largeUserMemory = 1;
 		else if (a == "--no-large-mem") o.largeUserMemory = 0;

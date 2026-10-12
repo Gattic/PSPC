@@ -26,6 +26,7 @@ struct Options {
 	bool strictMemory = false;
 	int timeoutSec = 0;        // stop after this many wall-clock seconds (0 = never)
 	u32 exitVblank = 0;        // stop after this VBlank, a point in game time (0 = never)
+	u64 rtcBase = 0;           // boot time in seconds since 1970 UTC (0 = the host clock's)
 	std::string memstickDir;
 	std::string flash0Dir;
 	std::string flash1Dir;
