@@ -4,7 +4,7 @@
 
 Phase 0 is done: the checkpoint harness, deeper scripted paths for all seven games (42
 checkpoints, every one byte-identical from run to run), and the fix for freshly compiled Daxter.
-The rest is the plan.
+The rest is the plan. The four decisions in Phase 3 are deferred, as a to-do list for later.
 
 ## Summary
 
@@ -299,15 +299,29 @@ online features in the same way:
 Joining needs both instances in real time (not `--fast-time`), so it can't be byte-exact. It
 would check states instead (in the lobby, in a match) from the servers' logs.
 
-## Phase 3: Decisions
+## Phase 3: Decisions, deferred to later (to do)
 
-- **3.1** Daxter's beacon (1.1.1): someone has to play it once in a window; scripted attempts
-  can't settle it.
-- **3.2** The default renderer for Combat Ops' 3D editor (1.2.2): keep software, or recommend
-  Direct3D 11 for it after 1.2.3.
-- **3.3** Online checkpoints (2.4): worth the complexity, or keep the manual procedures?
-- **3.4** MHFU's overlays as native code (1.4.2): an L item for 4.6% of the instructions. My
-  recommendation is to do it after 2.1, if at all.
+Set aside on 2026-10-12, to come back to. Each one says what to do and what it decides.
+
+- [ ] **3.1 Play to Daxter's light beacon by hand** (1.1.1).
+  - **What to do:** a person plays the windowed build: New Game, then walk into the first level's
+    light beacon (analog stick on I/J/K/L).
+  - **What it decides:** whether the beacon triggers. If it does, record the inputs and extend
+    the script and checkpoints past it. If not, it's a bug: do 1.1.2.
+  - Scripted attempts (about 40) can't settle it.
+- [ ] **3.2 Pick the renderer for Combat Ops' 3D editor** (1.2.2).
+  - **What to do:** first do 1.2.3 (why Direct3D 11 reads VRAM back so often there). Then
+    measure both renderers in the editor under load.
+  - **What it decides:** keep the software default, or recommend Direct3D 11 for this game.
+- [ ] **3.3 Decide on online checkpoints** (2.4).
+  - **What to do:** weigh a scripted two-instance check (the Combat Ops lobby and a match, an
+    Elite Squadron match) against keeping the manual procedures in the server documents.
+  - **The catch:** joining needs real time, so such a check would compare states from the
+    server logs, not frames.
+- [ ] **3.4 Decide on MHFU's overlays as native code** (1.4.2).
+  - **What to do:** decide after 2.1 (GE vertex work) is done, with fresh numbers for how much
+    of MHFU still runs interpreted (4.6% today).
+  - **The cost:** it's an L item. My recommendation is to do it after 2.1, if at all.
 
 ## Order and effort
 
