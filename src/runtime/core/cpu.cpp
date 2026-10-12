@@ -63,7 +63,7 @@ void RunFunction(Ctx *c, u32 func) {
 		c->unwinding = 0;
 		if (target == MAGIC_RETURN_ADDR) break;
 		// Nobody on the host stack owns the target: keep running the thread from there.
-		interp::Run(c, target, MAGIC_RETURN_ADDR, 0);
+		dispatch::Resume(c, target, MAGIC_RETURN_ADDR);
 	}
 }
 

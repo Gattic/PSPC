@@ -61,6 +61,7 @@ static void Usage() {
 	        "  --aot-dir <dir>      directory of AOT module DLLs (default: <exe>/cache/aot)\n"
 	        "  --fast-time          skip idle time instead of sleeping\n"
 	        "  --timeout <sec>      stop after this many seconds\n"
+	        "  --exit-vblank <n>    stop after VBlank n (game time, unlike --timeout; exit code 124)\n"
 	        "  --ram <32|64>        guest RAM size in MB (default 64)\n"
 	        "  --large-mem          let user code use RAM beyond 24 MB (default: for the XMB and\n"
 	        "                       games with MEMSIZE=1 in PARAM.SFO)\n"
@@ -377,6 +378,7 @@ int main(int argc, char **argv) {
 		else if (a == "--aot-dir") o.aotDir = next();
 		else if (a == "--fast-time") o.fastTime = true;
 		else if (a == "--timeout") o.timeoutSec = atoi(next().c_str());
+		else if (a == "--exit-vblank") o.exitVblank = (u32)strtoul(next().c_str(), nullptr, 0);
 		else if (a == "--ram") o.ramMB = atoi(next().c_str()) == 32 ? 32 : 64;
 		else if (a == "--large-mem") o.largeUserMemory = 1;
 		else if (a == "--no-large-mem") o.largeUserMemory = 0;

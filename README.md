@@ -41,16 +41,16 @@ LLVM and Visual Studio (below), which adds *Build native code* to the launcher.
 Retail games boot and play natively (AOT) and in the interpreter: Daxter (intro movie and
 gameplay), Syphon Filter: Logan's Shadow (story mode), Syphon Filter: Combat Ops, Monster Hunter
 Freedom Unite, Star Wars Battlefront: Elite Squadron and Renegade Squadron - see
-[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md). pspautotests: 517 of 559 pass, with identical
-results in the interpreter and as native code.
+[docs/COMPATIBILITY.md](docs/COMPATIBILITY.md). pspautotests: 539 of 559 pass (the other 20 are
+recorded hardware differences), with identical results in the interpreter and as native code.
 
 | Area | State |
 |---|---|
-| Allegrex CPU: decoder, interpreter, FPU, VFPU (bit-exact hardware model) | Working. `cpu/` 40/42 (the other two can't pass, see docs) |
+| Allegrex CPU: decoder, interpreter, FPU, VFPU (bit-exact hardware model) | Working. `cpu/` 42/42 |
 | AOT recompiler (`pspc-recomp`) + DLL pipeline | Working. 99%+ code coverage on retail games, whole discs build in about a minute |
-| Kernel: threads (fibers), sync objects, memory, modules, interrupts, timing | Working. `threads/` 148/158; ctrl, power, RTC, intr, modules, sysmem all complete |
-| GE graphics: multithreaded software renderer (default, reference) and optional Direct3D 11 renderer: 1-16x resolution (up to 8K, supersampled to the window), xBR texture upscaling, texture filtering | Working. `gpu/` 107/111 (software) |
-| Audio (sceAudio, SAS, ATRAC3/3+, MP3, AAC, audiocodec) | Working. `audio/` 72/74 |
+| Kernel: threads (fibers), sync objects, memory, modules, interrupts, timing | Working. `threads/` 152/158; ctrl, power, RTC, intr, modules all complete |
+| GE graphics: multithreaded software renderer (default, reference) and optional Direct3D 11 renderer: 1-16x resolution (up to 8K, supersampled to the window), xBR texture upscaling, texture filtering | Working. `gpu/` 111/111 (software) |
+| Audio (sceAudio, SAS, ATRAC3/3+, MP3, AAC, audiocodec) | Working. `audio/` 73/74 |
 | I/O, UMD, memory stick, ISO/CSO/ZSO/DAX | Working |
 | sceUtility (save data, dialogs, OSK), fonts (PGF) | Working |
 | Network: infrastructure (virtual access point on the host's network, BSD sockets, DNS, HTTP/HTTPS) and ad hoc play (PPSSPP-compatible ad hoc server, `pspc --adhoc-server`) | Working. [docs/networking.md](docs/networking.md) |
@@ -244,12 +244,19 @@ python -I tools\run_autotests.py --aot              :: the same with AOT-compile
 Comparing the two runs is a differential test of the recompiler. On a fatal error or a host crash
 pspc prints a symbolized backtrace (frames in AOT DLLs are named by guest function).
 
-Disc images past 1.8 GB (see [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md#large-disc-images)):
+Games and PSPC's own guest programs:
 
 ```bat
+python -I tools\smoke_games.py --record             :: once: this machine's checkpoint frames (Games\ folder)
+python -I tools\smoke_games.py                      :: the games still reach their checkpoints, frame for frame
+python -I tools\guest_tests.py                      :: tests/guest programs, interpreted and freshly compiled
 python -I tools\test_mkcso.py                       :: the CSO/ZSO/DAX writer's index shift and limits
-python -I tools\large_image_test.py                 :: boots an 8.75 GB sparse image (needs tools/build_guest_tests.sh)
+python -I tools\large_image_test.py --aot           :: boots an 8.75 GB sparse disc image
 ```
+
+The guest programs are built with pspdev by `tools/build_guest_tests.sh` (under Linux or WSL).
+Checkpoints are listed in `tools/checkpoints.txt`; the reference frames stay on your machine
+(`build/checkpoints`). Disc images past 1.8 GB: [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md#large-disc-images).
 
 ## License
 

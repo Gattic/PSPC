@@ -24,7 +24,10 @@ Where the work differs from the plan, or adds to it:
   - The guest program reads its commands from `disc0:/PROBES.TXT`, which the runner writes into
     the image. One list therefore drives both the program and the expected lines, and the
     expected lines are computed by reading the image file.
-  - `tools/large_image_test.py` matches 47 of 47 lines, in the interpreter and as AOT.
+  - `tools/large_image_test.py` matches 47 of 47 lines, in the interpreter and as native code.
+    (Correction, 2026-10-12: its first `--aot` runs still used the interpreter, as pspc only runs
+    native code that already exists. The runner now builds the program's native code fresh
+    first, and the result holds.)
   - The launcher lists the 8.75 GB image ("ISO · 8.8 GB") and shows the 5.3 note.
 - **Sparse files on Windows:** Python's `truncate()` extends a file by writing zeros (the CRT's
   `_chsize`), and that filled the disk once. `make_big_iso.py` extends by writing one byte at

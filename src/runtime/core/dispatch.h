@@ -28,8 +28,12 @@ u32 GuestFunctionAt(const void *hostAddr, size_t *offset);
 // Call semantics: $ra already holds the return address. Runs native code if registered,
 // otherwise interprets until the callee returns. Sets c->pc = target before a native call.
 void Call(Ctx *c, u32 target);
-// Tail jump from a function whose entry values of $ra/$sp were ra0/sp0.
+// Tail jump from a function whose entry values of $ra/$sp were ra0/sp0. A jump that leaves that
+// frame's stack (a coroutine switch) becomes a non-local return to `target` instead.
 void Jump(Ctx *c, u32 target, u32 ra0, u32 sp0);
+// The thread's top frame carrying on at `target` after a non-local return nobody caught: native
+// code if `target` starts a body, else the interpreter, until the guest returns to ra0.
+void Resume(Ctx *c, u32 target, u32 ra0);
 // Called (once per address) when native code has to fall back to the interpreter at `target`.
 void SetMissHook(void (*hook)(u32 target));
 

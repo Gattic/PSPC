@@ -20,6 +20,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))  # also when run with python -I
+import guest_tests  # noqa: E402
 import make_big_iso  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -139,7 +140,8 @@ def expected(iso, info, commands):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--pspc', default=str(ROOT / 'build' / 'RelWithDebInfo' / 'bin' / 'pspc.exe'))
-    ap.add_argument('--aot', action='store_true', help='native code instead of the interpreter')
+    ap.add_argument('--aot', action='store_true',
+                    help='native code, built fresh for the run, instead of the interpreter')
     ap.add_argument('--keep', action='store_true', help='keep the image (build/large-image/large.iso)')
     ap.add_argument('--timeout', type=int, default=60)
     args = ap.parse_args()
@@ -155,7 +157,18 @@ def main():
     ms = pathlib.Path(tempfile.mkdtemp(prefix='pspc_large_ms_'))
     cmd = [os.path.abspath(args.pspc), '--config', 'none', '--no-plugins', '--headless', '--fast-time',
            '--timeout', str(args.timeout), '--log', 'warn', '--memstick', str(ms)]
-    if not args.aot:
+    aot = None
+    if args.aot:
+        # pspc only runs native code that exists: build the program's (EBOOT.BIN's) first.
+        aot = pathlib.Path(tempfile.mkdtemp(prefix='pspc_large_aot_'))
+        err = guest_tests.build_native(PRX, aot, pathlib.Path(os.path.abspath(args.pspc)).parent.parent)
+        if err:
+            print('large image: ' + err)
+            shutil.rmtree(aot, ignore_errors=True)
+            iso.unlink(missing_ok=True)
+            return 1
+        cmd += ['--aot-dir', str(aot)]
+    else:
         cmd.append('--interp')
     cmd.append(str(iso))
     try:
@@ -166,6 +179,8 @@ def main():
         got, err = [], ['host timeout']
     finally:
         shutil.rmtree(ms, ignore_errors=True)
+        if aot:
+            shutil.rmtree(aot, ignore_errors=True)
         if not args.keep:
             iso.unlink(missing_ok=True)
     bad = [(i, w, g) for i, (w, g) in enumerate(zip(want, got)) if w != g]

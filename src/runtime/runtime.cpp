@@ -406,22 +406,26 @@ int RunOnce(const Options &o, BootTarget bt) {
 	netConfig.infraDns = o.infraDns;
 	netConfig.dataDir = o.dataDir;
 	net::Configure(netConfig);
+	std::string dumpDir;
 	if (!o.dumpFramesDir.empty()) {
 		std::error_code ec;
 		fs::create_directories(fs::u8path(o.dumpFramesDir), ec);
-		std::string dir = o.dumpFramesDir;
-		u32 every = (u32)std::max(1, o.dumpEvery);
-		display::SetVblankHook([dir, every]() {
-			ctrl::OnVblank();
-			ReportGpuStats();
-			if (display::Vcount() % every == 0) DumpFrame(dir);
-		});
-	} else {
-		display::SetVblankHook([]() {
-			ctrl::OnVblank();
-			ReportGpuStats();
-		});
+		dumpDir = o.dumpFramesDir;
 	}
+	const u32 dumpEvery = (u32)std::max(1, o.dumpEvery);
+	const u32 exitVblank = o.exitVblank;
+	display::SetVblankHook([dumpDir, dumpEvery, exitVblank]() {
+		ctrl::OnVblank();
+		ReportGpuStats();
+		const u32 v = display::Vcount();
+		if (!dumpDir.empty() && v % dumpEvery == 0) DumpFrame(dumpDir);
+		// After that VBlank's frame is dumped: the same stopping point in game time whatever the
+		// host's speed (checkpoint runs of tools/smoke_games.py).
+		if (exitVblank && v == exitVblank) {
+			LOGI("RUNTIME", "Stopping at VBlank %u", v);
+			sched::RequestStop(124);
+		}
+	});
 
 	// A sceKernelLoadExec relaunch boots the requested guest path, with every device mounted as
 	// for the original program.

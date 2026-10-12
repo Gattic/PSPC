@@ -80,7 +80,8 @@ void F_088040AC(Ctx *PSPC_RESTRICT c) { B_088040AC(c, c->r[31], c->r[29]); }
   both entries per address (`dispatch::RegisterNative`); `dispatch::Jump` uses the body.
 * **Returns.** `jr ra` returns from C when `$ra` equals `ra0`; otherwise it starts a non-local
   return (`c->unwinding`, target in `c->pc`) that unwinds C frames until one expects that address.
-  Nobody expecting it means the rest of the thread continues in the interpreter.
+  Nobody expecting it means the thread's top frame carries on from there (`dispatch::Resume`):
+  natively if the address starts a body, in the interpreter otherwise.
 * **Cycles.** One cycle per executed instruction, delay slots included, exactly as the interpreter
   counts: straight-line code accumulates a count paid (`c->budget -= N`) before anything that
   leaves it - control transfers, syscalls, labels. Back-edges check `c->budget < 0` and call
@@ -92,6 +93,11 @@ void F_088040AC(Ctx *PSPC_RESTRICT c) { B_088040AC(c, c->r[31], c->r[29]); }
   stay correct because the loader keeps the low 16 bits of the base.
 * Calls outside the module (imports, function pointers) go through `g_api->callIndirect`.
 * Unrecovered `jr` targets go to `g_api->jumpIndirect`, which runs native code or the interpreter.
+  A `jr` that leaves the jumper's stack (`$sp` above `sp0`, or more than 1 MB below it) is a
+  stack switch, not a jump within the frame: coroutine and task schedulers swap `$sp` and jump to
+  the other context's saved `$ra` through another register (Daxter's does). `dispatch::Jump`
+  makes it a non-local return, as for `jr ra`, so the host stack doesn't grow with every switch
+  (`tests/guest/coroutines`).
 * Words patched by variable imports run through `g_api->execWord` (read from memory at runtime).
 * A module that writes `fcr31` (`ctc1 x, $31`) is compiled with `#pragma STDC FENV_ACCESS ON` so
   clang doesn't constant-fold float arithmetic under round-to-nearest; other modules keep full
@@ -105,6 +111,10 @@ void F_088040AC(Ctx *PSPC_RESTRICT c) { B_088040AC(c, c->r[31], c->r[29]); }
   with the interpreter run is a differential test of the code generator.
 * Interpreter misses inside AOT modules are written to `<aot dir>/<sha1>.hints`; the next
   `pspc_build.py` run adds them as strong entries.
+* `tools/guest_tests.py` runs PSPC's own guest programs in the interpreter and as native code
+  built fresh for the run (no hints), the way a player's first build is.
+* `tools/smoke_games.py` checks that the games still reach their checkpoints
+  (`tools/checkpoints.txt`) with the same frames, interpreter or native.
 
 ## Known limits / next steps
 

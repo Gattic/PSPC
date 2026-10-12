@@ -7,7 +7,7 @@ furthest screen confirmed by a frame dump.
 
 | Game | Disc ID | Firmware req. | Native | Interpreter | Notes |
 |---|---|---|---|---|---|
-| Daxter | NPUG80329 | 5.50 | Gameplay (first level) | Gameplay | Intro movie plays with sound (sceMpeg, H.264 via Media Foundation). Renderer runs ~1.6x real time headless. |
+| Daxter | NPUG80329 | 5.50 | Gameplay (first level) | Gameplay | Intro movie plays with sound (sceMpeg, H.264 via Media Foundation). Renderer runs ~1.6x real time headless. Its task scheduler switches stacks; freshly compiled native code crashed on entering the first level until 2026-10-12 (docs/RECOMPILER.md, stack switches). |
 | Syphon Filter: Combat Ops | NPUG80114 | 3.71 | Online match (two instances) | Menus | Intro, save-data notice, keyboard and menus render correctly. Audio plays. Infrastructure: connects to the access point ("PSPC 1"), signs in to PSN through PSPC Network (hosted account or local), and with PSPC's Combat Ops server (`server/pspc_medius`, docs/combat-ops-server.md) enters the lobby, lists and downloads missions, hosts and joins games; two instances on one PC go through staging, the briefing and setup, play a full deathmatch together, rate the mission and return to the lobby; four play a ranked deathmatch whose results and stats reach the server. Cells, the Community pages (leaderboards, message board) and the game's own profile screens work. Ad hoc: two PSPC instances host and join a game through `pspc --adhoc-server` (staging area, 2/8 players). |
 | Syphon Filter: Logan's Shadow | UCUS98606 | 3.52 | Gameplay (training, story episode 1) | Same | Main code lives in USRDIR PRX modules, loaded and run natively. Story cutscenes use sceMpeg (now implemented). |
 | Monster Hunter Freedom Unite | ULUS10391 | 5.03 | Game menu, character creation | Same | Loads its font library through `sceKernelLoadModuleByID`; needs system fonts (`flash0/font`). Naming the character uses the keyboard dialog (windowed: a text box; headless: `--osk-text`). |
@@ -41,6 +41,22 @@ VRAM's swizzled mirrors (`--edram-mirrors`, for `gpu/ge/edramswizzle`) and the d
 with pspdev (under Linux or WSL) into `build/autotest-rebuilt`, and the runner uses that one (it
 skips the test until then). Font tests need the firmware fonts: run it with `--flash0` pointing
 at an installed flash0. The investigation behind all of this: [autotests-plan.md](autotests-plan.md).
+
+## Game checkpoints
+
+`tools/smoke_games.py` boots every game in `Games\` headless with scripted input
+(`tools/smoke_inputs.txt`). Games listed in `tools/checkpoints.txt` run to a fixed point in game
+time (`pspc --exit-vblank`), and their frames at the checkpoints must match references recorded on
+the same machine (`--record`, kept in `build/checkpoints`, outside the repository), so a change
+that alters how far a game gets, or what it shows on the way, fails the run. Runs are
+deterministic: the same build gives the same frames whatever the machine's load, except where a
+checkpoint allows a share of pixels to differ (Battlefront II's title screen, whose background
+animates differently from run to run). The firmware flash0 is passed explicitly: games take other
+paths without one.
+
+PSPC's own guest programs (`tests/guest`, built with pspdev by `tools/build_guest_tests.sh`) run
+with `tools/guest_tests.py`, in the interpreter and as native code compiled fresh for the run, the
+way a player's first build is: `coroutines` switches stacks the way Daxter's scheduler does.
 
 ## Large disc images
 

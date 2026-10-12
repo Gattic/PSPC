@@ -395,7 +395,7 @@ void WINAPI ThreadFiberProc(void *param) {
 		u32 target = c->pc;
 		c->unwinding = 0;
 		if (target == t->threadReturnStub) break;
-		interp::Run(c, target, t->threadReturnStub, 0);
+		dispatch::Resume(c, target, t->threadReturnStub);
 	}
 	if (t->deleteOnReturn) {
 		kernel::DeleteThreadCallbacks(t);

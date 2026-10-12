@@ -1,0 +1,44 @@
+# Checkpoints for tools/smoke_games.py: <disc id or file stem> <vblank>[~<percent>] <what the frame shows>
+# A run of the game stops at its last checkpoint (pspc --exit-vblank; 60 VBlanks = 1 second), with
+# the scripted input of tools/smoke_inputs.txt. Each checkpoint's frame is compared with this
+# machine's reference (build/checkpoints, written by --record): it must be identical, or with ~N,
+# have at most N% of its pixels different (a screen that animates differently from run to run).
+# The last checkpoint is the furthest the scripted input gets today; docs/games-plan.md has what
+# stops each game there.
+
+# Daxter: logos, title, New Game, the first level
+NPUG80329 600 Ready at Dawn logo
+NPUG80329 1200 title menu
+NPUG80329 2400 first level, movement hint
+NPUG80329 4500 first level
+
+# Monster Hunter Freedom Unite: language, title, game menu
+ULUS10391 1200 language menu
+ULUS10391 2400 title screen
+ULUS10391 3000 game menu
+
+# Syphon Filter: Combat Ops: intro, save-data notice, profile keyboard
+NPUG80114 1200 intro globe
+NPUG80114 1800 save-data notice
+NPUG80114 3000 profile name keyboard
+
+# Syphon Filter: Logan's Shadow: intro, save-data notice, profile keyboard
+UCUS98606 900 intro logo
+UCUS98606 1500 save-data notice
+UCUS98606 3000 profile name keyboard
+
+# Star Wars Battlefront II: logos, title (no scripted input yet)
+ULUS10053 1200 Pandemic logo
+ULUS10053 2400~5 title, press start (the background animates differently from run to run)
+
+# Star Wars Battlefront: Elite Squadron: logos, title, profile prompt
+ULUS10390 900 GameSpy logo
+ULUS10390 1800 title, press start
+ULUS10390 3000 load canceled (no profile)
+ULUS10390 4500 profile prompt
+
+# Star Wars Battlefront: Renegade Squadron: logo, title, profile, new profile
+ULUS10292 300 Rebellion logo
+ULUS10292 1200 title, press start
+ULUS10292 3300 load canceled (no profile)
+ULUS10292 4500 new profile screen

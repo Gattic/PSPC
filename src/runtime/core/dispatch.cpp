@@ -22,6 +22,10 @@ struct Page {
 	BodyFn body[SLOTS];
 };
 
+// No function's frame is this big: a jump whose $sp lands further below the frame's start than
+// this has switched to another stack.
+constexpr u32 kMaxFrameBytes = 1u << 20;
+
 std::unique_ptr<Page> g_pages[NUM_PAGES];
 std::atomic<u32> g_count{0};
 void (*g_missHook)(u32) = nullptr;
@@ -123,6 +127,16 @@ void Call(Ctx *c, u32 target) {
 }
 
 void Jump(Ctx *c, u32 target, u32 ra0, u32 sp0) {
+	// A jump that leaves the jumper's stack doesn't continue its frame: the guest switched stacks,
+	// as a coroutine or task switch does (Daxter's scheduler saves its registers, swaps $sp and
+	// jumps to the other context's saved $ra). Running the target inside this host frame would
+	// grow the host stack with every switch until it overflows, so unwind instead: to a frame
+	// waiting for that address if one is on the host stack, else to the thread's top, which
+	// carries on from there (Resume). sp0 == 0: the thread's top frame, nothing to unwind.
+	if (sp0 && (c->r[29] > sp0 || sp0 - c->r[29] > kMaxFrameBytes)) {
+		NonlocalReturn(c, target);
+		return;
+	}
 	// Recompiled code continues the jumper's frame: it returns to ra0 like the jumper would.
 	if (BodyFn body = LookupBody(target)) {
 		c->pc = target;
@@ -142,6 +156,16 @@ void Jump(Ctx *c, u32 target, u32 ra0, u32 sp0) {
 	}
 	Miss(target);
 	interp::Run(c, target, ra0, sp0);
+}
+
+void Resume(Ctx *c, u32 target, u32 ra0) {
+	if (BodyFn body = LookupBody(target)) {
+		c->pc = target;
+		body(c, ra0, 0);
+		return;
+	}
+	Miss(target);
+	interp::Run(c, target, ra0, 0);
 }
 
 void SetMissHook(void (*hook)(u32)) { g_missHook = hook; }

@@ -1,0 +1,5 @@
+rounds 100000
+task0 runs 66667 sum 2222278778
+task1 runs 33333 sum 555563111
+check 791580599
+done
