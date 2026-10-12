@@ -33,8 +33,10 @@ Updating: open a newer MSI; it replaces the old version and keeps your settings,
 accounts. Uninstalling (Windows Settings > Apps > PSPC) removes PSPC's programs and leaves what
 PSPC created in its folder (settings, saves, firmware, server databases).
 
-The installed PSPC runs games in its interpreter. Native (AOT) code needs a source build with
-LLVM and Visual Studio (below), which adds *Build native code* to the launcher.
+The installed PSPC includes everything needed for native (AOT) code. Choose *Build native code*
+in the launcher, or let *Play* build it first. No Visual Studio, LLVM or Python installation is
+needed. Native code is cached between runs; after a PSPC update the launcher offers to rebuild
+outdated code. Games can also run in the interpreter.
 
 ## Status
 
@@ -74,9 +76,13 @@ build.cmd                       :: configure + build into build\RelWithDebInfo
 build\RelWithDebInfo\bin\pspc_unittests.exe
 ```
 
-The installer: `python -I tools\make_installer.py` (Python 3.12: it uses `msilib`, gone in 3.13)
-packages `build\RelWithDebInfo` with a private Python runtime for the servers into
-`build\installer\PSPC-<version>-x64.msi`. The version is the one in `CMakeLists.txt`.
+For release packaging, run `python -I tools\fetch_aot.py` once to download the pinned, SHA-256
+verified LLVM/MinGW toolchain. Then `python -I tools\make_installer.py` (Python 3.12: it uses
+`msilib`, gone in 3.13) packages `build\RelWithDebInfo` into
+`build\installer\PSPC-<version>-x64.msi`. Use `--build-dir build\Release` for a Release tree.
+Every installer includes the recompiler, portable compiler, matching AOT SDK and private Python
+runtime for builds and servers. Packaging checks that native code builds and runs using only
+the installed tools, with no developer tools on PATH. The version is the one in `CMakeLists.txt`.
 
 ## Playing
 
@@ -96,6 +102,13 @@ From the command line:
 ```bat
 python -I tools\pspc_build.py Games\MyGame.iso     :: once per game: native code for every module
 build\RelWithDebInfo\bin\pspc.exe Games\MyGame.iso
+```
+
+In an installed copy, the equivalent commands (from its folder) are:
+
+```bat
+python\python.exe -I -B -X utf8 tools\pspc_build.py Games\MyGame.iso
+pspc.exe Games\MyGame.iso
 ```
 
 Keyboard: arrows = D-pad, Z = Cross, X = Circle, A = Square, S = Triangle, Q/W = L/R,

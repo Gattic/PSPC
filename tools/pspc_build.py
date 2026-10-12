@@ -30,6 +30,8 @@ BIN = ROOT / 'build' / 'RelWithDebInfo' / 'bin'
 LIB = ROOT / 'build' / 'RelWithDebInfo' / 'lib'
 SEM_HEADER = ROOT / 'build' / 'RelWithDebInfo' / 'generated' / 'pspc_sem_version.h'
 LINK_LIBS = ('pspc_sem.lib', 'pspc_common.lib')
+SRC = ROOT / 'src'
+TOOLCHAIN = None
 
 _seen_lock = threading.Lock()
 _seen = set()
@@ -38,7 +40,7 @@ _module_sha = {}  # module path -> SHA-1 of its plain ELF (for games.json)
 
 def source_sem_version():
     """Hash of src/allegrex computed exactly as src/CMakeLists.txt does."""
-    files = sorted(p.resolve().as_posix() for p in (ROOT / 'src' / 'allegrex').iterdir() if p.is_file())
+    files = sorted(p.resolve().as_posix() for p in (SRC / 'allegrex').iterdir() if p.is_file())
     joined = ''.join(hashlib.sha1(pathlib.Path(f).read_bytes()).hexdigest() for f in files)
     return hashlib.sha1(joined.encode()).hexdigest()[:8]
 
@@ -91,6 +93,34 @@ def vs_env():
     return env
 
 
+def bundled_env():
+    """Ignore developer-machine include/library overrides when using the private toolchain."""
+    env = {k.upper(): v for k, v in os.environ.items()}
+    for key in ('INCLUDE', 'LIB', 'LIBPATH', 'CPATH', 'C_INCLUDE_PATH', 'CPLUS_INCLUDE_PATH',
+                'LIBRARY_PATH', 'COMPILER_PATH', 'GCC_EXEC_PREFIX', 'CCC_OVERRIDE_OPTIONS',
+                'CL', '_CL_', 'LINK', '_LINK_'):
+        env.pop(key, None)
+    system = pathlib.Path(env.get('SYSTEMROOT', r'C:\Windows'))
+    env['PATH'] = os.pathsep.join(map(str, (TOOLCHAIN / 'bin', system / 'System32', system)))
+    return env
+
+
+def configure_bundle(root):
+    """The installed SDK is relocatable and never searches for a source tree or Visual Studio."""
+    global BIN, LIB, SEM_HEADER, LINK_LIBS, SRC, TOOLCHAIN
+    BIN = root
+    sdk = root / 'aot'
+    LIB, SRC = sdk / 'lib', sdk / 'src'
+    SEM_HEADER = sdk / 'generated' / 'pspc_sem_version.h'
+    LINK_LIBS = ('pspc_aot.a',)
+    TOOLCHAIN = sdk / 'toolchain'
+    for p in (BIN / 'pspc-recomp.exe', BIN / 'pspc-iso.exe', BIN / 'pspc-decrypt.exe',
+              LIB / LINK_LIBS[0], SEM_HEADER, SRC / 'allegrex' / 'sem.h',
+              TOOLCHAIN / 'bin' / 'x86_64-w64-mingw32-clang++.exe'):
+        if not p.is_file():
+            raise RuntimeError('AOT installation is incomplete (%s missing). Repair or reinstall PSPC.' % p)
+
+
 def plain_elf(path, work, decrypt_tool):
     with open(path, 'rb') as f:
         data = f.read(40)
@@ -110,7 +140,7 @@ def plain_elf(path, work, decrypt_tool):
         tmp_out = tmp_in.with_suffix('.elf')
         tmp_in.write_bytes(data)
         r = subprocess.run([str(decrypt_tool), 'prx', str(tmp_in), str(tmp_out)], stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE, text=True)
+                           stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
         if r.returncode != 0:
             raise RuntimeError('pspc-decrypt failed (%d): %s' % (r.returncode, r.stderr.strip()))
         return tmp_out.read_bytes()
@@ -133,7 +163,7 @@ def expand_inputs(args, paths, origins=None):
         dest = pathlib.Path(args.work) / ('disc_' + hashlib.sha1(str(p.resolve()).encode()).hexdigest()[:12])
         dest.mkdir(parents=True, exist_ok=True)
         r = subprocess.run([str(BIN / 'pspc-iso.exe'), 'modules', str(p), str(dest)], stdout=subprocess.PIPE,
-                           stderr=subprocess.PIPE, text=True)
+                           stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='replace')
         if r.returncode not in (0, 3):
             raise RuntimeError('pspc-iso failed on %s: %s' % (p, r.stderr.strip()))
         for line in r.stdout.splitlines():
@@ -226,6 +256,39 @@ def write_index(cache, origins, ok):
 # Must match the CMakeLists.txt pspc-recomp writes (used with --cmake).
 CLANG_FLAGS = ['/O2', '/clang:-fno-strict-aliasing', '-Wno-unused-label', '-Wno-unused-variable']
 MSVC_FLAGS = ['/O2', '/bigobj', '/wd4102', '/wd4189', '/utf-8', '/permissive-', '/Zc:preprocessor']
+MINGW_FLAGS = ['-std=c++20', '-O2', '-fno-strict-aliasing', '-ffp-contract=off',
+               '-DNDEBUG', '-DNOMINMAX', '-DWIN32_LEAN_AND_MEAN', '-D_CRT_SECURE_NO_WARNINGS',
+               '-Wno-unused-label', '-Wno-unused-variable']
+
+
+def build_bundled(args, env, src, sha):
+    cc = str(TOOLCHAIN / 'bin' / 'x86_64-w64-mingw32-clang++.exe')
+    obj_dir = src / 'obj'
+    obj_dir.mkdir(exist_ok=True)
+    flags = MINGW_FLAGS + ['-I' + str(SRC), '-I' + str(SEM_HEADER.parent), '-I' + str(src)]
+
+    def compile_one(cpp):
+        obj = obj_dir / (cpp.stem + '.o')
+        r = subprocess.run([cc] + flags + ['-c', str(cpp), '-o', str(obj)], env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if r.returncode:
+            raise RuntimeError('compile failed (%s):\n%s' % (cpp.name, r.stdout[-6000:]))
+        return obj
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as ex:
+        objs = list(ex.map(compile_one, sorted(src.glob('*.cpp'))))
+    dll = obj_dir / (sha + '.dll')
+    # Static C++ support: the resulting DLL needs only Windows' system DLLs, even when copied
+    # into another cache. A response file also handles large modules and long installation paths.
+    link = ['-shared', '-static', '-o', dll.as_posix()]
+    link += [o.as_posix() for o in objs] + [(pathlib.Path(args.lib_dir) / n).as_posix() for n in LINK_LIBS]
+    rsp = obj_dir / 'link.rsp'
+    rsp.write_text('\n'.join('"' + a + '"' for a in link), encoding='utf-8')
+    r = subprocess.run([cc, '@' + str(rsp)], env=env, stdout=subprocess.PIPE,
+                       stderr=subprocess.STDOUT, text=True)
+    if r.returncode:
+        raise RuntimeError('link failed:\n' + r.stdout[-6000:])
+    return dll
 
 
 def build_direct(args, env, src, sha):
@@ -239,7 +302,7 @@ def build_direct(args, env, src, sha):
     obj_dir = src / 'obj'
     obj_dir.mkdir(exist_ok=True)
     flags = ['/nologo', '/c', '/std:c++20', '/MT', '/EHsc', '/DNDEBUG', '/DNOMINMAX', '/DWIN32_LEAN_AND_MEAN',
-             '/D_CRT_SECURE_NO_WARNINGS', '/I' + str(ROOT / 'src'), '/I' + str(SEM_HEADER.parent), '/I' + str(src)]
+             '/D_CRT_SECURE_NO_WARNINGS', '/I' + str(SRC), '/I' + str(SEM_HEADER.parent), '/I' + str(src)]
     flags += CLANG_FLAGS if clang else MSVC_FLAGS
 
     def compile_one(cpp):
@@ -310,11 +373,15 @@ def build_one(args, env, path):
         cmd += ['--hints', str(hints)]
     if args.no_comments:
         cmd.append('--no-comments')
-    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                       encoding='utf-8', errors='replace')
     if r.returncode != 0:
         raise RuntimeError('pspc-recomp failed:\n' + r.stdout)
     summary = r.stdout.strip()
-    dll = build_with_cmake(args, env, src, sha) if args.cmake else build_direct(args, env, src, sha)
+    if TOOLCHAIN:
+        dll = build_bundled(args, env, src, sha)
+    else:
+        dll = build_with_cmake(args, env, src, sha) if args.cmake else build_direct(args, env, src, sha)
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(dll, dest)
     stamp.write_text(args.sem_version + '\n')
@@ -332,8 +399,9 @@ def main():
     ap.add_argument('--build-dir', default=None,
                     help='build tree for pspc-recomp, the link libraries and the semantics version '
                          '(default: build/RelWithDebInfo)')
+    ap.add_argument('--pspc-dir', help='installed PSPC folder (default: auto-detect next to this script)')
     ap.add_argument('--cache', default=None, help='AOT cache (default: <build dir>/bin/cache/aot)')
-    ap.add_argument('--work', default=str(ROOT / 'build' / 'aot-work'))
+    ap.add_argument('--work', help='temporary build parent (default: cache/aot-work in an install)')
     ap.add_argument('--decrypt', default=None)
     ap.add_argument('--compiler', choices=['clang', 'msvc'], default='clang')
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 4)
@@ -344,13 +412,34 @@ def main():
     ap.add_argument('--force', action='store_true')
     ap.add_argument('--cmake', action='store_true', help='build through the generated CMakeLists.txt')
     args = ap.parse_args()
+    if args.jobs < 1 or args.modules_in_parallel < 1:
+        ap.error('--jobs and --modules-in-parallel must be positive')
+    installed = pathlib.Path(args.pspc_dir).resolve() if args.pspc_dir else ROOT
+    bundled = args.pspc_dir or (not args.build_dir and (installed / 'pspc.exe').exists())
+    if bundled:
+        if args.build_dir or args.cmake or args.compiler != 'clang':
+            ap.error('the bundled toolchain cannot be combined with --build-dir, --cmake or --compiler msvc')
+        configure_bundle(installed)
     if args.build_dir:
         tree = pathlib.Path(args.build_dir).resolve()
         BIN, LIB, SEM_HEADER = tree / 'bin', tree / 'lib', tree / 'generated' / 'pspc_sem_version.h'
     args.cache = args.cache or str(BIN / 'cache' / 'aot')
     args.decrypt = args.decrypt or str(BIN / 'pspc-decrypt.exe')
-    env = vs_env()
+    args.work = args.work or str(installed / 'cache' / 'aot-work' if bundled else ROOT / 'build' / 'aot-work')
+    env = bundled_env() if bundled else vs_env()
     args.sem_version = sem_version()
+    # Launchers can build different games simultaneously, including games sharing modules.
+    # Give each invocation its own sources, objects and library snapshot.
+    pathlib.Path(args.work).mkdir(parents=True, exist_ok=True)
+    args.work = tempfile.mkdtemp(prefix='build-', dir=args.work)
+    try:
+        return build_batch(args, env)
+    finally:
+        if not args.keep_src:
+            shutil.rmtree(args.work, ignore_errors=True)
+
+
+def build_batch(args, env):
     args.lib_dir = snapshot_libs(pathlib.Path(args.work), args.sem_version)
     origins, ok = {}, {}
     paths = expand_inputs(args, [pathlib.Path(p) for p in args.inputs], origins)
@@ -372,4 +461,7 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except (OSError, RuntimeError) as e:
+        sys.exit('AOT build failed: %s' % e)

@@ -88,7 +88,7 @@ int Extract(vfs::IsoFileSystem &iso, const std::string &path, const fs::path &ou
 
 }  // namespace
 
-int main(int argc, char **argv) {
+static int Main(int argc, char **argv) {
 	if (argc < 3) {
 		fprintf(stderr, "usage: pspc-iso info|ls|get|modules <image> [...]\n");
 		return 1;
@@ -138,7 +138,7 @@ int main(int argc, char **argv) {
 			for (char &ch : flat)
 				if (ch == '/') ch = '_';
 			if (Extract(*iso, path, out / flat) == 0) {
-				printf("%s\t%s\n", path.c_str(), (out / flat).string().c_str());
+				printf("%s\t%s\n", path.c_str(), PathToUtf8(out / flat).c_str());
 				n++;
 			}
 		});
@@ -147,3 +147,5 @@ int main(int argc, char **argv) {
 	fprintf(stderr, "unknown command %s\n", cmd.c_str());
 	return 1;
 }
+
+int wmain(int argc, wchar_t **argv) { return RunUtf8Main(Main, argc, argv); }

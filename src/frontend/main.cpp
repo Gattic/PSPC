@@ -318,7 +318,7 @@ static int RunNpCommand(int argc, char **argv) {
 	return 1;
 }
 
-int main(int argc, char **argv) {
+static int Main(int argc, char **argv) {
 	for (int i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--version")) {
 			printf("PSPC %s\n", PSPC_VERSION);
@@ -329,14 +329,14 @@ int main(int argc, char **argv) {
 	}
 	runtime::Options o;
 	fs::path exeDir = ExecutableDir();
-	o.aotDir = (exeDir / "cache" / "aot").string();
-	o.memstickDir = (exeDir / "ms0").string();
-	o.flash0Dir = (exeDir / "flash0").string();
-	o.flash1Dir = (exeDir / "flash1").string();
-	o.dataDir = (exeDir / "data").string();
-	o.decryptTool = (exeDir / "pspc-decrypt.exe").string();
-	o.decryptCacheDir = (exeDir / "cache" / "decrypted").string();
-	o.screenshotDir = (exeDir / "screenshots").string();
+	o.aotDir = PathToUtf8(exeDir / "cache" / "aot");
+	o.memstickDir = PathToUtf8(exeDir / "ms0");
+	o.flash0Dir = PathToUtf8(exeDir / "flash0");
+	o.flash1Dir = PathToUtf8(exeDir / "flash1");
+	o.dataDir = PathToUtf8(exeDir / "data");
+	o.decryptTool = PathToUtf8(exeDir / "pspc-decrypt.exe");
+	o.decryptCacheDir = PathToUtf8(exeDir / "cache" / "decrypted");
+	o.screenshotDir = PathToUtf8(exeDir / "screenshots");
 	LogLevel level = LogLevel::Info;
 	std::string logFile;
 
@@ -454,11 +454,11 @@ int main(int argc, char **argv) {
 		Usage();
 		return 1;
 	}
-	if (!fs::exists(fs::path(o.dataDir) / "nids.csv")) {
+	if (!fs::exists(fs::u8path(o.dataDir) / "nids.csv")) {
 		// Running from the build tree: use the repository's data directory.
 		for (fs::path p = exeDir; !p.empty() && p != p.root_path(); p = p.parent_path()) {
 			if (fs::exists(p / "data" / "nids.csv")) {
-				o.dataDir = (p / "data").string();
+				o.dataDir = PathToUtf8(p / "data");
 				break;
 			}
 		}
@@ -467,7 +467,7 @@ int main(int argc, char **argv) {
 		// The launcher's Games folder: next to pspc.exe or in a parent (the repository's).
 		for (fs::path p = exeDir; !p.empty() && p != p.root_path(); p = p.parent_path()) {
 			if (fs::is_directory(p / "Games")) {
-				o.gamesDir = (p / "Games").string();
+				o.gamesDir = PathToUtf8(p / "Games");
 				break;
 			}
 		}
@@ -478,7 +478,7 @@ int main(int argc, char **argv) {
 		for (int pass = 0; pass < 2 && o.pluginsDir.empty(); pass++) {
 			for (fs::path p = exeDir; !p.empty() && p != p.root_path(); p = p.parent_path()) {
 				if (fs::is_directory(pass == 0 ? p / "plugins" / "seplugins" : p / "plugins")) {
-					o.pluginsDir = (p / "plugins").string();
+					o.pluginsDir = PathToUtf8(p / "plugins");
 					break;
 				}
 			}
@@ -557,3 +557,5 @@ int main(int argc, char **argv) {
 	}
 	return rc;
 }
+
+int wmain(int argc, wchar_t **argv) { return RunUtf8Main(Main, argc, argv); }

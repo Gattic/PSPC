@@ -206,7 +206,7 @@ bool TryLoadAot(PspModule *m, const loader::ElfFile &elf, u32 *requiredBase) {
 		}
 	}
 	std::string hex = HexString(m->sha1.data(), m->sha1.size());
-	fs::path dllPath = fs::path(g_aotDir) / (hex + ".dll");
+	fs::path dllPath = fs::u8path(g_aotDir) / (hex + ".dll");
 	if (!fs::exists(dllPath)) return false;
 	HMODULE h = LoadLibraryW(dllPath.wstring().c_str());
 	if (!h) {

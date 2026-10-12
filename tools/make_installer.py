@@ -12,6 +12,7 @@ The package is written with the standard library's msilib (Python 3.13 removed i
 refuses to run there); no WiX, Inno Setup or NSIS is needed. PSPC must already be built: the
 binaries in <build dir>/bin are packaged as they are (they link the C runtime statically, so no
 Visual C++ redistributable is needed).
+Run tools/fetch_aot.py once for the portable release AOT toolchain, or supply --aot-toolchain.
 
 What it does:
   1. Stages the install tree in <out dir>/stage: exactly the installed layout below.
@@ -28,10 +29,11 @@ What it does:
   3. Writes <out dir>/PSPC-<version>-x64.msi: every file in one cabinet embedded in the package.
 
 Installed layout (INSTALLDIR = %LOCALAPPDATA%\Programs\PSPC; msiexec /i <msi> INSTALLDIR=<dir>):
-    pspc.exe, pspc-launcher.exe, pspc-iso.exe, pspc-decrypt.exe, SDL2.dll
+    pspc.exe, pspc-launcher.exe, pspc-iso.exe, pspc-decrypt.exe, pspc-recomp.exe, SDL2.dll
     data\        data/* of the repository
     server\      pspc_network\, pspc_medius\, pspc_gamespy\ (the servers' .py files), README.md
-    tools\       pspc_install_fw.py
+    tools\       pspc_install_fw.py, pspc_build.py
+    aot\         matching semantics sources/headers, helper library and portable LLVM/MinGW
     python\      the private Python runtime (python.exe -m pspc_network ...)
     docs\        docs/*.md
     Games\       empty: where the user puts games
@@ -41,7 +43,7 @@ PSPC writes its own files next to pspc.exe at run time (pspc.ini, ms0, flash0/fl
 installs firmware, cache, screenshots, servers\): that is why the install is per user, into a folder
 the user can write, never Program Files. An uninstall removes only what the MSI installed; those
 files (and the folders holding them) stay. Never packaged: anything of <build dir>/bin besides the
-five binaries above - in particular flash0/flash1 (Sony's copyrighted firmware) and the
+six binaries above - in particular flash0/flash1 (Sony's copyrighted firmware) and the
 developer's ms0, cache, pspc.ini and screenshots. The stage is checked for them before packaging.
 
 The package: per user (no elevation prompt, ALLUSERS unset), 64-bit, Start menu and desktop
@@ -81,6 +83,10 @@ import uuid
 import warnings
 import zipfile
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import pspc_build
+import test_release_aot
+
 with warnings.catch_warnings():
     warnings.simplefilter('ignore', DeprecationWarning)  # "msilib is deprecated" - we know
     import msilib
@@ -98,13 +104,13 @@ MANUFACTURER = 'PSPC Project'
 URL = 'https://github.com/Gattic/PSPC'
 DEFAULT_VERSION = '0.1.0'
 
-BINARIES = ('pspc.exe', 'pspc-launcher.exe', 'pspc-iso.exe', 'pspc-decrypt.exe', 'SDL2.dll')
+BINARIES = ('pspc.exe', 'pspc-launcher.exe', 'pspc-iso.exe', 'pspc-decrypt.exe', 'pspc-recomp.exe', 'SDL2.dll')
 LAUNCHER = 'pspc-launcher.exe'
 TOP_FILES = set(BINARIES) | {'README.md', 'LICENSE.txt', 'THIRD_PARTY.md'}
-TOP_DIRS = {'data', 'server', 'tools', 'python', 'docs', 'Games', 'plugins'}
+TOP_DIRS = {'data', 'server', 'tools', 'python', 'docs', 'Games', 'plugins', 'aot'}
 SERVER_PACKAGES = ('pspc_network', 'pspc_medius', 'pspc_gamespy')
 # What pspc and the developer keep in bin\ (and what PSPC writes at run time): never packaged.
-FORBIDDEN_NAMES = {'flash0', 'flash1', 'ms0', 'cache', 'pspc.ini', 'screenshots', 'servers', 'pspc-recomp.exe',
+FORBIDDEN_NAMES = {'flash0', 'flash1', 'ms0', 'cache', 'pspc.ini', 'screenshots', 'servers',
                    'pspc_unittests.exe', 'pspc_decrypt_tests.exe'}
 FORBIDDEN_SUFFIXES = {'.pdb', '.ilk', '.exp', '.lib', '.sqlite', '.sqlite-wal', '.sqlite-shm', '.log'}
 
@@ -323,6 +329,7 @@ def stage_pspc(build_dir, stage):
                 copy(f, stage / 'server' / pkg / f.name)
     copy(need(ROOT / 'server' / 'README.md', 'server docs'), stage / 'server' / 'README.md')
     copy(need(ROOT / 'tools' / 'pspc_install_fw.py', 'firmware installer'), stage / 'tools' / 'pspc_install_fw.py')
+    copy(need(ROOT / 'tools' / 'pspc_build.py', 'AOT builder'), stage / 'tools' / 'pspc_build.py')
     for f in sorted((ROOT / 'docs').glob('*.md')):
         copy(f, stage / 'docs' / f.name)
     copy(need(ROOT / 'README.md', 'docs'), stage / 'README.md')
@@ -332,6 +339,51 @@ def stage_pspc(build_dir, stage):
     # PSPC's own (empty) plugins folder: pspc and the launcher look for the nearest plugins\seplugins
     # from their folder up, and must not adopt an unrelated one above the install.
     (stage / 'plugins' / 'seplugins').mkdir(parents=True, exist_ok=True)
+
+
+def stage_aot(build_dir, stage, toolchain):
+    """Build the portable SDK with its own compiler; MSVC C++ libraries cannot be mixed with it.
+
+    Only POD state and function pointers cross the x64 Windows ABI to the MSVC runtime.
+    The out-of-line VFPU helpers and generated functions share the bundled compiler's ABI.
+    """
+    pspc_build.SEM_HEADER = build_dir / 'generated' / 'pspc_sem_version.h'
+    try:
+        version = pspc_build.sem_version()  # refuse a runtime built from different semantics
+    except (OSError, RuntimeError) as e:
+        raise BuildError(str(e))
+    sdk = stage / 'aot'
+    cc_name = 'x86_64-w64-mingw32-clang++.exe'
+    need(toolchain / 'bin' / cc_name, 'run python -I tools/fetch_aot.py first')
+    need(toolchain / 'LICENSE.TXT', 'LLVM license')
+    need(toolchain / 'x86_64-w64-mingw32' / 'share' / 'mingw32' / 'COPYING', 'MinGW licenses')
+    shutil.copytree(toolchain, sdk / 'toolchain')
+    # Include all allegrex inputs so the source/semantics hash can still be checked after install.
+    for p in (ROOT / 'src' / 'allegrex').iterdir():
+        if p.is_file():
+            copy(p, sdk / 'src' / 'allegrex' / p.name)
+    copy(ROOT / 'src' / 'common' / 'common.h', sdk / 'src' / 'common' / 'common.h')
+    copy(pspc_build.SEM_HEADER, sdk / 'generated' / 'pspc_sem_version.h')
+    (sdk / 'lib').mkdir(parents=True)
+    pspc_build.TOOLCHAIN = sdk / 'toolchain'
+    env = pspc_build.bundled_env()
+    cc = sdk / 'toolchain' / 'bin' / cc_name
+    with tempfile.TemporaryDirectory(prefix='pspc-aot-sdk-') as tmp:
+        objects = []
+        for name in ('vfpu_exec', 'vfpu_math'):
+            obj = pathlib.Path(tmp) / (name + '.o')
+            cmd = [str(cc)] + pspc_build.MINGW_FLAGS + ['-I' + str(sdk / 'src'), '-c',
+                   str(sdk / 'src' / 'allegrex' / (name + '.cpp')), '-o', str(obj)]
+            r = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            if r.returncode:
+                raise BuildError('AOT SDK compilation failed:\n' + r.stdout)
+            objects.append(str(obj))
+        r = subprocess.run([str(sdk / 'toolchain' / 'bin' / 'llvm-ar.exe'), 'rcs',
+                            str(sdk / 'lib' / 'pspc_aot.a')] + objects,
+                           env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if r.returncode:
+            raise BuildError('AOT SDK archive failed:\n' + r.stdout)
+    print('  AOT SDK: semantics %s, bundled LLVM/MinGW' % version)
 
 
 def dll_dependencies(binaries, dll_dir):
@@ -435,7 +487,8 @@ def check_stage(stage):
         raise BuildError('unexpected stage contents: files %s, folders %s' % (sorted(files ^ TOP_FILES),
                                                                              sorted(dirs ^ TOP_DIRS)))
     for p in stage.rglob('*'):
-        if p.name.lower() in FORBIDDEN_NAMES or p.suffix.lower() in FORBIDDEN_SUFFIXES:
+        sdk_lib = p.suffix.lower() == '.lib' and p.is_relative_to(stage / 'aot' / 'toolchain')
+        if p.name.lower() in FORBIDDEN_NAMES or (p.suffix.lower() in FORBIDDEN_SUFFIXES and not sdk_lib):
             raise BuildError('%s must never be packaged' % p)
 
 
@@ -474,6 +527,8 @@ def verify_runtime(stage, pyhome):
             print('  python -m %s --help: ok' % pkg)
         run([str(stage / 'tools' / 'pspc_install_fw.py'), '--help'], 'python tools\\pspc_install_fw.py --help')
         print('  python tools\\pspc_install_fw.py --help: ok')
+        test_release_aot.verify(stage, pathlib.Path(work), env)
+        print('  AOT: compiled, loaded and executed with only the installed tools')
     finally:
         shutil.rmtree(work, ignore_errors=True)
     after = stage_listing(stage)
@@ -893,12 +948,14 @@ def main(argv=None):
                     help='PSPC build tree; the binaries come from its bin folder (default: %(default)s)')
     ap.add_argument('--python', default=sys.base_prefix,
                     help='Python 3.12 installation the private runtime is made from (default: %(default)s)')
+    ap.add_argument('--aot-toolchain', default=str(ROOT / 'third_party' / 'llvm-mingw'),
+                    help='portable LLVM/MinGW from tools/fetch_aot.py (included in every installer)')
     ap.add_argument('--version', help='ProductVersion x.y.z (default: from CMakeLists.txt)')
     ap.add_argument('--out-dir', default=str(ROOT / 'build' / 'installer'),
                     help='where the MSI and the stage go (default: %(default)s)')
     ap.add_argument('--icon', help='.ico (or an .exe to take the icon of) for the shortcuts and Add/Remove '
                                    'Programs (default: the icon of pspc-launcher.exe; none if it has none)')
-    ap.add_argument('--no-verify', action='store_true', help="don't run the staged Python runtime")
+    ap.add_argument('--no-verify', action='store_true', help="skip staged Python and AOT execution checks")
     args = ap.parse_args(argv)
 
     if struct.calcsize('P') != 8:
@@ -919,6 +976,7 @@ def main(argv=None):
         print('PSPC %s: staging %s' % (version, stage))
 
         stage_pspc(build_dir, stage)
+        stage_aot(build_dir, stage, pathlib.Path(args.aot_toolchain).resolve())
         tag, compiled, modules = stage_python(pyhome, stage / 'python')
         print('  runtime: %s from %s, %d standard library modules%s' %
               (tag, pyhome, modules, ' (compiled)' if compiled else ' (source)'))
@@ -945,7 +1003,7 @@ def main(argv=None):
         print('writing %s' % out)
         product_code, nfiles, ncomponents, (ndialogs, ncontrols) = build_msi(stage, out, version, icon, temp)
         shutil.rmtree(temp, ignore_errors=True)
-    except (BuildError, OSError, msilib.MSIError) as e:
+    except (BuildError, OSError, RuntimeError, msilib.MSIError) as e:
         print('error: %s' % e, file=sys.stderr)
         return 1
 

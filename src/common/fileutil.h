@@ -18,3 +18,5 @@ std::string HexString(const u8 *data, size_t size);
 std::string PathToUtf8(const fs::path &p);
 // Directory containing the running executable.
 fs::path ExecutableDir();
+// Console tools accept UTF-8 paths internally, regardless of the user's Windows code page.
+int RunUtf8Main(int (*run)(int, char **), int argc, wchar_t **argv);
