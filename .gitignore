@@ -2,6 +2,8 @@
 /Games/
 /private/
 /reference/
+/fwdownload.txt
+/fwdownloads.txt
 
 # Build output
 /build*/
