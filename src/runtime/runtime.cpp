@@ -135,7 +135,7 @@ std::string Host0PathOf(const Options &o, const fs::path &file) {
 }
 
 bool PrepareBoot(const Options &o, BootTarget &bt) {
-	io::Mount("host0", io::MakeHostDevice(Host0Root(o).string(), false));
+	io::Mount("host0", io::MakeHostDevice(PathToUtf8(Host0Root(o)), false));
 	if (!o.netSelftest.empty()) {
 		// A network test scenario runs instead of an executable (net::selftest::Start).
 		bt.pspPath = "host0:/net-selftest";
@@ -155,7 +155,7 @@ bool PrepareBoot(const Options &o, BootTarget &bt) {
 	fs::path file = fs::u8path(o.file);
 	std::string ext = ToLower(file.extension().string());
 	if (ext == ".iso" || ext == ".cso" || ext == ".zso" || ext == ".dax" || ext == ".jso") {
-		if (!media::MountDisc(file.string())) {
+		if (!media::MountDisc(PathToUtf8(file))) {
 			LOGE("BOOT", "Cannot open disc image %s", o.file.c_str());
 			return false;
 		}
@@ -390,7 +390,7 @@ int RunOnce(const Options &o, BootTarget bt) {
 	kernel::SetDecryptCacheDir(o.decryptCacheDir);
 
 	// Re-mount host0/disc0 for this run (PrepareBoot mounted them before io::Init cleared them).
-	io::Mount("host0", io::MakeHostDevice(Host0Root(o).string(), false));
+	io::Mount("host0", io::MakeHostDevice(PathToUtf8(Host0Root(o)), false));
 	if (!o.host0Extra.empty() && !io::AddHostFallback("host0", o.host0Extra))
 		LOGW("BOOT", "--host0-extra %s: not a folder", o.host0Extra.c_str());
 	media::RemountDiscIfAny();

@@ -25,7 +25,7 @@ static int Usage() {
 	return 1;
 }
 
-int main(int argc, char **argv) {
+static int Main(int argc, char **argv) {
 	std::string input, outDir, hintsFile, gapsFile;
 	u32 base = 0x08804000;
 	bool comments = true, infoOnly = false, gaps = true;
@@ -60,7 +60,7 @@ int main(int argc, char **argv) {
 	}
 	recomp::AnalysisOptions aopts;
 	if (!hintsFile.empty()) {
-		std::ifstream in(hintsFile);
+		std::ifstream in(fs::u8path(hintsFile));
 		std::string line;
 		while (std::getline(in, line)) {
 			if (line.empty() || line[0] == '#') continue;
@@ -89,7 +89,12 @@ int main(int argc, char **argv) {
 		       codeWords ? 100.0 * covered.size() / codeWords : 0.0);
 		if (!gapsFile.empty()) {
 			// Uncovered runs with their first words, for judging what the analysis misses.
+#ifdef _WIN32
+			FILE *g = _wfopen(fs::u8path(gapsFile).c_str(), L"w");
+#else
 			FILE *g = fopen(gapsFile.c_str(), "w");
+#endif
+			if (!g) return 2;
 			for (const auto &r : img.code) {
 				for (u32 pc = r.first; pc + 4 <= r.second;) {
 					if (covered.count(pc)) {
@@ -126,3 +131,9 @@ int main(int argc, char **argv) {
 	printf("  wrote %zu files, %.1f MB of C++ to %s\n", st.files, st.bytes / 1048576.0, outDir.c_str());
 	return 0;
 }
+
+#ifdef _WIN32
+int wmain(int argc, wchar_t **argv) { return RunUtf8Main(Main, argc, argv); }
+#else
+int main(int argc, char **argv) { return Main(argc, argv); }
+#endif

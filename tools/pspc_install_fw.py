@@ -70,7 +70,7 @@ def main():
     ap.add_argument('--fw', default=str(ROOT / 'private' / 'fw' / '401'),
                     help='decrypted firmware tree containing flash0/ (default: private/fw/401)')
     ap.add_argument('--m33', default=None, help='extracted M33 modules (default: <fw>/m33)')
-    ap.add_argument('--build-dir', default=str(ROOT / 'build' / 'RelWithDebInfo'),
+    ap.add_argument('--build-dir', default=None,
                     help='build tree with pspc.exe and pspc-recomp.exe (default: build/RelWithDebInfo)')
     ap.add_argument('--pspc-dir', default=None, help='where flash0/flash1 go (default: <build dir>/bin)')
     ap.add_argument('--cache', default=None, help='AOT cache (default: <pspc dir>/cache/aot)')
@@ -91,8 +91,9 @@ def main():
         sys.exit('%s not found: give --fw the directory pspc-decrypt psar wrote' % vshmain)
     if module_info(vshmain.read_bytes()) is None:
         sys.exit('%s is not a decrypted module (run pspc-decrypt psar on the update first)' % vshmain)
-    build = pathlib.Path(args.build_dir)
-    pspc_dir = pathlib.Path(args.pspc_dir) if args.pspc_dir else build / 'bin'
+    build = pathlib.Path(args.build_dir) if args.build_dir else ROOT / 'build' / 'RelWithDebInfo'
+    pspc_dir = pathlib.Path(args.pspc_dir) if args.pspc_dir else (ROOT if (ROOT / 'pspc.exe').is_file() else build / 'bin')
+    bundled = not args.build_dir and (pspc_dir / 'aot').is_dir()
     if not (pspc_dir / 'pspc.exe').exists():
         print('warning: no pspc.exe in %s' % pspc_dir)
 
@@ -144,11 +145,13 @@ def main():
                 'auth_plugin.prx', 'msgdialog_plugin.prx', 'osk_plugin.prx', 'savedata_plugin.prx'}
         core.update(M33_UI_MODULES)
         modules = [p for p in modules if p.name in core]
-    lst = (pathlib.Path(args.work) if args.work else build) / 'pspc_install_fw_modules.txt'
+    work = pathlib.Path(args.work) if args.work else (pspc_dir / 'cache' / 'aot-work' if bundled else build)
+    lst = work / 'pspc_install_fw_modules.txt'
     lst.parent.mkdir(parents=True, exist_ok=True)
     lst.write_text(''.join(str(p) + '\n' for p in modules), encoding='utf-8')
-    cmd = [sys.executable, '-I', str(ROOT / 'tools' / 'pspc_build.py'), '@' + str(lst),
-           '--build-dir', str(build), '--cache', args.cache or str(pspc_dir / 'cache' / 'aot'),
+    cmd = [sys.executable, '-I', '-B', '-X', 'utf8', str(ROOT / 'tools' / 'pspc_build.py'), '@' + str(lst),
+           '--pspc-dir' if bundled else '--build-dir', str(pspc_dir if bundled else build),
+           '--cache', args.cache or str(pspc_dir / 'cache' / 'aot'),
            '--modules-in-parallel', str(args.modules_in_parallel), '--jobs', str(args.jobs)]
     if args.work:
         cmd += ['--work', args.work]

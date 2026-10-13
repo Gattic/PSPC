@@ -87,3 +87,17 @@ std::string PathToUtf8(const fs::path &p) {
 	std::u8string s = p.u8string();
 	return std::string(s.begin(), s.end());
 }
+
+#ifdef _WIN32
+int RunUtf8Main(int (*run)(int, char **), int argc, wchar_t **argv) {
+	std::vector<std::string> args;
+	args.reserve(argc);
+	for (int i = 0; i < argc; ++i) args.push_back(PathToUtf8(fs::path(argv[i])));
+	std::vector<char *> pointers;
+	pointers.reserve(argc + 1);
+	for (auto &arg : args) pointers.push_back(arg.data());
+	pointers.push_back(nullptr);
+	SetConsoleOutputCP(CP_UTF8);
+	return run(argc, pointers.data());
+}
+#endif

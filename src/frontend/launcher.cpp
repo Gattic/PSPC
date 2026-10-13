@@ -13,9 +13,8 @@
 //     interpreter;
 //   * "Boot XMB" starts the firmware's XMB (pspc --vsh), and offers to install the firmware from
 //     Sony's 4.01 update (pspc-decrypt psar, then tools/pspc_install_fw.py) when it isn't yet.
-//   * Native code builds need PSPC's developer tools (tools/pspc_build.py, a compiler and the build
-//     tree); without them (an installed PSPC) games run in the interpreter and the build actions
-//     don't show.
+//   * Installed copies build native code with the bundled Python runtime and portable AOT SDK;
+//     source builds use their build tree and developer compiler.
 //
 //   pspc-launcher [games dir] [--list]   (--list prints the library to the console and exits)
 //   pspc-launcher --write-icon <file.ico>  (the app icon, from the sidebar's logo: src/frontend/pspc.ico)
@@ -533,6 +532,11 @@ bool Launch(const std::wstring &exe, const std::wstring &args, bool console, HAN
 
 fs::path BuildScript() { return FindUp(g_exeDir, fs::path("tools") / "pspc_build.py"); }
 
+bool BundledAot() {
+	std::error_code ec;
+	return fs::is_directory(g_exeDir / "aot", ec);
+}
+
 // Runs tools\pspc_build.py for the game in a console window. With playAfter the game starts
 // when it finishes (the window stays open only if the build fails).
 void Build(int idx, bool playAfter) {
@@ -548,28 +552,39 @@ void Build(int idx, bool playAfter) {
 		MessageBoxW(g_main, L"tools\\pspc_build.py not found.", L"PSPC", MB_ICONERROR);
 		return;
 	}
-	wchar_t local[MAX_PATH] = {};
-	GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH);
-	fs::path py = fs::path(local) / "Programs" / "Python" / "Python312" / "python.exe";
-	std::wstring exe = fs::exists(py) ? py.wstring() : L"python.exe";
-	std::wstring args = L"-I \"" + script.wstring() + L"\" \"" + g.path.wstring() + L"\" --cache \"" + CacheDir().wstring() + L"\"";
+	std::wstring python = servers::PythonCommand();
+	if (python.empty()) {
+		MessageBoxW(g_main, L"Python is missing. Repair or reinstall PSPC to restore its native-code tools.", L"PSPC", MB_ICONERROR);
+		return;
+	}
+	std::wstring args = L"-I -B -X utf8 \"" + script.wstring() + L"\" \"" + g.path.wstring() + L"\" --cache \"" + CacheDir().wstring() + L"\"";
 	// In a build tree, build against this tree's tools and libraries (pspc_build.py's default is
 	// build\RelWithDebInfo).
 	fs::path tree = g_exeDir.parent_path();
 	std::error_code ec;
-	if (fs::exists(tree / "generated" / "pspc_sem_version.h", ec) && fs::exists(tree / "lib" / "pspc_sem.lib", ec))
+	if (BundledAot())
+		args += L" --pspc-dir \"" + g_exeDir.wstring() + L"\"";
+	else if (fs::exists(tree / "generated" / "pspc_sem_version.h", ec) && fs::exists(tree / "lib" / "pspc_sem.lib", ec))
 		args += L" --build-dir \"" + tree.wstring() + L"\"";
 	// Run through cmd so the window stays open with the result.
 	std::wstring tail = playAfter ? L" || (pause & exit 1)" : L" & pause";
 	HANDLE process = nullptr;
-	if (!Launch(L"C:\\Windows\\System32\\cmd.exe", L"/c \"\"" + exe + L"\" " + args + tail + L"\"", true, &process)) return;
+	if (!Launch(L"C:\\Windows\\System32\\cmd.exe", L"/d /c \"" + python + L" " + args + tail + L"\"", true, &process)) return;
 	g_jobs.push_back({process, g.path, playAfter});
 	SetTimer(g_main, ID_TIMER_JOBS, 500, nullptr);
 	UpdateUi();
 }
 
-// Whether this copy of PSPC can build native code (a source tree with its tools).
-bool CanBuild() { return !BuildScript().empty(); }
+// An installed SDK, or a source tree with its build tools.
+bool CanBuild() {
+	if (BuildScript().empty() || servers::PythonCommand().empty()) return false;
+	if (!BundledAot()) return true;
+	std::error_code ec;
+	for (const char *file : {"pspc-recomp.exe", "aot/lib/pspc_aot.a", "aot/generated/pspc_sem_version.h",
+	                         "aot/toolchain/bin/x86_64-w64-mingw32-clang++.exe"})
+		if (!fs::is_regular_file(g_exeDir / file, ec)) return false;
+	return true;
+}
 
 void Play(int idx, bool interp, bool offerBuild = true) {
 	if (idx < 0) return;
@@ -660,7 +675,8 @@ void InstallFirmware() {
 	fs::path work = fs::path(temp) / ("pspc_firmware_" + std::to_string(GetCurrentProcessId()));
 	std::wstring args = L"--fw \"" + work.wstring() + L"\" --pspc-dir \"" + g_exeDir.wstring() + L"\"";
 	fs::path tree = g_exeDir.parent_path();
-	if (CanBuild() && fs::exists(tree / "lib" / "pspc_sem.lib", ec)) args += L" --build-dir \"" + tree.wstring() + L"\" --aot-core";
+	if (CanBuild() && BundledAot()) args += L" --aot-core";
+	else if (CanBuild() && fs::exists(tree / "lib" / "pspc_sem.lib", ec)) args += L" --build-dir \"" + tree.wstring() + L"\" --aot-core";
 	else args += L" --no-aot";
 	std::wstring steps = L"title Installing the PSP firmware for PSPC && echo Decrypting the update... && \"" + (g_exeDir / "pspc-decrypt.exe").wstring() +
 	                     L"\" psar \"" + pbp.wstring() + L"\" \"" + work.wstring() + L"\" --model 02g && echo. && echo Installing... && " + python +

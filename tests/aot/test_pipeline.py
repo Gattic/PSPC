@@ -8,10 +8,12 @@ removed on exit; subprocess output is retained in the CTest log on failure.
 """
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import struct
 import subprocess
 import sys
@@ -45,7 +47,42 @@ def run(command, cwd, env):
     return result.stdout
 
 
+def check_bundle_semantics(build_dir, work):
+    # Check the installed SDK layout without needing to execute a Windows compiler.
+    installed = work / 'relocated SDK λ'
+    src = installed / 'aot/src'
+    shutil.copytree(ROOT / 'src/allegrex', src / 'allegrex')
+    (src / 'recomp').mkdir()
+    shutil.copy2(ROOT / 'src/recomp/codegen.cpp', src / 'recomp/codegen.cpp')
+    (installed / 'tools').mkdir()
+    script = installed / 'tools/pspc_build.py'
+    shutil.copy2(ROOT / 'tools/pspc_build.py', script)
+    header = installed / 'aot/generated/pspc_sem_version.h'
+    header.parent.mkdir()
+    shutil.copy2(build_dir / 'generated/pspc_sem_version.h', header)
+    spec = importlib.util.spec_from_file_location('installed_builder', script)
+    builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+    builder.SRC, builder.SEM_HEADER = src, header
+    version = builder.sem_version()
+    for path in (src / 'allegrex/sem.h', src / 'recomp/codegen.cpp', script):
+        original = path.read_bytes()
+        try:
+            path.write_bytes(original + b'\n')
+            try:
+                builder.sem_version()
+            except RuntimeError as error:
+                require('rebuild the main tree first' in str(error), str(error))
+            else:
+                raise AssertionError('SDK source change did not invalidate semantics: ' + str(path))
+        finally:
+            path.write_bytes(original)
+        require(builder.sem_version() == version, 'restored SDK no longer matches the build')
+    print('Relocated SDK hash and semantics/emitter/builder invalidation checks passed', flush=True)
+
+
 def check_pipeline(build_dir, probe, compiler, work):
+    check_bundle_semantics(build_dir, work)
     env = dict(os.environ, CXX=str(compiler))
     inputs = []
     hashes = []
@@ -73,7 +110,13 @@ def check_pipeline(build_dir, probe, compiler, work):
     modules = [cache / (sha + '.so') for sha in hashes]
     stamps = [cache / (sha + '.semver') for sha in hashes]
 
+    gap_report = work / 'gap report λ.txt'
+    gap_report.write_text('stale report')
+    run([build_dir / 'bin/pspc-recomp', inputs[1], '--info', '--dump-gaps', gap_report], work, env)
+    require('stale report' not in gap_report.read_text(), 'gap report was not rewritten')
+
     run(command + inputs, work, env)
+    require(not list((work / 'work space').iterdir()), 'per-invocation workspace was not cleaned up')
     require(all(module.is_file() for module in modules), 'missing SHA-1-named .so files')
     version = stamps[0].read_text()
     require(version.strip() and all(stamp.read_text() == version for stamp in stamps),

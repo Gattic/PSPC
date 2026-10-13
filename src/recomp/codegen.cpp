@@ -318,7 +318,8 @@ private:
 bool Generate(const ModuleImage &img, const Analysis &an, const CodegenOptions &opts, CodegenStats *stats,
               std::string *err) {
 	std::error_code ec;
-	fs::create_directories(opts.outDir, ec);
+	const fs::path outDir = fs::u8path(opts.outDir);
+	fs::create_directories(outDir, ec);
 	std::set<u32> entries;
 	for (const Function &f : an.functions) entries.insert(f.entry);
 	std::string sha = HexString(img.sha1.data(), img.sha1.size());
@@ -330,7 +331,7 @@ bool Generate(const ModuleImage &img, const Analysis &an, const CodegenOptions &
 	hdr += "extern const PspcRuntimeApi *g_api;\nextern u32 g_delta;\nextern u8 g_patched[];\n\n";
 	for (u32 e : entries)
 		hdr += Fmt("void B_%08X(Ctx *PSPC_RESTRICT c, u32 ra0, u32 sp0);\nvoid F_%08X(Ctx *PSPC_RESTRICT c);\n", e, e);
-	if (!WriteTextFile(fs::path(opts.outDir) / "module.h", hdr)) {
+	if (!WriteTextFile(outDir / "module.h", hdr)) {
 		if (err) *err = "cannot write module.h";
 		return false;
 	}
@@ -351,7 +352,7 @@ bool Generate(const ModuleImage &img, const Analysis &an, const CodegenOptions &
 	auto flush = [&]() -> bool {
 		if (body.empty()) return true;
 		std::string text = std::string(prologue) + "#include \"module.h\"\n\n" + body;
-		fs::path p = fs::path(opts.outDir) / Fmt("code_%03zu.cpp", fileIndex++);
+		fs::path p = outDir / Fmt("code_%03zu.cpp", fileIndex++);
 		if (stats) stats->bytes += text.size();
 		body.clear();
 		return WriteTextFile(p, text);
@@ -392,7 +393,7 @@ bool Generate(const ModuleImage &img, const Analysis &an, const CodegenOptions &
 	glue += "\tif (!api || api->abiVersion != PSPC_AOT_ABI_VERSION || api->structSize < sizeof(PspcRuntimeApi)) return nullptr;\n";
 	glue += "\tg_api = api;\n\tg_membase = api->membase;\n\tg_cop0 = api->cop0;\n\tg_intrEnabled = api->intrEnabled;\n";
 	glue += "\treturn &g_desc;\n}\n";
-	if (!WriteTextFile(fs::path(opts.outDir) / "glue.cpp", glue)) {
+	if (!WriteTextFile(outDir / "glue.cpp", glue)) {
 		if (err) *err = "cannot write glue.cpp";
 		return false;
 	}
@@ -414,7 +415,7 @@ bool Generate(const ModuleImage &img, const Analysis &an, const CodegenOptions &
 	cm += "\ttarget_link_options(aot PRIVATE -Wl,-Bsymbolic -Wl,--exclude-libs,ALL -Wl,--no-undefined)\nendif()\n";
 	cm += "find_package(Threads REQUIRED)\n";
 	cm += "target_link_libraries(aot PRIVATE \"${PSPC_LIB_DIR}/${CMAKE_STATIC_LIBRARY_PREFIX}pspc_sem${CMAKE_STATIC_LIBRARY_SUFFIX}\" \"${PSPC_LIB_DIR}/${CMAKE_STATIC_LIBRARY_PREFIX}pspc_common${CMAKE_STATIC_LIBRARY_SUFFIX}\" Threads::Threads ${CMAKE_DL_LIBS})\n";
-	if (!WriteTextFile(fs::path(opts.outDir) / "CMakeLists.txt", cm)) {
+	if (!WriteTextFile(outDir / "CMakeLists.txt", cm)) {
 		if (err) *err = "cannot write CMakeLists.txt";
 		return false;
 	}
