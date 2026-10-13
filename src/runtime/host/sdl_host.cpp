@@ -400,21 +400,20 @@ CtrlState GetCtrl() {
 	return s;
 }
 
-void AudioSubmit(const s16 *samples, int frames) {
-	if (g_headless || !g_audio) return;
-	// Keep roughly 4 PSP audio blocks queued; beyond that, wait for the device to drain.
+bool AudioSubmit(const s16 *samples, int frames, bool waitForSpace) {
+	if (g_headless || !g_audio) return false;
 	const Uint32 maxBytes = 44100 / 10 * 4;
-	while (SDL_GetQueuedAudioSize(g_audio) > maxBytes) SDL_Delay(1);
-	int volume = g_volume;
-	if (volume >= 100) {
-		SDL_QueueAudio(g_audio, samples, (Uint32)frames * 4);
-		return;
+	while (SDL_GetQueuedAudioSize(g_audio) > maxBytes) {
+		if (!waitForSpace) return false;
+		SDL_Delay(1);
 	}
-	// Scaled (muted = silence, still queued so audio keeps pacing the game).
+	int volume = g_volume;
+	if (volume >= 100) return SDL_QueueAudio(g_audio, samples, (Uint32)frames * 4) == 0;
+	// Muted audio is still queued so virtual-time pacing is unchanged.
 	thread_local std::vector<s16> scaled;
 	scaled.resize((size_t)frames * 2);
 	for (size_t i = 0; i < scaled.size(); i++) scaled[i] = (s16)(samples[i] * volume / 100);
-	SDL_QueueAudio(g_audio, scaled.data(), (Uint32)frames * 4);
+	return SDL_QueueAudio(g_audio, scaled.data(), (Uint32)frames * 4) == 0;
 }
 
 int AudioQueuedFrames() { return g_audio ? (int)(SDL_GetQueuedAudioSize(g_audio) / 4) : 0; }

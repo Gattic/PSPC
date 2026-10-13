@@ -57,9 +57,11 @@ void SetFramePresenter(std::function<bool(const u32 *rgba, int width, int height
 bool ScreenshotRequested();
 void SaveScreenshotIfRequested(const u32 *rgba, int width, int height);
 
-// Audio: interleaved stereo s16 at 44100 Hz. Blocks (sleeps) while more than `maxQueuedMs` is
-// already queued, which paces audio-driven games.
-void AudioSubmit(const s16 *samples, int frames);
+// Audio: interleaved stereo s16 at 44100 Hz, with roughly 100 ms of bounded buffering.
+// Virtual-time callers may wait for space to pace emulation. Real-time callers must not wait:
+// their clock keeps advancing, so blocking inside a timer callback can starve guest threads.
+// Returns false when the block was not queued (full nonblocking queue or no audio device).
+bool AudioSubmit(const s16 *samples, int frames, bool waitForSpace);
 int AudioQueuedFrames();
 
 }  // namespace host

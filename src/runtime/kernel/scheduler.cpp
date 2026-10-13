@@ -67,6 +67,8 @@ struct EventCmp {
 
 void *g_mainFiber = nullptr;
 PspThread *g_current = nullptr;
+// Identity of the thread whose CPU work was interrupted, even on the scheduler fiber.
+PspThread *g_interrupted = nullptr;
 PspThread *g_lastRun = nullptr;  // last thread that had the CPU (for switch costs)
 std::deque<PspThread *> g_ready[kNumPrio];
 int g_readyCount = 0;
@@ -189,8 +191,11 @@ int BestReadyPrio() {
 void SwitchToScheduler() { hostsys::SwitchFiber(g_mainFiber); }
 
 void ProcessDueEvents() {
+	// Real-time callbacks consume wall time. Chasing a moving deadline can keep this
+	// loop busy forever, starving ready threads and interrupts under host load.
+	const u64 batchTime = NowUs();
 	for (;;) {
-		u64 now = NowUs();
+		u64 now = g_fastTime ? NowUs() : batchTime;
 		u64 next = NextEventTime();
 		if (next > now) break;
 		Event e = g_events.top();
@@ -258,9 +263,13 @@ void RunThread(PspThread *t) {
 	hostsys::SwitchFiber(t->fiber);
 	// Back on the scheduler.
 	SyncClock();
+	g_interrupted = nullptr;
 	if (PspThread *ran = g_current) {
 		u64 now = NowUs();
 		if (now > g_sliceStartUs) ran->runUs += now - g_sliceStartUs;
+		// A blocked thread becoming ready in a timer callback was not interrupted.
+		if ((ran->status & (THREADSTATUS_RUNNING | THREADSTATUS_READY)) || ran->busy)
+			g_interrupted = ran;
 	}
 	g_current = nullptr;
 	g_budgetCtx = nullptr;
@@ -329,6 +338,7 @@ bool RunBusy() {
 		if (g_lastRun != nullptr) ChargeCycles(kSwitchCycles);
 		g_lastRun = busy;
 	}
+	g_interrupted = busy;
 	SyncClock();
 	u64 now = g_vcycles / kCyclesPerUs;
 	u64 next = NextEventTime();
@@ -727,6 +737,7 @@ int Run() {
 			g_exitCode = 0;
 			break;
 		}
+		g_interrupted = nullptr;
 		IdleUntil(NextEventTime());
 	}
 	hostsys::LeaveFibers();
@@ -744,8 +755,11 @@ void RequestStop(int exitCode) {
 
 bool StopRequested() { return g_stop; }
 
-PspThread *Current() { return g_current; }
-SceUID CurrentId() { return g_current ? g_current->uid : 0; }
+PspThread *Current() { return g_current ? g_current : (g_inInterrupt ? g_interrupted : nullptr); }
+SceUID CurrentId() {
+	PspThread *t = Current();
+	return t ? t->uid : 0;
+}
 
 void MakeReady(PspThread *t, bool front) {
 	t->status = (t->status & ~(THREADSTATUS_RUNNING | THREADSTATUS_WAIT | THREADSTATUS_DORMANT)) | THREADSTATUS_READY;
@@ -1028,6 +1042,7 @@ void ExitCurrentThread(s32 status, bool deleteAfter) {
 
 void TerminateThread(PspThread *t, s32 status) {
 	if (t == g_current) ExitCurrentThread(status, false);
+	if (g_interrupted == t) g_interrupted = nullptr;
 	RemoveFromReady(t);
 	if (t->timeoutEventId) {
 		CancelEvent(t->timeoutEventId);
@@ -1063,6 +1078,7 @@ void DeleteThread(PspThread *t) {
 	RemoveFromReady(t);
 	if (g_returnTo == t) g_returnTo = nullptr;
 	if (g_lastRun == t) g_lastRun = nullptr;
+	if (g_interrupted == t) g_interrupted = nullptr;
 	if (t->fiber) {
 		g_deadFibers.push_back(t->fiber);
 		t->fiber = nullptr;

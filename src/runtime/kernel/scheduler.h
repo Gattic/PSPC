@@ -63,6 +63,7 @@ void PostFromHost(std::function<void()> fn);
 void HoldRealTime(bool hold);
 
 // ---- Threads ----
+// Includes the interrupted thread inside a guest interrupt handler; null for idle CPU work.
 PspThread *Current();
 SceUID CurrentId();
 // Prepare a started thread (status READY) and queue it.

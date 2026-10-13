@@ -474,10 +474,10 @@ void SubmitToHost() {
 	const int queued = host::AudioQueuedFrames();
 	if (queued == 0) {
 		std::vector<s16> silence(1024 * 2, 0);
-		host::AudioSubmit(silence.data(), 1024);
+		host::AudioSubmit(silence.data(), 1024, sched::FastTime());
 	} else if (!sched::FastTime() && queued > 3072) {
 		// The device clock runs a little slower than ours: drop one frame in 64 until the queue is
-		// back near its usual depth, instead of letting AudioSubmit stall the emulation. (With
+		// back near its usual depth, reducing overflow in the nonblocking host queue. (With
 		// --fast-time the queue limit is what paces the emulation, so leave it alone.)
 		size_t out = 0;
 		const size_t n = g_hostBuffer.size() / 2;
@@ -492,22 +492,24 @@ void SubmitToHost() {
 	}
 	// Rate and level check for debugging: what reached the device, against the wall clock.
 	static u64 statFrames = 0;
+	static u64 statDropped = 0;
 	static int statPeak = 0;
 	static auto statStart = std::chrono::steady_clock::now();
-	statFrames += frames;
 	if (logging::g_level <= LogLevel::Debug) {
 		for (size_t i = 0; i < frames * 2; i++) statPeak = std::max(statPeak, std::abs((int)g_hostBuffer[i]));
 	}
-	host::AudioSubmit(g_hostBuffer.data(), (int)frames);
+	if (host::AudioSubmit(g_hostBuffer.data(), (int)frames, sched::FastTime())) statFrames += frames;
+	else statDropped += frames;
 	g_hostBuffer.clear();
 	const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - statStart).count();
 	if (secs >= 5.0) {
-		LOGD("AUDIO", "host output: %llu frames in %.2fs = %.0f Hz, %d frames queued, peak %d", (unsigned long long)statFrames, secs,
-		     statFrames / secs, host::AudioQueuedFrames(), statPeak);
+		LOGD("AUDIO", "host output: %llu frames in %.2fs = %.0f Hz, %d frames queued, peak %d, %llu dropped", (unsigned long long)statFrames, secs,
+		     statFrames / secs, host::AudioQueuedFrames(), statPeak, (unsigned long long)statDropped);
 		if (g_mixCostBlocks) LOGD("AUDIO", "mixer: %.2f us per 64-sample block (%.1f us per 60Hz frame)", g_mixCostUs / g_mixCostBlocks, g_mixCostUs / g_mixCostBlocks * 44100.0 / 64 / 60);
 		g_mixCostUs = 0;
 		g_mixCostBlocks = 0;
 		statFrames = 0;
+		statDropped = 0;
 		statPeak = 0;
 		statStart = std::chrono::steady_clock::now();
 	}
