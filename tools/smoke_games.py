@@ -41,6 +41,7 @@ import zlib
 from functools import reduce
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+EXE_SUFFIX = '.exe' if sys.platform == 'win32' else ''
 GAME_EXTS = {'.iso', '.cso', '.zso', '.dax', '.pbp'}
 RTC_BASE = 1767225600  # 2026-01-01 00:00:00 UTC
 
@@ -81,7 +82,7 @@ def load_checkpoints(path):
 def disc_id(pspc_dir, game):
     if game.suffix.lower() == '.pbp':
         return ''
-    r = subprocess.run([str(pspc_dir / 'pspc-iso.exe'), 'info', str(game)], stdout=subprocess.PIPE,
+    r = subprocess.run([str(pspc_dir / ('pspc-iso' + EXE_SUFFIX)), 'info', str(game)], stdout=subprocess.PIPE,
                        stderr=subprocess.DEVNULL, text=True, errors='replace')
     for line in r.stdout.splitlines():
         if line.startswith('DISC_ID='):
@@ -238,7 +239,7 @@ def record(result, refs, args, flash0):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--pspc', default=str(ROOT / 'build' / 'RelWithDebInfo' / 'bin' / 'pspc.exe'))
+    ap.add_argument('--pspc', default=str(ROOT / 'build' / 'RelWithDebInfo' / 'bin' / ('pspc' + EXE_SUFFIX)))
     ap.add_argument('--flash0', help='firmware flash0 (default: next to pspc.exe, else build/RelWithDebInfo)')
     ap.add_argument('--aot-dir', help='AOT module DLLs (default: pspc\'s own cache)')
     ap.add_argument('--games', default=str(ROOT / 'Games'))
