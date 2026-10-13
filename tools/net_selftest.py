@@ -257,7 +257,7 @@ SCENARIOS = {
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--pspc', default=str(ROOT / 'build' / 'net' / 'bin' / 'pspc.exe'))
+    ap.add_argument('--pspc', default=str(ROOT / 'build' / 'RelWithDebInfo' / 'bin' / ('pspc.exe' if sys.platform == 'win32' else 'pspc')))
     ap.add_argument('--timeout', type=int, default=60)
     ap.add_argument('--fast-time', action='store_true', help='run pspc with --fast-time')
     ap.add_argument('--internet', action='store_true', help='also fetch pages from the internet (http)')

@@ -20,6 +20,7 @@
 #include "gpu/ge.h"
 #include "gpu/ge_constants.h"
 #include "testing.h"
+#include "test_guest_memory.h"
 
 using namespace gpu;
 
@@ -39,10 +40,10 @@ struct GeEnv {
 	u8 *mem = nullptr;
 	u8 *saved = nullptr;
 	explicit GeEnv(int threads = 1) {
-		mem = (u8 *)VirtualAlloc(nullptr, 0x0A000000, MEM_RESERVE, PAGE_NOACCESS);
-		VirtualAlloc(mem + VRAM, 0x200000, MEM_COMMIT, PAGE_READWRITE);
-		VirtualAlloc(mem + RAM, RAM_SIZE, MEM_COMMIT, PAGE_READWRITE);
-		VirtualAlloc(mem + 0x10000, 0x4000, MEM_COMMIT, PAGE_READWRITE);
+		mem = gputest::Reserve(0x0A000000);
+		gputest::Commit(mem + VRAM, 0x200000);
+		gputest::Commit(mem + RAM, RAM_SIZE);
+		gputest::Commit(mem + 0x10000, 0x4000);
 		saved = g_membase;
 		g_membase = mem;
 		SetRamSize(RAM_SIZE);
@@ -53,7 +54,7 @@ struct GeEnv {
 	~GeEnv() {
 		Shutdown();
 		g_membase = saved;
-		VirtualFree(mem, 0, MEM_RELEASE);
+		gputest::Release(mem, 0x0A000000);
 	}
 };
 
@@ -895,6 +896,7 @@ double BenchFrames(int scenario, int threads, int frames, Stats *stats) {
 
 namespace {
 
+#ifdef _WIN32
 // A sampling profiler for the calling thread (GPU_PROFILE=<scenario>): which functions the time goes to.
 void ProfileScenario(int scenario, int frames) {
 	HANDLE process = GetCurrentProcess();
@@ -943,12 +945,18 @@ void ProfileScenario(int scenario, int frames) {
 		printf("    %5.1f%%  %s\n", 100.0 * sorted[i].first / samples.size(), sorted[i].second.c_str());
 	SymCleanup(process);
 }
+#endif
 
 }  // namespace
 
 TEST(gpu_perf) {
 	if (const char *prof = getenv("GPU_PROFILE")) {
+#ifdef _WIN32
 		ProfileScenario(atoi(prof), 60);
+#else
+		fprintf(stderr, "GPU_PROFILE=%s is Windows-only; use perf record on Linux.\n", prof);
+		CHECK(false);
+#endif
 		return;
 	}
 	// Not pass/fail: ms per frame for typical workloads, one thread and the automatic count.

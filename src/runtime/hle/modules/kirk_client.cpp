@@ -3,7 +3,18 @@
 // tools/pspc-decrypt/src/kirk_service.h for the protocol).
 #include "runtime/hle/modules/kirk_client.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <spawn.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <signal.h>
+#include <cerrno>
+#include "common/host.h"
+extern char **environ;
+#endif
 
 #include <algorithm>
 #include <cstring>
@@ -27,9 +38,14 @@ constexpr u32 kInPlace = 1;
 constexpr u32 kMaxBuffer = 16u << 20;
 
 std::mutex g_lock;
+#ifdef _WIN32
 HANDLE g_process = nullptr;
 HANDLE g_toService = nullptr;    // our end of its stdin
 HANDLE g_fromService = nullptr;  // our end of its stdout
+#else
+pid_t g_process = 0;
+int g_service = -1;
+#endif
 bool g_failed = false;           // couldn't start it: don't retry every call
 
 void Put32(u8 *p, u32 v) { memcpy(p, &v, 4); }
@@ -39,6 +55,7 @@ u32 Get32(const u8 *p) {
 	return v;
 }
 
+#ifdef _WIN32
 void Stop() {
 	if (g_toService) CloseHandle(g_toService);
 	if (g_fromService) CloseHandle(g_fromService);
@@ -129,6 +146,71 @@ bool ReadAll(void *data, size_t size) {
 	return true;
 }
 
+#else
+void Stop() {
+	if (g_service >= 0) close(g_service);
+	g_service = -1;
+	if (g_process) {
+		int status;
+		u64 end = hostsys::MonotonicUs() + 2000000;
+		pid_t result;
+		do {
+			result = waitpid(g_process, &status, WNOHANG);
+			if (result == 0) hostsys::SleepMs(10);
+		} while ((result == 0 || (result < 0 && errno == EINTR)) && hostsys::MonotonicUs() < end);
+		if (result == 0) {
+			kill(g_process, SIGKILL);
+			while (waitpid(g_process, &status, 0) < 0 && errno == EINTR) {}
+		}
+	}
+	g_process = 0;
+}
+bool Start() {
+	const auto &tool = kernel::DecryptToolPath();
+	int sockets[2];
+	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets)) return false;
+	posix_spawn_file_actions_t actions;
+	posix_spawn_file_actions_init(&actions);
+	posix_spawn_file_actions_adddup2(&actions, sockets[1], STDIN_FILENO);
+	posix_spawn_file_actions_adddup2(&actions, sockets[1], STDOUT_FILENO);
+	char fuse[32];
+	snprintf(fuse, sizeof(fuse), "%016llX", (unsigned long long)console::Get().fuseId);
+	char *args[] = {const_cast<char *>(tool.c_str()), const_cast<char *>("kirk-service"),
+	               const_cast<char *>("--fuse"), fuse, nullptr};
+	int error = posix_spawn(&g_process, tool.c_str(), &actions, nullptr, args, environ);
+	posix_spawn_file_actions_destroy(&actions);
+	close(sockets[1]);
+	if (error) {
+		close(sockets[0]); g_process = 0;
+		LOGE(LOG, "Cannot start KIRK service: %s", strerror(error));
+		return false;
+	}
+	g_service = sockets[0];
+	LOGI(LOG, "KIRK service started (pid %d)", (int)g_process);
+	return true;
+}
+bool WriteAll(const void *data, size_t size) {
+	const u8 *p = (const u8 *)data;
+	while (size) {
+		ssize_t n = send(g_service, p, size, MSG_NOSIGNAL);
+		if (n < 0 && errno == EINTR) continue;
+		if (n <= 0) return false;
+		p += n; size -= n;
+	}
+	return true;
+}
+bool ReadAll(void *data, size_t size) {
+	u8 *p = (u8 *)data;
+	while (size) {
+		ssize_t n = recv(g_service, p, size, 0);
+		if (n < 0 && errno == EINTR) continue;
+		if (n <= 0) return false;
+		p += n; size -= n;
+	}
+	return true;
+}
+#endif
+
 // One request/response; false if the pipe broke.
 bool Exchange(int cmd, u8 *out, int outSize, const u8 *in, int inSize, int *result) {
 	const bool inPlace = out == in;
@@ -154,7 +236,7 @@ bool Available() {
 	if (g_process) return true;
 	if (g_failed) return false;
 	if (!Start()) g_failed = true;
-	return g_process != nullptr;
+	return !!g_process;
 }
 
 int Command(int cmd, u8 *out, int outSize, const u8 *in, int inSize) {

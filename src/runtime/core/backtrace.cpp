@@ -3,6 +3,7 @@
 // executable; frames in AOT DLLs are named after the guest function they belong to).
 #include "runtime/core/backtrace.h"
 
+#ifdef _WIN32
 #include <windows.h>
 
 #include <dbghelp.h>
@@ -122,3 +123,60 @@ void InstallFatalHook() {
 }
 
 }  // namespace backtrace
+#else
+#include <unwind.h>
+#include <dlfcn.h>
+#include <signal.h>
+#include <unistd.h>
+#include <cstdio>
+#include "common/log.h"
+#include "runtime/core/dispatch.h"
+#include "runtime/kernel/scheduler.h"
+#include "runtime/kernel/thread.h"
+namespace backtrace {
+namespace {
+struct Frames { void *pc[48]; unsigned count = 0; };
+_Unwind_Reason_Code Collect(_Unwind_Context *ctx, void *arg) {
+	auto &f = *(Frames *)arg;
+	if (f.count == 48) return _URC_END_OF_STACK;
+	f.pc[f.count++] = (void *)_Unwind_GetIP(ctx);
+	return _URC_NO_REASON;
+}
+void Crash(int sig) {
+	const char message[] = "PSPC: fatal host signal; enable core dumps (ulimit -c unlimited) for a crash backtrace\n";
+	(void)!write(STDERR_FILENO, message, sizeof(message) - 1);
+	struct sigaction action{};
+	action.sa_handler = SIG_DFL;
+	sigemptyset(&action.sa_mask);
+	sigaction(sig, &action, nullptr);
+	raise(sig);
+}
+}
+void Print(FILE *out) {
+	Frames frames;
+	_Unwind_Backtrace(Collect, &frames);
+	for (unsigned i = 0; i < frames.count; ++i) {
+		Dl_info info{};
+		dladdr(frames.pc[i], &info);
+		size_t offset = 0;
+		u32 guest = dispatch::GuestFunctionAt(frames.pc[i], &offset);
+		if (guest) fprintf(out, "  #%u guest fn %08x +0x%zx\n", i, guest, offset);
+		else fprintf(out, "  #%u %s!%s %p\n", i, info.dli_fname ? info.dli_fname : "?",
+		             info.dli_sname ? info.dli_sname : "?", frames.pc[i]);
+	}
+	if (auto *t = sched::Current())
+		fprintf(out, "  guest thread %s pc=%08x ra=%08x sp=%08x\n", t->name.c_str(), t->ctx.pc, t->ctx.r[31], t->ctx.r[29]);
+	fflush(out);
+}
+void InstallFatalHook() {
+	logging::SetFatalHook([] { Print(stderr); });
+	// Each thread executing guest code gets a signal stack, including fiber stack-overflow faults.
+	static thread_local unsigned char signalStack[64 * 1024];
+	stack_t stack{}; stack.ss_sp = signalStack; stack.ss_size = sizeof(signalStack);
+	if (sigaltstack(&stack, nullptr)) Fatal("Cannot install crash signal stack");
+	struct sigaction action{}; action.sa_handler = Crash; action.sa_flags = SA_ONSTACK;
+	sigemptyset(&action.sa_mask);
+	for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) sigaction(sig, &action, nullptr);
+}
+}
+#endif

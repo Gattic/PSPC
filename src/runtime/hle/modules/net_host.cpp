@@ -3,7 +3,14 @@
 // Glue between the network libraries' guest side and the host (see net_internal.h): the per-run
 // configuration, the instance number and MAC address, guest threads sleeping on host socket events
 // or on blocking host calls, and the guest threads the libraries run their handlers on.
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#endif
+#include <cstdlib>
 
 #include <atomic>
 #include <cstring>
@@ -36,13 +43,18 @@ constexpr const char *LOG = "NET";
 
 Config g_config;
 int g_instance = 1;
+#ifdef _WIN32
 HANDLE g_instanceMutex = nullptr;
+#else
+int g_instanceSocket = -1;  // Abstract Unix socket reservation, held until process exit.
+#endif
 int g_hostSockets = 0;
 
 // One number per networked PSPC process on this PC, kept for the process's lifetime. A relaunch
 // (LoadExec, back to the XMB) inherits the number through the environment: the parent waits for
-// it and still holds the mutex.
+// it and still holds the reservation (a Windows mutex or Linux abstract Unix socket).
 int ClaimInstance() {
+#ifdef _WIN32
 	char buf[16];
 	DWORD n = GetEnvironmentVariableA("PSPC_NET_INSTANCE", buf, sizeof(buf));
 	if (n > 0 && n < sizeof(buf)) {
@@ -64,6 +76,30 @@ int ClaimInstance() {
 		return i;
 	}
 	return 1;
+#else
+	if (const char *inherited = std::getenv("PSPC_NET_INSTANCE")) {
+		char *end = nullptr;
+		long value = strtol(inherited, &end, 10);
+		if (*end == 0 && value >= 1 && value <= 32) return (int)value;
+	}
+	int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	if (fd < 0) Fatal("Cannot create network instance reservation: %s", strerror(errno));
+	for (int i = 1; i <= 32; ++i) {
+		sockaddr_un address{};
+		address.sun_family = AF_UNIX;
+		int length = snprintf(address.sun_path + 1, sizeof(address.sun_path) - 1,
+		                      "pspc-net-%u-%d", (unsigned)getuid(), i);
+		if (bind(fd, (sockaddr *)&address, offsetof(sockaddr_un, sun_path) + 1 + length) == 0) {
+			g_instanceSocket = fd;
+			if (setenv("PSPC_NET_INSTANCE", std::to_string(i).c_str(), 1) != 0)
+				Fatal("Cannot export network instance: %s", strerror(errno));
+			return i;
+		}
+		if (errno != EADDRINUSE) Fatal("Cannot reserve network instance: %s", strerror(errno));
+	}
+	close(fd);
+	Fatal("All 32 network instance numbers are in use");
+#endif
 }
 
 }  // namespace
@@ -128,7 +164,7 @@ bool CanWait() {
 
 }  // namespace
 
-WaitResult WaitHostEvents(const WSAEVENT *events, size_t count, u64 deadlineUs, u64 abortKey, u64 recheckUs) {
+WaitResult WaitHostEvents(const hostnet::EventHandle *events, size_t count, u64 deadlineUs, u64 abortKey, u64 recheckUs) {
 	if (!CanWait()) return HOSTWAIT_ABORTED;
 	SceUID tid = sched::CurrentId();
 	SceUID waitId = NextWaitId();

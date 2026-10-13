@@ -209,7 +209,12 @@ public:
 	}
 
 private:
+#ifdef _WIN32
 	static constexpr int kMfTrimmedDelay = 528;
+#else
+	// FFmpeg returns the PSP's raw frame-aligned synthesis; it does not trim decoder delay.
+	static constexpr int kMfTrimmedDelay = 0;
+#endif
 	void StartStream() {
 		fifo_.assign(kMfTrimmedDelay * 2, 0);
 		debt_ = 0;

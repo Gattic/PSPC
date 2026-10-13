@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // GE display list queue semantics: enqueue, stall, signals, finish, break/continue, callbacks.
-#ifdef _WIN32
-#include <windows.h>
-#endif
+#include "test_guest_memory.h"
 #include <cstring>
 #include <string>
 #include <vector>
@@ -34,9 +32,9 @@ struct Env {
 	u8 *mem = nullptr;
 	u8 *saved = nullptr;
 	Env() {
-		mem = (u8 *)VirtualAlloc(nullptr, 0x0A000000, MEM_RESERVE, PAGE_NOACCESS);
-		VirtualAlloc(mem + VRAM, 0x200000, MEM_COMMIT, PAGE_READWRITE);
-		VirtualAlloc(mem + RAM, RAM_SIZE, MEM_COMMIT, PAGE_READWRITE);
+		mem = gputest::Reserve(0x0A000000);
+		gputest::Commit(mem + VRAM, 0x200000);
+		gputest::Commit(mem + RAM, RAM_SIZE);
 		saved = g_membase;
 		g_membase = mem;
 		SetRamSize(RAM_SIZE);
@@ -47,7 +45,7 @@ struct Env {
 	~Env() {
 		Shutdown();
 		g_membase = saved;
-		VirtualFree(mem, 0, MEM_RELEASE);
+		gputest::Release(mem, 0x0A000000);
 	}
 };
 

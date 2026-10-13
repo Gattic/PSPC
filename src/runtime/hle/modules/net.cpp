@@ -213,7 +213,11 @@ u32 sceNetStrncpy(u32 dst, u32 srcAddr, u32 count) {
 }
 int sceNetStrcmp(const char *a, const char *b) { return a && b ? strcmp(a, b) : 0; }
 int sceNetStrncmp(const char *a, const char *b, u32 n) { return a && b ? strncmp(a, b, n) : 0; }
-int sceNetStrcasecmp(const char *a, const char *b) { return a && b ? _stricmp(a, b) : 0; }
+int sceNetStrcasecmp(const char *a, const char *b) {
+	if (!a || !b) return 0;
+	while (*a && std::tolower((unsigned char)*a) == std::tolower((unsigned char)*b)) { ++a; ++b; }
+	return std::tolower((unsigned char)*a) - std::tolower((unsigned char)*b);
+}
 u32 sceNetStrlen(const char *s) { return s ? (u32)strlen(s) : 0; }
 u32 sceNetStrchr(u32 strAddr, int ch) {
 	const char *s = mem::GetCString(strAddr);
@@ -786,9 +790,9 @@ int sceNetInetShutdown(int s, int how) {
 		sock->shutdown = true;
 		return 0;
 	}
-	int hostHow = how == 0 ? SD_RECEIVE : how == 1 ? SD_SEND : SD_BOTH;
+	int hostHow = how == 0 ? hostnet::ShutRead : how == 1 ? hostnet::ShutWrite : hostnet::ShutBoth;
 	if (how < 0 || how > 2) return SetErrno(net::INET_EINVAL);
-	if (shutdown(sock->host.s, hostHow) != 0) return SetErrnoFromWsa(WSAGetLastError());
+	if (shutdown(sock->host.s, hostHow) != 0) return SetErrnoFromWsa(hostnet::LastSocketError());
 	sock->shutdown = true;
 	return 0;
 }
@@ -805,7 +809,7 @@ bool GuestHoldsUdpPort(const InetSocket *self, u16 port) {
 		if (&o == self || !o.used || !o.bound || o.type != INET_SOCK_DGRAM || !o.host.Valid()) continue;
 		sockaddr_in got{};
 		int len = sizeof(got);
-		if (getsockname(o.host.s, (sockaddr *)&got, &len) == 0 && ntohs(got.sin_port) == port) return true;
+		if (hostnet::GetSockName(o.host.s, (sockaddr *)&got, &len) == 0 && ntohs(got.sin_port) == port) return true;
 	}
 	return false;
 }
@@ -819,25 +823,25 @@ int BindHost(InetSocket *sock, sockaddr_in a) {
 		else sock->wildcard = true;
 	}
 	if (bind(sock->host.s, (const sockaddr *)&a, sizeof(a)) != 0) {
-		const int e = WSAGetLastError();
+		const int e = hostnet::LastSocketError();
 		const u16 port = ntohs(a.sin_port);
-		if ((e != WSAEADDRINUSE && e != WSAEACCES) || sock->type != INET_SOCK_DGRAM || port == 0 ||
+		if ((e != hostnet::Error_EADDRINUSE && e != hostnet::Error_EACCES) || sock->type != INET_SOCK_DGRAM || port == 0 ||
 		    GuestHoldsUdpPort(sock, port))
 			return SetErrnoFromWsa(e);
 		if (SharedSystemPort(port)) {
-			BOOL on = TRUE;
+			int on = 1;
 			setsockopt(sock->host.s, SOL_SOCKET, SO_REUSEADDR, (const char *)&on, sizeof(on));
-			if (bind(sock->host.s, (const sockaddr *)&a, sizeof(a)) != 0) return SetErrnoFromWsa(WSAGetLastError());
+			if (bind(sock->host.s, (const sockaddr *)&a, sizeof(a)) != 0) return SetErrnoFromWsa(hostnet::LastSocketError());
 			LOGI(LOG, "  UDP port %u is held by a Windows service too: shared", port);
 		} else {
 			// Another program - or another PSPC instance on this PC - has the port (or Windows reserved
 			// it): take a free one. getsockname reports the real port, so a game that tells other players
 			// where to reach it (peer-to-peer games) gives them an address that works.
 			a.sin_port = 0;
-			if (bind(sock->host.s, (const sockaddr *)&a, sizeof(a)) != 0) return SetErrnoFromWsa(WSAGetLastError());
+			if (bind(sock->host.s, (const sockaddr *)&a, sizeof(a)) != 0) return SetErrnoFromWsa(hostnet::LastSocketError());
 			sockaddr_in got{};
 			int len = sizeof(got);
-			getsockname(sock->host.s, (sockaddr *)&got, &len);
+			hostnet::GetSockName(sock->host.s, (sockaddr *)&got, &len);
 			LOGI(LOG, "  UDP port %u is in use on this PC: using %u instead", port, ntohs(got.sin_port));
 		}
 	}
@@ -845,7 +849,7 @@ int BindHost(InetSocket *sock, sockaddr_in a) {
 	if (logging::g_level <= LogLevel::Debug) {
 		sockaddr_in got{};
 		int len = sizeof(got);
-		getsockname(sock->host.s, (sockaddr *)&got, &len);
+		hostnet::GetSockName(sock->host.s, (sockaddr *)&got, &len);
 		LOGD(LOG, "  bound to %s:%u on the host", hostnet::Ipv4ToString(got.sin_addr.s_addr).c_str(), ntohs(got.sin_port));
 	}
 	return 0;
@@ -885,7 +889,7 @@ int sceNetInetListen(int s, int backlog) {
 		if (BindHost(sock, any) < 0) return -1;
 	}
 	if (listen(sock->host.s, backlog == INET_SOMAXCONN || backlog <= 0 ? SOMAXCONN : backlog) != 0)
-		return SetErrnoFromWsa(WSAGetLastError());
+		return SetErrnoFromWsa(hostnet::LastSocketError());
 	sock->listening = true;
 	LOGI(LOG, "sceNetInetListen(%d, %d)", s, backlog);
 	return 0;
@@ -900,18 +904,18 @@ int sceNetInetAccept(int s, u32 addrPtr, u32 addrLenPtr) {
 	for (;;) {
 		sockaddr_in peer{};
 		int peerLen = sizeof(peer);
-		SOCKET ns = accept(sock->host.s, (sockaddr *)&peer, &peerLen);
-		if (ns != INVALID_SOCKET) {
+		hostnet::SocketHandle ns = hostnet::Accept(sock->host.s, (sockaddr *)&peer, &peerLen);
+		if (ns != hostnet::InvalidSocket) {
 			int id = INET_MIN_SOCKET;
 			while (id < INET_MAX_SOCKETS && g_inetSockets[id].used) id++;
 			if (id == INET_MAX_SOCKETS) {
-				closesocket(ns);
+				hostnet::CloseSocketHandle(ns);
 				return SetErrno(net::INET_ENOBUFS);
 			}
 			InetSocket n;
 			int err = 0;
 			if (!hostnet::AdoptSocket(ns, &n.host, &err)) {
-				closesocket(ns);
+				hostnet::CloseSocketHandle(ns);
 				return SetErrnoFromWsa(err);
 			}
 			n.used = true;
@@ -931,8 +935,8 @@ int sceNetInetAccept(int s, u32 addrPtr, u32 addrLenPtr) {
 			     ntohs(peer.sin_port));
 			return id;
 		}
-		int e = WSAGetLastError();
-		if (e != WSAEWOULDBLOCK) return SetErrnoFromWsa(e);
+		int e = hostnet::LastSocketError();
+		if (e != hostnet::Error_EWOULDBLOCK) return SetErrnoFromWsa(e);
 		if (sock->nonblocking) return SetErrno(net::INET_EAGAIN);
 		if (DeadlinePassed(deadline)) return SetErrno(net::INET_EAGAIN);
 		if (WaitSocket(sock, deadline) == net::HOSTWAIT_ABORTED) return SetErrno(net::INET_EINTR);
@@ -950,7 +954,7 @@ bool ConnectFinished(InetSocket *sock, int *pspErrno) {
 	}
 	if (r.except) {
 		int e = hostnet::PendingError(sock->host.s);
-		*pspErrno = hostnet::PspErrnoFromWsa(e ? e : WSAECONNREFUSED);
+		*pspErrno = hostnet::PspErrnoFromWsa(e ? e : hostnet::Error_ECONNREFUSED);
 		return true;
 	}
 	if (r.write) {
@@ -979,10 +983,10 @@ int sceNetInetConnect(int s, u32 addrPtr, int addrLen) {
 		sock->connecting = false;
 		return 0;
 	}
-	int e = WSAGetLastError();
-	if (e == WSAEINVAL && sock->connecting) e = WSAEALREADY;  // a second connect while one runs
-	if (e != WSAEWOULDBLOCK) {
-		if (e == WSAEISCONN) sock->connecting = false;
+	int e = hostnet::LastSocketError();
+	if (e == hostnet::Error_EINVAL && sock->connecting) e = hostnet::Error_EALREADY;  // a second connect while one runs
+	if (e != hostnet::Error_EWOULDBLOCK) {
+		if (e == hostnet::Error_EISCONN) sock->connecting = false;
 		return SetErrnoFromWsa(e, true);
 	}
 	sock->bound = true;
@@ -1016,17 +1020,17 @@ int SendCommon(int s, u32 buf, u32 len, u32 flags, const sockaddr_in *to) {
 	u32 sent = 0;
 	for (;;) {
 		const char *p = (const char *)GPtr(buf) + sent;
-		int n = to ? sendto(sock->host.s, p, (int)(len - sent), hostFlags, (const sockaddr *)to, sizeof(*to))
-		           : send(sock->host.s, p, (int)(len - sent), hostFlags);
+		int n = to ? hostnet::SendTo(sock->host.s, p, (int)(len - sent), hostFlags, (const sockaddr *)to, sizeof(*to))
+		           : hostnet::Send(sock->host.s, p, (int)(len - sent), hostFlags);
 		if (n >= 0) {
 			sent += (u32)n;
 			if (sent >= len || sock->type != INET_SOCK_STREAM || dontWait) return (int)sent;
 			continue;  // a blocking stream send queues everything
 		}
-		int e = WSAGetLastError();
-		if (e != WSAEWOULDBLOCK) {
+		int e = hostnet::LastSocketError();
+		if (e != hostnet::Error_EWOULDBLOCK) {
 			if (sent) return (int)sent;
-			if (e == WSAESHUTDOWN) return SetErrno(net::INET_EPIPE);
+			if (e == hostnet::Error_ESHUTDOWN) return SetErrno(net::INET_EPIPE);
 			return SetErrnoFromWsa(e);
 		}
 		if (dontWait || DeadlinePassed(deadline)) return sent ? (int)sent : SetErrno(net::INET_EAGAIN);
@@ -1058,9 +1062,9 @@ int RecvCommon(int s, u32 buf, u32 len, u32 flags, u32 fromPtr, u32 fromLenPtr) 
 		char *p = (char *)GPtr(buf) + got;
 		sockaddr_in from{};
 		int fromLen = sizeof(from);
-		int n = recvfrom(sock->host.s, p, (int)(len - got), hostFlags, (sockaddr *)&from, &fromLen);
-		int e = n < 0 ? WSAGetLastError() : 0;
-		if (n < 0 && e == WSAEMSGSIZE && sock->type != INET_SOCK_STREAM) {
+		int n = hostnet::RecvFrom(sock->host.s, p, (int)(len - got), hostFlags, (sockaddr *)&from, &fromLen);
+		int e = n < 0 ? hostnet::LastSocketError() : 0;
+		if (n < 0 && e == hostnet::Error_EMSGSIZE && sock->type != INET_SOCK_STREAM) {
 			n = (int)len;  // the datagram was cut to the buffer: BSD returns what fit
 			e = 0;
 		}
@@ -1072,7 +1076,7 @@ int RecvCommon(int s, u32 buf, u32 len, u32 flags, u32 fromPtr, u32 fromLenPtr) 
 			if (n == 0 || !waitAll || got >= len) return (int)got;
 			continue;
 		}
-		if (e != WSAEWOULDBLOCK) {
+		if (e != hostnet::Error_EWOULDBLOCK) {
 			if (got) return (int)got;
 			return SetErrnoFromWsa(e);
 		}
@@ -1118,7 +1122,7 @@ int sceNetInetSend(int s, u32 buf, u32 len, u32 flags) {
 	if (sock->type == INET_SOCK_DGRAM) {
 		sockaddr_in peer{};
 		int peerLen = sizeof(peer);
-		if (getpeername(sock->host.s, (sockaddr *)&peer, &peerLen) == 0 && IsDnsServer(peer)) {
+		if (hostnet::GetPeerName(sock->host.s, (sockaddr *)&peer, &peerLen) == 0 && IsDnsServer(peer)) {
 			const int r = TryAnswerDns(s, buf, len, peer);
 			if (r >= 0) return r;
 		}
@@ -1206,11 +1210,11 @@ int sceNetInetSendmsg(int s, u32 msgAddr, u32 flags) {
 	bool dontWait = sock->nonblocking || (flags & INET_MSG_DONTWAIT);
 	u64 deadline = Deadline(sock->sndTimeoutUs);
 	for (;;) {
-		int n = haveTo ? sendto(sock->host.s, data.data(), (int)data.size(), hostnet::MapMsgFlags((int)flags), (const sockaddr *)&to, sizeof(to))
-		               : send(sock->host.s, data.data(), (int)data.size(), hostnet::MapMsgFlags((int)flags));
+		int n = haveTo ? hostnet::SendTo(sock->host.s, data.data(), (int)data.size(), hostnet::MapMsgFlags((int)flags), (const sockaddr *)&to, sizeof(to))
+		               : hostnet::Send(sock->host.s, data.data(), (int)data.size(), hostnet::MapMsgFlags((int)flags));
 		if (n >= 0) return n;
-		int e = WSAGetLastError();
-		if (e != WSAEWOULDBLOCK) return SetErrnoFromWsa(e);
+		int e = hostnet::LastSocketError();
+		if (e != hostnet::Error_EWOULDBLOCK) return SetErrnoFromWsa(e);
 		if (dontWait || DeadlinePassed(deadline)) return SetErrno(net::INET_EAGAIN);
 		if (WaitSocket(sock, deadline) == net::HOSTWAIT_ABORTED) return SetErrno(net::INET_EINTR);
 		sock = GetSocket(s);
@@ -1234,9 +1238,9 @@ int sceNetInetRecvmsg(int s, u32 msgAddr, u32 flags) {
 	for (;;) {
 		sockaddr_in from{};
 		int fromLen = sizeof(from);
-		int n = recvfrom(sock->host.s, data.data(), (int)total, hostnet::MapMsgFlags((int)flags), (sockaddr *)&from, &fromLen);
+		int n = hostnet::RecvFrom(sock->host.s, data.data(), (int)total, hostnet::MapMsgFlags((int)flags), (sockaddr *)&from, &fromLen);
 		bool truncated = false;
-		if (n < 0 && WSAGetLastError() == WSAEMSGSIZE) {
+		if (n < 0 && hostnet::LastSocketError() == hostnet::Error_EMSGSIZE) {
 			n = (int)total;
 			truncated = true;
 		}
@@ -1258,8 +1262,8 @@ int sceNetInetRecvmsg(int s, u32 msgAddr, u32 flags) {
 			GWrite32(msgAddr + 24, truncated ? (u32)hostnet::PSP_MSG_TRUNC : 0);  // msg_flags
 			return n;
 		}
-		int e = WSAGetLastError();
-		if (e != WSAEWOULDBLOCK) return SetErrnoFromWsa(e);
+		int e = hostnet::LastSocketError();
+		if (e != hostnet::Error_EWOULDBLOCK) return SetErrnoFromWsa(e);
 		if (dontWait || DeadlinePassed(deadline)) return SetErrno(net::INET_EAGAIN);
 		if (WaitSocket(sock, deadline) == net::HOSTWAIT_ABORTED) return SetErrno(net::INET_EINTR);
 		sock = GetSocket(s);
@@ -1301,7 +1305,7 @@ int sceNetInetSetsockopt(int s, int level, int name, u32 valPtr, int valLen) {
 			if (valLen < 8 || !mem::IsValidRange(valPtr, 8)) return SetErrno(net::INET_EINVAL);
 			linger l{(u_short)(GRead32(valPtr) != 0), (u_short)std::min<u32>(GRead32(valPtr + 4), 0xFFFF)};
 			if (setsockopt(sock->host.s, SOL_SOCKET, SO_LINGER, (const char *)&l, sizeof(l)) != 0)
-				return SetErrnoFromWsa(WSAGetLastError());
+				return SetErrnoFromWsa(hostnet::LastSocketError());
 			return 0;
 		}
 		default: break;
@@ -1318,7 +1322,7 @@ int sceNetInetSetsockopt(int s, int level, int name, u32 valPtr, int valLen) {
 		mem::ReadBytes(raw.data(), valPtr, (u32)raw.size());
 	}
 	if (setsockopt(sock->host.s, hl, hn, raw.data(), (int)raw.size()) != 0) {
-		int e = WSAGetLastError();
+		int e = hostnet::LastSocketError();
 		LOGD(LOG, "sceNetInetSetsockopt(%d, %x, %x, %u): host error %d", s, level, name, val, e);
 		return SetErrnoFromWsa(e);
 	}
@@ -1364,7 +1368,7 @@ int sceNetInetGetsockopt(int s, int level, int name, u32 valPtr, u32 valLenPtr) 
 		if (hostnet::MapSockopt(level, name, &hl, &hn)) {
 			int hv = 0;
 			int hlen = sizeof(hv);
-			if (getsockopt(sock->host.s, hl, hn, (char *)&hv, &hlen) != 0) return SetErrnoFromWsa(WSAGetLastError());
+			if (hostnet::GetSockOpt(sock->host.s, hl, hn, (char *)&hv, &hlen) != 0) return SetErrnoFromWsa(hostnet::LastSocketError());
 			val = hlen == 1 ? (u32)(u8)hv : (u32)hv;
 		}
 	}
@@ -1392,9 +1396,9 @@ int sceNetInetGetsockname(int s, u32 namePtr, u32 nameLenPtr) {
 	sockaddr_in a{};
 	a.sin_family = AF_INET;
 	int len = sizeof(a);
-	if (getsockname(sock->host.s, (sockaddr *)&a, &len) != 0) {
-		int e = WSAGetLastError();
-		if (e != WSAEINVAL) return SetErrnoFromWsa(e);
+	if (hostnet::GetSockName(sock->host.s, (sockaddr *)&a, &len) != 0) {
+		int e = hostnet::LastSocketError();
+		if (e != hostnet::Error_EINVAL) return SetErrnoFromWsa(e);
 		a = sockaddr_in{};  // not bound yet: BSD reports 0.0.0.0:0
 		a.sin_family = AF_INET;
 	}
@@ -1410,7 +1414,7 @@ int sceNetInetGetpeername(int s, u32 namePtr, u32 nameLenPtr) {
 	if (!mem::IsValidRange(namePtr, 8) || !mem::IsValidRange(nameLenPtr, 4)) return SetErrno(net::INET_EFAULT);
 	sockaddr_in a{};
 	int len = sizeof(a);
-	if (getpeername(sock->host.s, (sockaddr *)&a, &len) != 0) return SetErrnoFromWsa(WSAGetLastError());
+	if (hostnet::GetPeerName(sock->host.s, (sockaddr *)&a, &len) != 0) return SetErrnoFromWsa(hostnet::LastSocketError());
 	WriteSockaddr(namePtr, nameLenPtr, a);
 	return 0;
 }
@@ -1425,7 +1429,7 @@ hostnet::Readiness SocketReadiness(InetSocket *sock) {
 		sock->connecting = false;
 		if (r.except) {
 			int e = hostnet::PendingError(sock->host.s);
-			sock->savedError = hostnet::PspErrnoFromWsa(e ? e : WSAECONNREFUSED);
+			sock->savedError = hostnet::PspErrnoFromWsa(e ? e : hostnet::Error_ECONNREFUSED);
 			r.read = r.write = true;
 			r.except = false;
 		}
@@ -1478,7 +1482,7 @@ int sceNetInetSelect(int nfds, u32 readfds, u32 writefds, u32 exceptfds, u32 tim
 	}
 	for (;;) {
 		std::vector<Want> ready;
-		std::vector<WSAEVENT> events;
+		std::vector<hostnet::EventHandle> events;
 		for (const Want &w : wants) {
 			InetSocket *sock = GetSocket(w.fd);
 			if (!sock) return SetErrno(net::INET_EBADF);
@@ -1514,7 +1518,7 @@ int sceNetInetPoll(u32 fdsPtr, u32 nfds, int timeoutMs) {
 	u64 deadline = timeoutMs > 0 ? sched::NowUs() + (u64)timeoutMs * 1000 : 0;
 	for (;;) {
 		int count = 0;
-		std::vector<WSAEVENT> events;
+		std::vector<hostnet::EventHandle> events;
 		for (u32 i = 0; i < nfds; i++) {
 			u32 e = fdsPtr + i * 8;
 			int fd = (int)GRead32(e);
@@ -1640,9 +1644,9 @@ u64 ResolverDeadline(int timeout, int retry) {
 
 u32 ResolverError(int hostError) {
 	switch (hostError) {
-	case WSANO_DATA: return SCE_NET_RESOLVER_ERROR_NO_RECORD;
-	case WSATRY_AGAIN: return SCE_NET_RESOLVER_ERROR_RES_SERVER_FAILURE;
-	case WSANO_RECOVERY: return SCE_NET_RESOLVER_ERROR_RES_SERVER_REFUSED;
+	case hostnet::Error_NO_DATA: return SCE_NET_RESOLVER_ERROR_NO_RECORD;
+	case hostnet::Error_TRY_AGAIN: return SCE_NET_RESOLVER_ERROR_RES_SERVER_FAILURE;
+	case hostnet::Error_NO_RECOVERY: return SCE_NET_RESOLVER_ERROR_RES_SERVER_REFUSED;
 	default: return SCE_NET_RESOLVER_ERROR_INVALID_HOST;
 	}
 }
@@ -1668,7 +1672,7 @@ int sceNetResolverStartNtoA(int id, u32 hostnamePtr, u32 inAddrPtr, int timeout,
 	it->second.running = true;
 	u64 key = it->second.abortKey;
 	struct Result {
-		int rc = WSAHOST_NOT_FOUND;
+		int rc = hostnet::Error_HOST_NOT_FOUND;
 		u32 addr = 0;
 	};
 	auto res = std::make_shared<Result>();
@@ -1705,7 +1709,7 @@ int sceNetResolverStartAtoN(int id, u32 inAddrPtr, u32 hostnamePtr, int hostname
 	u32 addr = GRead32(inAddrPtr);
 	it->second.running = true;
 	struct Result {
-		int rc = WSAHOST_NOT_FOUND;
+		int rc = hostnet::Error_HOST_NOT_FOUND;
 		std::string name;
 	};
 	auto res = std::make_shared<Result>();

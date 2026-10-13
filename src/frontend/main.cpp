@@ -8,7 +8,13 @@
 #include <filesystem>
 #include <string>
 
+#include "common/host.h"
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <termios.h>
+#include <unistd.h>
+#endif
 
 #include "common/fileutil.h"
 #include "common/log.h"
@@ -179,17 +185,29 @@ static void LogSettings(const runtime::Options &o) {
 
 // A password from the console without echo, or a line of stdin when it isn't a console (scripts).
 static std::string ReadPassword(const char *prompt) {
+#ifdef _WIN32
 	HANDLE in = GetStdHandle(STD_INPUT_HANDLE);
 	DWORD mode = 0;
 	const bool console = GetConsoleMode(in, &mode) != 0;
+	if (console) SetConsoleMode(in, mode & ~(DWORD)ENABLE_ECHO_INPUT);
+#else
+	termios mode{};
+	const bool console = tcgetattr(STDIN_FILENO, &mode) == 0;
 	if (console) {
-		fprintf(stderr, "%s", prompt);
-		SetConsoleMode(in, mode & ~(DWORD)ENABLE_ECHO_INPUT);
+		auto hidden = mode;
+		hidden.c_lflag &= ~ECHO;
+		tcsetattr(STDIN_FILENO, TCSAFLUSH, &hidden);
 	}
+#endif
+	if (console) fprintf(stderr, "%s", prompt);
 	char buf[256] = {};
 	if (!fgets(buf, sizeof(buf), stdin)) buf[0] = 0;
 	if (console) {
+#ifdef _WIN32
 		SetConsoleMode(in, mode);
+#else
+		tcsetattr(STDIN_FILENO, TCSAFLUSH, &mode);
+#endif
 		fprintf(stderr, "\n");
 	}
 	std::string s = buf;
@@ -334,7 +352,7 @@ int main(int argc, char **argv) {
 	o.flash0Dir = (exeDir / "flash0").string();
 	o.flash1Dir = (exeDir / "flash1").string();
 	o.dataDir = (exeDir / "data").string();
-	o.decryptTool = (exeDir / "pspc-decrypt.exe").string();
+	o.decryptTool = (exeDir / (std::string("pspc-decrypt") + hostsys::ExecutableSuffix)).string();
 	o.decryptCacheDir = (exeDir / "cache" / "decrypted").string();
 	o.screenshotDir = (exeDir / "screenshots").string();
 	LogLevel level = LogLevel::Info;
@@ -500,7 +518,7 @@ int main(int argc, char **argv) {
 		// LoadExec: a fresh runtime (new process) for the new executable, with the same options.
 		// M33 swaps the host file; plain sceKernelLoadExec boots a guest path with the original
 		// mounts. From the XMB the game's file replaces --vsh, and its exit comes back to the XMB.
-		std::wstring cmd = L"\"" + (exeDir / "pspc.exe").wstring() + L"\"";
+		std::vector<std::string> cmd{PathToUtf8(exeDir / (std::string("pspc") + hostsys::ExecutableSuffix))};
 		bool fileSeen = false;
 		for (int i = 1; i < argc; i++) {
 			std::string a = argv[i];
@@ -512,48 +530,39 @@ int main(int argc, char **argv) {
 			if (a == "--umd" && i + 1 < argc) {
 				// The disc stays in the drive: through the game the XMB launched and back to the
 				// XMB (an image from ms0:/ISO only stands in for it while its game runs).
-				cmd += L" \"--umd\" \"" + fs::u8path(argv[++i]).wstring() + L"\"";
+				cmd.push_back("--umd");
+				cmd.push_back(argv[++i]);
 				continue;
 			}
 			if (a == "--vsh-args" && i + 1 < argc && m33) {
 				i++;  // replaced by the XMB state of this launch (below)
 				continue;
 			}
-			std::wstring arg = fs::u8path(a).wstring();
+			std::string arg = a;
 			if (!o.file.empty() && a == o.file) {
 				fileSeen = true;
 				if (toVsh) continue;
-				if (m33) arg = fs::u8path(next).wstring();
+				if (m33) arg = next;
 			}
-			cmd += L" \"" + arg + L"\"";
+			cmd.push_back(arg);
 		}
-		if (toVsh) cmd += L" --vsh";
-		else if (m33 && !fileSeen) cmd += L" \"" + fs::u8path(next).wstring() + L"\"";
-		if ((m33 || loadExec) && (o.vsh || o.returnToVsh)) cmd += L" --return-to-vsh";
+		if (toVsh) cmd.push_back("--vsh");
+		else if (m33 && !fileSeen) cmd.push_back(next);
+		if ((m33 || loadExec) && (o.vsh || o.returnToVsh)) cmd.push_back("--return-to-vsh");
 		std::string vshArgs;
-		if (m33 && runtime::TakeVshArgsFile(vshArgs)) cmd += L" --vsh-args \"" + fs::u8path(vshArgs).wstring() + L"\"";
+		if (m33 && runtime::TakeVshArgsFile(vshArgs)) cmd.insert(cmd.end(), {"--vsh-args", vshArgs});
 		if (loadExec) {
-			cmd += L" --boot-path \"" + fs::u8path(bootPath).wstring() + L"\"";
-			if (!bootArgs.empty()) cmd += L" --boot-args \"" + fs::u8path(bootArgs).wstring() + L"\"";
+			cmd.insert(cmd.end(), {"--boot-path", bootPath});
+			if (!bootArgs.empty()) cmd.insert(cmd.end(), {"--boot-args", bootArgs});
 		}
 		fflush(stdout);
 		fflush(stderr);
-		STARTUPINFOW si{};
-		si.cb = sizeof(si);
-		si.dwFlags = STARTF_USESTDHANDLES;
-		si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-		si.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
-		si.hStdError = GetStdHandle(STD_ERROR_HANDLE);
-		PROCESS_INFORMATION pi{};
-		if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) {
-			CloseHandle(pi.hThread);
-			WaitForSingleObject(pi.hProcess, INFINITE);
-			DWORD code = 0;
-			GetExitCodeProcess(pi.hProcess, &code);
-			CloseHandle(pi.hProcess);
-			if (!bootArgs.empty()) DeleteFileW(fs::u8path(bootArgs).wstring().c_str());
-			return (int)code;
-		}
+		int code = hostsys::RunProcess(cmd);
+		std::error_code ec;
+		if (!bootArgs.empty()) fs::remove(fs::u8path(bootArgs), ec);
+		if (code >= 0) return code;
+		LOGE("BOOT", "Could not start replacement runtime");
+		return 1;
 	}
 	return rc;
 }

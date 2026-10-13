@@ -90,7 +90,7 @@ int PdpRecvInternal(int id, u8 *mac, u16 *port, void *buf, int *len);
 int PdpDeleteInternal(int id);
 bool PdpWritable(int id);
 bool PdpReadable(int id);
-WSAEVENT SocketEvent(int id);
+hostnet::EventHandle SocketEvent(int id);
 int SetSocketAlertInternal(int id, s32 flags);
 void AdhocShutdownSockets();
 

@@ -10,6 +10,7 @@
 
 #include "allegrex/guestmem.h"
 #include "common/log.h"
+#include "common/host.h"
 #include "runtime/core/memory.h"
 #include "runtime/dialogs/save_fs.h"
 #include "runtime/kernel/errors.h"
@@ -600,7 +601,7 @@ void SaveDialog::DisplaySaveDataInfo2(bool showNewData) {
 	if (showNewData || info.size == 0) {
 		time_t now = time(nullptr);
 		tm t{};
-		localtime_s(&t, &now);
+		hostsys::LocalTime(now, t);
 		year = t.tm_year + 1900, month = t.tm_mon + 1, day = t.tm_mday, hour = t.tm_hour, minute = t.tm_min;
 		saveTitle = FixedString(param_.GetPspParam()->sfoParam.savedataTitle, sizeof(param_.GetPspParam()->sfoParam.savedataTitle));
 		dataSize = param_.GetPspParam()->dataSize;

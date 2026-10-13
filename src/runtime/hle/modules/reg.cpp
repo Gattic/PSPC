@@ -9,7 +9,7 @@
 //
 // Ported from PPSSPP (Core/HLE/sceReg.cpp, sceOpenPSID.cpp, sceUsb.cpp, sceUsbAcc.cpp,
 // sceChkreg.cpp), Copyright (c) 2012- PPSSPP Project, GPL-2.0-or-later.
-#include <windows.h>
+#include "common/host.h"
 
 #include <algorithm>
 #include <map>
@@ -858,13 +858,12 @@ std::vector<RegKey> MergedCategory(const std::string &path) {
 	// time_zone_area) agree with the clock PSPC shows; with a window also the default formats
 	// (headless runs keep the region's, like sceUtilityGetSystemParamInt).
 	if (path == "CONFIG/DATE") {
-		TIME_ZONE_INFORMATION tzi{};
-		DWORD r = GetTimeZoneInformation(&tzi);
-		const s32 standard = -(s32)tzi.Bias;
+		const auto zone = hostsys::LocalTimeZone();
+		const s32 standard = zone.standardMinutes;
 		const char *area = TimeZoneAreaFor(standard);
 		for (RegKey &k : keys) {
 			if (k.name == "time_zone_offset") k.intValue = standard;
-			if (k.name == "summer_time") k.intValue = r == TIME_ZONE_ID_DAYLIGHT ? 1 : 0;
+			if (k.name == "summer_time") k.intValue = zone.daylight ? 1 : 0;
 			if (k.name == "time_zone_area" && area) k.data = std::string(area) + '\0';
 			if ((k.name == "date_format" || k.name == "time_format") && !host::IsHeadless()) k.intValue = 0;
 		}

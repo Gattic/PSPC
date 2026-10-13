@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
 // sceHttp (libhttp.prx) and sceSsl (libssl.prx). Templates, connections and requests are created
-// and configured as on hardware; sending a request makes it over WinHTTP (http and https, the
-// system's proxy settings, redirects, chunked bodies), on a worker thread while the calling guest
-// thread sleeps. The body is read as the game asks for it (sceHttpReadData).
+// and configured as on hardware; the host HTTP backend sends requests on a worker thread while
+// the calling guest thread sleeps. The body is read as the game asks for it (sceHttpReadData).
 //
 // Like libhttp, a request needs the PSP to be on a network: without an access point (sceNetApctl not
 // at GOT_IP) a host name fails with the resolver's NO_DNS_SERVER and an address with
@@ -27,8 +26,6 @@
 #include "runtime/kernel/errors.h"
 #include "runtime/kernel/scheduler.h"
 #include "runtime/kernel/sysmem.h"
-
-#include <winhttp.h>  // after windows.h (via net_internal.h)
 
 namespace {
 
@@ -79,11 +76,11 @@ struct HttpConnection {
 	u16 port = 80;
 };
 
-// The host side of a request: shared with the worker thread doing its WinHTTP calls, which may
+// The host side of a request: shared with the worker thread doing its HTTP calls, which may
 // outlive the request (a deleted or aborted request's worker finishes on its own).
 struct HttpTransfer {
 	hostnet::HttpExchange exchange;
-	u32 error = 0;           // WinHTTP error of the last call
+	u32 error = 0;           // backend error of the last call
 	std::vector<u8> buffer;  // body bytes read ahead of the game
 	size_t pos = 0;
 	bool eof = false;
@@ -323,35 +320,26 @@ int sceHttpDeleteRequest(u32 id) {
 	return 0;
 }
 
-// libhttp result of a failed WinHTTP call, and the PSP errno sceHttpGetNetworkErrno reports.
+// Translate backend failures into libhttp errors and the PSP's network errno.
 u32 HttpErrorFrom(u32 err, int *networkErrno) {
+	using hostnet::HttpFailure;
 	*networkErrno = 0;
-	switch (err) {
-	case ERROR_WINHTTP_NAME_NOT_RESOLVED: return SCE_NET_RESOLVER_ERROR_INVALID_HOST;
-	case ERROR_WINHTTP_CANNOT_CONNECT:
+	switch (hostnet::HttpExchange::ClassifyError(err)) {
+	case HttpFailure::Resolve: return SCE_NET_RESOLVER_ERROR_INVALID_HOST;
+	case HttpFailure::Connect:
 		*networkErrno = net::INET_ECONNREFUSED;
 		return SCE_HTTP_ERROR_NETWORK;
-	case ERROR_WINHTTP_CONNECTION_ERROR:
+	case HttpFailure::Connection:
 		*networkErrno = net::INET_ECONNRESET;
 		return SCE_HTTP_ERROR_NETWORK;
-	case ERROR_WINHTTP_TIMEOUT:
+	case HttpFailure::Timeout:
 		*networkErrno = net::INET_ETIMEDOUT;
 		return SCE_HTTP_ERROR_TIMEOUT;
-	case ERROR_WINHTTP_OPERATION_CANCELLED: return SCE_HTTP_ERROR_ABORTED;
-	case ERROR_WINHTTP_INVALID_SERVER_RESPONSE:
-	case ERROR_WINHTTP_REDIRECT_FAILED:
-	case ERROR_WINHTTP_HEADER_SIZE_OVERFLOW: return SCE_HTTP_ERROR_BAD_RESPONSE;
-	case ERROR_WINHTTP_INVALID_URL: return SCE_HTTP_ERROR_INVALID_URL;
-	case ERROR_WINHTTP_UNRECOGNIZED_SCHEME: return SCE_HTTP_ERROR_UNKNOWN_SCHEME;
-	case ERROR_WINHTTP_SECURE_FAILURE:
-	case ERROR_WINHTTP_SECURE_INVALID_CA:
-	case ERROR_WINHTTP_SECURE_CERT_DATE_INVALID:
-	case ERROR_WINHTTP_SECURE_CERT_CN_INVALID:
-	case ERROR_WINHTTP_SECURE_CERT_REV_FAILED:
-	case ERROR_WINHTTP_SECURE_INVALID_CERT:
-	case ERROR_WINHTTP_SECURE_CERT_REVOKED:
-	case ERROR_WINHTTP_SECURE_CERT_WRONG_USAGE:
-	case ERROR_WINHTTP_CLIENT_AUTH_CERT_NEEDED: return SCE_HTTP_ERROR_SSL;
+	case HttpFailure::Cancelled: return SCE_HTTP_ERROR_ABORTED;
+	case HttpFailure::BadResponse: return SCE_HTTP_ERROR_BAD_RESPONSE;
+	case HttpFailure::InvalidUrl: return SCE_HTTP_ERROR_INVALID_URL;
+	case HttpFailure::UnknownScheme: return SCE_HTTP_ERROR_UNKNOWN_SCHEME;
+	case HttpFailure::Secure: return SCE_HTTP_ERROR_SSL;
 	default: return SCE_HTTP_ERROR_UNKNOWN;
 	}
 }

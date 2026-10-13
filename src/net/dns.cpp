@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "net/dns.h"
 
-#include <winsock2.h>
+#include "net/host_net.h"
+#include "common/host.h"
 
 #include <algorithm>
 #include <cctype>
@@ -114,39 +115,37 @@ std::vector<u8> BuildQuery(u16 id, const std::string &name) {
 }
 
 bool Lookup(u32 server, const std::string &name, u32 *ipv4, u32 timeoutMs) {
-	SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-	if (s == INVALID_SOCKET) return false;
+	int error = 0;
+	auto sock = hostnet::OpenSocket(AF_INET, SOCK_DGRAM, IPPROTO_UDP, &error);
+	if (!sock.Valid()) return false;
 	sockaddr_in to{};
 	to.sin_family = AF_INET;
 	to.sin_port = htons(53);
 	to.sin_addr.s_addr = server;
-	const u16 id = (u16)(GetTickCount() ^ (uintptr_t)&to);
+	const u16 id = (u16)(hostsys::MonotonicUs() ^ (uintptr_t)&to);
 	const std::vector<u8> query = BuildQuery(id, name);
 	bool found = false;
-	const DWORD start = GetTickCount();
+	const u64 start = hostsys::MonotonicUs();
 	for (int attempt = 0; attempt < 2 && !found; attempt++) {
-		sendto(s, (const char *)query.data(), (int)query.size(), 0, (const sockaddr *)&to, sizeof(to));
-		const DWORD attemptEnd = start + timeoutMs * (DWORD)(attempt + 1) / 2;
+		hostnet::SendTo(sock.s, (const char *)query.data(), (int)query.size(), 0, (const sockaddr *)&to, sizeof(to));
+		const u64 attemptEnd = start + (u64)timeoutMs * 1000 * (attempt + 1) / 2;
 		for (;;) {
-			const DWORD now = GetTickCount();
-			if ((LONG)(attemptEnd - now) <= 0) break;
-			fd_set rd;
-			FD_ZERO(&rd);
-			FD_SET(s, &rd);
-			const DWORD left = attemptEnd - now;
-			timeval tv{(long)(left / 1000), (long)(left % 1000) * 1000};
-			if (select(0, &rd, nullptr, nullptr, &tv) <= 0) break;
+			const u64 now = hostsys::MonotonicUs();
+			if (now >= attemptEnd) break;
+			hostnet::PollFd fd{sock.s, POLLIN, 0};
+			const int left = (int)std::min<u64>((attemptEnd - now + 999) / 1000, 0x7FFFFFFF);
+			if (hostnet::Poll(&fd, 1, left) <= 0) break;
 			u8 buf[1500];
 			sockaddr_in from{};
 			int fromLen = sizeof(from);
-			const int n = recvfrom(s, (char *)buf, sizeof(buf), 0, (sockaddr *)&from, &fromLen);
-			if (n > 0 && from.sin_addr.s_addr == server && ParseAnswer(buf, (size_t)n, id, ipv4)) {
+			const int n = hostnet::RecvFrom(sock.s, (char *)buf, sizeof(buf), 0, (sockaddr *)&from, &fromLen);
+			if (n > 0 && from.sin_addr.s_addr == server && from.sin_port == to.sin_port && ParseAnswer(buf, (size_t)n, id, ipv4)) {
 				found = true;
 				break;
 			}
 		}
 	}
-	closesocket(s);
+	hostnet::CloseSocket(sock);
 	return found;
 }
 

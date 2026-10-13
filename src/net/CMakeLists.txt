@@ -1,6 +1,17 @@
 # pspc_net: host networking shared by the network HLE libraries and pspc's ad hoc server
-# (Winsock sockets with readiness events, the poller thread, the host's network configuration).
+# (platform sockets/events, the poller, host configuration, and HTTP transport).
 file(GLOB PSPC_NET_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
+if(WIN32)
+	list(FILTER PSPC_NET_SOURCES EXCLUDE REGEX "/http_curl.cpp$")
+else()
+	list(FILTER PSPC_NET_SOURCES EXCLUDE REGEX "/http_client.cpp$")
+	find_package(CURL 7.85 REQUIRED)
+endif()
 add_library(pspc_net STATIC ${PSPC_NET_SOURCES})
 target_include_directories(pspc_net PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
-target_link_libraries(pspc_net PUBLIC pspc_common ws2_32 iphlpapi)
+target_link_libraries(pspc_net PUBLIC pspc_common)
+if(WIN32)
+	target_link_libraries(pspc_net PRIVATE ws2_32 iphlpapi winhttp)
+else()
+	target_link_libraries(pspc_net PRIVATE CURL::libcurl)
+endif()

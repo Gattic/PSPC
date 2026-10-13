@@ -8,8 +8,8 @@
 // Project, GPL-2.0-or-later.
 #include "runtime/kernel/scheduler.h"
 
-#include <windows.h>
-#include <timeapi.h>
+#include "common/host.h"
+#include <thread>
 
 #include <algorithm>
 #include <atomic>
@@ -79,9 +79,9 @@ SceUID g_handoff = 0;
 bool g_stop = false;
 int g_exitCode = 0;
 bool g_fastTime = false;
-LARGE_INTEGER g_qpcFreq, g_qpcStart;
+u64 g_clockStart = 0;
 u64 g_timeOffset = 0;
-DWORD g_emuThreadId = 0;
+std::thread::id g_emuThreadId;
 
 // Virtual clock (fast-time mode).
 u64 g_vcycles = 0;
@@ -97,8 +97,7 @@ u64 g_nextEventId = 1;
 std::mutex g_hostMutex;
 std::vector<std::function<void()>> g_hostPosts;
 std::atomic<bool> g_hostPending{false};
-HANDLE g_wakeEvent = nullptr;
-HANDLE g_timer = nullptr;
+hostsys::WakeEvent g_wakeEvent;
 
 bool g_dispatchEnabled = true;
 bool g_inInterrupt = false;
@@ -116,15 +115,9 @@ u64 g_sliceStartUs = 0;
 
 int PrioIndex(s32 prio) { return prio < 0 ? 0 : (prio >= kNumPrio ? kNumPrio - 1 : prio); }
 
-bool OnEmuThread() { return GetCurrentThreadId() == g_emuThreadId; }
+bool OnEmuThread() { return std::this_thread::get_id() == g_emuThreadId; }
 
-u64 RealUs() {
-	LARGE_INTEGER now;
-	QueryPerformanceCounter(&now);
-	u64 ticks = (u64)(now.QuadPart - g_qpcStart.QuadPart);
-	return (ticks / (u64)g_qpcFreq.QuadPart) * 1000000ull +
-	       ((ticks % (u64)g_qpcFreq.QuadPart) * 1000000ull) / (u64)g_qpcFreq.QuadPart;
-}
+u64 RealUs() { return hostsys::MonotonicUs() - g_clockStart; }
 
 // Fold the guest cycles run since the last sync into the virtual clock. Interpreted and native
 // code both charge one cycle per instruction to the running context's budget, so the clock (and
@@ -193,7 +186,7 @@ int BestReadyPrio() {
 	return t ? t->currentPriority : 0x7FFFFFFF;
 }
 
-void SwitchToScheduler() { SwitchToFiber(g_mainFiber); }
+void SwitchToScheduler() { hostsys::SwitchFiber(g_mainFiber); }
 
 void ProcessDueEvents() {
 	for (;;) {
@@ -231,7 +224,7 @@ void RunInterrupts() {
 }
 
 void FreeDeadFibers() {
-	for (void *f : g_deadFibers) DeleteFiber(f);
+	for (void *f : g_deadFibers) hostsys::FreeFiber(f);
 	g_deadFibers.clear();
 	for (PspThread *t : g_pendingDelete) {
 		RemoveFromReady(t);
@@ -262,7 +255,7 @@ void RunThread(PspThread *t) {
 	t->ctx.llbit = 0;
 	SetBudget(&t->ctx);
 	g_sliceStartUs = NowUs();
-	SwitchToFiber(t->fiber);
+	hostsys::SwitchFiber(t->fiber);
 	// Back on the scheduler.
 	SyncClock();
 	if (PspThread *ran = g_current) {
@@ -280,7 +273,7 @@ int g_realTimeHolds = 0;
 void IdleUntil(u64 next) {
 	u64 now = NowUs();
 	if (next == UINT64_MAX) {
-		WaitForSingleObject(g_wakeEvent, 50);
+		g_wakeEvent.WaitUs(50000);
 		return;
 	}
 	if (next <= now) return;
@@ -288,7 +281,7 @@ void IdleUntil(u64 next) {
 	if (g_fastTime && g_realTimeHolds > 0 && delta >= 1000) {
 		// Host-paced: sleep (until a host post at the latest) and let the virtual clock follow.
 		u64 start = RealUs();
-		WaitForSingleObject(g_wakeEvent, (DWORD)std::min<u64>(delta / 1000, 50));
+		g_wakeEvent.WaitUs(std::min<u64>(delta, 50000));
 		u64 slept = std::max<u64>(RealUs() - start, 1);
 		g_vcycles = (now + std::min(delta, slept)) * kCyclesPerUs;
 		g_vcyclesPublished.store(g_vcycles, std::memory_order_relaxed);
@@ -300,14 +293,10 @@ void IdleUntil(u64 next) {
 		return;
 	}
 	if (delta > 1500) {
-		LARGE_INTEGER due;
-		due.QuadPart = -(LONGLONG)((delta - 500) * 10);
-		SetWaitableTimer(g_timer, &due, 0, nullptr, nullptr, FALSE);
-		HANDLE hs[2] = {g_timer, g_wakeEvent};
-		WaitForMultipleObjects(2, hs, FALSE, INFINITE);
+		g_wakeEvent.WaitUs(delta - 500);
 		return;
 	}
-	while (NowUs() < next && !g_hostPending.load(std::memory_order_relaxed)) YieldProcessor();
+	while (NowUs() < next && !g_hostPending.load(std::memory_order_relaxed)) std::this_thread::yield();
 }
 
 PspThread *BestBusyThread() {
@@ -380,7 +369,7 @@ PspThread *TakeForcedNext() {
 	return nullptr;
 }
 
-void WINAPI ThreadFiberProc(void *param) {
+void ThreadFiberProc(void *param) {
 	PspThread *t = (PspThread *)param;
 	Ctx *c = &t->ctx;
 	if (t->onFirstRun) {
@@ -588,15 +577,10 @@ s32 DoWait(PspThread *t, WaitType type, SceUID id, u64 deadline, u32 latency, u3
 
 void Init(bool fastTime) {
 	g_fastTime = fastTime;
-	g_emuThreadId = GetCurrentThreadId();
-	QueryPerformanceFrequency(&g_qpcFreq);
-	QueryPerformanceCounter(&g_qpcStart);
+	g_emuThreadId = std::this_thread::get_id();
+	g_clockStart = hostsys::MonotonicUs();
 	g_vcycles = 0;
 	g_lastIcount = interp::InstructionCount();
-	g_wakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-	g_timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-	if (!g_timer) g_timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
-	timeBeginPeriod(1);
 	memset(&g_intrCtx, 0, sizeof(g_intrCtx));
 	u32 stack = kernel::AllocKernelMemory(0x4000, "interrupt stack");
 	g_intrStackTop = stack + 0x4000 - 0x10;
@@ -606,7 +590,7 @@ void Init(bool fastTime) {
 	g_dispatchEnabled = true;
 }
 
-void Shutdown() { timeEndPeriod(1); }
+void Shutdown() {}
 
 bool FastTime() { return g_fastTime; }
 
@@ -706,7 +690,7 @@ void PostFromHost(std::function<void()> fn) {
 		g_hostPosts.push_back(std::move(fn));
 		g_hostPending = true;
 	}
-	SetEvent(g_wakeEvent);
+	g_wakeEvent.Signal();
 }
 
 void HoldRealTime(bool hold) {
@@ -715,9 +699,9 @@ void HoldRealTime(bool hold) {
 }
 
 int Run() {
-	g_mainFiber = ConvertThreadToFiberEx(nullptr, FIBER_FLAG_FLOAT_SWITCH);
-	if (!g_mainFiber) Fatal("ConvertThreadToFiber failed (%lu)", GetLastError());
-	g_emuThreadId = GetCurrentThreadId();
+	g_mainFiber = hostsys::EnterFibers();
+	if (!g_mainFiber) Fatal("Cannot enter guest fiber scheduler");
+	g_emuThreadId = std::this_thread::get_id();
 	while (!g_stop) {
 		DrainHostPosts();
 		ProcessDueEvents();
@@ -745,16 +729,16 @@ int Run() {
 		}
 		IdleUntil(NextEventTime());
 	}
-	ConvertFiberToThread();
+	hostsys::LeaveFibers();
 	return g_exitCode;
 }
 
 void RequestStop(int exitCode) {
 	if (!g_stop) g_exitCode = exitCode;
 	g_stop = true;
-	if (g_current && GetCurrentFiber() != g_mainFiber) {
+	if (g_current && hostsys::CurrentFiber() != g_mainFiber) {
 		// Called from a guest thread: leave it for good.
-		SwitchToFiber(g_mainFiber);
+		hostsys::SwitchFiber(g_mainFiber);
 	}
 }
 
@@ -798,8 +782,8 @@ void LaunchThread(PspThread *t) {
 		g_deadFibers.push_back(t->fiber);
 		t->fiber = nullptr;
 	}
-	t->fiber = CreateFiberEx(64 * 1024, 8 * 1024 * 1024, FIBER_FLAG_FLOAT_SWITCH, ThreadFiberProc, t);
-	if (!t->fiber) Fatal("CreateFiberEx failed (%lu)", GetLastError());
+	t->fiber = hostsys::NewFiber(8 * 1024 * 1024, ThreadFiberProc, t);
+	if (!t->fiber) Fatal("Cannot allocate guest fiber stack");
 	t->ctx.thread = t;
 	t->hasWaited = false;
 	t->callbackDepth = 0;
@@ -1038,7 +1022,7 @@ void ExitCurrentThread(s32 status, bool deleteAfter) {
 		t->status = THREADSTATUS_DEAD;
 		g_pendingDelete.push_back(t);
 	}
-	SwitchToFiber(g_mainFiber);
+	hostsys::SwitchFiber(g_mainFiber);
 	Fatal("Exited thread resumed");
 }
 

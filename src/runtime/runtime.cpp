@@ -1,7 +1,7 @@
 ﻿// SPDX-License-Identifier: GPL-2.0-or-later
 #include "runtime/runtime.h"
 
-#include <windows.h>
+#include "common/host.h"
 
 #include <algorithm>
 #include <atomic>
@@ -560,18 +560,18 @@ int Run(const Options &o) {
 	std::thread watchdog;
 	if (o.timeoutSec > 0) {
 		watchdog = std::thread([&]() {
-			for (int i = 0; i < o.timeoutSec * 10 && !finished; i++) Sleep(100);
+			for (int i = 0; i < o.timeoutSec * 10 && !finished; i++) hostsys::SleepMs(100);
 			if (!finished) {
 				LOGW("RUNTIME", "Timeout after %d s", o.timeoutSec);
 				sched::PostFromHost([]() { sched::RequestStop(124); });
 				// The emulation thread may be stuck somewhere that never looks at host posts.
-				for (int i = 0; i < 50 && !finished; i++) Sleep(100);
+				for (int i = 0; i < 50 && !finished; i++) hostsys::SleepMs(100);
 				if (!finished) {
 					fprintf(stderr, "[FATAL] Emulation did not stop within 5 s of the timeout; terminating\n");
 					fflush(stdout);
 					fflush(stderr);
 					logging::Shutdown();
-					TerminateProcess(GetCurrentProcess(), 124);
+					std::_Exit(124);
 				}
 			}
 		});
@@ -592,9 +592,7 @@ int Run(const Options &o) {
 			if (code == boot::kExitLoadExec && boot::TakeLoadExecRequest(next, args)) {
 				// LoadExec needs a full reset (fresh memory and kernel objects): the frontend starts a
 				// new process that boots `next`. The argument block travels in a temp file.
-				wchar_t tmp[MAX_PATH];
-				GetTempPathW(MAX_PATH, tmp);
-				fs::path argsFile = fs::path(tmp) / ("pspc_loadexec_" + std::to_string(GetCurrentProcessId()) + ".bin");
+				fs::path argsFile = fs::temp_directory_path() / ("pspc_loadexec_" + std::to_string(hostsys::ProcessId()) + ".bin");
 				if (!args.empty()) WriteWholeFile(argsFile, args.data(), args.size());
 				LOGI("RUNTIME", "sceKernelLoadExec(%s): restarting", next.c_str());
 				g_loadExecPath = next;
@@ -610,9 +608,7 @@ int Run(const Options &o) {
 				// The XMB's own state goes with the game and comes back to vshmain (--vsh-args).
 				std::vector<u8> vshArgs;
 				if (m33::TakeVshmainArgs(vshArgs)) {
-					wchar_t tmp[MAX_PATH];
-					GetTempPathW(MAX_PATH, tmp);
-					fs::path f = fs::path(tmp) / ("pspc_vshargs_" + std::to_string(GetCurrentProcessId()) + ".bin");
+					fs::path f = fs::temp_directory_path() / ("pspc_vshargs_" + std::to_string(hostsys::ProcessId()) + ".bin");
 					if (WriteWholeFile(f, vshArgs.data(), vshArgs.size())) g_vshArgsFile = PathToUtf8(f);
 				}
 			}

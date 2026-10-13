@@ -12,6 +12,7 @@
 #include <memory>
 
 #include "common/log.h"
+#include "common/fileutil.h"
 #include "fs/vfs.h"
 #include "runtime/hle/hle_wrap.h"
 #include "runtime/core/cpu.h"
@@ -143,7 +144,7 @@ int DispatchDisabledError(const std::string &device) {
 
 bool IsTtyPath(const char *path) {
 	while (*path == ' ') path++;
-	if (_strnicmp(path, "tty", 3) != 0) return false;
+	if (ToLower(std::string(path).substr(0, 3)) != "tty") return false;
 	const char *p = path + 3;
 	while (*p >= '0' && *p <= '9') p++;
 	return *p == ':' && p > path + 3;

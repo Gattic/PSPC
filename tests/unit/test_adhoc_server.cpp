@@ -18,13 +18,17 @@ namespace {
 
 // A blocking TCP client bound to its own loopback address (the server tells players apart by IP).
 struct FakeClient {
-	SOCKET s = INVALID_SOCKET;
+	hostnet::SocketHandle s = hostnet::InvalidSocket;
 	u32 ip = 0;
 
 	bool Connect(const char *localIp, u16 port) {
 		s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-		if (s == INVALID_SOCKET) return false;
+		if (s == hostnet::InvalidSocket) return false;
+#ifdef _WIN32
 		DWORD tmo = 3000;
+#else
+		timeval tmo{3, 0};
+#endif
 		setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tmo, sizeof(tmo));
 		sockaddr_in a{};
 		a.sin_family = AF_INET;
@@ -38,12 +42,12 @@ struct FakeClient {
 		return connect(s, (sockaddr *)&srv, sizeof(srv)) == 0;
 	}
 	void Close() {
-		if (s != INVALID_SOCKET) closesocket(s);
-		s = INVALID_SOCKET;
+		if (s != hostnet::InvalidSocket) hostnet::CloseSocketHandle(s);
+		s = hostnet::InvalidSocket;
 	}
 	~FakeClient() { Close(); }
 
-	bool Send(const void *p, size_t n) { return send(s, (const char *)p, (int)n, 0) == (int)n; }
+	bool Send(const void *p, size_t n) { return hostnet::Send(s, (const char *)p, (int)n, 0) == (int)n; }
 	bool Login(const u8 *mac, const char *name, const char *game) {
 		LoginC2S p{};
 		p.opcode = OPCODE_LOGIN;
@@ -85,6 +89,51 @@ const u8 kMacA[6] = {0x00, 0x16, 0xFE, 0x50, 0x53, 0x43};
 const u8 kMacB[6] = {0x00, 0x16, 0xFE, 0x50, 0x53, 0x44};
 
 }  // namespace
+
+TEST(adhoc_server_activity_across_clock_tick) {
+	CHECK(hostnet::Startup());
+	int logins = 0, timeouts = 0;
+	adhocserver::Server server;
+	adhocserver::Options opt;
+	opt.bindAddress = "127.0.0.1";
+	opt.port = 0;
+	opt.log = [&](const std::string &line) {
+		if (line.find(" started playing ") != std::string::npos) {
+			logins++;
+			// Force a millisecond tick while processing the first user, before receiving
+			// from the next. Its new activity must not be compared to an older loop time.
+			std::this_thread::sleep_for(std::chrono::milliseconds(2));
+		}
+		if (line.find(" timed out") != std::string::npos) timeouts++;
+	};
+	std::string err;
+	CHECK(server.Listen(opt, &err));
+
+	// Queue both clients before running the server so both are readable in one poll batch.
+	FakeClient a, b;
+	CHECK(a.Connect("127.0.0.1", server.Port()));
+	CHECK(b.Connect("127.0.0.2", server.Port()));
+	CHECK(a.Login(kMacA, "Alice", "ULUS10000"));
+	CHECK(b.Login(kMacB, "Bob", "ULUS10000"));
+	CHECK(a.Group(OPCODE_SCAN));
+	CHECK(b.Group(OPCODE_SCAN));
+	std::thread worker([&] { server.Run(); });
+
+	for (FakeClient *client : {&a, &b}) {
+		std::string p = client->Read();
+		CHECK(p.size() == 1 && (u8)p[0] == OPCODE_SCAN_COMPLETE);
+		// A response may have been sent just before an erroneous timeout. Require
+		// a second request to succeed on the same connection, not just the first reply.
+		CHECK(client->Group(OPCODE_SCAN));
+		p = client->Read();
+		CHECK(p.size() == 1 && (u8)p[0] == OPCODE_SCAN_COMPLETE);
+	}
+
+	server.Stop();
+	worker.join();
+	CHECK_EQ(logins, 2);
+	CHECK_EQ(timeouts, 0);
+}
 
 TEST(adhoc_server_groups) {
 	CHECK(hostnet::Startup());

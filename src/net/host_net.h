@@ -4,8 +4,8 @@
 // sceNetAdhoc*, sceHttp, ...) and by pspc's built-in ad hoc server. Nothing here knows about guest
 // memory or guest threads.
 //
-//  - Winsock start-up.
-//  - Non-blocking sockets that carry a readiness event (WSAEventSelect on every network event).
+//  - Host socket initialization.
+//  - Non-blocking sockets with readiness events (Winsock events on Windows, epoll on Linux).
 //    Sockets are never put in blocking mode: a guest call that blocks waits for the event.
 //  - A poller thread that tells whoever waits when one of a set of socket events is signalled
 //    (one-shot watches). The guest side turns that into a wake-up of a sleeping guest thread.
@@ -18,8 +18,7 @@
 // and also wake up periodically; see WaitHostEvents in the runtime (hle/modules/net_host.cpp).
 #pragma once
 
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#include "net/socket.h"
 
 #include <functional>
 #include <string>
@@ -29,7 +28,7 @@
 
 namespace hostnet {
 
-// WSAStartup, once per process. Returns false if Winsock is unusable.
+// Initializes the host socket API once per process.
 bool Startup();
 
 // ---------------------------------------------------------------- PSP constants
@@ -76,7 +75,7 @@ enum PspErrno : int {
 	PSP_ENOTCONN = 128,
 };
 
-// Winsock error (WSAGetLastError) -> PSP errno. connect's WSAEWOULDBLOCK is EINPROGRESS; pass
+// Host socket error -> PSP errno. connect's Error_EWOULDBLOCK is EINPROGRESS; pass
 // forConnect for that call.
 int PspErrnoFromWsa(int wsaError, bool forConnect = false);
 // "EAGAIN", "ECONNREFUSED"... for logs.
@@ -152,18 +151,18 @@ int MapMsgFlags(int pspFlags);
 
 // A host socket and its readiness event.
 struct Socket {
-	SOCKET s = INVALID_SOCKET;
-	WSAEVENT ev = WSA_INVALID_EVENT;
-	bool Valid() const { return s != INVALID_SOCKET; }
+	SocketHandle s = InvalidSocket;
+	EventHandle ev = InvalidEvent;
+	bool Valid() const { return s != InvalidSocket; }
 };
 
 // Creates a non-blocking socket with a readiness event. UDP sockets don't report ICMP "port
-// unreachable" as WSAECONNRESET on later receives (the BSD behaviour). On failure returns an invalid
+// unreachable" as hostnet::Error_ECONNRESET on later receives (the BSD behaviour). On failure returns an invalid
 // Socket and sets *wsaError.
 Socket OpenSocket(int af, int type, int protocol, int *wsaError);
 // Gives a socket that accept() returned its own readiness event (an accepted socket inherits the
 // listening socket's WSAEventSelect, event object included).
-bool AdoptSocket(SOCKET s, Socket *out, int *wsaError);
+bool AdoptSocket(hostnet::SocketHandle s, Socket *out, int *wsaError);
 // Closes the socket (abortive with RST when `reset`) and releases its event (see ReleaseEvent).
 void CloseSocket(Socket &sock, bool reset = false);
 
@@ -172,24 +171,24 @@ struct Readiness {
 	bool write = false;   // room to send, or a connect that completed
 	bool except = false;  // a connect that failed, or out-of-band data
 };
-// The socket's state right now (select with a zero timeout). False if select failed (bad socket).
-bool CheckReady(SOCKET s, Readiness *r);
-// The pending error of a socket (SO_ERROR), as a Winsock error code; reading it clears it.
-int PendingError(SOCKET s);
+// The socket's state right now (poll with a zero timeout). False for a bad socket.
+bool CheckReady(hostnet::SocketHandle s, Readiness *r);
+// The pending host error of a socket (SO_ERROR); reading it clears it.
+int PendingError(hostnet::SocketHandle s);
 // Bytes that a recv would return now (FIONREAD).
-u32 BytesAvailable(SOCKET s);
+u32 BytesAvailable(hostnet::SocketHandle s);
 
 // ---------------------------------------------------------------- poller
 
 using WatchId = u64;
 // Calls `fired` once, on the poller thread, as soon as any of the events is signalled. The events
 // that fired are reset. Watching nothing never fires. Thread-safe.
-WatchId Watch(const WSAEVENT *events, size_t count, std::function<void()> fired);
+WatchId Watch(const EventHandle *events, size_t count, std::function<void()> fired);
 // Cancels a watch that hasn't fired (no-op otherwise). `fired` may still be running, or about to,
 // on the poller thread when this returns.
 void Unwatch(WatchId id);
 // Closes an event once the poller no longer waits on it, and cancels the watches that use it.
-void ReleaseEvent(WSAEVENT ev);
+void ReleaseEvent(EventHandle ev);
 // Stops the poller thread (tests; the runtime lets it end with the process).
 void StopPoller();
 
@@ -217,7 +216,7 @@ inline bool IsLoopback(u32 addrNbo) { return (addrNbo & 0xFF) == 127; }
 // ---------------------------------------------------------------- name resolution
 
 // getaddrinfo for IPv4 (blocking: call it on a worker thread). Returns 0 with the first address
-// (network byte order), or the getaddrinfo error (WSAHOST_NOT_FOUND, WSATRY_AGAIN...).
+// (network byte order), or the getaddrinfo error (hostnet::Error_HOST_NOT_FOUND, hostnet::Error_TRY_AGAIN...).
 int ResolveIpv4(const std::string &host, u32 *addrNbo);
 // getnameinfo for an IPv4 address (blocking). Returns 0 and the name, or the error.
 int ReverseLookup(u32 addrNbo, std::string *name);

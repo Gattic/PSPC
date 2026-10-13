@@ -175,6 +175,31 @@ u32 HttpExchange::Read(u8 *buf, u32 size, u32 *got) {
 	return 0;
 }
 
+HttpFailure HttpExchange::ClassifyError(u32 err) {
+	switch (err) {
+	case ERROR_WINHTTP_NAME_NOT_RESOLVED: return HttpFailure::Resolve;
+	case ERROR_WINHTTP_CANNOT_CONNECT: return HttpFailure::Connect;
+	case ERROR_WINHTTP_CONNECTION_ERROR: return HttpFailure::Connection;
+	case ERROR_WINHTTP_TIMEOUT: return HttpFailure::Timeout;
+	case ERROR_WINHTTP_OPERATION_CANCELLED: return HttpFailure::Cancelled;
+	case ERROR_WINHTTP_INVALID_SERVER_RESPONSE:
+	case ERROR_WINHTTP_REDIRECT_FAILED:
+	case ERROR_WINHTTP_HEADER_SIZE_OVERFLOW: return HttpFailure::BadResponse;
+	case ERROR_WINHTTP_INVALID_URL: return HttpFailure::InvalidUrl;
+	case ERROR_WINHTTP_UNRECOGNIZED_SCHEME: return HttpFailure::UnknownScheme;
+	case ERROR_WINHTTP_SECURE_FAILURE:
+	case ERROR_WINHTTP_SECURE_INVALID_CA:
+	case ERROR_WINHTTP_SECURE_CERT_DATE_INVALID:
+	case ERROR_WINHTTP_SECURE_CERT_CN_INVALID:
+	case ERROR_WINHTTP_SECURE_CERT_REV_FAILED:
+	case ERROR_WINHTTP_SECURE_INVALID_CERT:
+	case ERROR_WINHTTP_SECURE_CERT_REVOKED:
+	case ERROR_WINHTTP_SECURE_CERT_WRONG_USAGE:
+	case ERROR_WINHTTP_CLIENT_AUTH_CERT_NEEDED: return HttpFailure::Secure;
+	default: return HttpFailure::Other;
+	}
+}
+
 const char *HttpExchange::ErrorName(u32 err) {
 	switch (err) {
 	case 0: return "OK";

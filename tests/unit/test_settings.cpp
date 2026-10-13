@@ -3,7 +3,11 @@
 #include <string>
 #include <vector>
 
-#include <windows.h>
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 #include "common/fileutil.h"
 #include "common/settings.h"
@@ -12,7 +16,12 @@
 namespace {
 
 fs::path TempIni(const char *name) {
-	fs::path dir = fs::temp_directory_path() / ("pspc_settings_test_" + std::to_string(GetCurrentProcessId()));
+#ifdef _WIN32
+	const int pid = _getpid();
+#else
+	const int pid = getpid();
+#endif
+	fs::path dir = fs::temp_directory_path() / ("pspc_settings_test_" + std::to_string(pid));
 	std::error_code ec;
 	fs::create_directories(dir, ec);
 	fs::path p = dir / name;

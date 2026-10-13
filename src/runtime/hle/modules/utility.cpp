@@ -6,7 +6,8 @@
 // Behaviour (status machines, which calls fail with WRONG_TYPE/INVALID_STATUS, the dialog threads
 // and their timing) ported from PPSSPP (Core/HLE/sceUtility.cpp), Copyright (c) 2012- PPSSPP
 // Project, GPL-2.0-or-later, which encodes pspautotests results recorded on hardware.
-#include <windows.h>
+#include "common/host.h"
+#include <thread>
 
 #include <algorithm>
 #include <map>
@@ -182,7 +183,7 @@ void EatUs(u64 us) {
 		sched::BusyDelayCycles((s64)us * (s64)(sched::kCpuHz / 1000000));
 	} else {
 		u64 end = sched::NowUs() + us;
-		while (sched::NowUs() < end) YieldProcessor();
+		while (sched::NowUs() < end) std::this_thread::yield();
 	}
 }
 
@@ -655,10 +656,9 @@ const SystemSettings &Settings() {
 			s.timezone = 60;
 		} else {
 			s.nickname = "PSPC";
-			TIME_ZONE_INFORMATION tzi{};
-			DWORD r = GetTimeZoneInformation(&tzi);
-			s.timezone = -(int)tzi.Bias;
-			s.daylightSavings = r == TIME_ZONE_ID_DAYLIGHT ? 1 : 0;
+			const auto zone = hostsys::LocalTimeZone();
+			s.timezone = zone.standardMinutes;
+			s.daylightSavings = zone.daylight ? 1 : 0;
 		}
 	}
 	return s;

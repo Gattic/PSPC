@@ -3,6 +3,7 @@
 #include <algorithm>
 
 #include "common/log.h"
+#include "common/fileutil.h"
 #include "loader/psp_header.h"
 #include "runtime/boot.h"
 #include "runtime/hle/hle_wrap.h"
@@ -38,7 +39,7 @@ const char *const kNativeModules[] = {
 
 bool IsNativeModuleName(const std::string &name) {
 	for (const char *n : kNativeModules)
-		if (_stricmp(n, name.c_str()) == 0) return true;
+		if (ToLower(n) == ToLower(name)) return true;
 	return false;
 }
 
@@ -65,7 +66,7 @@ SceUID MakePlaceholderModule(const std::string &name, const std::string &path) {
 // A kernel-mode module of the firmware's flash0:/kd (the XMB loads drivers such as usbstor.prx):
 // kernel modules are native, so it isn't run.
 bool IsFirmwareKernelModule(const std::vector<u8> &data, const std::string &path) {
-	if (_strnicmp(path.c_str(), "flash0:/kd/", 11) != 0) return false;
+	if (ToLower(path.substr(0, 11)) != "flash0:/kd/") return false;
 	loader::ElfFile elf;
 	if (elf.Parse(data.data(), data.size(), nullptr)) return elf.IsKernelModule();
 	loader::PspHeader h;
@@ -217,7 +218,7 @@ PspModule *CallerModule() {
 
 // noinline: MSVC 19.44 at /O2 miscompiled the inlined HLE wrapper of this never-returning
 // function (it dropped the body and evaluated a stack argument that doesn't exist).
-__declspec(noinline) int sceKernelSelfStopUnloadModule(int exitCode, u32 argSize, u32 argPtr) {
+PSPC_NOINLINE int sceKernelSelfStopUnloadModule(int exitCode, u32 argSize, u32 argPtr) {
 	(void)argSize;
 	(void)argPtr;
 	PspModule *m = CallerModule();

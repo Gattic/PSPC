@@ -6,14 +6,25 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <unistd.h>
+#include <stdexcept>
 #endif
 
 bool ReadWholeFile(const fs::path &path, std::vector<u8> &out) {
-	FILE *f = _wfopen(path.wstring().c_str(), L"rb");
+#ifdef _WIN32
+	FILE *f = _wfopen(path.c_str(), L"rb");
 	if (!f) return false;
 	_fseeki64(f, 0, SEEK_END);
 	s64 size = _ftelli64(f);
 	_fseeki64(f, 0, SEEK_SET);
+#else
+	FILE *f = fopen(path.c_str(), "rb");
+	if (!f) return false;
+	fseeko(f, 0, SEEK_END);
+	s64 size = ftello(f);
+	fseeko(f, 0, SEEK_SET);
+#endif
 	if (size < 0) {
 		fclose(f);
 		return false;
@@ -27,7 +38,11 @@ bool ReadWholeFile(const fs::path &path, std::vector<u8> &out) {
 bool WriteWholeFile(const fs::path &path, const void *data, size_t size) {
 	std::error_code ec;
 	if (path.has_parent_path()) fs::create_directories(path.parent_path(), ec);
-	FILE *f = _wfopen(path.wstring().c_str(), L"wb");
+#ifdef _WIN32
+	FILE *f = _wfopen(path.c_str(), L"wb");
+#else
+	FILE *f = fopen(path.c_str(), "wb");
+#endif
 	if (!f) return false;
 	size_t wrote = size ? fwrite(data, 1, size, f) : 0;
 	fclose(f);
@@ -60,7 +75,11 @@ fs::path ExecutableDir() {
 	DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
 	return fs::path(std::wstring(buf, n)).parent_path();
 #else
-	return fs::current_path();
+	// /proc/self/exe is independent of the caller's working directory and PATH.
+	std::error_code ec;
+	fs::path exe = fs::read_symlink("/proc/self/exe", ec);
+	if (ec) throw std::system_error(ec, "read /proc/self/exe");
+	return exe.parent_path();
 #endif
 }
 

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Ported from PPSSPP (Core/FileSystems/DirectoryFileSystem.cpp), Copyright (c) 2012- PPSSPP Project, GPL-2.0-or-later.
-// A PSP volume backed by a host directory: ms0: (memory stick), flash0:, host0:. Win32 only.
+// A PSP volume backed by a host directory: ms0: (memory stick), flash0:, host0:.
 #pragma once
 
 #include <filesystem>
@@ -72,26 +72,25 @@ private:
 	struct EntryInfo;
 
 	// Result >= 0: 1 if the path exists, 0 if only its parent does (allowMissingLast).
-	s32 Resolve(std::string_view path, bool allowMissingLast, std::wstring *hostPath, std::vector<std::string> *comps);
-	s32 ResolveIn(const std::wstring &rootW, std::string_view path, bool allowMissingLast, std::wstring *hostPath,
+	s32 Resolve(std::string_view path, bool allowMissingLast, std::filesystem::path *hostPath, std::vector<std::string> *comps);
+	s32 ResolveIn(const std::filesystem::path &rootW, std::string_view path, bool allowMissingLast, std::filesystem::path *hostPath,
 		std::vector<std::string> *comps);
-	void ListInto(const std::wstring &dir, std::vector<EntryInfo> *entries) const;
+	void ListInto(const std::filesystem::path &dir, std::vector<EntryInfo> *entries) const;
 	void FillStat(const EntryInfo &e, SceIoStat *out) const;
 	s32 AllocHandle();
 	std::shared_ptr<OpenFile> GetFile(s32 fd);
 
 	std::filesystem::path root_;
-	std::wstring rootW_;  // "\\?\" form, no trailing separator
-	std::vector<std::wstring> fallbackW_;  // AddFallbackRoot, same form
+	std::vector<std::filesystem::path> fallbackRoots_;
 	HostFsOptions opt_;
 
 	std::mutex mutex_;
 	// Files the guest created in this session (not FAT): psplink's host0: shows those 0644, the
 	// files that were there already 0664 (io/file/file). Keys: lower-case host paths.
-	std::set<std::wstring> created_;
+	std::set<std::filesystem::path> created_;
 	mutable std::mutex createdMutex_;
-	bool Created(const std::wstring &hostPath) const;
-	void SetCreated(const std::wstring &hostPath, bool created);
+	bool Created(const std::filesystem::path &hostPath) const;
+	void SetCreated(const std::filesystem::path &hostPath, bool created);
 	std::map<s32, std::shared_ptr<OpenFile>> files_;
 	std::map<s32, std::shared_ptr<OpenDir>> dirs_;
 	s32 nextHandle_ = 1;

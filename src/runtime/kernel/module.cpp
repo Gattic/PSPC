@@ -1,7 +1,7 @@
 ﻿// SPDX-License-Identifier: GPL-2.0-or-later
 #include "runtime/kernel/module.h"
 
-#include <windows.h>
+#include "common/host.h"
 
 #include <algorithm>
 #include <filesystem>
@@ -54,20 +54,7 @@ bool RunDecryptTool(const std::vector<u8> &in, std::vector<u8> &out, std::string
 		if (err) *err = "cannot write decrypt input";
 		return false;
 	}
-	std::wstring cmd = L"\"" + fs::path(g_decryptTool).wstring() + L"\" prx \"" + inPath.wstring() + L"\" \"" +
-	                   cached.wstring() + L"\"";
-	STARTUPINFOW si{};
-	si.cb = sizeof(si);
-	PROCESS_INFORMATION pi{};
-	if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
-		if (err) *err = "failed to launch pspc-decrypt";
-		return false;
-	}
-	WaitForSingleObject(pi.hProcess, INFINITE);
-	DWORD code = 1;
-	GetExitCodeProcess(pi.hProcess, &code);
-	CloseHandle(pi.hProcess);
-	CloseHandle(pi.hThread);
+	int code = hostsys::RunProcess({g_decryptTool, "prx", PathToUtf8(inPath), PathToUtf8(cached)});
 	fs::remove(inPath, ec);
 	if (code != 0 || !ReadWholeFile(cached, out)) {
 		if (err) *err = code == 3 ? "pspc-decrypt has no key for this module" : "pspc-decrypt failed";
@@ -206,19 +193,19 @@ bool TryLoadAot(PspModule *m, const loader::ElfFile &elf, u32 *requiredBase) {
 		}
 	}
 	std::string hex = HexString(m->sha1.data(), m->sha1.size());
-	fs::path dllPath = fs::path(g_aotDir) / (hex + ".dll");
+	fs::path dllPath = fs::path(g_aotDir) / (hex + hostsys::ModuleSuffix);
 	if (!fs::exists(dllPath)) return false;
-	HMODULE h = LoadLibraryW(dllPath.wstring().c_str());
+	void *h = hostsys::OpenModule(dllPath);
 	if (!h) {
-		LOGW("AOT", "LoadLibrary(%s) failed: %lu", dllPath.string().c_str(), GetLastError());
+		LOGW("AOT", "Cannot load native module %s", dllPath.string().c_str());
 		return false;
 	}
-	auto entry = (PspcAotModuleFn)GetProcAddress(h, PSPC_AOT_ENTRY_NAME);
+	auto entry = (PspcAotModuleFn)hostsys::ModuleSymbol(h, PSPC_AOT_ENTRY_NAME);
 	const AotModuleDesc *desc = entry ? entry(cpu::AotApi()) : nullptr;
 	if (!desc || desc->abiVersion != PSPC_AOT_ABI_VERSION || desc->semVersion != PSPC_SEM_VERSION ||
 	    memcmp(desc->sha1, m->sha1.data(), 20) != 0) {
 		LOGW("AOT", "%s is stale or mismatched; ignoring", dllPath.string().c_str());
-		FreeLibrary(h);
+		hostsys::CloseModule(h);
 		return false;
 	}
 	m->dll = h;
@@ -230,7 +217,7 @@ bool TryLoadAot(PspModule *m, const loader::ElfFile &elf, u32 *requiredBase) {
 }
 
 void RegisterAotFunctions(PspModule *m) {
-	auto entry = (PspcAotModuleFn)GetProcAddress((HMODULE)m->dll, PSPC_AOT_ENTRY_NAME);
+	auto entry = (PspcAotModuleFn)hostsys::ModuleSymbol(m->dll, PSPC_AOT_ENTRY_NAME);
 	const AotModuleDesc *desc = entry(cpu::AotApi());
 	u32 delta = m->image.relocatable ? (m->image.lowAddr - desc->recompileBase) : 0;
 	*desc->delta = delta;
@@ -536,7 +523,7 @@ int UnloadModule(PspModule *m) {
 	if (m->status == MODULE_STATUS_STARTING || m->status == MODULE_STATUS_STOPPING) return (int)SCE_KERNEL_ERROR_MODULE_CANNOT_REMOVE;
 	dispatch::UnregisterRange(m->memAddr, m->memSize);
 	if (BlockAllocator *a = AllocatorForAddress(m->memAddr)) a->Free(m->memAddr);
-	if (m->dll) FreeLibrary((HMODULE)m->dll);
+	if (m->dll) hostsys::CloseModule(m->dll);
 	g_modules.erase(std::remove(g_modules.begin(), g_modules.end(), m->uid), g_modules.end());
 	Destroy(m->uid);
 	return 0;

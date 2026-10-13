@@ -55,16 +55,20 @@ void *av_malloc(size_t size) {
     void *ptr = NULL;
 
     // Some code requires av malloc to have an alignment of 32 at least. See #20155
+#ifdef _WIN32
     ptr = _aligned_malloc(size ? size : 1, 32);
-    if (!ptr && !size) {
-        // Compensate for platforms that don't allow zero-size allocations (not sure if this is actually an issue)
-        return av_malloc(1);
-    }
+#else
+    if (posix_memalign(&ptr, 32, size ? size : 1) != 0) return NULL;
+#endif
     return ptr;
 }
 
 void av_free(void *ptr) {
+#ifdef _WIN32
     _aligned_free(ptr);
+#else
+    free(ptr);
+#endif
 }
 
 void av_freep(void *arg) {

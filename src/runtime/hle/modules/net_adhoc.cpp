@@ -14,8 +14,7 @@
 // game mode synchronisation are ported from PPSSPP (Core/HLE/sceNetAdhoc.cpp, proAdhoc.cpp),
 // Copyright (c) 2013- PPSSPP Project, GPL-2.0-or-later, itself based on Coldbird's aemu.
 // PPSSPP's relay ("aemu postoffice") mode and UPnP are not ported.
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#include "net/socket.h"
 
 #include <algorithm>
 #include <array>
@@ -162,7 +161,7 @@ bool PtpPortInUse(u16 port, bool forListen, const u8 *dstMac = nullptr, u16 dstP
 	return false;
 }
 
-void SetBuffers(SOCKET s, u32 bufferSize) {
+void SetBuffers(hostnet::SocketHandle s, u32 bufferSize) {
 	int snd = std::max<int>((int)bufferSize * 5, 1024);
 	int rcv = std::max<int>((int)bufferSize * 10, 128);
 	setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char *)&snd, sizeof(snd));
@@ -175,7 +174,7 @@ u16 OpenBound(int type, u16 hostPort, u32 bufferSize, hostnet::Socket *out, int 
 	if (!out->Valid()) return 0;
 	SetBuffers(out->s, bufferSize);
 	if (type == SOCK_STREAM) {
-		BOOL on = TRUE;
+		int on = 1;
 		setsockopt(out->s, IPPROTO_TCP, TCP_NODELAY, (const char *)&on, sizeof(on));
 		// A PTP port may be listened on and connected from at once.
 		setsockopt(out->s, SOL_SOCKET, SO_REUSEADDR, (const char *)&on, sizeof(on));
@@ -185,13 +184,13 @@ u16 OpenBound(int type, u16 hostPort, u32 bufferSize, hostnet::Socket *out, int 
 	a.sin_addr.s_addr = LocalIp();
 	a.sin_port = htons(hostPort);
 	if (bind(out->s, (const sockaddr *)&a, sizeof(a)) != 0) {
-		*wsaError = WSAGetLastError();
+		*wsaError = hostnet::LastSocketError();
 		LOGW(LOG, "Cannot bind %s:%u (%d)", hostnet::Ipv4ToString(a.sin_addr.s_addr).c_str(), hostPort, *wsaError);
 		hostnet::CloseSocket(*out);
 		return 0;
 	}
 	int len = sizeof(a);
-	getsockname(out->s, (sockaddr *)&a, &len);
+	hostnet::GetSockName(out->s, (sockaddr *)&a, &len);
 	return ntohs(a.sin_port);
 }
 
@@ -209,7 +208,7 @@ void DeleteSocket(int id) {
 	if (!s) return;
 	net::AbortWaits(s->abortKey);
 	if (s->host.Valid()) {
-		shutdown(s->host.s, SD_RECEIVE);
+		shutdown(s->host.s, hostnet::ShutRead);
 		hostnet::CloseSocket(s->host);
 	}
 	net::HostSocketClosed();
@@ -237,10 +236,10 @@ int PdpTryRecv(AdhocSocket *s, u8 *mac, u16 *port, void *buf, int *len) {
 	for (int tries = 0; tries < 16; tries++) {
 		sockaddr_in from{};
 		int fromLen = sizeof(from);
-		int n = recvfrom(s->host.s, g_peek.data(), (int)g_peek.size(), MSG_PEEK, (sockaddr *)&from, &fromLen);
+		int n = hostnet::RecvFrom(s->host.s, g_peek.data(), (int)g_peek.size(), MSG_PEEK, (sockaddr *)&from, &fromLen);
 		if (n < 0) {
-			int e = WSAGetLastError();
-			if (e == WSAEWOULDBLOCK || e == WSAECONNRESET) return (int)SCE_NET_ADHOC_ERROR_WOULD_BLOCK;
+			int e = hostnet::LastSocketError();
+			if (e == hostnet::Error_EWOULDBLOCK || e == hostnet::Error_ECONNRESET) return (int)SCE_NET_ADHOC_ERROR_WOULD_BLOCK;
 			LOGD(LOG, "PDP recv error %d", e);
 			return (int)SCE_NET_ADHOC_ERROR_TIMEOUT;
 		}
@@ -248,7 +247,7 @@ int PdpTryRecv(AdhocSocket *s, u8 *mac, u16 *port, void *buf, int *len) {
 		if (!ResolveIp(from.sin_addr.s_addr, sender)) {
 			// Not from a member of the group: drop it.
 			fromLen = sizeof(from);
-			recvfrom(s->host.s, g_peek.data(), (int)g_peek.size(), 0, (sockaddr *)&from, &fromLen);
+			hostnet::RecvFrom(s->host.s, g_peek.data(), (int)g_peek.size(), 0, (sockaddr *)&from, &fromLen);
 			LOGD(LOG, "PDP: dropped %d bytes from unknown %s:%u", n, hostnet::Ipv4ToString(from.sin_addr.s_addr).c_str(), ntohs(from.sin_port));
 			continue;
 		}
@@ -261,7 +260,7 @@ int PdpTryRecv(AdhocSocket *s, u8 *mac, u16 *port, void *buf, int *len) {
 			return (int)SCE_NET_ADHOC_ERROR_NOT_ENOUGH_SPACE;
 		}
 		fromLen = sizeof(from);
-		n = recvfrom(s->host.s, (char *)buf, std::max(0, *len), 0, (sockaddr *)&from, &fromLen);
+		n = hostnet::RecvFrom(s->host.s, (char *)buf, std::max(0, *len), 0, (sockaddr *)&from, &fromLen);
 		if (n < 0) return (int)SCE_NET_ADHOC_ERROR_WOULD_BLOCK;
 		*len = n;
 		memcpy(mac, sender, 6);
@@ -289,7 +288,7 @@ int PdpCreate(u32 macAddr, int port, int bufferSize, u32 flag) {
 	int err = 0;
 	u16 bound = OpenBound(SOCK_DGRAM, HostPort(port), (u32)bufferSize, &sock->host, &err);
 	if (!bound) {
-		if (!sock->host.Valid() && err != WSAEADDRINUSE && err != WSAEACCES && err != WSAEADDRNOTAVAIL) return (int)ERROR_NET_NO_SPACE;
+		if (!sock->host.Valid() && err != hostnet::Error_EADDRINUSE && err != hostnet::Error_EACCES && err != hostnet::Error_EADDRNOTAVAIL) return (int)ERROR_NET_NO_SPACE;
 		return (int)SCE_NET_ADHOC_ERROR_PORT_NOT_AVAIL;
 	}
 	sock->type = SOCK_PDP;
@@ -316,8 +315,8 @@ int PdpSendTo(AdhocSocket *s, const PdpTarget &t, const void *data, int len, int
 	to.sin_family = AF_INET;
 	to.sin_addr.s_addr = t.ip;
 	to.sin_port = htons(t.port);
-	int n = sendto(s->host.s, (const char *)data, len, 0, (const sockaddr *)&to, sizeof(to));
-	*wsaError = n < 0 ? WSAGetLastError() : 0;
+	int n = hostnet::SendTo(s->host.s, (const char *)data, len, 0, (const sockaddr *)&to, sizeof(to));
+	*wsaError = n < 0 ? hostnet::LastSocketError() : 0;
 	return n;
 }
 
@@ -359,7 +358,7 @@ int sceNetAdhocPdpSend(int id, u32 macAddr, u32 port, u32 dataAddr, int len, u32
 		for (auto it = targets.begin(); it != targets.end();) {
 			int e = 0;
 			int n = PdpSendTo(s, *it, data, len, &e);
-			if (n >= 0 || e != WSAEWOULDBLOCK) {
+			if (n >= 0 || e != hostnet::Error_EWOULDBLOCK) {
 				if (n < 0) LOGD(LOG, "PDP send error %d", e);
 				it = targets.erase(it);
 			} else {
@@ -458,14 +457,14 @@ ConnectProgress ConnectStep(AdhocSocket *s) {
 		to.sin_addr.s_addr = ip;
 		to.sin_port = htons(HostPort(s->pport));
 		int r = connect(s->host.s, (const sockaddr *)&to, sizeof(to));
-		int e = r == 0 ? 0 : WSAGetLastError();
+		int e = r == 0 ? 0 : hostnet::LastSocketError();
 		s->attemptCount++;
 		s->lastAttempt = s->internalLastAttempt = sched::NowUs();
-		if (r == 0 || e == WSAEISCONN) {
+		if (r == 0 || e == hostnet::Error_EISCONN) {
 			s->state = PTP_ESTABLISHED;
 			return CONNECT_DONE;
 		}
-		if (e == WSAEWOULDBLOCK || e == WSAEINPROGRESS || e == WSAEALREADY || e == WSAEINVAL) {
+		if (e == hostnet::Error_EWOULDBLOCK || e == hostnet::Error_EINPROGRESS || e == hostnet::Error_EALREADY || e == hostnet::Error_EINVAL) {
 			s->state = PTP_SYN_SENT;
 			return CONNECT_PENDING;
 		}
@@ -479,7 +478,7 @@ ConnectProgress ConnectStep(AdhocSocket *s) {
 		if (r.write) {
 			sockaddr_in peer{};
 			int len = sizeof(peer);
-			if (getpeername(s->host.s, (sockaddr *)&peer, &len) == 0) {
+			if (hostnet::GetPeerName(s->host.s, (sockaddr *)&peer, &len) == 0) {
 				s->state = PTP_ESTABLISHED;
 				LOGI(LOG, "PTP connection established to %s:%u", hostnet::Ipv4ToString(peer.sin_addr.s_addr).c_str(), ntohs(peer.sin_port));
 				return CONNECT_DONE;
@@ -587,10 +586,10 @@ int sceNetAdhocPtpListen(u32 srcMacAddr, int sport, int bufsize, int rexmtInt, i
 	auto sock = std::make_unique<AdhocSocket>();
 	int err = 0;
 	u16 bound = OpenBound(SOCK_STREAM, HostPort(sport), (u32)bufsize, &sock->host, &err);
-	if (!bound) return sock->host.Valid() || err == WSAEADDRINUSE || err == WSAEACCES ? (int)SCE_NET_ADHOC_ERROR_PORT_NOT_AVAIL
+	if (!bound) return sock->host.Valid() || err == hostnet::Error_EADDRINUSE || err == hostnet::Error_EACCES ? (int)SCE_NET_ADHOC_ERROR_PORT_NOT_AVAIL
 	                                                                                   : (int)SCE_NET_ADHOC_ERROR_SOCKET_ID_NOT_AVAIL;
 	if (listen(sock->host.s, backlog) != 0) {
-		LOGW(LOG, "listen failed (%d)", WSAGetLastError());
+		LOGW(LOG, "listen failed (%d)", hostnet::LastSocketError());
 		hostnet::CloseSocket(sock->host);
 		return (int)SCE_NET_ADHOC_ERROR_PORT_NOT_AVAIL;
 	}
@@ -618,28 +617,28 @@ int AcceptOne(int listenId, AdhocSocket *ls, u32 macAddr, u32 portAddr, bool *go
 	*gotOne = false;
 	sockaddr_in peer{};
 	int len = sizeof(peer);
-	SOCKET ns = accept(ls->host.s, (sockaddr *)&peer, &len);
-	if (ns == INVALID_SOCKET) return 0;
+	hostnet::SocketHandle ns = hostnet::Accept(ls->host.s, (sockaddr *)&peer, &len);
+	if (ns == hostnet::InvalidSocket) return 0;
 	*gotOne = true;
 	u8 mac[6];
 	if (!ResolveIp(peer.sin_addr.s_addr, mac)) {
 		LOGW(LOG, "PTP %d: connection from unknown %s:%u refused", listenId, hostnet::Ipv4ToString(peer.sin_addr.s_addr).c_str(),
 		     ntohs(peer.sin_port));
-		closesocket(ns);
+		hostnet::CloseSocketHandle(ns);
 		return 0;
 	}
 	auto sock = std::make_unique<AdhocSocket>();
 	int err = 0;
 	if (!hostnet::AdoptSocket(ns, &sock->host, &err)) {
-		closesocket(ns);
+		hostnet::CloseSocketHandle(ns);
 		return 0;
 	}
-	BOOL on = TRUE;
+	int on = 1;
 	setsockopt(ns, IPPROTO_TCP, TCP_NODELAY, (const char *)&on, sizeof(on));
 	SetBuffers(ns, ls->bufferSize);
 	sockaddr_in local{};
 	len = sizeof(local);
-	getsockname(ns, (sockaddr *)&local, &len);
+	hostnet::GetSockName(ns, (sockaddr *)&local, &len);
 	sock->type = SOCK_PTP;
 	sock->nonblocking = ls->nonblocking;
 	sock->attemptCount = 1;  // a closed state now means "disconnected", not "not connected yet"
@@ -698,7 +697,7 @@ int sceNetAdhocPtpAccept(int id, u32 macAddr, u32 portAddr, int timeout, int fla
 // Inside a send / receive loop a closed state means "connecting again" (ConnectStep after a refusal).
 bool ConnectPending(AdhocSocket *s, int e) {
 	return (s->state == PTP_SYN_SENT || s->state == PTP_CLOSED) &&
-	       (e == WSAENOTCONN || e == WSAEWOULDBLOCK || e == WSAEINPROGRESS || e == WSAEALREADY || e == WSAEINVAL);
+	       (e == hostnet::Error_ENOTCONN || e == hostnet::Error_EWOULDBLOCK || e == hostnet::Error_EINPROGRESS || e == hostnet::Error_EALREADY || e == hostnet::Error_EINVAL);
 }
 
 int sceNetAdhocPtpSend(int id, u32 dataAddr, u32 sizeAddr, int timeout, int flag) {
@@ -718,15 +717,15 @@ int sceNetAdhocPtpSend(int id, u32 dataAddr, u32 sizeAddr, int timeout, int flag
 	u64 deadline = Deadline((u32)timeout);
 	for (;;) {
 		if (s->state == PTP_SYN_SENT || s->state == PTP_CLOSED) ConnectStep(s);
-		int n = send(s->host.s, (const char *)GPtr(dataAddr), len, 0);
+		int n = hostnet::Send(s->host.s, (const char *)GPtr(dataAddr), len, 0);
 		if (n > 0) {
 			sched::ChargeUs(50);
 			GWrite32(sizeAddr, (u32)n);
 			if (s->state == PTP_SYN_SENT) s->state = PTP_ESTABLISHED;
 			return 0;
 		}
-		int e = n < 0 ? WSAGetLastError() : 0;
-		if (!(n < 0 && (e == WSAEWOULDBLOCK || ConnectPending(s, e)))) {
+		int e = n < 0 ? hostnet::LastSocketError() : 0;
+		if (!(n < 0 && (e == hostnet::Error_EWOULDBLOCK || ConnectPending(s, e)))) {
 			LOGD(LOG, "PTP %d send error %d: disconnected", id, e);
 			s->state = PTP_CLOSED;
 			return (int)SCE_NET_ADHOC_ERROR_DISCONNECTED;
@@ -768,8 +767,8 @@ int sceNetAdhocPtpRecv(int id, u32 dataAddr, u32 sizeAddr, int timeout, int flag
 			sched::ChargeUs(50);
 			return 0;
 		}
-		int e = n < 0 ? WSAGetLastError() : 0;
-		if (!(n < 0 && (e == WSAEWOULDBLOCK || ConnectPending(s, e)))) {
+		int e = n < 0 ? hostnet::LastSocketError() : 0;
+		if (!(n < 0 && (e == hostnet::Error_EWOULDBLOCK || ConnectPending(s, e)))) {
 			// End of stream or a broken connection.
 			LOGD(LOG, "PTP %d recv: %s (%d)", id, n == 0 ? "closed by the peer" : "error", e);
 			s->state = PTP_CLOSED;
@@ -893,7 +892,7 @@ int sceNetAdhocPollSocket(u32 sdsAddr, int count, int timeout, int nonblock) {
 		writeBack();
 		if (r > 0) return r;
 		if (Expired(deadline)) return r < 0 ? (int)SCE_NET_ADHOC_ERROR_EXCEPTION_EVENT : r;
-		std::vector<WSAEVENT> evs;
+		std::vector<hostnet::EventHandle> evs;
 		bool wantConnect = false;
 		for (auto &sd : sds) {
 			if (AdhocSocket *s = GetSocket(sd.id)) {
@@ -913,7 +912,7 @@ u32 RecvQueued(AdhocSocket *s) {
 	if (n == 0) {
 		// FIONREAD can read 0 while there is data; peek.
 		int r = s->type == SOCK_PTP ? recv(s->host.s, g_peek.data(), (int)std::min<u32>((u32)g_peek.size(), s->bufferSize), MSG_PEEK)
-		                            : recvfrom(s->host.s, g_peek.data(), (int)std::min<u32>((u32)g_peek.size(), s->bufferSize), MSG_PEEK, nullptr, nullptr);
+		                            : hostnet::RecvFrom(s->host.s, g_peek.data(), (int)std::min<u32>((u32)g_peek.size(), s->bufferSize), MSG_PEEK, nullptr, nullptr);
 		if (r > 0) n = (u32)r;
 	}
 	return n;
@@ -1392,7 +1391,7 @@ int PdpSendInternal(int id, const u8 *mac, u16 port, const void *data, int len) 
 	if (!ResolveMac(mac, &ip)) return 0;  // unknown peer: faked success, like the HLE call
 	int e = 0;
 	int n = PdpSendTo(s, PdpTarget{ip, HostPort(port)}, data, len, &e);
-	if (n < 0 && e == WSAEWOULDBLOCK) return (int)SCE_NET_ADHOC_ERROR_WOULD_BLOCK;
+	if (n < 0 && e == hostnet::Error_EWOULDBLOCK) return (int)SCE_NET_ADHOC_ERROR_WOULD_BLOCK;
 	return 0;
 }
 
@@ -1425,9 +1424,9 @@ bool PdpReadable(int id) {
 	return s && hostnet::CheckReady(s->host.s, &r) && r.read;
 }
 
-WSAEVENT SocketEvent(int id) {
+hostnet::EventHandle SocketEvent(int id) {
 	AdhocSocket *s = GetSocket(id);
-	return s ? s->host.ev : WSA_INVALID_EVENT;
+	return s ? s->host.ev : hostnet::InvalidEvent;
 }
 
 int SetSocketAlertInternal(int id, s32 flags) {

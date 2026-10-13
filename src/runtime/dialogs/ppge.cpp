@@ -3,7 +3,12 @@
 // (Core/Util/PPGeDraw.cpp), Copyright (c) 2012- PPSSPP Project, GPL-2.0-or-later. See ppge.h.
 #include "runtime/dialogs/ppge.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <ft2build.h>
+#include FT_FREETYPE_H
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -17,6 +22,11 @@
 #include "runtime/hle/modules/font_pgf.h"
 #include "runtime/host/host.h"
 #include "runtime/io/io.h"
+
+#ifndef _WIN32
+// fontconfig exposes POSIX stat macros; include it after the PSP's stat layout declarations.
+#include <fontconfig/fontconfig.h>
+#endif
 
 namespace ppge {
 
@@ -42,6 +52,7 @@ struct GlyphImg {
 
 // Characters from a Windows font: the fallback when the firmware fonts aren't installed, and for
 // the few characters they lack.
+#ifdef _WIN32
 class GdiFont {
 public:
 	~GdiFont() {
@@ -97,6 +108,54 @@ private:
 	float ascent_ = 15, descent_ = 4;
 };
 
+#else
+class GdiFont {
+public:
+	~GdiFont() {
+		if (face_) FT_Done_Face(face_);
+		if (library_) FT_Done_FreeType(library_);
+	}
+	bool Init(int emPx) {
+		if (FT_Init_FreeType(&library_)) return false;
+		FcPattern *pattern = FcNameParse((const FcChar8 *)"sans:weight=demibold");
+		if (!pattern) return false;
+		FcConfigSubstitute(nullptr, pattern, FcMatchPattern);
+		FcDefaultSubstitute(pattern);
+		FcResult result;
+		FcPattern *match = FcFontMatch(nullptr, pattern, &result);
+		FcPatternDestroy(pattern);
+		if (!match) return false;
+		FcChar8 *file = nullptr;
+		int index = 0;
+		FcPatternGetInteger(match, FC_INDEX, 0, &index);
+		bool ok = FcPatternGetString(match, FC_FILE, 0, &file) == FcResultMatch &&
+		          FT_New_Face(library_, (const char *)file, index, &face_) == 0;
+		FcPatternDestroy(match);
+		return ok && FT_Set_Pixel_Sizes(face_, 0, emPx) == 0;
+	}
+	bool Valid() const { return face_ != nullptr; }
+	float Ascent() const { return face_ ? face_->size->metrics.ascender / 64.0f : 15; }
+	float Descent() const { return face_ ? -face_->size->metrics.descender / 64.0f : 4; }
+	bool Render(u32 code, GlyphImg &out) {
+		if (!face_ || !FT_Get_Char_Index(face_, code) || FT_Load_Char(face_, code, FT_LOAD_RENDER | FT_LOAD_TARGET_NORMAL)) return false;
+		auto *g = face_->glyph;
+		out = {};
+		out.w = g->bitmap.width; out.h = g->bitmap.rows;
+		out.left = g->bitmap_left; out.top = g->bitmap_top; out.adv = g->advance.x / 64.0f;
+		out.alpha.resize((size_t)out.w * out.h);
+		for (int y = 0; y < out.h; ++y) {
+			const u8 *row = g->bitmap.buffer + (g->bitmap.pitch < 0 ? out.h - 1 - y : y) * std::abs(g->bitmap.pitch);
+			for (int x = 0; x < out.w; ++x)
+				out.alpha[(size_t)y * out.w + x] = g->bitmap.pixel_mode == FT_PIXEL_MODE_MONO ? ((row[x / 8] >> (7 - x % 8)) & 1) * 255 : row[x];
+		}
+		return true;
+	}
+private:
+	FT_Library library_ = nullptr;
+	FT_Face face_ = nullptr;
+};
+#endif
+
 class FontSet {
 public:
 	const GlyphImg *Get(u32 code) {
@@ -141,7 +200,7 @@ private:
 		// The PGF fonts are 18 px to the em.
 		gdi_.Init(18);
 		if (pgf_.empty()) {
-			LOGW("PPGE", "no firmware fonts in flash0:/font; the dialogs use a Windows font");
+			LOGW("PPGE", "no firmware fonts in flash0:/font; the dialogs use a host font");
 			ascend_ = gdi_.Ascent();
 			height_ = (gdi_.Ascent() + gdi_.Descent()) * kLineSpacing;
 		}

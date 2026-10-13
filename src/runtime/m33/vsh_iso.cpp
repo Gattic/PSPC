@@ -6,7 +6,8 @@
 // folder holds a virtual EBOOT.PBP. Our own code, written from the behaviour description.
 #include "runtime/m33/vsh_iso.h"
 
-#include <windows.h>
+#include "common/host.h"
+#include "common/host_file.h"
 
 #include <algorithm>
 #include <cstring>
@@ -119,26 +120,26 @@ std::vector<std::filesystem::path> g_extraDirs;
 
 vfs::SceIoStat HostFileStat(const std::filesystem::path &p) {
 	vfs::SceIoStat st{};
-	WIN32_FILE_ATTRIBUTE_DATA d;
-	if (!GetFileAttributesExW(p.wstring().c_str(), GetFileExInfoStandard, &d)) return st;
+	hostfile::Info info;
+	std::error_code ec;
+	if (!hostfile::Stat(p, info, ec)) return st;
 	st.st_mode = (s32)(vfs::FIO_S_IFREG | 0777);
 	st.st_attr = vfs::FIO_SO_IFREG;
-	st.st_size = (s64)(((u64)d.nFileSizeHigh << 32) | d.nFileSizeLow);
-	auto conv = [](const FILETIME &ft, vfs::ScePspDateTime *out) {
-		SYSTEMTIME t;
-		FILETIME local;
-		if (!FileTimeToLocalFileTime(&ft, &local) || !FileTimeToSystemTime(&local, &t)) return;
-		out->year = t.wYear;
-		out->month = t.wMonth;
-		out->day = t.wDay;
-		out->hour = t.wHour;
-		out->minute = t.wMinute;
-		out->second = t.wSecond;
-		out->microsecond = (u32)t.wMilliseconds * 1000;
+	st.st_size = (s64)info.size;
+	auto conv = [](s64 us, vfs::ScePspDateTime *out) {
+		std::tm t{};
+		if (!hostsys::LocalTime(us / 1000000, t)) return;
+		out->year = t.tm_year + 1900;
+		out->month = t.tm_mon + 1;
+		out->day = t.tm_mday;
+		out->hour = t.tm_hour;
+		out->minute = t.tm_min;
+		out->second = t.tm_sec;
+		out->microsecond = (u32)((us % 1000000 + 1000000) % 1000000);
 	};
-	conv(d.ftCreationTime, &st.st_ctime);
-	conv(d.ftLastAccessTime, &st.st_atime);
-	conv(d.ftLastWriteTime, &st.st_mtime);
+	conv(info.created, &st.st_ctime);
+	conv(info.accessed, &st.st_atime);
+	conv(info.modified, &st.st_mtime);
 	return st;
 }
 
@@ -168,9 +169,8 @@ public:
 			if (r == 0) return inner_->Open(path, flags, mode);
 			if (r < 0) return r;
 			if ((flags & vfs::PSP_O_WRONLY) || (flags & (vfs::PSP_O_CREAT | vfs::PSP_O_TRUNC))) return vfs::SCE_ERRNO_EACCES;
-			HANDLE h = CreateFileW(host.wstring().c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-			                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-			if (h == INVALID_HANDLE_VALUE) return vfs::SCE_ERRNO_ENOENT;
+			FILE *h = hostfile::Open(host, true, false, false, false);
+			if (!h) return vfs::SCE_ERRNO_ENOENT;
 			std::lock_guard<std::mutex> lock(mu_);
 			s32 fd = next_++;
 			files_[fd] = VFile{-1, 0, flags, h};
@@ -191,7 +191,7 @@ public:
 		std::lock_guard<std::mutex> lock(mu_);
 		auto it = files_.find(fd);
 		if (it == files_.end()) return vfs::SCE_KERNEL_ERROR_BADF;
-		if (it->second.host) CloseHandle(it->second.host);
+		if (it->second.host) fclose(it->second.host);
 		files_.erase(it);
 		return 0;
 	}
@@ -202,9 +202,8 @@ public:
 		auto it = files_.find(fd);
 		if (it == files_.end()) return vfs::SCE_KERNEL_ERROR_BADF;
 		if (it->second.host) {
-			DWORD got = 0;
-			if (!ReadFile(it->second.host, buf, (DWORD)std::min<u64>(size, 0x7FFFFFFF), &got, nullptr)) return vfs::SCE_ERRNO_EIO;
-			return (s64)got;
+			size_t got = fread(buf, 1, (size_t)size, it->second.host);
+			return !got && ferror(it->second.host) ? vfs::SCE_ERRNO_EIO : (s64)got;
 		}
 		const std::vector<u8> &pbp = images_[it->second.image].pbp;
 		u64 pos = it->second.pos;
@@ -225,11 +224,8 @@ public:
 		auto it = files_.find(fd);
 		if (it == files_.end()) return vfs::SCE_KERNEL_ERROR_BADF;
 		if (it->second.host) {
-			LARGE_INTEGER to, now;
-			to.QuadPart = offset;
-			if (!SetFilePointerEx(it->second.host, to, &now, whence == 1 ? FILE_CURRENT : whence == 2 ? FILE_END : FILE_BEGIN))
-				return -1;
-			return now.QuadPart;
+			if (hostfile::Seek(it->second.host, offset, whence == 1 ? SEEK_CUR : whence == 2 ? SEEK_END : SEEK_SET)) return -1;
+			return hostfile::Tell(it->second.host);
 		}
 		s64 base = whence == 1 ? (s64)it->second.pos : whence == 2 ? (s64)images_[it->second.image].pbp.size() : 0;
 		if (base + offset < 0) return -1;
@@ -245,11 +241,12 @@ public:
 		*out = vfs::HandleInfo();
 		out->flags = it->second.flags;
 		if (it->second.host) {
-			LARGE_INTEGER size{}, zero{}, pos{};
-			GetFileSizeEx(it->second.host, &size);
-			SetFilePointerEx(it->second.host, zero, &pos, FILE_CURRENT);
-			out->size = (u64)size.QuadPart;
-			out->position = (u64)pos.QuadPart;
+			s64 pos = hostfile::Tell(it->second.host);
+			if (pos < 0 || hostfile::Seek(it->second.host, 0, SEEK_END)) return vfs::SCE_ERRNO_EIO;
+			s64 size = hostfile::Tell(it->second.host);
+			if (size < 0 || hostfile::Seek(it->second.host, pos, SEEK_SET)) return vfs::SCE_ERRNO_EIO;
+			out->size = (u64)size;
+			out->position = (u64)pos;
 			return 0;
 		}
 		out->size = images_[it->second.image].pbp.size();
@@ -492,7 +489,7 @@ private:
 		int image;  // -1: a file of a Games folder game (host)
 		u64 pos;
 		u32 flags;
-		HANDLE host = nullptr;
+		FILE *host = nullptr;
 	};
 
 	const PbpGame *FindPbp(const std::string &name) const {

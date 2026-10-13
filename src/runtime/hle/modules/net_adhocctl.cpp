@@ -24,8 +24,7 @@
 // Behaviour ported from PPSSPP (Core/HLE/sceNetAdhoc.cpp, proAdhoc.cpp: friendFinder, __AdhocctlNotify,
 // __NetTriggerCallbacks, NetAdhocctl_*), Copyright (c) 2013- PPSSPP Project, GPL-2.0-or-later,
 // itself based on Coldbird's aemu.
-#include <winsock2.h>
-#include <windows.h>
+#include "net/socket.h"
 
 #include <algorithm>
 #include <atomic>
@@ -39,6 +38,7 @@
 
 #include "allegrex/guestmem.h"
 #include "common/log.h"
+#include "common/host.h"
 #include "runtime/core/memory.h"
 #include "runtime/hle/hle_wrap.h"
 #include "runtime/hle/modules/net_adhoc_internal.h"
@@ -183,8 +183,8 @@ struct LinkShared {
 	std::deque<Outgoing> queue;
 	bool loginRequested = false;
 	std::atomic<bool> stop{false};
-	HANDLE wake = nullptr;
-	HANDLE done = nullptr;  // set when the thread has ended
+	hostnet::EventHandle wake = nullptr;
+	hostnet::EventHandle done = nullptr;  // set when the thread has ended
 	// Fixed at start.
 	u32 gen = 0;
 	std::string host;
@@ -193,8 +193,8 @@ struct LinkShared {
 	LoginC2S login{};
 
 	~LinkShared() {
-		if (wake) CloseHandle(wake);
-		if (done) CloseHandle(done);
+		if (wake) hostnet::CloseEvent(wake);
+		if (done) hostnet::CloseEvent(done);
 	}
 };
 
@@ -212,10 +212,10 @@ void Post(LinkShared &sh, std::function<void()> fn) {
 }
 
 // Waits on the link's wake event and (optionally) the socket's event. Returns false if stopping.
-bool LinkWait(LinkShared &sh, WSAEVENT sockEv, DWORD ms) {
-	HANDLE hs[2] = {sh.wake, sockEv};
-	WaitForMultipleObjects(sockEv != WSA_INVALID_EVENT ? 2 : 1, hs, FALSE, ms);
-	if (sockEv != WSA_INVALID_EVENT) WSAResetEvent(sockEv);
+bool LinkWait(LinkShared &sh, hostnet::EventHandle sockEv, int ms) {
+	hostnet::EventHandle hs[2] = {sh.wake, sockEv};
+	hostnet::WaitEvents(hs, sockEv != hostnet::InvalidEvent ? 2 : 1, ms);
+	if (sockEv != hostnet::InvalidEvent) hostnet::ResetEvent(sockEv);
 	return !sh.stop;
 }
 
@@ -234,7 +234,7 @@ hostnet::Socket LinkConnect(LinkShared &sh, u32 *localIp, std::string *why) {
 		*why = "socket failed (" + std::to_string(err) + ")";
 		return sock;
 	}
-	BOOL on = TRUE;
+	int on = 1;
 	setsockopt(sock.s, IPPROTO_TCP, TCP_NODELAY, (const char *)&on, sizeof(on));
 	setsockopt(sock.s, SOL_SOCKET, SO_KEEPALIVE, (const char *)&on, sizeof(on));
 	if (sh.bindIp) {
@@ -242,7 +242,7 @@ hostnet::Socket LinkConnect(LinkShared &sh, u32 *localIp, std::string *why) {
 		local.sin_family = AF_INET;
 		local.sin_addr.s_addr = sh.bindIp;
 		if (bind(sock.s, (const sockaddr *)&local, sizeof(local)) != 0) {
-			*why = "cannot bind " + hostnet::Ipv4ToString(sh.bindIp) + " (" + std::to_string(WSAGetLastError()) + ")";
+			*why = "cannot bind " + hostnet::Ipv4ToString(sh.bindIp) + " (" + std::to_string(hostnet::LastSocketError()) + ")";
 			hostnet::CloseSocket(sock);
 			return sock;
 		}
@@ -251,12 +251,12 @@ hostnet::Socket LinkConnect(LinkShared &sh, u32 *localIp, std::string *why) {
 	srv.sin_family = AF_INET;
 	srv.sin_addr.s_addr = addr;
 	srv.sin_port = htons(sh.port);
-	if (connect(sock.s, (const sockaddr *)&srv, sizeof(srv)) != 0 && WSAGetLastError() != WSAEWOULDBLOCK) {
-		*why = "connect failed (" + std::to_string(WSAGetLastError()) + ")";
+	if (connect(sock.s, (const sockaddr *)&srv, sizeof(srv)) != 0 && hostnet::LastSocketError() != hostnet::Error_EWOULDBLOCK) {
+		*why = "connect failed (" + std::to_string(hostnet::LastSocketError()) + ")";
 		hostnet::CloseSocket(sock);
 		return sock;
 	}
-	u64 start = GetTickCount64();
+	u64 start = (hostsys::MonotonicUs() / 1000);
 	for (;;) {
 		hostnet::Readiness r;
 		if (!hostnet::CheckReady(sock.s, &r) || r.except) {
@@ -266,7 +266,7 @@ hostnet::Socket LinkConnect(LinkShared &sh, u32 *localIp, std::string *why) {
 			return sock;
 		}
 		if (r.write) break;
-		if (GetTickCount64() - start > kConnectTimeoutMs) {
+		if ((hostsys::MonotonicUs() / 1000) - start > kConnectTimeoutMs) {
 			*why = "connecting to " + hostnet::Ipv4ToString(addr) + ":" + std::to_string(sh.port) + " timed out";
 			hostnet::CloseSocket(sock);
 			return sock;
@@ -278,20 +278,20 @@ hostnet::Socket LinkConnect(LinkShared &sh, u32 *localIp, std::string *why) {
 	}
 	sockaddr_in me{};
 	int len = sizeof(me);
-	getsockname(sock.s, (sockaddr *)&me, &len);
+	hostnet::GetSockName(sock.s, (sockaddr *)&me, &len);
 	*localIp = me.sin_addr.s_addr;
 	// The login packet is the first thing the server expects.
 	const char *p = (const char *)&sh.login;
 	size_t left = sizeof(sh.login);
-	start = GetTickCount64();
+	start = (hostsys::MonotonicUs() / 1000);
 	while (left) {
-		int n = send(sock.s, p, (int)left, 0);
+		int n = hostnet::Send(sock.s, p, (int)left, 0);
 		if (n > 0) {
 			p += n;
 			left -= (size_t)n;
 			continue;
 		}
-		if (WSAGetLastError() != WSAEWOULDBLOCK || GetTickCount64() - start > kConnectTimeoutMs || !LinkWait(sh, sock.ev, 20)) {
+		if (hostnet::LastSocketError() != hostnet::Error_EWOULDBLOCK || (hostsys::MonotonicUs() / 1000) - start > kConnectTimeoutMs || !LinkWait(sh, sock.ev, 20)) {
 			*why = "cannot send the login";
 			hostnet::CloseSocket(sock);
 			return sock;
@@ -328,20 +328,20 @@ void LinkThread(std::shared_ptr<LinkShared> sh) {
 			connected = sock.Valid();
 			if (connected) {
 				LOGI(LOG, "Connected to the ad hoc server %s:%u from %s", sh->host.c_str(), sh->port, hostnet::Ipv4ToString(localIp).c_str());
-				lastPing = GetTickCount64();
+				lastPing = (hostsys::MonotonicUs() / 1000);
 			} else {
 				LOGW(LOG, "Ad hoc server %s:%u: %s", sh->host.c_str(), sh->port, why.c_str());
 			}
 			bool ok = connected;
 			Post(*sh, [gen, ok, localIp] { OnLinkLogin(gen, ok, localIp); });
 		}
-		DWORD waitMs = 100;
+		int waitMs = 100;
 		if (connected) {
-			u64 now = GetTickCount64();
+			u64 now = (hostsys::MonotonicUs() / 1000);
 			if (now - lastPing >= kPingIntervalMs) {
 				u8 ping = OPCODE_PING;
-				if (send(sock.s, (const char *)&ping, 1, 0) == 1) lastPing = now;
-				else if (WSAGetLastError() != WSAEWOULDBLOCK) {
+				if (hostnet::Send(sock.s, (const char *)&ping, 1, 0) == 1) lastPing = now;
+				else if (hostnet::LastSocketError() != hostnet::Error_EWOULDBLOCK) {
 					lost("ping failed");
 					continue;
 				}
@@ -355,9 +355,9 @@ void LinkThread(std::shared_ptr<LinkShared> sh) {
 					if (sh->queue.empty()) break;
 					out = sh->queue.front();
 				}
-				int n = send(sock.s, out.bytes.data(), (int)out.bytes.size(), 0);
-				int e = n < 0 ? WSAGetLastError() : 0;
-				if (n < 0 && e == WSAEWOULDBLOCK) break;
+				int n = hostnet::Send(sock.s, out.bytes.data(), (int)out.bytes.size(), 0);
+				int e = n < 0 ? hostnet::LastSocketError() : 0;
+				if (n < 0 && e == hostnet::Error_EWOULDBLOCK) break;
 				{
 					std::lock_guard<std::mutex> l(sh->mu);
 					if (!sh->queue.empty() && sh->queue.front().reqId == out.reqId && sh->queue.front().bytes == out.bytes) {
@@ -387,7 +387,7 @@ void LinkThread(std::shared_ptr<LinkShared> sh) {
 					rx.append(buf, (size_t)n);
 					continue;
 				}
-				if (n < 0 && WSAGetLastError() == WSAEWOULDBLOCK) break;
+				if (n < 0 && hostnet::LastSocketError() == hostnet::Error_EWOULDBLOCK) break;
 				broken = true;
 				break;
 			}
@@ -408,20 +408,20 @@ void LinkThread(std::shared_ptr<LinkShared> sh) {
 				lost("closed by the server");
 				continue;
 			}
-			u64 sincePing = GetTickCount64() - lastPing;
-			waitMs = (DWORD)std::min<u64>(100, sincePing >= kPingIntervalMs ? 1 : kPingIntervalMs - sincePing);
+			u64 sincePing = (hostsys::MonotonicUs() / 1000) - lastPing;
+			waitMs = (int)std::min<u64>(100, sincePing >= kPingIntervalMs ? 1 : kPingIntervalMs - sincePing);
 		}
-		LinkWait(*sh, connected ? sock.ev : WSA_INVALID_EVENT, waitMs);
+		LinkWait(*sh, connected ? sock.ev : hostnet::InvalidEvent, waitMs);
 	}
 	if (connected) {
 		// Last requests (a DISCONNECT from sceNetAdhocctlTerm), best effort.
 		std::lock_guard<std::mutex> l(sh->mu);
-		for (auto &out : sh->queue) send(sock.s, out.bytes.data(), (int)out.bytes.size(), 0);
+		for (auto &out : sh->queue) hostnet::Send(sock.s, out.bytes.data(), (int)out.bytes.size(), 0);
 		sh->queue.clear();
-		shutdown(sock.s, SD_BOTH);
+		shutdown(sock.s, hostnet::ShutBoth);
 	}
 	hostnet::CloseSocket(sock);
-	SetEvent(sh->done);
+	hostnet::SignalEvent(sh->done);
 }
 
 void LinkSend(std::string bytes, u32 reqId) {
@@ -430,7 +430,7 @@ void LinkSend(std::string bytes, u32 reqId) {
 		std::lock_guard<std::mutex> l(g_link->mu);
 		g_link->queue.push_back(Outgoing{std::move(bytes), reqId});
 	}
-	SetEvent(g_link->wake);
+	hostnet::SignalEvent(g_link->wake);
 }
 
 // Drops a request that hasn't been written yet (its caller gave up).
@@ -448,7 +448,7 @@ void LinkRequestLogin() {
 		std::lock_guard<std::mutex> l(g_link->mu);
 		g_link->loginRequested = true;
 	}
-	SetEvent(g_link->wake);
+	hostnet::SignalEvent(g_link->wake);
 }
 
 void ParseServer(const std::string &server, std::string *host, u16 *port) {
@@ -476,8 +476,8 @@ bool IsLoopbackHost(const std::string &host) {
 
 void StartLink() {
 	auto sh = std::make_shared<LinkShared>();
-	sh->wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-	sh->done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+	sh->wake = hostnet::NewEvent();
+	sh->done = hostnet::NewEvent(true);
 	sh->gen = g_nextLinkGen++;
 	ParseServer(net::CurrentConfig().adhocServer, &sh->host, &sh->port);
 	g_localServer = IsLoopbackHost(sh->host);
@@ -505,8 +505,8 @@ void StartLink() {
 		std::atexit([] {
 			if (auto link = g_link) {
 				link->stop = true;
-				SetEvent(link->wake);
-				WaitForSingleObject(link->done, 500);
+				hostnet::SignalEvent(link->wake);
+				hostnet::WaitEvents(&link->done, 1, 500);
 			}
 		});
 		atExitRegistered = true;
@@ -517,7 +517,7 @@ void StartLink() {
 void StopLink() {
 	if (!g_link) return;
 	g_link->stop = true;
-	SetEvent(g_link->wake);
+	hostnet::SignalEvent(g_link->wake);
 	g_link.reset();  // the thread keeps its own reference and ends by itself
 	g_serverConnected = false;
 }

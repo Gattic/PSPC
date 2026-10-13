@@ -7,7 +7,9 @@
 // Frames come from the emulation thread (PresentFrame) and are shown with an SDL renderer, unless a GPU
 // renderer presents them to the window itself (SetFramePresenter, Config::gpuPresent).
 #include <SDL.h>
+#ifdef _WIN32
 #include <SDL_syswm.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -20,6 +22,7 @@
 
 #include "common/fileutil.h"
 #include "common/log.h"
+#include "common/host.h"
 #include "common/settings.h"
 #include "runtime/host/host.h"
 
@@ -29,7 +32,8 @@ namespace {
 
 bool g_headless = true;
 Config g_cfg;
-HWND g_hwnd = nullptr;
+void *g_hwnd = nullptr;  // Only the Windows hardware renderer needs a native handle.
+std::atomic<int> g_fitScale{0};
 std::mutex g_frameMutex;
 std::vector<u32> g_frame;
 int g_frameW = 0, g_frameH = 0;
@@ -128,7 +132,7 @@ void SaveScreenshot(const Config &cfg, const u32 *px, int w, int h) {
 	fs::create_directories(dir, ec);
 	time_t now = time(nullptr);
 	tm local{};
-	localtime_s(&local, &now);
+	hostsys::LocalTime(now, local);
 	char stamp[32];
 	strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &local);
 	std::string base = cfg.gameName + "_" + stamp;
@@ -163,9 +167,19 @@ int Run(const Config &cfg, const std::function<int()> &emulation, const std::fun
 	SDL_Window *win = SDL_CreateWindow(cfg.title.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
 	                                   480 * cfg.windowScale, 272 * cfg.windowScale, winFlags);
 	if (cfg.fullscreen) SDL_ShowCursor(SDL_DISABLE);
+	// FitScale is read by the emulation thread; keep all SDL window queries on this thread.
+	auto updateFitScale = [&]() {
+		int w = 0, h = 0;
+		if (win) SDL_GetWindowSize(win, &w, &h);
+		const int pictureW = std::min(w, (int)((long long)h * 480 / 272));
+		g_fitScale = win ? std::max(1, (pictureW + 479) / 480) : 0;
+	};
+	updateFitScale();
+#ifdef _WIN32
 	SDL_SysWMinfo wm;
 	SDL_VERSION(&wm.version);
 	if (win && SDL_GetWindowWMInfo(win, &wm) && wm.subsystem == SDL_SYSWM_WINDOWS) g_hwnd = wm.info.win.window;
+#endif
 	// The SDL renderer, unless a GPU renderer will present instead (then made once a frame comes here).
 	SDL_Renderer *ren = nullptr;
 	SDL_Texture *tex = nullptr;
@@ -270,6 +284,7 @@ int Run(const Config &cfg, const std::function<int()> &emulation, const std::fun
 			default: break;
 			}
 		}
+		updateFitScale();
 		bool present = false;
 		{
 			std::lock_guard<std::mutex> lock(g_frameMutex);
@@ -324,6 +339,7 @@ int Run(const Config &cfg, const std::function<int()> &emulation, const std::fun
 	if (tex) SDL_DestroyTexture(tex);
 	if (ren) SDL_DestroyRenderer(ren);
 	g_hwnd = nullptr;
+	g_fitScale = 0;
 	SDL_DestroyWindow(win);
 	SDL_Quit();
 	return result;
@@ -345,13 +361,7 @@ void PresentFrame(const u32 *rgba, int width, int height, int stride) {
 
 void *NativeWindow() { return g_hwnd; }
 
-int FitScale() {
-	RECT rc{};
-	if (!g_hwnd || !GetClientRect(g_hwnd, &rc)) return 0;
-	const int w = rc.right - rc.left, h = rc.bottom - rc.top;
-	const int pictureW = std::min(w, (int)((long long)h * 480 / 272));
-	return std::max(1, (pictureW + 479) / 480);
-}
+int FitScale() { return g_fitScale.load(); }
 
 void SetFramePresenter(std::function<bool(const u32 *, int, int, int)> presenter) {
 	g_presenter = std::move(presenter);

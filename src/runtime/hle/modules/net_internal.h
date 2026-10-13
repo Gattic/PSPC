@@ -128,7 +128,7 @@ enum WaitResult : int {
 // (sched::NowUs time, 0 = none) passes, or AbortWaits(abortKey) is called. Also returns
 // HOSTWAIT_TIMEOUT after at most `recheckUs` so the caller re-checks the real socket state (readiness
 // events are edge-like). Callers loop: try the operation, wait, try again.
-WaitResult WaitHostEvents(const WSAEVENT *events, size_t count, u64 deadlineUs, u64 abortKey, u64 recheckUs = 100000);
+WaitResult WaitHostEvents(const hostnet::EventHandle *events, size_t count, u64 deadlineUs, u64 abortKey, u64 recheckUs = 100000);
 // Wakes every guest thread in WaitHostEvents with this key (socket closed or aborted).
 void AbortWaits(u64 abortKey);
 

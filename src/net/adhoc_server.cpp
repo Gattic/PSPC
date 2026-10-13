@@ -7,10 +7,17 @@
 // which player counts as a group's founder (BSSID).
 #include "net/adhoc_server.h"
 
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#include "net/socket.h"
+#include "common/host.h"
+#ifdef _WIN32
 #include <iphlpapi.h>
 #include <windows.h>
+#else
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <signal.h>
+#include <pthread.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -53,7 +60,7 @@ struct Game;
 struct Group;
 
 struct User {
-	SOCKET s = INVALID_SOCKET;
+	hostnet::SocketHandle s = hostnet::InvalidSocket;
 	u32 ip = 0;  // network byte order
 	u8 mac[kMacLen] = {};
 	u8 name[kNicknameLen] = {};
@@ -80,7 +87,7 @@ struct Game {
 
 struct Server::Impl {
 	Options opt;
-	SOCKET listener = INVALID_SOCKET;
+	hostnet::SocketHandle listener = hostnet::InvalidSocket;
 	u16 port = 0;
 	u32 bindAddr = 0;
 	std::atomic<bool> stop{false};
@@ -118,20 +125,20 @@ struct Server::Impl {
 
 	// Queues bytes for a user; sends what the socket takes now.
 	void Send(User *u, const void *data, size_t len) {
-		if (u->dead || u->s == INVALID_SOCKET) return;
+		if (u->dead || u->s == hostnet::InvalidSocket) return;
 		u->tx.append((const char *)data, len);
 		Flush(u);
 	}
 
 	void Flush(User *u) {
 		while (!u->tx.empty() && !u->dead) {
-			int n = send(u->s, u->tx.data(), (int)std::min<size_t>(u->tx.size(), 0x10000), 0);
+			int n = hostnet::Send(u->s, u->tx.data(), (int)std::min<size_t>(u->tx.size(), 0x10000), 0);
 			if (n > 0) {
 				u->tx.erase(0, (size_t)n);
 				continue;
 			}
-			int e = WSAGetLastError();
-			if (n == SOCKET_ERROR && e == WSAEWOULDBLOCK) break;
+			int e = hostnet::LastSocketError();
+			if (n == hostnet::SocketError && e == hostnet::Error_EWOULDBLOCK) break;
 			Log("Send error %d to %s", e, Who(u).c_str());
 			u->tx.clear();
 			break;  // the receive side notices the broken connection
@@ -144,7 +151,7 @@ struct Server::Impl {
 
 	// ---- database (login_user_stream / login_user_data / logout_user)
 
-	void LoginStream(SOCKET s, u32 ip) {
+	void LoginStream(hostnet::SocketHandle s, u32 ip) {
 		size_t alive = 0;
 		bool dupIp = false;
 		for (auto &u : users) {
@@ -154,13 +161,13 @@ struct Server::Impl {
 		}
 		if (alive >= kMaxUsers || dupIp) {
 			if (dupIp) Log("Already existing IP: %s", hostnet::Ipv4ToString(ip).c_str());
-			closesocket(s);
+			hostnet::CloseSocketHandle(s);
 			return;
 		}
 		auto u = std::make_unique<User>();
 		u->s = s;
 		u->ip = ip;
-		u->lastRecvMs = GetTickCount64();
+		u->lastRecvMs = hostsys::MonotonicUs() / 1000;
 		Log("New connection from %s", hostnet::Ipv4ToString(ip).c_str());
 		users.insert(users.begin(), std::move(u));
 	}
@@ -202,8 +209,8 @@ struct Server::Impl {
 		if (u->group) Disconnect(u);
 		if (u->dead) return;
 		u->dead = true;
-		if (u->s != INVALID_SOCKET) closesocket(u->s);
-		u->s = INVALID_SOCKET;
+		if (u->s != hostnet::InvalidSocket) hostnet::CloseSocketHandle(u->s);
+		u->s = hostnet::InvalidSocket;
 		if (u->game) {
 			Log("%s stopped playing %s", Who(u).c_str(), Fixed(u->game->code, kProductCodeLen).c_str());
 			if (--u->game->playerCount == 0) {
@@ -388,13 +395,16 @@ struct Server::Impl {
 		for (;;) {
 			sockaddr_in a{};
 			int len = sizeof(a);
-			SOCKET s = accept(listener, (sockaddr *)&a, &len);
-			if (s == INVALID_SOCKET) break;
-			u_long on = 1;
-			ioctlsocket(s, FIONBIO, &on);
-			BOOL nodelay = TRUE;
+			hostnet::SocketHandle s = hostnet::Accept(listener, (sockaddr *)&a, &len);
+			if (s == hostnet::InvalidSocket) break;
+			unsigned long on = 1;
+			if (hostnet::SocketIoctl(s, FIONBIO, &on) != 0) {
+				hostnet::CloseSocketHandle(s);
+				continue;
+			}
+			int nodelay = 1;
 			setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&nodelay, sizeof(nodelay));
-			BOOL keepalive = TRUE;
+			int keepalive = 1;
 			setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (const char *)&keepalive, sizeof(keepalive));
 			LoginStream(s, a.sin_addr.s_addr);
 		}
@@ -406,45 +416,45 @@ struct Server::Impl {
 			int n = recv(u->s, buf, sizeof(buf), 0);
 			if (n > 0) {
 				u->rx.append(buf, (size_t)n);
-				u->lastRecvMs = GetTickCount64();
+				u->lastRecvMs = hostsys::MonotonicUs() / 1000;
 				if (u->rx.size() > 0x10000) {
 					Logout(u);
 					return;
 				}
 				continue;
 			}
-			int e = WSAGetLastError();
-			if (n == SOCKET_ERROR && e == WSAEWOULDBLOCK) return;
+			int e = hostnet::LastSocketError();
+			if (n == hostnet::SocketError && e == hostnet::Error_EWOULDBLOCK) return;
 			Logout(u);  // closed, or broken
 			return;
 		}
 	}
 
 	void Loop() {
-		std::vector<WSAPOLLFD> fds;
+		std::vector<hostnet::PollFd> fds;
 		std::vector<User *> polled;
 		while (!stop) {
 			fds.clear();
 			polled.clear();
-			WSAPOLLFD l{};
+			hostnet::PollFd l{};
 			l.fd = listener;
 			l.events = POLLRDNORM;
 			fds.push_back(l);
 			for (auto &u : users) {
 				if (u->dead) continue;
-				WSAPOLLFD f{};
+				hostnet::PollFd f{};
 				f.fd = u->s;
 				f.events = POLLRDNORM | (u->tx.empty() ? 0 : POLLWRNORM);
 				fds.push_back(f);
 				polled.push_back(u.get());
 			}
-			int r = WSAPoll(fds.data(), (ULONG)fds.size(), 20);
-			if (r == SOCKET_ERROR) {
-				Sleep(10);
-				continue;
+			int r = hostnet::Poll(fds.data(), fds.size(), 20);
+			if (r == hostnet::SocketError) {
+				if (hostnet::LastSocketError() == hostnet::Error_EINTR) continue;
+				Log("Socket poll failed: %d", hostnet::LastSocketError());
+				break;
 			}
 			if (fds[0].revents) AcceptAll();
-			u64 now = GetTickCount64();
 			for (size_t i = 0; i < polled.size(); i++) {
 				User *u = polled[i];
 				if (u->dead) continue;
@@ -453,6 +463,8 @@ struct Server::Impl {
 				if (u->dead) continue;
 				Process(u);
 				if (u->dead) continue;
+				// ReceiveFrom may advance lastRecvMs past the start of this poll batch.
+				const u64 now = hostsys::MonotonicUs() / 1000;
 				if (now - u->lastRecvMs >= kUserTimeoutMs) {
 					Log("%s timed out", Who(u).c_str());
 					Logout(u);
@@ -475,8 +487,8 @@ struct Server::Impl {
 		users.clear();
 		games.clear();
 		UpdateCounts();
-		if (listener != INVALID_SOCKET) closesocket(listener);
-		listener = INVALID_SOCKET;
+		if (listener != hostnet::InvalidSocket) hostnet::CloseSocketHandle(listener);
+		listener = hostnet::InvalidSocket;
 		Log("Server stopped");
 	}
 };
@@ -497,31 +509,36 @@ bool Server::Listen(const Options &options, std::string *error) {
 		if (error) *error = "bad bind address " + options.bindAddress;
 		return false;
 	}
-	SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (s == INVALID_SOCKET) {
-		if (error) *error = "socket() failed: " + std::to_string(WSAGetLastError());
+	hostnet::SocketHandle s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (s == hostnet::InvalidSocket) {
+		if (error) *error = "socket() failed: " + std::to_string(hostnet::LastSocketError());
 		return false;
 	}
-	// Exclusive: no other program can take over the port while the server runs.
+#ifdef _WIN32
+	// Linux sockets are exclusive unless SO_REUSEPORT is requested.
 	BOOL excl = TRUE;
 	setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *)&excl, sizeof(excl));
+#endif
 	sockaddr_in a{};
 	a.sin_family = AF_INET;
 	a.sin_addr.s_addr = addr;
 	a.sin_port = htons(options.port);
 	if (bind(s, (const sockaddr *)&a, sizeof(a)) != 0 || listen(s, kListenBacklog) != 0) {
-		int e = WSAGetLastError();
-		closesocket(s);
+		int e = hostnet::LastSocketError();
+		hostnet::CloseSocketHandle(s);
 		if (error) {
 			*error = "cannot listen on " + options.bindAddress + ":" + std::to_string(options.port) + " (error " + std::to_string(e) +
-			         (e == WSAEADDRINUSE ? ": the port is in use - is another ad hoc server running?" : "") + ")";
+			         (e == hostnet::Error_EADDRINUSE ? ": the port is in use - is another ad hoc server running?" : "") + ")";
 		}
 		return false;
 	}
-	u_long on = 1;
-	ioctlsocket(s, FIONBIO, &on);
+	unsigned long on = 1;
 	int len = sizeof(a);
-	getsockname(s, (sockaddr *)&a, &len);
+	if (hostnet::SocketIoctl(s, FIONBIO, &on) != 0 || hostnet::GetSockName(s, (sockaddr *)&a, &len) != 0) {
+		if (error) *error = "cannot configure listening socket: " + std::to_string(hostnet::LastSocketError());
+		hostnet::CloseSocketHandle(s);
+		return false;
+	}
 	m.listener = s;
 	m.port = ntohs(a.sin_port);
 	m.bindAddr = addr;
@@ -530,7 +547,7 @@ bool Server::Listen(const Options &options, std::string *error) {
 }
 
 void Server::Run() {
-	if (impl_->listener == INVALID_SOCKET) return;
+	if (impl_->listener == hostnet::InvalidSocket) return;
 	impl_->Loop();
 }
 
@@ -553,6 +570,7 @@ std::vector<std::string> Server::Addresses() const {
 		out.push_back(hostnet::Ipv4ToString(impl_->bindAddr));
 		return out;
 	}
+#ifdef _WIN32
 	ULONG size = 16384;
 	std::vector<u8> buf(size);
 	ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
@@ -572,6 +590,17 @@ std::vector<std::string> Server::Addresses() const {
 			}
 		}
 	}
+#else
+	ifaddrs *addresses = nullptr;
+	if (getifaddrs(&addresses) == 0) {
+		for (auto *a = addresses; a; a = a->ifa_next) {
+			if (!a->ifa_addr || a->ifa_addr->sa_family != AF_INET || !(a->ifa_flags & IFF_UP)) continue;
+			u32 ip = ((sockaddr_in *)a->ifa_addr)->sin_addr.s_addr;
+			if (!hostnet::IsLoopback(ip)) out.push_back(hostnet::Ipv4ToString(ip));
+		}
+		freeifaddrs(addresses);
+	}
+#endif
 	out.push_back("127.0.0.1");
 	return out;
 }
@@ -583,6 +612,7 @@ int Server::GroupCount() const { return impl_->groupCount; }
 
 namespace {
 
+#ifdef _WIN32
 Server *g_cmdServer = nullptr;
 HANDLE g_cmdDone = nullptr;
 
@@ -596,11 +626,12 @@ BOOL WINAPI ConsoleHandler(DWORD type) {
 	}
 	return FALSE;
 }
+#endif
 
 void PrintLine(const std::string &s) {
 	time_t t = time(nullptr);
 	struct tm lt;
-	localtime_s(&lt, &t);
+	hostsys::LocalTime(t, lt);
 	printf("[%02d:%02d:%02d] %s\n", lt.tm_hour, lt.tm_min, lt.tm_sec, s.c_str());
 	fflush(stdout);
 }
@@ -616,9 +647,11 @@ int RunCommandLine(const Options &options) {
 		fprintf(stderr, "pspc --adhoc-server: %s\n", err.c_str());
 		return 1;
 	}
+#ifdef _WIN32
 	g_cmdServer = &server;
 	g_cmdDone = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 	SetConsoleCtrlHandler(ConsoleHandler, TRUE);
+#endif
 	printf("PSPC ad hoc server (PPSSPP-compatible) listening on TCP port %u\n", server.Port());
 	printf("Players set adhoc_server= in pspc.ini (PPSSPP: Settings > Networking > Ad hoc server) to one of:\n");
 	for (const std::string &a : server.Addresses()) {
@@ -627,10 +660,26 @@ int RunCommandLine(const Options &options) {
 	}
 	printf("Press Ctrl+C to stop.\n");
 	fflush(stdout);
+#ifdef _WIN32
 	server.Run();
 	SetConsoleCtrlHandler(ConsoleHandler, FALSE);
 	g_cmdServer = nullptr;
 	SetEvent(g_cmdDone);
+#else
+	// Wait synchronously for shutdown signals; Stop() is not async-signal-safe.
+	sigset_t signals, previous;
+	sigemptyset(&signals);
+	sigaddset(&signals, SIGINT);
+	sigaddset(&signals, SIGTERM);
+	if (pthread_sigmask(SIG_BLOCK, &signals, &previous) != 0) return 1;
+	std::thread worker([&] { server.Run(); });
+	int signal = 0;
+	int result = sigwait(&signals, &signal);
+	server.Stop();
+	worker.join();
+	pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+	if (result != 0) return 1;
+#endif
 	return 0;
 }
 

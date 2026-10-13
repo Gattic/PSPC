@@ -4,9 +4,17 @@
 // (Copyright (c) 2012- PPSSPP Project, GPL-2.0-or-later), mapped from Winsock's error codes.
 #include "net/host_net.h"
 
+#ifdef _WIN32
 #include <iphlpapi.h>
 #include <mstcpip.h>
 #include <windows.h>
+#else
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <fstream>
+#include <sstream>
+#include <limits>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -14,14 +22,15 @@
 #include <map>
 #include <mutex>
 #include <thread>
+#include <stdexcept>
 
 #include "common/log.h"
+#include "common/host.h"
 
-#pragma comment(lib, "ws2_32.lib")
-#pragma comment(lib, "iphlpapi.lib")
-
+#ifdef _WIN32
 #ifndef SIO_UDP_CONNRESET
 #define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
 #endif
 
 namespace hostnet {
@@ -31,6 +40,7 @@ constexpr const char *LOG = "HOSTNET";
 }
 
 bool Startup() {
+#ifdef _WIN32
 	static std::once_flag once;
 	static bool ok = false;
 	std::call_once(once, [] {
@@ -39,6 +49,9 @@ bool Startup() {
 		if (!ok) LOGE(LOG, "WSAStartup failed");
 	});
 	return ok;
+#else
+	return true;
+#endif
 }
 
 // ---------------------------------------------------------------- PSP constants
@@ -46,41 +59,44 @@ bool Startup() {
 int PspErrnoFromWsa(int e, bool forConnect) {
 	switch (e) {
 	case 0: return 0;
-	case WSAEINTR: return PSP_EINTR;
-	case WSAEBADF: return PSP_EBADF;
-	case WSAEACCES: return PSP_EACCES;
-	case WSAEFAULT: return PSP_EFAULT;
-	case WSAEINVAL: return PSP_EINVAL;
-	case WSAEMFILE: return PSP_EMFILE;
-	case WSAEWOULDBLOCK: return forConnect ? PSP_EINPROGRESS : PSP_EAGAIN;
-	case WSAEINPROGRESS: return PSP_EINPROGRESS;
-	case WSAEALREADY: return PSP_EALREADY;
-	case WSAENOTSOCK: return PSP_ENOTSOCK;
-	case WSAEDESTADDRREQ: return PSP_EDESTADDRREQ;
-	case WSAEMSGSIZE: return PSP_EMSGSIZE;
-	case WSAEPROTOTYPE: return PSP_EPROTOTYPE;
-	case WSAENOPROTOOPT: return PSP_ENOPROTOOPT;
-	case WSAEPROTONOSUPPORT: return PSP_EPROTONOSUPPORT;
-	case WSAESOCKTNOSUPPORT: return PSP_ESOCKTNOSUPPORT;
-	case WSAEOPNOTSUPP: return PSP_EOPNOTSUPP;
-	case WSAEPFNOSUPPORT: return PSP_EPFNOSUPPORT;
-	case WSAEAFNOSUPPORT: return PSP_EAFNOSUPPORT;
-	case WSAEADDRINUSE: return PSP_EADDRINUSE;
-	case WSAEADDRNOTAVAIL: return PSP_EADDRNOTAVAIL;
-	case WSAENETDOWN: return PSP_ENETDOWN;
-	case WSAENETUNREACH: return PSP_ENETUNREACH;
-	case WSAENETRESET: return PSP_ENETRESET;
-	case WSAECONNABORTED: return PSP_ECONNABORTED;
-	case WSAECONNRESET: return PSP_ECONNRESET;
-	case WSAENOBUFS: return PSP_ENOBUFS;
-	case WSAEISCONN: return PSP_EISCONN;
-	case WSAENOTCONN: return PSP_ENOTCONN;
-	case WSAESHUTDOWN: return PSP_ESHUTDOWN;
-	case WSAETIMEDOUT: return PSP_ETIMEDOUT;
-	case WSAECONNREFUSED: return PSP_ECONNREFUSED;
-	case WSAEHOSTDOWN: return PSP_EHOSTDOWN;
-	case WSAEHOSTUNREACH: return PSP_EHOSTUNREACH;
-	case WSA_NOT_ENOUGH_MEMORY: return PSP_ENOMEM;
+	case hostnet::Error_EINTR: return PSP_EINTR;
+	case hostnet::Error_EBADF: return PSP_EBADF;
+	case hostnet::Error_EACCES: return PSP_EACCES;
+	case hostnet::Error_EFAULT: return PSP_EFAULT;
+	case hostnet::Error_EINVAL: return PSP_EINVAL;
+	case hostnet::Error_EMFILE: return PSP_EMFILE;
+	case hostnet::Error_EWOULDBLOCK: return forConnect ? PSP_EINPROGRESS : PSP_EAGAIN;
+	case hostnet::Error_EINPROGRESS: return PSP_EINPROGRESS;
+	case hostnet::Error_EALREADY: return PSP_EALREADY;
+	case hostnet::Error_ENOTSOCK: return PSP_ENOTSOCK;
+	case hostnet::Error_EDESTADDRREQ: return PSP_EDESTADDRREQ;
+	case hostnet::Error_EMSGSIZE: return PSP_EMSGSIZE;
+	case hostnet::Error_EPROTOTYPE: return PSP_EPROTOTYPE;
+	case hostnet::Error_ENOPROTOOPT: return PSP_ENOPROTOOPT;
+	case hostnet::Error_EPROTONOSUPPORT: return PSP_EPROTONOSUPPORT;
+	case hostnet::Error_ESOCKTNOSUPPORT: return PSP_ESOCKTNOSUPPORT;
+	case hostnet::Error_EOPNOTSUPP: return PSP_EOPNOTSUPP;
+	case hostnet::Error_EPFNOSUPPORT: return PSP_EPFNOSUPPORT;
+	case hostnet::Error_EAFNOSUPPORT: return PSP_EAFNOSUPPORT;
+	case hostnet::Error_EADDRINUSE: return PSP_EADDRINUSE;
+	case hostnet::Error_EADDRNOTAVAIL: return PSP_EADDRNOTAVAIL;
+	case hostnet::Error_ENETDOWN: return PSP_ENETDOWN;
+	case hostnet::Error_ENETUNREACH: return PSP_ENETUNREACH;
+	case hostnet::Error_ENETRESET: return PSP_ENETRESET;
+	case hostnet::Error_ECONNABORTED: return PSP_ECONNABORTED;
+	case hostnet::Error_ECONNRESET: return PSP_ECONNRESET;
+	case hostnet::Error_ENOBUFS: return PSP_ENOBUFS;
+	case hostnet::Error_EISCONN: return PSP_EISCONN;
+	case hostnet::Error_ENOTCONN: return PSP_ENOTCONN;
+	case hostnet::Error_ESHUTDOWN: return PSP_ESHUTDOWN;
+	case hostnet::Error_ETIMEDOUT: return PSP_ETIMEDOUT;
+	case hostnet::Error_ECONNREFUSED: return PSP_ECONNREFUSED;
+	case hostnet::Error_EHOSTDOWN: return PSP_EHOSTDOWN;
+	case hostnet::Error_EHOSTUNREACH: return PSP_EHOSTUNREACH;
+	case Error_NOT_ENOUGH_MEMORY: return PSP_ENOMEM;
+#ifndef _WIN32
+	case EPIPE: return PSP_EPIPE;
+#endif
 	default: return PSP_EINVAL;
 	}
 }
@@ -206,51 +222,42 @@ int MapMsgFlags(int f) {
 // ---------------------------------------------------------------- sockets
 
 namespace {
-constexpr long kAllEvents = FD_READ | FD_WRITE | FD_OOB | FD_ACCEPT | FD_CONNECT | FD_CLOSE;
-
-bool AttachEvent(SOCKET s, WSAEVENT *ev, int *wsaError) {
-	WSAEVENT e = WSACreateEvent();
-	if (e == WSA_INVALID_EVENT) {
-		if (wsaError) *wsaError = WSAGetLastError();
-		return false;
-	}
-	// WSAEventSelect also makes the socket non-blocking, for good.
-	if (WSAEventSelect(s, e, kAllEvents) != 0) {
-		if (wsaError) *wsaError = WSAGetLastError();
-		WSACloseEvent(e);
-		return false;
-	}
-	*ev = e;
-	return true;
+bool AttachEvent(SocketHandle s, EventHandle *ev, int *error) {
+	*ev = SocketEvent(s);
+	if (*ev) return true;
+	if (error) *error = LastSocketError();
+	return false;
 }
 }  // namespace
 
 Socket OpenSocket(int af, int type, int protocol, int *wsaError) {
 	Socket out;
 	if (!Startup()) {
-		if (wsaError) *wsaError = WSANOTINITIALISED;
+		if (wsaError) *wsaError = hostnet::Error_NOTINITIALISED;
 		return out;
 	}
-	SOCKET s = socket(af, type, protocol);
-	if (s == INVALID_SOCKET) {
-		if (wsaError) *wsaError = WSAGetLastError();
+	hostnet::SocketHandle s = socket(af, type, protocol);
+	if (s == InvalidSocket) {
+		if (wsaError) *wsaError = hostnet::LastSocketError();
 		return out;
 	}
+#ifdef _WIN32
 	if (type == SOCK_DGRAM) {
-		// No WSAECONNRESET on recvfrom after an ICMP port unreachable (BSD doesn't report it).
+		// No hostnet::Error_ECONNRESET on recvfrom after an ICMP port unreachable (BSD doesn't report it).
 		BOOL off = FALSE;
 		DWORD bytes = 0;
 		WSAIoctl(s, SIO_UDP_CONNRESET, &off, sizeof(off), nullptr, 0, &bytes, nullptr, nullptr);
 	}
+#endif
 	if (!AttachEvent(s, &out.ev, wsaError)) {
-		closesocket(s);
+		CloseSocketHandle(s);
 		return out;
 	}
 	out.s = s;
 	return out;
 }
 
-bool AdoptSocket(SOCKET s, Socket *out, int *wsaError) {
+bool AdoptSocket(hostnet::SocketHandle s, Socket *out, int *wsaError) {
 	*out = Socket{};
 	if (!AttachEvent(s, &out->ev, wsaError)) return false;
 	out->s = s;
@@ -258,22 +265,24 @@ bool AdoptSocket(SOCKET s, Socket *out, int *wsaError) {
 }
 
 void CloseSocket(Socket &sock, bool reset) {
-	if (sock.s != INVALID_SOCKET) {
+	if (sock.s != InvalidSocket) {
 		if (reset) {
 			linger l{1, 0};
 			setsockopt(sock.s, SOL_SOCKET, SO_LINGER, (const char *)&l, sizeof(l));
 		}
-		closesocket(sock.s);
-		sock.s = INVALID_SOCKET;
+		CloseSocketHandle(sock.s);
+		sock.s = InvalidSocket;
 	}
-	if (sock.ev != WSA_INVALID_EVENT) {
+	if (sock.ev != InvalidEvent) {
 		ReleaseEvent(sock.ev);
-		sock.ev = WSA_INVALID_EVENT;
+		sock.ev = InvalidEvent;
 	}
 }
 
-bool CheckReady(SOCKET s, Readiness *r) {
+bool CheckReady(SocketHandle s, Readiness *r) {
 	*r = Readiness{};
+#ifdef _WIN32
+	// Winsock reports failed nonblocking connects through select's exception set.
 	fd_set rd, wr, ex;
 	FD_ZERO(&rd);
 	FD_ZERO(&wr);
@@ -282,24 +291,31 @@ bool CheckReady(SOCKET s, Readiness *r) {
 	FD_SET(s, &wr);
 	FD_SET(s, &ex);
 	timeval tv{0, 0};
-	int n = select(0, &rd, &wr, &ex, &tv);
-	if (n == SOCKET_ERROR) return false;
+	if (select(0, &rd, &wr, &ex, &tv) == SOCKET_ERROR) return false;
 	r->read = FD_ISSET(s, &rd) != 0;
 	r->write = FD_ISSET(s, &wr) != 0;
 	r->except = FD_ISSET(s, &ex) != 0;
+#else
+	// Unlike fd_set, poll accepts Linux descriptors above FD_SETSIZE.
+	PollFd fd{s, POLLIN | POLLOUT | POLLPRI, 0};
+	if (s == InvalidSocket || Poll(&fd, 1, 0) < 0 || (fd.revents & POLLNVAL)) return false;
+	r->read = (fd.revents & (POLLIN | POLLHUP | POLLERR)) != 0;
+	r->write = (fd.revents & POLLOUT) != 0;
+	r->except = (fd.revents & (POLLPRI | POLLERR)) != 0;
+#endif
 	return true;
 }
 
-int PendingError(SOCKET s) {
+int PendingError(hostnet::SocketHandle s) {
 	int err = 0;
 	int len = sizeof(err);
-	if (getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &len) != 0) return WSAGetLastError();
+	if (GetSockOpt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &len) != 0) return LastSocketError();
 	return err;
 }
 
-u32 BytesAvailable(SOCKET s) {
-	u_long n = 0;
-	if (ioctlsocket(s, FIONREAD, &n) != 0) return 0;
+u32 BytesAvailable(hostnet::SocketHandle s) {
+	unsigned long n = 0;
+	if (SocketIoctl(s, FIONREAD, &n) != 0) return 0;
 	return (u32)n;
 }
 
@@ -308,16 +324,16 @@ u32 BytesAvailable(SOCKET s) {
 namespace {
 
 struct WatchEntry {
-	std::vector<WSAEVENT> events;
+	std::vector<EventHandle> events;
 	std::function<void()> fired;
 };
 
 struct Poller {
 	std::mutex mu;
 	std::map<WatchId, WatchEntry> watches;
-	std::vector<WSAEVENT> toClose;
+	std::vector<EventHandle> toClose;
 	WatchId nextId = 1;
-	HANDLE wake = nullptr;
+	EventHandle wake = nullptr;
 	std::thread thread;
 	bool running = false;
 	bool stop = false;
@@ -325,7 +341,8 @@ struct Poller {
 	void EnsureRunning() {
 		// Called with mu held.
 		if (running) return;
-		if (!wake) wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+		if (!wake) wake = NewEvent();
+		if (!wake) throw std::runtime_error("Cannot create network poller wake event");
 		stop = false;
 		running = true;
 		thread = std::thread([this] { Loop(); });
@@ -334,64 +351,56 @@ struct Poller {
 	void Loop() {
 		size_t rotate = 0;
 		for (;;) {
-			std::vector<HANDLE> handles;
-			DWORD timeout = INFINITE;
+			std::vector<EventHandle> handles;
+			int timeout = -1;
 			{
-				std::unique_lock<std::mutex> lock(mu);
+				std::lock_guard<std::mutex> lock(mu);
 				if (stop) break;
-				for (WSAEVENT e : toClose) WSACloseEvent(e);
+				for (auto e : toClose) CloseEvent(e);
 				toClose.clear();
-				std::vector<HANDLE> all;
+				std::vector<EventHandle> all;
 				for (auto &w : watches)
-					for (WSAEVENT e : w.second.events)
+					for (auto e : w.second.events)
 						if (std::find(all.begin(), all.end(), e) == all.end()) all.push_back(e);
 				handles.push_back(wake);
-				if (all.size() <= MAXIMUM_WAIT_OBJECTS - 1) {
+				// Keep each wait within Windows' 64-handle limit on both platforms.
+				constexpr size_t batch = 63;
+				if (all.size() <= batch) {
 					handles.insert(handles.end(), all.begin(), all.end());
 				} else {
-					// More events than one wait can hold: take turns, and don't wait long on any batch.
-					for (size_t i = 0; i < MAXIMUM_WAIT_OBJECTS - 1; i++) handles.push_back(all[(rotate + i) % all.size()]);
-					rotate += MAXIMUM_WAIT_OBJECTS - 1;
+					for (size_t i = 0; i < batch; ++i) handles.push_back(all[(rotate + i) % all.size()]);
+					rotate += batch;
 					timeout = 5;
 				}
 			}
-			DWORD r = WaitForMultipleObjects((DWORD)handles.size(), handles.data(), FALSE, timeout);
+			if (WaitEvents(handles.data(), handles.size(), timeout) == -2)
+				throw std::runtime_error("Network poller wait failed");
 			std::vector<std::function<void()>> fire;
 			{
-				std::unique_lock<std::mutex> lock(mu);
+				std::lock_guard<std::mutex> lock(mu);
 				if (stop) break;
-				if (r == WAIT_FAILED) {
-					// A handle went bad under us; rebuild after a short pause rather than spin.
-					lock.unlock();
-					Sleep(1);
-					continue;
+				std::vector<EventHandle> signalled;
+				for (size_t i = 1; i < handles.size(); ++i) {
+					// Only this thread closes released events, after this snapshot is discarded.
+					if (WaitEvents(&handles[i], 1, 0) == 0) signalled.push_back(handles[i]);
 				}
-				std::vector<WSAEVENT> signalled;
-				for (size_t i = 1; i < handles.size(); i++) {
-					// toClose events may be in `handles`; they haven't been closed yet (only this thread
-					// closes them), so testing them is safe.
-					if (WaitForSingleObject(handles[i], 0) == WAIT_OBJECT_0) signalled.push_back(handles[i]);
-				}
-				for (WSAEVENT e : signalled) WSAResetEvent(e);
-				if (!signalled.empty()) {
-					for (auto it = watches.begin(); it != watches.end();) {
-						bool hit = false;
-						for (WSAEVENT e : it->second.events)
-							if (std::find(signalled.begin(), signalled.end(), e) != signalled.end()) hit = true;
-						if (hit) {
-							fire.push_back(std::move(it->second.fired));
-							it = watches.erase(it);
-						} else {
-							++it;
-						}
+				for (auto e : signalled) ResetEvent(e);
+				for (auto it = watches.begin(); it != watches.end();) {
+					bool hit = false;
+					for (auto e : it->second.events)
+						if (std::find(signalled.begin(), signalled.end(), e) != signalled.end()) hit = true;
+					if (hit) {
+						fire.push_back(std::move(it->second.fired));
+						it = watches.erase(it);
+					} else {
+						++it;
 					}
 				}
 			}
-			for (auto &f : fire)
-				if (f) f();
+			for (auto &f : fire) if (f) f();
 		}
 		std::lock_guard<std::mutex> lock(mu);
-		for (WSAEVENT e : toClose) WSACloseEvent(e);
+		for (auto e : toClose) CloseEvent(e);
 		toClose.clear();
 		running = false;
 	}
@@ -404,7 +413,7 @@ Poller &ThePoller() {
 
 }  // namespace
 
-WatchId Watch(const WSAEVENT *events, size_t count, std::function<void()> fired) {
+WatchId Watch(const EventHandle *events, size_t count, std::function<void()> fired) {
 	Poller &p = ThePoller();
 	std::lock_guard<std::mutex> lock(p.mu);
 	WatchId id = p.nextId++;
@@ -414,18 +423,18 @@ WatchId Watch(const WSAEVENT *events, size_t count, std::function<void()> fired)
 	w.fired = std::move(fired);
 	p.watches.emplace(id, std::move(w));
 	p.EnsureRunning();
-	SetEvent(p.wake);
+	SignalEvent(p.wake);
 	return id;
 }
 
 void Unwatch(WatchId id) {
 	Poller &p = ThePoller();
 	std::lock_guard<std::mutex> lock(p.mu);
-	if (p.watches.erase(id) && p.wake) SetEvent(p.wake);
+	if (p.watches.erase(id) && p.wake) SignalEvent(p.wake);
 }
 
-void ReleaseEvent(WSAEVENT ev) {
-	if (ev == WSA_INVALID_EVENT) return;
+void ReleaseEvent(EventHandle ev) {
+	if (ev == InvalidEvent) return;
 	Poller &p = ThePoller();
 	std::lock_guard<std::mutex> lock(p.mu);
 	bool used = false;
@@ -441,10 +450,10 @@ void ReleaseEvent(WSAEVENT ev) {
 	if (p.running) {
 		// The poller may be waiting on it right now: let it close the event once it isn't.
 		p.toClose.push_back(ev);
-		SetEvent(p.wake);
+		SignalEvent(p.wake);
 	} else {
 		(void)used;
-		WSACloseEvent(ev);
+		CloseEvent(ev);
 	}
 }
 
@@ -455,7 +464,7 @@ void StopPoller() {
 		std::lock_guard<std::mutex> lock(p.mu);
 		if (!p.running) return;
 		p.stop = true;
-		SetEvent(p.wake);
+		SignalEvent(p.wake);
 		t = std::move(p.thread);
 	}
 	if (t.joinable()) t.join();
@@ -500,6 +509,7 @@ HostConfig QueryHostConfig() {
 	cfg.adapter = "loopback";
 	if (!Startup()) return cfg;
 
+#ifdef _WIN32
 	// The interface of the route to a public address. Only the routing table is consulted.
 	DWORD bestIf = 0;
 	sockaddr_in probe{};
@@ -562,19 +572,59 @@ HostConfig QueryHostConfig() {
 		cfg.adapter.assign((size_t)len - 1, '\0');
 		WideCharToMultiByte(CP_UTF8, 0, chosen->FriendlyName, -1, cfg.adapter.data(), len, nullptr, nullptr);
 	}
+#else
+	// /proc/net/route stores IPv4 addresses in host-readable little-endian hex.
+	std::ifstream routes("/proc/net/route");
+	std::string line, iface;
+	unsigned bestMetric = std::numeric_limits<unsigned>::max();
+	u32 gateway = 0;
+	std::getline(routes, line);
+	while (std::getline(routes, line)) {
+		std::istringstream row(line);
+		std::string name;
+		u32 destination, gw, flags, mask;
+		unsigned ref, use, metric;
+		if (!(row >> name >> std::hex >> destination >> gw >> flags >> std::dec >> ref >> use >> metric >> std::hex >> mask)) continue;
+		if (destination != 0 || mask != 0 || !(flags & 1) || metric >= bestMetric) continue;
+		iface = name;
+		gateway = gw;
+		bestMetric = metric;
+	}
+	ifaddrs *addresses = nullptr;
+	if (!iface.empty() && getifaddrs(&addresses) == 0) {
+		for (auto *a = addresses; a; a = a->ifa_next) {
+			if (!a->ifa_addr || !a->ifa_netmask || a->ifa_addr->sa_family != AF_INET ||
+			    iface != a->ifa_name || !(a->ifa_flags & IFF_UP)) continue;
+			cfg.ip = ((sockaddr_in *)a->ifa_addr)->sin_addr.s_addr;
+			cfg.netmask = ((sockaddr_in *)a->ifa_netmask)->sin_addr.s_addr;
+			cfg.gateway = gateway;
+			cfg.adapter = iface;
+			cfg.valid = true;
+			break;
+		}
+		freeifaddrs(addresses);
+	}
+	std::ifstream resolv("/etc/resolv.conf");
+	int n = 0;
+	while (n < 2 && std::getline(resolv, line)) {
+		std::istringstream row(line);
+		std::string key, address;
+		if (row >> key >> address && key == "nameserver" && ParseIpv4(address.c_str(), &cfg.dns[n])) ++n;
+	}
+#endif
 	return cfg;
 }
 
 // ---------------------------------------------------------------- name resolution
 
 int ResolveIpv4(const std::string &host, u32 *out) {
-	if (!Startup()) return WSANOTINITIALISED;
+	if (!Startup()) return hostnet::Error_NOTINITIALISED;
 	addrinfo hints{};
 	hints.ai_family = AF_INET;
 	addrinfo *res = nullptr;
 	int rc = getaddrinfo(host.c_str(), nullptr, &hints, &res);
 	if (rc != 0) return rc;
-	rc = WSAHOST_NOT_FOUND;
+	rc = hostnet::Error_HOST_NOT_FOUND;
 	for (addrinfo *p = res; p; p = p->ai_next) {
 		if (p->ai_family == AF_INET && p->ai_addr) {
 			*out = ((const sockaddr_in *)p->ai_addr)->sin_addr.s_addr;
@@ -587,7 +637,7 @@ int ResolveIpv4(const std::string &host, u32 *out) {
 }
 
 int ReverseLookup(u32 addr, std::string *name) {
-	if (!Startup()) return WSANOTINITIALISED;
+	if (!Startup()) return hostnet::Error_NOTINITIALISED;
 	sockaddr_in sa{};
 	sa.sin_family = AF_INET;
 	sa.sin_addr.s_addr = addr;

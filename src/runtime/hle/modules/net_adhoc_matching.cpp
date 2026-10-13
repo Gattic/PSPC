@@ -685,10 +685,10 @@ void InputThread(std::weak_ptr<Context> wc, u32 gen) {
 		if (!c || !c->inputRunning || c->inputGen != gen) return;
 		InputStep(c.get());
 		if (!c->inputRunning || c->inputGen != gen) return;
-		WSAEVENT ev = SocketEvent(c->socket);
+		hostnet::EventHandle ev = SocketEvent(c->socket);
 		u64 key = c->abortKey;
 		c.reset();
-		net::WaitHostEvents(&ev, ev != WSA_INVALID_EVENT ? 1 : 0, 0, key, 10000);
+		net::WaitHostEvents(&ev, ev != hostnet::InvalidEvent ? 1 : 0, 0, key, 10000);
 	}
 }
 

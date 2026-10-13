@@ -6,7 +6,14 @@
 // which mirrors PPSSPP's default of ignoring bad accesses (and logs the guest address).
 #include "runtime/core/memory.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#include <signal.h>
+#include <cerrno>
+#endif
 
 #include <atomic>
 #include <mutex>
@@ -78,6 +85,7 @@ namespace mem {
 
 u32 g_ramSize = 0;
 
+#ifdef _WIN32
 namespace {
 
 constexpr size_t WINDOW_SIZE = 0x20000000;
@@ -196,6 +204,80 @@ void Shutdown() {
 	// The window is released with the process.
 }
 
+#else
+namespace {
+constexpr size_t WINDOW_SIZE = 0x20000000;
+constexpr size_t GRANULE = 0x10000;
+constexpr size_t SEC_VRAM = GRANULE;
+constexpr size_t SEC_RAM = SEC_VRAM + VRAM_SIZE;
+int g_section = -1, g_junkSection = -1;
+u8 *g_privateVram = nullptr;
+std::atomic<u32> g_badAccesses{0};
+struct sigaction g_previousFault{};
+bool g_faultInstalled = false;
+
+void FaultHandler(int signal, siginfo_t *info, void *context) {
+	uintptr_t addr = (uintptr_t)info->si_addr;
+	uintptr_t base = (uintptr_t)g_membase;
+	if (g_membase && addr >= base && addr < base + WINDOW_SIZE) {
+		g_badAccesses.fetch_add(1, std::memory_order_relaxed);
+		if (!cpu::StrictMemory()) {
+			size_t off = (addr - base) & ~(GRANULE - 1);
+			// No allocation, locks or logging in the signal handler. Linux mmap replaces this
+			// reserved granule atomically even if another renderer thread faults there too.
+			if (mmap(g_membase + off, GRANULE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
+			         g_junkSection, 0) != MAP_FAILED) return;
+		}
+		const char message[] = "PSPC: invalid guest memory access (strict mode or mapping failure)\n";
+		(void)!write(STDERR_FILENO, message, sizeof(message) - 1);
+	}
+	if (g_previousFault.sa_flags & SA_SIGINFO) {
+		if (g_previousFault.sa_sigaction) { g_previousFault.sa_sigaction(signal, info, context); return; }
+	} else if (g_previousFault.sa_handler != SIG_DFL && g_previousFault.sa_handler != SIG_IGN) {
+		g_previousFault.sa_handler(signal); return;
+	}
+	sigaction(signal, &g_previousFault, nullptr);
+	raise(signal);
+}
+}
+bool Init(u32 ramSize) {
+	g_ramSize = ramSize;
+	g_badAccesses = 0;
+	g_section = memfd_create("pspc-guest", MFD_CLOEXEC);
+	g_junkSection = memfd_create("pspc-junk", MFD_CLOEXEC);
+	if (g_section < 0 || g_junkSection < 0 || ftruncate(g_section, SEC_RAM + ramSize) ||
+	    ftruncate(g_junkSection, GRANULE)) { Shutdown(); return false; }
+	void *base = mmap(nullptr, WINDOW_SIZE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (base == MAP_FAILED) { Shutdown(); return false; }
+	g_membase = (u8 *)base;
+	auto map = [](size_t addr, size_t offset, size_t size) {
+		return mmap(g_membase + addr, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, g_section, offset) != MAP_FAILED;
+	};
+	bool ok = map(SCRATCHPAD_BASE, 0, GRANULE) && map(RAM_BASE, SEC_RAM, ramSize);
+	for (size_t i = 0; i < 4 && ok; ++i) ok = map(VRAM_BASE + i * VRAM_SIZE, SEC_VRAM, VRAM_SIZE);
+	if (!ok) { Shutdown(); return false; }
+	struct sigaction action{};
+	action.sa_sigaction = FaultHandler;
+	action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+	sigemptyset(&action.sa_mask);
+	if (sigaction(SIGSEGV, &action, &g_previousFault)) { Shutdown(); return false; }
+	g_faultInstalled = true;
+	LOGI("MEM", "Guest memory at %p (RAM %u MB, aliased mirrors)", g_membase, ramSize >> 20);
+	return true;
+}
+void Shutdown() {
+	if (g_faultInstalled) sigaction(SIGSEGV, &g_previousFault, nullptr);
+	g_faultInstalled = false;
+	if (g_privateVram) munmap(g_privateVram, VRAM_SIZE);
+	g_privateVram = nullptr;
+	if (g_membase) munmap(g_membase, WINDOW_SIZE);
+	g_membase = nullptr;
+	if (g_section >= 0) close(g_section);
+	if (g_junkSection >= 0) close(g_junkSection);
+	g_section = g_junkSection = -1;
+}
+#endif
+
 bool IsValidAddress(u32 addr) {
 	u32 p = addr & GUEST_ADDR_MASK;
 	if (p >= RAM_BASE && p < RAM_BASE + g_ramSize) return true;
@@ -254,10 +336,18 @@ void ReadBytes(void *dst, u32 src, u32 size) {
 u32 BadAccessCount() { return g_badAccesses.load(); }
 
 u8 *PrivateVramView() {
+#ifdef _WIN32
 	static u8 *view = nullptr;
 	if (!view && g_placeholders && g_section)
 		view = (u8 *)MapViewOfFile(g_section, FILE_MAP_ALL_ACCESS, (DWORD)(SEC_VRAM >> 32), (DWORD)SEC_VRAM, VRAM_SIZE);
 	return view;
+#else
+	if (!g_privateVram && g_section >= 0) {
+		void *p = mmap(nullptr, VRAM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, g_section, SEC_VRAM);
+		if (p != MAP_FAILED) g_privateVram = (u8 *)p;
+	}
+	return g_privateVram;
+#endif
 }
 
 }  // namespace mem

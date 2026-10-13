@@ -6,7 +6,7 @@
 // measured them.
 #include "runtime/hle/modules/rtc.h"
 
-#include <windows.h>
+#include "common/host.h"
 
 #include <chrono>
 #include <cstdio>
@@ -203,7 +203,13 @@ int DaysInMonth(u32 year, u32 month) {
 	}
 }
 
-time_t TimeGm(tm *t) { return _mkgmtime(t); }
+time_t TimeGm(tm *t) {
+#ifdef _WIN32
+	return _mkgmtime(t);
+#else
+	return timegm(t);
+#endif
+}
 
 // ---------------------------------------------------------------- current time
 
@@ -242,7 +248,7 @@ u32 sceRtcGetCurrentClockLocalTime(u32 ptr) {
 	const u64 unixUs = rtc::NowUnixUs();
 	const time_t sec = (time_t)(unixUs / 1000000ULL);
 	tm local{};
-	if (localtime_s(&local, &sec) != 0) return 0;  // too high/low to handle: pretend it worked
+	if (!hostsys::LocalTime(sec, local)) return 0;  // too high/low to handle: pretend it worked
 	if (Valid(ptr, sizeof(PspDateTime))) {
 		PspDateTime t{};
 		TmToPspTime(t, local);
@@ -334,9 +340,7 @@ int sceRtcSetConf(int dateFormat, int timeFormat, int zoneMinutes, int dstMinute
 	LoadClock();
 	// The XMB's default zone is the host's (reg.cpp): then local time keeps following the host
 	// (daylight saving changes included); another zone the user picked takes over.
-	TIME_ZONE_INFORMATION tzi{};
-	const DWORD r = GetTimeZoneInformation(&tzi);
-	const s32 host = -(s32)(tzi.Bias + (r == TIME_ZONE_ID_DAYLIGHT ? tzi.DaylightBias : tzi.StandardBias));
+	const s32 host = hostsys::LocalTimeZone().offsetMinutes;
 	const s32 zone = zoneMinutes + dstMinutes;
 	const bool set = zone != host;
 	if (set != g_zoneSet || (set && g_zoneMinutes != zone)) {
@@ -742,10 +746,7 @@ u64 NowUnixUs() {
 }
 
 s64 StandardOffsetUs() {
-	_tzset();
-	long tz = 0;
-	_get_timezone(&tz);
-	return -(s64)tz * 1000000LL;
+	return (s64)hostsys::LocalTimeZone().standardMinutes * 60000000LL;
 }
 
 }  // namespace rtc
