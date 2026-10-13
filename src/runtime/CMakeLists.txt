@@ -86,9 +86,14 @@ if(WIN32)
 	target_link_libraries(pspc-launcher PRIVATE pspc_fs pspc_net pspc_common comctl32 gdiplus dwmapi uxtheme)
 	# Wide-character Win32 macros (ListView_InsertItem & co. take LVITEMW).
 	target_compile_definitions(pspc-launcher PRIVATE UNICODE _UNICODE)
-	# PSPC_SEM_VERSION: the launcher tells current AOT DLLs from stale ones; pspc_version.h.
-	target_include_directories(pspc-launcher PRIVATE ${CMAKE_BINARY_DIR}/generated)
+else()
+	pkg_check_modules(PSPC_GTK REQUIRED IMPORTED_TARGET gtk+-3.0>=3.22)
+	add_executable(pspc-launcher ${CMAKE_SOURCE_DIR}/src/frontend/launcher_gtk.cpp)
+	target_link_libraries(pspc-launcher PRIVATE PkgConfig::PSPC_GTK)
 endif()
+target_link_libraries(pspc-launcher PRIVATE pspc_game_library)
+# PSPC_SEM_VERSION: the launcher tells current AOT DLLs from stale ones; pspc_version.h.
+target_include_directories(pspc-launcher PRIVATE ${CMAKE_BINARY_DIR}/generated)
 
 # sceUtility dialogs (src/runtime/dialogs/).
 file(GLOB PSPC_DIALOG_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/dialogs/*.cpp)

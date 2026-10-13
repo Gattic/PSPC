@@ -45,6 +45,7 @@ using std::min;
 
 #include "common/fileutil.h"
 #include "common/settings.h"
+#include "frontend/game_library.h"
 #include "frontend/network_dialog.h"
 #include "frontend/online_page.h"
 #include "frontend/plugins_dialog.h"
@@ -275,86 +276,24 @@ std::wstring Widen(const std::string &s) {
 	return w;
 }
 
-void ReadSfo(const std::vector<u8> &sfo, Game &g) {
-	vfs::ParamSfo p;
-	if (!p.Parse(sfo)) return;
-	std::string t = p.GetString("TITLE");
-	if (!t.empty()) g.title = Widen(t);
-	g.id = Widen(p.GetString("DISC_ID"));
-}
-
-bool IsDisc(const fs::path &p) {
-	std::string ext = ToLower(p.extension().string());
-	return ext == ".iso" || ext == ".cso" || ext == ".zso" || ext == ".dax";
-}
-
-// A PBP's PARAM.SFO, ICON0 or PIC1, unless its offsets make it implausibly big.
-bool GetPbpMetadata(const vfs::PbpFile &pbp, vfs::PbpSection which, std::vector<u8> &out) {
-	out.clear();
-	return pbp.SectionSize(which) <= vfs::kMaxMetadataBytes && pbp.GetSection(which, out);
-}
-
-bool Describe(const fs::path &p, Game &g) {
-	g.path = p;
-	g.title = p.stem().wstring();
-	std::error_code ec;
-	g.size = fs::file_size(p, ec);
-	std::string ext = ToLower(p.extension().string());
-	if (IsDisc(p)) {
-		std::string err;
-		auto bd = vfs::OpenBlockDevice(p, &err);
-		if (!bd) return false;
-		vfs::IsoFileSystem iso(std::shared_ptr<vfs::BlockDevice>(std::move(bd)));
-		if (!iso.IsValid()) return false;
-		std::vector<u8> sfo;
-		if (iso.ReadWholeFile("/PSP_GAME/PARAM.SFO", sfo, vfs::kMaxMetadataBytes) == 0) ReadSfo(sfo, g);
-		iso.ReadWholeFile("/PSP_GAME/ICON0.PNG", g.icon, vfs::kMaxMetadataBytes);
-		return true;
-	}
-	if (ext == ".pbp") {
-		vfs::PbpFile pbp;
-		if (!pbp.Open(p)) return false;
-		std::vector<u8> sfo;
-		if (GetPbpMetadata(pbp, vfs::PbpSection::ParamSfo, sfo)) ReadSfo(sfo, g);
-		GetPbpMetadata(pbp, vfs::PbpSection::Icon0Png, g.icon);
-		if (p.filename() == "EBOOT.PBP" && g.title.empty()) g.title = p.parent_path().filename().wstring();
-		return true;
-	}
-	return ext == ".prx" || ext == ".elf";
-}
-
-std::vector<u8> ReadPic1(const fs::path &p) {
-	std::vector<u8> png;
-	if (IsDisc(p)) {
-		std::string err;
-		if (auto bd = vfs::OpenBlockDevice(p, &err)) {
-			vfs::IsoFileSystem iso(std::shared_ptr<vfs::BlockDevice>(std::move(bd)));
-			if (iso.IsValid() && iso.ReadWholeFile("/PSP_GAME/PIC1.PNG", png, vfs::kMaxMetadataBytes) != 0) png.clear();
-		}
-	} else if (ToLower(p.extension().string()) == ".pbp") {
-		vfs::PbpFile pbp;
-		if (pbp.Open(p)) GetPbpMetadata(pbp, vfs::PbpSection::Pic1Png, png);
-	}
-	return png;
-}
-
-bool IsLooseModule(const fs::path &p) {
-	std::string ext = ToLower(p.extension().string());
-	return ext == ".prx" || ext == ".elf";
-}
+using frontend::IsDisc;
+using frontend::ReadPic1;
 
 void Scan() {
 	g_games.clear();
-	std::error_code ec;
-	if (!fs::exists(g_gamesDir, ec)) fs::create_directories(g_gamesDir, ec);
-	for (auto it = fs::recursive_directory_iterator(g_gamesDir, fs::directory_options::skip_permission_denied, ec);
-	     it != fs::recursive_directory_iterator(); it.increment(ec)) {
-		if (ec || !it->is_regular_file(ec)) continue;
-		if (it.depth() > 3) continue;
-		// Modules inside a game's folders are its libraries, not games.
-		if (it.depth() > 0 && IsLooseModule(it->path())) continue;
-		Game g;
-		if (Describe(it->path(), g)) g_games.push_back(std::move(g));
+	try {
+		fs::create_directories(g_gamesDir);
+		for (auto &info : frontend::ScanGames(g_gamesDir)) {
+			Game game;
+			game.path = std::move(info.path);
+			game.title = Widen(info.title);
+			game.id = Widen(info.id);
+			game.size = info.size;
+			game.icon = std::move(info.icon);
+			g_games.push_back(std::move(game));
+		}
+	} catch (const fs::filesystem_error &error) {
+		MessageBoxW(g_main, Widen(error.what()).c_str(), L"Game library", MB_ICONERROR);
 	}
 }
 

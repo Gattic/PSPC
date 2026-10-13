@@ -53,3 +53,6 @@ foreach(component ${PSPC_COMPONENTS})
 		add_subdirectory(${component})
 	endif()
 endforeach()
+
+add_library(pspc_game_library STATIC frontend/game_library.cpp)
+target_link_libraries(pspc_game_library PUBLIC pspc_fs)
