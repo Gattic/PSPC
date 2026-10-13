@@ -17,6 +17,9 @@ belongs in the gitignored `private/` folder, never in the repository.
 
 ## Building and testing
 
+Prepare the [test fixtures](#test-fixtures) before running CTest. For the Linux tools-only
+build, see [Linux port status](../../docs/linux-port.md).
+
 It builds with the rest of PSPC (`tools/CMakeLists.txt` adds it):
 
 ```
@@ -179,7 +182,48 @@ readable by the same installation.
 
 ## Tests
 
-`pspc_decrypt_tests` (registered with CTest as `pspc_decrypt_tests`) needs no Sony data:
+`pspc_decrypt_tests` (registered with CTest as `pspc_decrypt_tests`) needs no official Sony
+updater, but its real-input tests require the original **4.01 M33** installer and SDK sample.
+These user-supplied binaries are gitignored, not bundled with the checkout. Missing fixtures
+are failures, not skips; they affect five CLI cases, two PRX cases and the negative updater
+check in `psar_cli_with_pbp`.
+
+### Test fixtures
+
+Use the original M33 distribution, not M33-2 or Sony's `401.PBP`. The archive below is
+447,329 bytes, SHA-256 `efd686afdc5248309cafd27b395a6169a6641bcfb8740d833d86922724a781c7`.
+From the repository root on Linux, download it, verify it, and extract the three decryption
+inputs plus `PARAM.SFO` for the related filesystem unit test:
+
+```sh
+mkdir -p build/fixtures reference/401M33 &&
+curl --fail --location --max-time 60 --max-filesize 447329 \
+  'https://archive.org/download/psp-firmware-collection.-7z/PSP%20Firmware%20Collection.7z/PSP%20Firmware%20Collection%2FCustom_Firmware%2F4.01%20M33.rar' \
+  -o build/fixtures/401M33.rar &&
+printf '%s  %s\n' \
+  efd686afdc5248309cafd27b395a6169a6641bcfb8740d833d86922724a781c7 \
+  build/fixtures/401M33.rar | sha256sum -c - &&
+cmake -E chdir reference/401M33 cmake -E tar xf ../../build/fixtures/401M33.rar \
+  UPDATE/EBOOT.PBP SDK/samples/bootload/EBOOT.PBP SDK/samples/bootload/bootload.prx \
+  SDK/samples/bootload/PARAM.SFO
+```
+
+The same archive can be acquired separately and extracted with a RAR-capable tool on Windows.
+The final paths (case-sensitive on Linux) must be:
+
+| Path relative to the repository root | Bytes |
+|---|---:|
+| `reference/401M33/UPDATE/EBOOT.PBP` | 497928 |
+| `reference/401M33/SDK/samples/bootload/EBOOT.PBP` | 42993 |
+| `reference/401M33/SDK/samples/bootload/bootload.prx` | 94442 |
+| `reference/401M33/SDK/samples/bootload/PARAM.SFO` | 408 |
+
+Keep these binaries out of Git. The build and tests do not download them automatically.
+After building, run `ctest --test-dir build/RelWithDebInfo --output-on-failure -R '^pspc_decrypt_tests$'`.
+The existing tests check module sizes, hashes, decoded bytes and CLI results; synthetic data
+is not a substitute for these real-input checks.
+
+### Coverage
 
 - The kirk-service command set: CMD4/7 and CMD5/8 round trips, the fuse ID's effect on 5/8,
   refused sizes and commands (`tests/test_kirk_service.cpp`).
