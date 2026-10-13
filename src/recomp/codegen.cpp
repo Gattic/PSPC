@@ -335,8 +335,8 @@ bool Generate(const ModuleImage &img, const Analysis &an, const CodegenOptions &
 		return false;
 	}
 
-	// A module that changes the FPU rounding mode (ctc1 to fcr31) needs the compiler to honour the
-	// dynamic mode: no constant folding under round-to-nearest. Others keep full optimisation.
+	// Clang needs FENV_ACCESS for modules that change fcr31. GCC ignores that pragma and
+	// relies on -frounding-math in both AOT build routes to prevent round-to-nearest folding.
 	bool setsRounding = false;
 	for (const auto &r : img.code)
 		for (u32 pc = r.first; pc + 4 <= r.second && !setsRounding; pc += 4) {
@@ -388,7 +388,7 @@ bool Generate(const ModuleImage &img, const Analysis &an, const CodegenOptions &
 	glue += "},\n";
 	glue += Fmt("\t0x%08Xu, %u, (u32)(sizeof(kFunctions) / sizeof(kFunctions[0])), kFunctions, &g_delta, g_patched,\n};\n\n",
 	            img.low, img.relocatable ? 1u : 0u);
-	glue += "extern \"C\" __declspec(dllexport) const AotModuleDesc *pspc_aot_module(const PspcRuntimeApi *api) {\n";
+	glue += "extern \"C\" PSPC_EXPORT const AotModuleDesc *pspc_aot_module(const PspcRuntimeApi *api) {\n";
 	glue += "\tif (!api || api->abiVersion != PSPC_AOT_ABI_VERSION || api->structSize < sizeof(PspcRuntimeApi)) return nullptr;\n";
 	glue += "\tg_api = api;\n\tg_membase = api->membase;\n\tg_cop0 = api->cop0;\n\tg_intrEnabled = api->intrEnabled;\n";
 	glue += "\treturn &g_desc;\n}\n";
@@ -403,13 +403,17 @@ bool Generate(const ModuleImage &img, const Analysis &an, const CodegenOptions &
 	cm += "set(CMAKE_CXX_STANDARD 20)\nset(CMAKE_MSVC_RUNTIME_LIBRARY \"MultiThreaded\")\n";
 	cm += "file(GLOB AOT_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)\n";
 	cm += "add_library(aot SHARED ${AOT_SOURCES})\n";
-	cm += Fmt("set_target_properties(aot PROPERTIES OUTPUT_NAME \"%s\")\n", sha.c_str());
+	cm += Fmt("set_target_properties(aot PROPERTIES PREFIX \"\" OUTPUT_NAME \"%s\" CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN YES)\n", sha.c_str());
 	cm += "target_include_directories(aot PRIVATE ${PSPC_SRC_DIR} ${PSPC_GEN_DIR} ${CMAKE_CURRENT_SOURCE_DIR})\n";
 	cm += "target_compile_definitions(aot PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)\n";
-	cm += "if(CMAKE_CXX_COMPILER_ID STREQUAL \"Clang\")\n";
-	cm += "\ttarget_compile_options(aot PRIVATE /O2 /clang:-fno-strict-aliasing -Wno-unused-label -Wno-unused-variable)\n";
-	cm += "else()\n\ttarget_compile_options(aot PRIVATE /O2 /bigobj /wd4102 /wd4189 /utf-8 /permissive- /Zc:preprocessor)\nendif()\n";
-	cm += "target_link_libraries(aot PRIVATE ${PSPC_LIB_DIR}/pspc_sem.lib ${PSPC_LIB_DIR}/pspc_common.lib)\n";
+	cm += "if(MSVC)\n\tif(CMAKE_CXX_COMPILER_ID STREQUAL \"Clang\")\n";
+	cm += "\t\ttarget_compile_options(aot PRIVATE /O2 /clang:-fno-strict-aliasing -Wno-unused-label -Wno-unused-variable)\n";
+	cm += "\telse()\n\t\ttarget_compile_options(aot PRIVATE /O2 /bigobj /wd4102 /wd4189 /utf-8 /permissive- /Zc:preprocessor)\n\tendif()\n";
+	cm += "else()\n\ttarget_compile_options(aot PRIVATE -O2 -fno-strict-aliasing -ffp-contract=off -frounding-math)\n";
+	// AOT globals belong to this module, never to the executable or another loaded module.
+	cm += "\ttarget_link_options(aot PRIVATE -Wl,-Bsymbolic -Wl,--exclude-libs,ALL -Wl,--no-undefined)\nendif()\n";
+	cm += "find_package(Threads REQUIRED)\n";
+	cm += "target_link_libraries(aot PRIVATE \"${PSPC_LIB_DIR}/${CMAKE_STATIC_LIBRARY_PREFIX}pspc_sem${CMAKE_STATIC_LIBRARY_SUFFIX}\" \"${PSPC_LIB_DIR}/${CMAKE_STATIC_LIBRARY_PREFIX}pspc_common${CMAKE_STATIC_LIBRARY_SUFFIX}\" Threads::Threads ${CMAKE_DL_LIBS})\n";
 	if (!WriteTextFile(fs::path(opts.outDir) / "CMakeLists.txt", cm)) {
 		if (err) *err = "cannot write CMakeLists.txt";
 		return false;

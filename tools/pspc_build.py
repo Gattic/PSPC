@@ -29,7 +29,10 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 BIN = ROOT / 'build' / 'RelWithDebInfo' / 'bin'
 LIB = ROOT / 'build' / 'RelWithDebInfo' / 'lib'
 SEM_HEADER = ROOT / 'build' / 'RelWithDebInfo' / 'generated' / 'pspc_sem_version.h'
-LINK_LIBS = ('pspc_sem.lib', 'pspc_common.lib')
+WINDOWS = sys.platform == 'win32'
+EXE_SUFFIX = '.exe' if WINDOWS else ''
+MODULE_SUFFIX = '.dll' if WINDOWS else '.so'
+LINK_LIBS = ('pspc_sem.lib', 'pspc_common.lib') if WINDOWS else ('libpspc_sem.a', 'libpspc_common.a')
 
 _seen_lock = threading.Lock()
 _seen = set()
@@ -37,8 +40,10 @@ _module_sha = {}  # module path -> SHA-1 of its plain ELF (for games.json)
 
 
 def source_sem_version():
-    """Hash of src/allegrex computed exactly as src/CMakeLists.txt does."""
-    files = sorted(p.resolve().as_posix() for p in (ROOT / 'src' / 'allegrex').iterdir() if p.is_file())
+    """Hash of AOT semantics, codegen and compiler policy, matching src/CMakeLists.txt."""
+    sources = [p for p in (ROOT / 'src' / 'allegrex').iterdir() if p.is_file()]
+    sources += [ROOT / 'src' / 'recomp' / 'codegen.cpp', ROOT / 'tools' / 'pspc_build.py']
+    files = sorted(p.resolve().as_posix() for p in sources)
     joined = ''.join(hashlib.sha1(pathlib.Path(f).read_bytes()).hexdigest() for f in files)
     return hashlib.sha1(joined.encode()).hexdigest()[:8]
 
@@ -54,14 +59,15 @@ def sem_version():
         raise RuntimeError('no PSPC_SEM_VERSION in %s' % SEM_HEADER)
     current = source_sem_version()
     if built != current:
-        raise RuntimeError('src/allegrex changed since %s was built (%s != %s): rebuild the main tree first'
+        raise RuntimeError('AOT sources or compiler policy changed since %s was built (%s != %s): rebuild the main tree first'
                            % (SEM_HEADER.parent.parent, built, current))
     return '0x' + built
 
 
 def snapshot_libs(work, version):
     """Copies the libraries the DLLs link so a concurrent main build can't swap them mid-batch."""
-    dest = work / ('lib-' + version)
+    # CMake's target_link_libraries treats relative archive paths as library names.
+    dest = work.resolve() / ('lib-' + version)
     dest.mkdir(parents=True, exist_ok=True)
     for name in LINK_LIBS:
         src = LIB / name
@@ -132,7 +138,7 @@ def expand_inputs(args, paths, origins=None):
             continue
         dest = pathlib.Path(args.work) / ('disc_' + hashlib.sha1(str(p.resolve()).encode()).hexdigest()[:12])
         dest.mkdir(parents=True, exist_ok=True)
-        r = subprocess.run([str(BIN / 'pspc-iso.exe'), 'modules', str(p), str(dest)], stdout=subprocess.PIPE,
+        r = subprocess.run([str(BIN / ('pspc-iso' + EXE_SUFFIX)), 'modules', str(p), str(dest)], stdout=subprocess.PIPE,
                            stderr=subprocess.PIPE, text=True)
         if r.returncode not in (0, 3):
             raise RuntimeError('pspc-iso failed on %s: %s' % (p, r.stderr.strip()))
@@ -170,7 +176,7 @@ def game_info(path):
         if path.suffix.lower() in DISC_EXTS:
             with tempfile.TemporaryDirectory() as tmp:
                 out = pathlib.Path(tmp) / 'PARAM.SFO'
-                subprocess.run([str(BIN / 'pspc-iso.exe'), 'get', str(path), '/PSP_GAME/PARAM.SFO', str(out)],
+                subprocess.run([str(BIN / ('pspc-iso' + EXE_SUFFIX)), 'get', str(path), '/PSP_GAME/PARAM.SFO', str(out)],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 if out.exists():
                     sfo = out.read_bytes()
@@ -228,8 +234,50 @@ CLANG_FLAGS = ['/O2', '/clang:-fno-strict-aliasing', '-Wno-unused-label', '-Wno-
 MSVC_FLAGS = ['/O2', '/bigobj', '/wd4102', '/wd4189', '/utf-8', '/permissive-', '/Zc:preprocessor']
 
 
+def linux_compiler(args):
+    if args.compiler == 'msvc':
+        raise RuntimeError('MSVC is only supported on Windows')
+    name = os.environ.get('CXX') or ('clang++' if args.compiler == 'clang' else 'g++')
+    cc = shutil.which(name)
+    if not cc:
+        raise RuntimeError('C++ compiler not found: %s (set CXX or use --compiler gcc)' % name)
+    return cc
+
+
+def build_linux(args, env, src, sha):
+    cc = linux_compiler(args)
+    obj_dir = src / 'obj'
+    obj_dir.mkdir(exist_ok=True)
+    flags = ['-std=c++20', '-O2', '-DNDEBUG', '-fPIC', '-fvisibility=hidden',
+             '-fvisibility-inlines-hidden', '-fno-strict-aliasing', '-ffp-contract=off', '-frounding-math',
+             '-I' + str(ROOT / 'src'), '-I' + str(SEM_HEADER.parent), '-I' + str(src)]
+
+    def compile_one(cpp):
+        obj = obj_dir / (cpp.stem + '.o')
+        r = subprocess.run([cc, *flags, '-c', str(cpp), '-o', str(obj)], env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if r.returncode:
+            raise RuntimeError('compile failed (%s):\n%s' % (cpp.name, r.stdout[-6000:]))
+        return obj
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as ex:
+        objs = list(ex.map(compile_one, sorted(src.glob('*.cpp'))))
+    module = obj_dir / (sha + MODULE_SUFFIX)
+    cmd = [cc, '-shared', '-Wl,-Bsymbolic', '-Wl,--exclude-libs,ALL', '-Wl,--no-undefined',
+           '-o', str(module), *map(str, objs)]
+    cmd += [str(pathlib.Path(args.lib_dir) / n) for n in LINK_LIBS] + ['-pthread', '-ldl']
+    r = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if r.returncode:
+        raise RuntimeError('link failed:\n' + r.stdout[-6000:])
+    return module
+
+
 def build_direct(args, env, src, sha):
     """Compiles and links the generated sources directly: no CMake configure per module."""
+    if not WINDOWS:
+        return build_linux(args, env, src, sha)
+    if args.compiler == 'gcc':
+        raise RuntimeError('GCC is only supported on Linux')
     clang = args.compiler == 'clang'
     # CreateProcess searches our own PATH, not env's: resolve the tools against the VS environment.
     cc = shutil.which('clang-cl' if clang else 'cl', path=env['PATH'])
@@ -264,7 +312,7 @@ def build_direct(args, env, src, sha):
 
 def build_with_cmake(args, env, src, sha):
     bdir = src / 'build'
-    compiler = 'clang-cl' if args.compiler == 'clang' else 'cl'
+    compiler = ('clang-cl' if args.compiler == 'clang' else 'cl') if WINDOWS else linux_compiler(args)
     cfg = ['cmake', '-S', str(src), '-B', str(bdir), '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
            '-DCMAKE_CXX_COMPILER=' + compiler, '-DPSPC_SRC_DIR=' + str(ROOT / 'src').replace('\\', '/'),
            '-DPSPC_LIB_DIR=' + str(args.lib_dir).replace('\\', '/'),
@@ -276,7 +324,7 @@ def build_with_cmake(args, env, src, sha):
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if r.returncode != 0:
         raise RuntimeError('compile failed:\n' + r.stdout[-6000:])
-    return bdir / (sha + '.dll')
+    return bdir / (sha + MODULE_SUFFIX)
 
 
 def build_one(args, env, path):
@@ -289,7 +337,7 @@ def build_one(args, env, path):
         if sha in _seen:
             return '%s: same module as another input (%s)' % (path.name, sha)
         _seen.add(sha)
-    dest = pathlib.Path(args.cache) / (sha + '.dll')
+    dest = pathlib.Path(args.cache) / (sha + MODULE_SUFFIX)
     hints = pathlib.Path(args.cache) / (sha + '.hints')
     stamp = pathlib.Path(args.cache) / (sha + '.semver')
     stale = hints.exists() and dest.exists() and hints.stat().st_mtime > dest.stat().st_mtime
@@ -302,7 +350,7 @@ def build_one(args, env, path):
     src = work / sha
     if src.exists():
         shutil.rmtree(src)
-    cmd = [str(BIN / 'pspc-recomp.exe'), str(elf_path), '-o', str(src)]
+    cmd = [str(BIN / ('pspc-recomp' + EXE_SUFFIX)), str(elf_path), '-o', str(src)]
     if args.hints:
         cmd += ['--hints', args.hints]
     elif hints.exists():
@@ -335,8 +383,8 @@ def main():
     ap.add_argument('--cache', default=None, help='AOT cache (default: <build dir>/bin/cache/aot)')
     ap.add_argument('--work', default=str(ROOT / 'build' / 'aot-work'))
     ap.add_argument('--decrypt', default=None)
-    ap.add_argument('--compiler', choices=['clang', 'msvc'], default='clang')
-    ap.add_argument('--jobs', type=int, default=os.cpu_count() or 4)
+    ap.add_argument('--compiler', choices=['clang', 'msvc', 'gcc'], default='clang')
+    ap.add_argument('--jobs', type=int, default=min(os.cpu_count() or 4, 8))
     ap.add_argument('--modules-in-parallel', type=int, default=1)
     ap.add_argument('--hints', default=None)
     ap.add_argument('--no-comments', action='store_true')
@@ -348,8 +396,10 @@ def main():
         tree = pathlib.Path(args.build_dir).resolve()
         BIN, LIB, SEM_HEADER = tree / 'bin', tree / 'lib', tree / 'generated' / 'pspc_sem_version.h'
     args.cache = args.cache or str(BIN / 'cache' / 'aot')
-    args.decrypt = args.decrypt or str(BIN / 'pspc-decrypt.exe')
-    env = vs_env()
+    args.decrypt = args.decrypt or str(BIN / ('pspc-decrypt' + EXE_SUFFIX))
+    if args.jobs < 1 or args.modules_in_parallel < 1:
+        ap.error('--jobs and --modules-in-parallel must be positive')
+    env = vs_env() if WINDOWS else os.environ.copy()
     args.sem_version = sem_version()
     args.lib_dir = snapshot_libs(pathlib.Path(args.work), args.sem_version)
     origins, ok = {}, {}

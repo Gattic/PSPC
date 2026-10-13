@@ -61,6 +61,16 @@ if(TARGET pspc_runtime)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+	find_package(Python3 REQUIRED COMPONENTS Interpreter)
+	add_executable(pspc_aot_probe aot/module_probe.cpp)
+	target_link_libraries(pspc_aot_probe PRIVATE pspc_common)
+	target_include_directories(pspc_aot_probe PRIVATE ${CMAKE_BINARY_DIR}/generated)
+	add_dependencies(pspc_aot_probe pspc-recomp pspc_sem)
+	add_test(NAME aot_pipeline COMMAND ${Python3_EXECUTABLE} -I
+		${CMAKE_CURRENT_SOURCE_DIR}/aot/test_pipeline.py
+		--build-dir ${CMAKE_BINARY_DIR} --probe $<TARGET_FILE:pspc_aot_probe>
+		--compiler ${CMAKE_CXX_COMPILER})
+	set_tests_properties(aot_pipeline PROPERTIES TIMEOUT 180)
 	if(TARGET pspc_runtime)
 		add_executable(pspc_net_recvmsg_tests runtime/test_net_recvmsg.cpp)
 		target_link_libraries(pspc_net_recvmsg_tests PRIVATE pspc_runtime)
@@ -68,5 +78,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 			add_test(NAME net_recvmsg_${mode} COMMAND pspc_net_recvmsg_tests ${mode})
 			set_tests_properties(net_recvmsg_${mode} PROPERTIES TIMEOUT 5)
 		endforeach()
+		add_executable(pspc_aot_runtime_probe aot/runtime_probe.cpp)
+		target_link_libraries(pspc_aot_runtime_probe PRIVATE pspc_runtime)
+		add_dependencies(pspc_aot_runtime_probe pspc-recomp pspc_sem)
+		add_test(NAME aot_runtime COMMAND ${Python3_EXECUTABLE} -I
+			${CMAKE_CURRENT_SOURCE_DIR}/aot/test_pipeline.py --runtime
+			--build-dir ${CMAKE_BINARY_DIR} --probe $<TARGET_FILE:pspc_aot_runtime_probe>
+			--compiler ${CMAKE_CXX_COMPILER})
+		set_tests_properties(aot_runtime PROPERTIES TIMEOUT 180)
 	endif()
 endif()

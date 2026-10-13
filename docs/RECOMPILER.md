@@ -99,14 +99,25 @@ void F_088040AC(Ctx *PSPC_RESTRICT c) { B_088040AC(c, c->r[31], c->r[29]); }
   makes it a non-local return, as for `jr ra`, so the host stack doesn't grow with every switch
   (`tests/guest/coroutines`).
 * Words patched by variable imports run through `g_api->execWord` (read from memory at runtime).
-* A module that writes `fcr31` (`ctc1 x, $31`) is compiled with `#pragma STDC FENV_ACCESS ON` so
-  clang doesn't constant-fold float arithmetic under round-to-nearest; other modules keep full
-  optimisation.
+* A module that writes `fcr31` (`ctc1 x, $31`) is compiled with `#pragma STDC FENV_ACCESS ON`
+  for Clang. GCC ignores that pragma, so both Linux AOT build routes also use `-frounding-math`
+  to prevent constant-folding under round-to-nearest when the guest changes rounding modes.
 * DLLs carry the ABI version (`PSPC_AOT_ABI_VERSION`, now 2) and the semantics version (a hash of
-  `src/allegrex`); the runtime ignores a DLL built against different ones.
+  `src/allegrex`, `src/recomp/codegen.cpp`, and `tools/pspc_build.py`). The runtime rejects a
+  different version, and the builder regenerates cached modules after semantics, codegen or
+  compiler-policy changes. Rebuild the main tree before rebuilding AOT modules.
 
 ## Validation
 
+* On Linux, with `PSPC_BUILD_TESTS=ON` (the default), build `pspc_aot_probe`, then run
+  `ctest --test-dir <build-dir> -R '^aot_pipeline$' --output-on-failure`. This synthetic ELF
+  test covers both build routes, guest round-up, native execution, ABI isolation and cache
+  invalidation. It needs Python 3, CMake, Ninja and GCC or Clang, but no PSP compiler, firmware
+  or full runtime (`PSPC_BUILD_RUNTIME=OFF` is supported). With the full runtime enabled,
+  also build `pspc_aot_runtime_probe` and run
+  `ctest --test-dir <build-dir> -R '^aot_runtime$' --output-on-failure` to check actual native
+  loading, interpreter fallback and unload. These fixed-address fixtures do not establish
+  retail AOT, relocatable PRX or firmware compatibility.
 * `tools/run_autotests.py --aot` runs the pspautotests suite with AOT DLLs enabled; comparing it
   with the interpreter run is a differential test of the code generator.
 * Interpreter misses inside AOT modules are written to `<aot dir>/<sha1>.hints`; the next
