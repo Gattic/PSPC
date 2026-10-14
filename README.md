@@ -47,6 +47,11 @@ outdated code. Games can also run in the interpreter.
 
 ## Status
 
+The compatibility results below are not a cross-platform parity claim. For the current Linux
+build/test milestone, genuine GTK/Sony XMB workflows and remaining limits, see
+[Linux milestone status](docs/linux-port.md#current-linux-milestone). The port is still in
+progress; Windows/D3D11 has not been rebuilt or retested after the Linux changes.
+
 Retail games boot and play natively (AOT) and in the interpreter: Daxter (intro movie and
 gameplay), Syphon Filter: Logan's Shadow (story mode), Syphon Filter: Combat Ops, Monster Hunter
 Freedom Unite, Star Wars Battlefront II, Elite Squadron and Renegade Squadron - see

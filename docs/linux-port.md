@@ -1,9 +1,36 @@
 # Linux port status
 
-The Linux runtime and a native GTK game-library launcher now build and pass the automated
-suite below. Retail validation and its remaining limits are documented below. The port is **in progress**, not full
-Windows feature parity or a supported release. Windows backends remain in the source tree, but have not been built or tested
-on Windows after these changes.
+The Linux runtime and native GTK game-library launcher build and pass the scoped checks
+summarized below. The port is **in progress**, not full Windows feature parity or a supported
+release. Windows backends remain in the source tree, but have not been built or tested on
+Windows after these changes.
+
+## Current Linux milestone
+
+The milestone checkpoint ending at `73963b6` passed both configured builds, **25/25 runtime
+CTests** with `PSPC_RENDERER_REQUIRE=1`, and **5/5 tools-only CTests**. Reference-dependent
+VFPU omissions remain explicit; these totals do not mean those comparisons ran. Additional
+checks passed for the mount-hidden, read-only relocated package, registered desktop/GIO GTK
+activation and owned shutdown, and synthetic GTK workflows including XDG writes, settings,
+plugins, accounts/server/admin/routing, failure/cancellation, native build/play, live native
+rebuild and stop. Evidence is retained locally in `build/linux-milestone-checkpoint/`.
+
+Separate genuine Sony 4.01 checks established CLI installation/native XMB boot and, later,
+**GTK installation, changed-setting persistence across restart, and Combat Ops launch from
+XMB with public-UI return to a responsive XMB**. The latter game run used interpreter fallback,
+not game AOT. See [firmware/XMB evidence and limits](#sony-401-firmware-installation-and-xmb-validation).
+
+These results do not establish broad retail AOT/OpenGL compatibility, pixel-level
+presentation/overlay/capture parity, physical controller or audio-quality acceptance, other
+desktops/drivers, actual Ghidra analysis, or Windows/D3D11 regression safety. The package
+requires host libraries, Python and a compiler; it is not an AppImage or a cross-distro ABI
+guarantee. Hosted CI/artifact upload and release publication are not demonstrated by the
+local gates. See [work still required](#work-still-required).
+
+The sections below retain **stage-specific history**: older suite counts, failures and
+run-local exclusions describe those particular runs, not the current milestone totals.
+Later follow-ups supersede only the claims they explicitly exercise; earlier captures and
+failed attempts are not discarded or reclassified as passes.
 
 ## Buildable foundation
 
@@ -21,7 +48,7 @@ four). This configuration builds the filesystem, loader, semantics, recompiler a
 decryption tools, not the emulator or launcher. The unit executable also builds the
 host socket, DNS and ad hoc server code without the runtime/HTTP dependencies.
 
-The foundation build and unit CTest passed on Fedora 44 with GCC 16.2.1: 75 registered
+The initial foundation build and unit CTest passed on Fedora 44 with GCC 16.2.1: 75 registered
 unit cases, zero reported failures. This includes TCP/UDP loopback, refused connects,
 network poller watches, ad hoc group operations, fiber stack/rounding-mode preservation,
 and event reset/wakeup behavior. Several reference-dependent VFPU cases report internal
@@ -30,7 +57,7 @@ is not a claim that those hardware comparisons ran.
 
 After provisioning the gitignored M33
 [test fixtures](../tools/pspc-decrypt/README.md#test-fixtures), a full tools-only CTest run
-passed all three entries (`unittests`, `pspc_decrypt_tests`, and `aot_pipeline`):
+passed all three then-registered entries (`unittests`, `pspc_decrypt_tests`, and `aot_pipeline`):
 
 ```sh
 ctest --test-dir build/RelWithDebInfo --output-on-failure
@@ -116,10 +143,10 @@ The initial probe allocated its scratch/stack over the fixed ELF address; alloca
 scratch at the top of user RAM corrected the fixture without changing runtime behavior.
 Temporary inputs, snapshots and caches are removed after each run; diagnostics remain in
 CTest logs. No game assets, source saves, acquisition attempt or save reload are involved.
-The full Linux build and all **16 CTest entries** pass with this check and the UDP receive
-tests below registered. The tools-only build and its existing `aot_pipeline` test also
-pass, without requiring the runtime probe. This does **not** cover relocatable PRXs, guest
-imports, scheduler-driven AOT execution, retail AOT or firmware/XMB.
+At that stage, the full Linux build and all **16 CTest entries** passed with this check and
+the UDP receive tests below registered. The tools-only build and its existing `aot_pipeline`
+test also passed, without requiring the runtime probe. This does **not** cover relocatable
+PRXs, guest imports, scheduler-driven AOT execution, retail AOT or firmware/XMB.
 
 ## Guest UDP receive truncation
 
@@ -166,7 +193,7 @@ multi interface with bounded body buffering, phase timeouts and concurrent cance
 normal TLS verification uses the host trust store. The existing explicit revival-server
 certificate exception remains scoped by the request's `connectAddress` setting.
 
-Checks completed:
+Initial full-runtime checks completed:
 
 - Full build and all CTest entries: 126 unit cases with zero failures, 38 decryption cases
   with 7,224 checks, synthetic AOT pipeline, and the Linux launcher CLI test. The same
@@ -717,10 +744,12 @@ The GTK launcher provides:
   owned runtime. Builds use the existing compiler pipeline and private temporary work
   directories, removed after the child group has stopped.
 - Sony 4.01 extraction/install steps, optional firmware AOT, progress/error output and
-  XMB launch. A successful real Sony installation/XMB run remains **unverified**.
+  XMB launch. The later [genuine GUI/XMB run](#gtk-installation-setting-persistence-and-game-return)
+  passed installation, setting persistence and a bounded game-launch/return workflow.
 
-Native building requires the source tree and development tools; a missing builder is
-reported explicitly. Child commands use argv/stdin, not shell command interpolation.
+Native building works from the source tree or the [installed AOT SDK](#relocatable-linux-aot-sdk)
+with host Python and development tools; a missing builder is reported explicitly.
+Child commands use argv/stdin, not shell command interpolation.
 Their process groups are owned and reaped; shutdown never targets arbitrary matching
 process names. Captured output is bounded to 256 KiB, with 2 MiB disk logs and one rotated
 copy per role. Admin output remains parseable rather than including lifecycle log markers.
@@ -750,8 +779,8 @@ use retail assets, existing installation data or global key events. The GTK layo
 copy of the Windows UI; firmware installation and every admin mutation are not covered by
 this UI check.
 
-The full runtime regression passed **16/16 CTests** with hardware availability required;
-the tools-only build passed **3/3 CTests**. Focused launcher checks follow the final
+This initial renderer/GTK regression passed **16/16 CTests** with hardware availability
+required; the tools-only build passed **3/3 CTests**. Focused launcher checks followed the
 process-ownership and raw-admin-output changes. Local evidence is under
 `build/linux-parity-review/`. Canonical checks are CTest and the explicit drivers above:
 the generic test-runner's inferred `pytest -q` command is not applicable to the repository's
@@ -784,12 +813,13 @@ synthetic ELF and executes its output through the native module probe. It reprod
 false failure before the suffix fix. This covers the shared helper without PSP tools or
 firmware, not the full guest/reference/large-image suites.
 
-The delivery audit also leaves these explicit follow-ups under roadmap item 3.1.2:
+The delivery audit and subsequent follow-ups under roadmap item 3.1.2 establish:
 
 - `build.sh`, guest-build shell scripts, smoke/network helpers and the native builder have
-  Linux entry points. Ghidra's headless/JDK discovery still assumes Windows. The firmware
-  helper now distinguishes executables from writable firmware/cache/work destinations;
-  successful installation/boot with Sony assets remains unverified.
+  Linux entry points. [Ghidra headless/JDK discovery](#ghidra-headless-tooling) is now portable
+  and fixture-tested; actual Ghidra analysis remains unrun. The firmware helper separates
+  executables from writable firmware/cache/work destinations. Genuine Sony installation
+  and bounded XMB workflows passed in the [firmware checks](#sony-401-firmware-installation-and-xmb-validation).
 - `tools/make_installer.py` and its bundled-toolchain release test are Windows-only. The
   Linux AOT SDK component below installs PSPC's build dependencies, but is not a full
   application package or a self-contained compiler distribution by itself. Runtime builds now
@@ -973,6 +1003,8 @@ these tests establish the helper's launch contract, not full analysis parity.
 
 ## Sony 4.01 firmware installation and XMB validation
 
+### CLI installation and native XMB boot
+
 A bounded Linux run installed genuine Sony 4.01 PSP-2000/02g assets into a fresh,
 XDG-isolated profile. The archive linked from `fwdownloads.txt` confirmed the cached
 `401.PBP` MD5 (`c593abc023aa9b215710df6e263b3fff`); extraction produced 300 files,
@@ -999,17 +1031,49 @@ Sony user-mode XMB over PSPC's native kernel, not execution of Sony kernel modul
 Evidence is local and ignored under `build/linux-firmware-validation/`: extraction
 and installation results, `aot-result.json`, four bounded run cases, red/green
 lifetime regressions and the final runtime CTest log. The task preserves the original
-firmware, settings and saves; no gameplay acceptance runs were added. The GTK install
-dialog, changed-setting persistence, XMB game launch/return, hardware GE rendering,
-physical audio/controller behavior and other firmware versions remain untested by
-this validation. See [VSH boot](vsh-boot.md) for the workflow and architecture.
+firmware, settings and saves; no gameplay acceptance runs were added. This CLI validation
+did not test the GTK install dialog, changed-setting persistence or XMB game launch/return;
+the separate continuation below covers those workflows. Hardware GE rendering, physical
+audio/controller behavior and other firmware versions were outside both runs' scope.
+See [VSH boot](vsh-boot.md) for the architecture.
+
+### GTK installation, setting persistence and game return
+
+A subsequent isolated GUI continuation used the same Sony 4.01 PBP (MD5 above), read-only
+copies of the updater and Combat Ops ISO, and fresh HOME/XDG roots with no copied AOT
+cache. It used the software renderer, muted/dummy host audio, and disabled networking and
+plugins. No production source, tests or binaries changed during this continuation.
+
+- **GTK installation:** selecting the PBP through the real Install firmware file chooser
+  completed extraction and installation with exit 0 in about 289 seconds. All 205 modules
+  decrypted; installation wrote 299 flash0 files and built 14 core native ELF modules.
+  This was Sony-only: the earlier CLI run's 301 files/16 modules included the optional
+  M33 UI assets, so the counts describe different inputs, not a regression.
+- **Setting persistence:** public XMB controls changed Settings → Sound Settings → Key Tone
+  from On to Off. After a clean exit and fresh Boot XMB process, Off was displayed again;
+  `CONFIG/SYSTEM/SOUND / operation_sound_mode` remained 0 in the persisted registry.
+- **Launch/return:** XMB Game → Memory Stick launched Combat Ops (`NPUG80114`) from the copied
+  ISO. The game reached its title/autosave notice and interactive profile-name entry.
+  Home/Escape → Quit the game? → Yes returned to a fresh XMB; subsequent category navigation
+  confirmed responsiveness. The game used **interpreter fallback**, not a warmed native cache.
+
+All four runtime processes reported zero bad memory accesses; final runtime-chain and GTK
+shutdown exited 0. Original firmware/games/saves/settings, source and binaries were hash-checked
+unchanged. Reports, process logs, registry snapshots and 21 captures are retained locally in
+`build/linux-xmb-workflow-validation/` (`review.md` and `final-result.json` index the evidence).
+
+This establishes only these three public workflows. It does not establish mission gameplay,
+game save creation/reload, game AOT compilation, OpenGL rendering, audible audio, physical
+controllers, network play or broader XMB feature coverage. Earlier retail save/reload results
+above remain separate evidence, not outcomes of this GUI run.
 
 ## Work still required
 
 - Validate real Ghidra/Allegrex imports and analysis on Linux; fixture headless tests
   cover the helper's orchestration only.
-- Validate the GTK firmware-install dialog, XMB setting persistence and game launch/return,
-  other firmware versions, additional desktop/driver combinations, and remaining UI/admin paths.
+- Extend firmware/XMB coverage beyond the Sony 4.01 install, one persisted setting and bounded
+  Combat Ops launch/return above; test other firmware versions, additional desktop/driver
+  combinations and remaining UI/admin paths.
 - Validate Combat Ops editor manipulation/playable missions, a progressed Dark Mirror
   checkpoint resume, and later Logan's Shadow checkpoints. Draft persistence and the
   initial Logan's Shadow story checkpoint now pass within the limits above.
@@ -1020,5 +1084,7 @@ this validation. See [VSH boot](vsh-boot.md) for the workflow and architecture.
   gaps rather than masking unresolved-import warnings.
 - Validate retail OpenGL rendering, overlays/captures, performance and additional GPU drivers;
   the default software renderer and synthetic hardware checks are not retail parity proof.
-- Finish remaining script, packaging/install and CI portability.
+- Validate remaining asset-dependent scripts, distro-native packaging/upgrade integration and
+  broader ABI baselines; observe hosted CI/artifact upload before claiming a hosted pass.
+  Release distribution/signing remain outside the demonstrated local package gates.
 - Run a Windows build and regression tests before claiming Windows support is preserved.

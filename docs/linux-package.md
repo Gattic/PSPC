@@ -182,9 +182,9 @@ are not persisted, and no release is published. Logs (including failures) and su
 packages are separate artifacts with seven-day retention; build trees and CPack staging are
 not uploaded or cached between runners. The artifact name records Ubuntu 24.04/x86-64, not a
 universal Linux ABI. Local rehearsal is not evidence of a hosted Actions run or artifact
-upload; first hosted execution remains to be observed after these changes are committed.
+upload; first hosted execution and artifact upload remain unobserved.
 
-Local evidence: native Fedora checks passed both builds, tools 4/4 and runtime 20/20 CTest
+Initial package/CI-stage evidence: native Fedora checks passed both builds, tools 4/4 and runtime 20/20 CTest
 entries, mount-hidden archive execution and real GTK desktop activation. The complete
 Ubuntu 24.04/GCC 13 shared recipe also passed: all 19 selected fixture-free CTest entries,
 strict mount-hidden/read-only archive execution, registered GTK launch and clean closure
@@ -195,6 +195,13 @@ was enabled, and no host-wide security policy or isolation assertion was changed
 verifier's GIO call uses an explicit receiver for the supported typelibs' function/method
 annotations. This is a complete local recipe pass, not a hosted Actions or upload result.
 
-Synthetic gates do not validate Sony firmware extraction/XMB, retail compatibility, other
-hosts/drivers, Windows, or signing/publishing. Distro-native package hooks, a supported
+The later [Linux milestone checkpoint](linux-port.md#current-linux-milestone) passed 25/25
+runtime CTests with hardware availability required and 5/5 tools CTests, plus mount-hidden
+package isolation, registered desktop activation and the synthetic GTK/live-rebuild workflow.
+These are later host-side results, not new totals for the historical Ubuntu recipe run above.
+
+Synthetic package/CI gates do not validate Sony firmware extraction/XMB, retail compatibility,
+other hosts/drivers, Windows, or signing/publishing. Separate [genuine GUI/XMB checks](linux-port.md#gtk-installation-setting-persistence-and-game-return)
+passed Sony 4.01 installation, one persisted setting and a bounded interpreter game launch/return;
+they do not expand the package gate's coverage. Distro-native package hooks, a supported
 multi-distro ABI matrix and release distribution remain roadmap follow-ups.

@@ -1,7 +1,7 @@
 # Booting the real 4.01 XMB (`pspc --vsh`)
 
 PSPC boots Sony's own 4.01 VSH (the XMB) on top of its native kernel: `vshmain`, `paf`,
-`common_gui`, `common_util` and the `*_plugin` modules run as guest code (AOT DLLs when built,
+`common_gui`, `common_util` and the `*_plugin` modules run as guest code (native AOT modules when built,
 otherwise interpreted), exactly as they ship. Every kernel module, including `vshbridge.prx`, and
 M33's `systemctrl`/`vshctrl` stay native. M33's user-mode UI (the VSH menu `satelite.prx` and
 `recovery.prx`) runs as guest code too.
@@ -11,6 +11,12 @@ boots the VSH by running the real `kd/` drivers as MIPS code). PSPC takes the ot
 prescribes: no Sony kernel code runs, so none of that document's driver/MMIO workarounds apply.
 
 ## Quick start
+
+The commands and historical timings below describe the Windows setup. For Linux installation
+paths and bounded CLI/GTK XMB evidence, including persisted Key Tone and Combat Ops launch/return,
+see [Linux firmware/XMB validation](linux-port.md#sony-401-firmware-installation-and-xmb-validation)
+and [Linux user-data paths](linux-port.md#linux-runtime-and-gtk-user-data-paths). Those checks do
+not establish every XMB feature described here or revalidate Windows after the Linux port.
 
 ```bat
 :: once: decrypt the update and the M33 installer (docs/firmware-tooling.md)

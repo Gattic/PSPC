@@ -5,7 +5,11 @@ All of them are our own code (GPL-2.0-or-later) and take input paths as
 arguments. Outputs that are derived from copyrighted firmware go under
 `private/` (gitignored); `data/` and `docs/` hold only facts and our words.
 
-Prerequisites:
+The paths and Windows commands below record the original analysis setup, not Linux
+requirements. For Linux builds and current verification scope, see [Linux port status](linux-port.md#current-linux-milestone);
+for portable Ghidra/JDK selection, see [the headless pipeline](#6-ghidra-headless-pipeline----toolsghidraghidra_analyzepy).
+
+Original Windows prerequisites:
 - Python 3.12 at `C:\Users\yoelr\AppData\Local\Programs\Python\Python312\python.exe`.
   **Always run with `-I`** (isolated: ignores `PYTHONPATH`/user site, so a
   planted module next to an untrusted input cannot be imported). All tools are
@@ -196,22 +200,24 @@ not establish actual Ghidra/Allegrex analysis or native Windows batch execution.
 
 ---
 
-## 7. When the official Sony 4.01 update arrives
+## 7. Extract the official Sony 4.01 update
 
-The M33 installer only carries the 11 M33 patch modules; the ~100 Sony modules
-(kernel, drivers, codecs, XMB, fonts, resources) come from Sony's 4.01 update,
-which the user must supply as `401.PBP`. A separate agent is building
-`tools/pspc-decrypt`. Once it exists:
+The M33 installer carries the 11 M33 patch modules, not the Sony kernel, drivers,
+codecs, XMB, fonts and resources. The user must supply Sony's 4.01 update as `401.PBP`;
+it is not distributed with PSPC. The implemented `pspc-decrypt` tool unpacks and decrypts it:
 
 ```
-pspc-decrypt psar 401.PBP private\fw\401\flash0
+pspc-decrypt psar 401.PBP private/fw/401 --model 02g
 ```
 
-is expected to unpack the PSAR and KIRK-decrypt every module and resource into
-`private/fw/401/flash0/` (mirroring the on-device `flash0:` layout:
-`kd/*.prx`, `vsh/module/*.prx`, `font/*.pgf`, `vsh/resource/*.rco`, `data/*`).
+The output root contains `flash0/`, mirroring the on-device layout
+(`kd/*.prx`, `vsh/module/*.prx`, `font/*.pgf`, `vsh/resource/*.rco`, `data/*`),
+plus a manifest and other extracted outputs; see the [decrypt tool's output contract](../tools/pspc-decrypt/README.md#firmware-updates-psar).
+Genuine Linux Sony 4.01 extraction, CLI/GTK installation and bounded XMB workflows
+have passed; their distinct inputs and limits are recorded in [Linux firmware validation](linux-port.md#sony-401-firmware-installation-and-xmb-validation).
+This is not evidence of actual Linux Ghidra analysis.
 
-Then this pipeline runs on that tree unchanged:
+The inventory and analysis commands can then use the extracted tree (Windows examples):
 
 ```
 REM inventory every decrypted module + the M33 modules together
@@ -239,14 +245,20 @@ Notes for that run:
 
 ## 7b. Installing the firmware for pspc -- `tools/pspc_install_fw.py`
 
-Copies the decrypted firmware's `flash0/{vsh,font,dic,data,kd}` and M33's `satelite.prx` /
-`recovery.prx` into `<pspc dir>/flash0`, prepares `<pspc dir>/flash1`, and AOT-compiles every
-user-mode module of `flash0/vsh/module` with `tools/pspc_build.py`. Then `pspc --vsh` boots the
-XMB (docs/vsh-boot.md).
+Copies the decrypted firmware's `flash0/{vsh,font,dic,data,kd}` and optional M33
+`satelite.prx` / `recovery.prx` into `flash0`, prepares `flash1`, and AOT-compiles the
+user-mode modules of `flash0/vsh/module` with `tools/pspc_build.py`. Then `pspc --vsh` boots
+the XMB ([VSH boot](vsh-boot.md)).
+
+On Linux, `--data-dir` is required for the writable parent of `flash0`/`flash1`; firmware AOT
+also requires explicit writable `--cache` and `--work` paths. Use the runtime's
+[XDG user-data/cache roots](linux-port.md#linux-runtime-and-gtk-user-data-paths), not the installed
+executable directory. `--build-dir` or `--pspc-dir` selects the build/installed SDK separately.
+On Windows, the data directory defaults to `<pspc dir>`; the original examples below use that default:
 
 ```
 PY -I tools/pspc_install_fw.py --fw private/fw/401 --build-dir build/RelWithDebInfo
-PY -I tools/pspc_install_fw.py --aot-core      REM only the 16 modules the XMB starts with
+PY -I tools/pspc_install_fw.py --aot-core      REM 14 Sony core modules, plus 2 M33 UI modules when present
 PY -I tools/pspc_install_fw.py --no-aot        REM files only
 ```
 
