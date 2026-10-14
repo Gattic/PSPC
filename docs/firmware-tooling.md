@@ -132,7 +132,7 @@ build\tools\pspdecompiler\pspdecompiler.exe -vi -n data/psplibdoc.xml \
    reference\401M33\SDK\samples\bootload\bootload.prx
 ```
 
-## 6. Ghidra headless pipeline -- `tools/ghidra_analyze.cmd`
+## 6. Ghidra headless pipeline -- `tools/ghidra/ghidra_analyze.py`
 
 Imports each module into a Ghidra project under `private/ghidra/` with the
 Allegrex loader/language, names imports and exports from `data/nids.csv`
@@ -141,17 +141,39 @@ Allegrex loader/language, names imports and exports from `data/nids.csv`
 tables, string refs, code pointers) and `private/fw/401/decomp/<module>.c`
 (decompiled C) via `PspcExportAnalysis.java`.
 
+Install Ghidra with the `ghidra-allegrex` loader/language and a full JDK compatible
+with that Ghidra version (not just a JRE). Select the installation explicitly;
+there is no machine-specific default Ghidra directory.
+
+Linux:
+
+```sh
+python3 -I tools/ghidra/ghidra_analyze.py --ghidra /opt/ghidra \
+    --java-home /path/to/jdk private/fw/401/m33
 ```
-cmd /c tools\ghidra_analyze.cmd private\fw\401\m33
+
+Windows (the wrapper accepts the same options):
+
+```bat
+cmd /c tools\ghidra_analyze.cmd --ghidra C:\Tools\ghidra private\fw\401\m33
 ```
 
 Details:
 - Kernel modules (attribute `0x1000`) load at image base `0x88000000`, all
   others at `0x08804000`; modules sharing a project folder and base are
   imported in one `analyzeHeadless` run. Logs go to `private/ghidra/logs/`.
-- The wrapper picks the newest `jdk-21*` (or `%PSPC_JAVA_HOME%`) and sets
-  `JAVA_HOME` before calling `analyzeHeadless.bat`. Override Ghidra with
-  `%GHIDRA_INSTALL_DIR%`.
+- `--ghidra` overrides `GHIDRA_INSTALL_DIR`. Linux runs `support/analyzeHeadless`;
+  Windows runs `support/analyzeHeadless.bat`.
+- JDK selection order is `--java-home`, `PSPC_JAVA_HOME`, `JAVA_HOME`, then
+  Windows `jdk-21*` installation discovery, then `javac` on `PATH`. Linux
+  resolves alternatives/symlink chains to the actual JDK home. Both `java` and
+  `javac` must exist (and be executable on Linux); an invalid explicitly selected
+  home fails rather than silently selecting another installation. Ghidra checks
+  Java-version compatibility. The helper sets `JAVA_HOME` and prepends its `bin`
+  to the child process's `PATH`.
+- `--dry-run` prints commands without starting Ghidra, using POSIX shell quoting
+  on Linux. It still validates the installation/JDK and creates the project/log
+  directories. Use `--project-dir` and `--out` for isolated analysis output.
 - Options (pass through to `tools/ghidra/ghidra_analyze.py`): `--no-decomp`,
   `--timeout <s>`, `--max-cpu <n>`, `--folder <name>`, `--out <dir>`,
   `--raw-base <addr>` to import a raw code blob (e.g. a systemctrl reboot
@@ -164,6 +186,13 @@ Details:
   reboot code. Headless cannot set loader options, so those two must be
   imported through the Ghidra GUI with that checkbox; every other module
   (all M33 modules and all normal game modules) needs no special handling.
+
+Regression coverage: the Linux CTest `ghidra_headless` runs
+`tests/tools/test_ghidra_analyze.py` with temporary launcher/JDK fixtures and
+original synthetic module headers. It exercises real Python CLI/subprocess
+execution, module grouping, arguments/environment, discovery, configuration
+errors, dry runs and exit propagation, plus simulated Windows selection. It does
+not establish actual Ghidra/Allegrex analysis or native Windows batch execution.
 
 ---
 

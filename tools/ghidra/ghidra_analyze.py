@@ -10,7 +10,8 @@ Allegrex:LE:32:default language, names imports/exports from data/nids.csv
 private/fw/401/analysis/<stem>.json and private/fw/401/decomp/<stem>.c
 (PspcExportAnalysis.java).
 
-Usually started through tools/ghidra_analyze.cmd.
+Run directly on Linux, or through tools/ghidra_analyze.cmd on Windows.
+Set GHIDRA_INSTALL_DIR or pass --ghidra to select an installation.
 
     python -I tools/ghidra/ghidra_analyze.py [options] <prx|dir> [<prx|dir> ...]
 
@@ -22,34 +23,42 @@ imported by one analyzeHeadless invocation.
 import argparse
 import glob
 import os
+import shlex
+import shutil
 import struct
 import subprocess
 import sys
 import time
 
 REPO = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-DEFAULT_GHIDRA = r"C:\Users\yoelr\Tools\ghidra_12.1.3_PUBLIC"
 LANGUAGE = "Allegrex:LE:32:default"
 LOADER = "PspElfLoader"
 KERNEL_BASE = 0x88000000
 USER_BASE = 0x08804000
 
 
+def is_executable(path):
+    return os.path.isfile(path) and (os.name == "nt" or os.access(path, os.X_OK))
+
+
 def find_java_home(explicit):
-    if explicit:
-        return explicit
-    env = os.environ.get("PSPC_JAVA_HOME")
-    if env:
-        return env
-    cands = []
-    for root in (r"C:\Program Files\Eclipse Adoptium", r"C:\Program Files\Java",
-                 r"C:\Program Files\Microsoft", r"C:\Program Files\Zulu"):
-        cands += glob.glob(os.path.join(root, "jdk-21*"))
-    cands = [c for c in cands if os.path.exists(os.path.join(c, "bin", "java.exe"))]
-    if cands:
-        return sorted(cands)[-1]
-    jh = os.environ.get("JAVA_HOME")
-    return jh
+    for home in (explicit, os.environ.get("PSPC_JAVA_HOME"), os.environ.get("JAVA_HOME")):
+        if home:
+            return os.path.abspath(home)
+    if os.name == "nt":
+        cands = []
+        for root in (r"C:\Program Files\Eclipse Adoptium", r"C:\Program Files\Java",
+                     r"C:\Program Files\Microsoft", r"C:\Program Files\Zulu"):
+            cands += glob.glob(os.path.join(root, "jdk-21*"))
+        cands = [c for c in cands if all(is_executable(os.path.join(c, "bin", tool))
+                                       for tool in ("java.exe", "javac.exe"))]
+        if cands:
+            return sorted(cands)[-1]
+    compiler = shutil.which("javac.exe" if os.name == "nt" else "javac")
+    if compiler:
+        # Resolve distro alternatives links to the JDK, not /usr/bin.
+        return os.path.dirname(os.path.dirname(os.path.realpath(compiler)))
+    return None
 
 
 def module_kind(path):
@@ -93,8 +102,10 @@ def collect(inputs):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("inputs", nargs="+", help="PRX/ELF files or directories")
-    ap.add_argument("--ghidra", default=os.environ.get("GHIDRA_INSTALL_DIR", DEFAULT_GHIDRA))
-    ap.add_argument("--java-home", help="JDK 21 home (default: newest jdk-21* found)")
+    ap.add_argument("--ghidra", default=os.environ.get("GHIDRA_INSTALL_DIR"),
+                    help="Ghidra installation directory (or set GHIDRA_INSTALL_DIR)")
+    ap.add_argument("--java-home", help="JDK home (otherwise PSPC_JAVA_HOME, JAVA_HOME, "
+                    "Windows jdk-21* installations, then javac on PATH)")
     ap.add_argument("--project-dir", default=os.path.join(REPO, "private", "ghidra"))
     ap.add_argument("--project", default="pspc_fw401")
     ap.add_argument("--folder", help="project folder (default: name of each file's directory)")
@@ -113,12 +124,18 @@ def main():
     files = collect(args.inputs)
     if not files:
         sys.exit("no input files")
-    headless = os.path.join(args.ghidra, "support", "analyzeHeadless.bat")
-    if not os.path.exists(headless):
-        sys.exit("analyzeHeadless.bat not found under %s" % args.ghidra)
+    if not args.ghidra:
+        sys.exit("Select Ghidra with --ghidra or set GHIDRA_INSTALL_DIR")
+    headless_name = "analyzeHeadless.bat" if os.name == "nt" else "analyzeHeadless"
+    headless = os.path.abspath(os.path.join(args.ghidra, "support", headless_name))
+    if not is_executable(headless):
+        sys.exit("%s not found or not executable under %s" % (headless_name, args.ghidra))
     java_home = find_java_home(args.java_home)
-    if not java_home or not os.path.exists(os.path.join(java_home, "bin", "java.exe")):
-        sys.exit("JDK 21 not found; install it or pass --java-home / set PSPC_JAVA_HOME")
+    java_tools = ("java.exe", "javac.exe") if os.name == "nt" else ("java", "javac")
+    if not java_home or not all(is_executable(os.path.join(java_home, "bin", tool))
+                                for tool in java_tools):
+        sys.exit("JDK not found or incomplete; pass --java-home, set PSPC_JAVA_HOME/JAVA_HOME, "
+                 "or put javac on PATH (selected home: %s)" % (java_home or "none"))
     env = dict(os.environ)
     env["JAVA_HOME"] = java_home
     env["PATH"] = os.path.join(java_home, "bin") + os.pathsep + env.get("PATH", "")
@@ -164,7 +181,7 @@ def main():
             cmd += ["-max-cpu", str(args.max_cpu)]
         print("== %s @ 0x%08X: %s" % (folder, base, ", ".join(os.path.basename(p) for p in paths)))
         if args.dry_run:
-            print(subprocess.list2cmdline(cmd))
+            print(subprocess.list2cmdline(cmd) if os.name == "nt" else shlex.join(cmd))
             continue
         rc = subprocess.call(cmd, env=env)
         if rc:

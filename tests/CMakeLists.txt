@@ -88,6 +88,9 @@ endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 	find_package(Python3 REQUIRED COMPONENTS Interpreter)
+	add_test(NAME ghidra_headless COMMAND ${Python3_EXECUTABLE} -I
+		${CMAKE_CURRENT_SOURCE_DIR}/tools/test_ghidra_analyze.py)
+	set_tests_properties(ghidra_headless PROPERTIES TIMEOUT 30)
 	add_executable(pspc_aot_probe aot/module_probe.cpp)
 	target_link_libraries(pspc_aot_probe PRIVATE pspc_common)
 	target_include_directories(pspc_aot_probe PRIVATE ${CMAKE_BINARY_DIR}/generated)
