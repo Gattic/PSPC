@@ -14,8 +14,6 @@
 // and redirects that send a game to a server (infrastructure.json next to pspc.exe).
 #pragma once
 
-#include <windows.h>
-
 #include <string>
 #include <vector>
 
@@ -70,7 +68,7 @@ void StopAll();
 // on its own.
 State Poll(Kind k);
 bool AnyRunning();
-DWORD ExitCode(Kind k);
+unsigned ExitCode(Kind k);
 // The last lines of a server's log (for an error message).
 std::wstring LogTail(Kind k, int lines);
 

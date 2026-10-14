@@ -45,6 +45,7 @@ using std::min;
 #include "common/fileutil.h"
 #include "common/settings.h"
 #include "frontend/game_library.h"
+#include "frontend/native_cache.h"
 #include "frontend/network_dialog.h"
 #include "frontend/online_page.h"
 #include "frontend/plugins_dialog.h"
@@ -82,165 +83,10 @@ enum : int {
 };
 
 // ---------------------------------------------------------------------------------------------
-// A minimal JSON reader (for games.json).
-
-struct Json {
-	enum Type { Null, Bool, Number, String, Array, Object } type = Null;
-	bool b = false;
-	double n = 0;
-	std::string s;
-	std::vector<Json> items;
-	std::vector<std::pair<std::string, Json>> members;
-	const Json *Get(const char *key) const {
-		for (const auto &m : members)
-			if (m.first == key) return &m.second;
-		return nullptr;
-	}
-	bool IsTrue() const { return type == Bool && b; }
-};
-
-class JsonReader {
-public:
-	explicit JsonReader(const std::string &text) : p_(text.c_str()), end_(text.c_str() + text.size()) {}
-	bool Read(Json &out) {
-		if (!Value(out, 0)) return false;
-		Space();
-		return p_ == end_;
-	}
-
-private:
-	void Space() {
-		while (p_ < end_ && (*p_ == ' ' || *p_ == '\t' || *p_ == '\r' || *p_ == '\n')) p_++;
-	}
-	bool Word(const char *w) {
-		size_t n = strlen(w);
-		if ((size_t)(end_ - p_) < n || memcmp(p_, w, n) != 0) return false;
-		p_ += n;
-		return true;
-	}
-	void Utf8(u32 cp, std::string &out) {
-		if (cp < 0x80) out += (char)cp;
-		else if (cp < 0x800) out += {(char)(0xC0 | cp >> 6), (char)(0x80 | (cp & 0x3F))};
-		else if (cp < 0x10000) out += {(char)(0xE0 | cp >> 12), (char)(0x80 | ((cp >> 6) & 0x3F)), (char)(0x80 | (cp & 0x3F))};
-		else
-			out += {(char)(0xF0 | cp >> 18), (char)(0x80 | ((cp >> 12) & 0x3F)), (char)(0x80 | ((cp >> 6) & 0x3F)),
-			        (char)(0x80 | (cp & 0x3F))};
-	}
-	bool Hex4(u32 &v) {
-		if (end_ - p_ < 4) return false;
-		v = 0;
-		for (int i = 0; i < 4; i++) {
-			char c = *p_++;
-			v <<= 4;
-			if (c >= '0' && c <= '9') v |= c - '0';
-			else if (c >= 'a' && c <= 'f') v |= c - 'a' + 10;
-			else if (c >= 'A' && c <= 'F') v |= c - 'A' + 10;
-			else return false;
-		}
-		return true;
-	}
-	bool Str(std::string &out) {
-		if (p_ >= end_ || *p_ != '"') return false;
-		p_++;
-		while (p_ < end_ && *p_ != '"') {
-			char c = *p_++;
-			if (c != '\\') {
-				out += c;
-				continue;
-			}
-			if (p_ >= end_) return false;
-			c = *p_++;
-			switch (c) {
-			case 'b': out += '\b'; break;
-			case 'f': out += '\f'; break;
-			case 'n': out += '\n'; break;
-			case 'r': out += '\r'; break;
-			case 't': out += '\t'; break;
-			case 'u': {
-				u32 cp;
-				if (!Hex4(cp)) return false;
-				if (cp >= 0xD800 && cp < 0xDC00 && end_ - p_ >= 6 && p_[0] == '\\' && p_[1] == 'u') {
-					p_ += 2;
-					u32 lo;
-					if (!Hex4(lo)) return false;
-					cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-				}
-				Utf8(cp, out);
-				break;
-			}
-			default: out += c; break;  // \" \\ \/
-			}
-		}
-		if (p_ >= end_) return false;
-		p_++;
-		return true;
-	}
-	bool Value(Json &v, int depth) {
-		Space();
-		if (p_ >= end_ || depth > 32) return false;
-		if (*p_ == '{' || *p_ == '[') {
-			bool object = *p_++ == '{';
-			v.type = object ? Json::Object : Json::Array;
-			Space();
-			if (p_ < end_ && *p_ == (object ? '}' : ']')) {
-				p_++;
-				return true;
-			}
-			for (;;) {
-				Json child;
-				std::string key;
-				if (object) {
-					Space();
-					if (!Str(key)) return false;
-					Space();
-					if (p_ >= end_ || *p_++ != ':') return false;
-				}
-				if (!Value(child, depth + 1)) return false;
-				if (object) v.members.emplace_back(std::move(key), std::move(child));
-				else v.items.push_back(std::move(child));
-				Space();
-				if (p_ < end_ && *p_ == ',') {
-					p_++;
-					continue;
-				}
-				if (p_ < end_ && *p_ == (object ? '}' : ']')) {
-					p_++;
-					return true;
-				}
-				return false;
-			}
-		}
-		if (*p_ == '"') {
-			v.type = Json::String;
-			return Str(v.s);
-		}
-		if (Word("true") || Word("false")) {
-			v.type = Json::Bool;
-			v.b = p_[-1] == 'e' && p_[-2] == 'u';
-			return true;
-		}
-		if (Word("null")) return true;
-		char *e = nullptr;
-		v.n = strtod(p_, &e);  // the text is NUL-terminated
-		if (e == p_ || e > end_) return false;
-		v.type = Json::Number;
-		p_ = e;
-		return true;
-	}
-	const char *p_, *end_;
-};
-
-// ---------------------------------------------------------------------------------------------
 // The library.
 
-enum class Native { None, Partial, Stale, Built };
-
-struct NativeInfo {
-	Native state = Native::None;
-	int built = 0, total = 0;  // distinct modules with current DLLs / that built successfully
-	int failed = 0;            // modules whose build failed
-	bool operator==(const NativeInfo &o) const = default;
-};
+using frontend::Native;
+using frontend::NativeInfo;
 
 struct Game {
 	fs::path path;
@@ -301,76 +147,16 @@ void Scan() {
 
 fs::path CacheDir() { return g_exeDir / "cache" / "aot"; }
 
-std::string ReadText(const fs::path &p) {
-	std::vector<u8> d;
-	if (!ReadWholeFile(p, d)) return "";
-	return std::string(d.begin(), d.end());
-}
-
-std::wstring NormPath(const fs::path &p) {
-	std::error_code ec;
-	fs::path c = fs::weakly_canonical(p, ec);
-	std::wstring w = (ec ? p : c).wstring();
-	CharLowerBuffW(w.data(), (DWORD)w.size());
-	return w;
-}
-
-NativeInfo NativeStatus(const Json *entry) {
-	NativeInfo ni;
-	const Json *modules = entry ? entry->Get("modules") : nullptr;
-	if (!modules || modules->type != Json::Array) return ni;
-	char want[16];
-	snprintf(want, sizeof(want), "0x%08x", (unsigned)PSPC_SEM_VERSION);
-	std::vector<std::string> seen;
-	int stale = 0;
-	for (const Json &m : modules->items) {
-		const Json *ok = m.Get("ok"), *sha = m.Get("sha1");
-		if (!ok || !ok->IsTrue() || !sha || sha->type != Json::String || sha->s.size() != 40) {
-			ni.failed++;
-			continue;
-		}
-		// BOOT.BIN and EBOOT.BIN are often the same module.
-		if (std::find(seen.begin(), seen.end(), sha->s) != seen.end()) continue;
-		seen.push_back(sha->s);
-		ni.total++;
-		std::error_code ec;
-		if (!fs::exists(CacheDir() / (sha->s + ".dll"), ec)) continue;
-		std::string stamp = ReadText(CacheDir() / (sha->s + ".semver"));
-		while (!stamp.empty() && (stamp.back() == '\n' || stamp.back() == '\r' || stamp.back() == ' ')) stamp.pop_back();
-		if (stamp == want) ni.built++;
-		else stale++;
-	}
-	if (ni.built > 0 && ni.built == ni.total) ni.state = Native::Built;
-	else if (ni.built > 0) ni.state = Native::Partial;
-	else if (stale > 0) ni.state = Native::Stale;
-	return ni;
-}
-
-// Re-reads the index; returns true if any game's status changed.
 bool RefreshNative() {
-	Json index;
-	std::string text = ReadText(CacheDir() / "games.json");
-	const Json *games = nullptr;
-	if (!text.empty() && JsonReader(text).Read(index)) games = index.Get("games");
-	std::vector<std::pair<std::wstring, const Json *>> entries;
-	if (games && games->type == Json::Object)
-		for (const auto &m : games->members) entries.emplace_back(NormPath(fs::u8path(m.first)), &m.second);
 	bool changed = false;
 	for (Game &g : g_games) {
-		const Json *entry = nullptr;
-		std::wstring key = NormPath(g.path);
-		for (const auto &e : entries)
-			if (e.first == key) entry = e.second;
-		// A disc image that was moved or renamed since: the same disc ID and size.
-		for (size_t i = 0; !entry && !g.id.empty() && i < entries.size(); i++) {
-			const Json *id = entries[i].second->Get("disc_id"), *size = entries[i].second->Get("size");
-			if (id && id->type == Json::String && Widen(id->s) == g.id && size && size->type == Json::Number &&
-			    (u64)size->n == g.size)
-				entry = entries[i].second;
-		}
-		NativeInfo ni = NativeStatus(entry);
+		frontend::GameInfo info;
+		info.path = g.path;
+		info.id = PathToUtf8(fs::path(g.id));
+		info.size = g.size;
+		NativeInfo ni = frontend::InspectNativeCache(CacheDir(), info, PSPC_SEM_VERSION);
 		changed |= !(ni == g.native);
-		g.native = ni;
+		g.native = std::move(ni);
 	}
 	return changed;
 }

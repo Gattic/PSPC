@@ -146,6 +146,12 @@ u32 HttpExchange::Send(const HttpRequestSpec &spec) {
 		s.Set(CURLOPT_POST, 1L);
 		s.Set(CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)s.spec.body.size());
 		s.Set(CURLOPT_POSTFIELDS, s.spec.body.empty() ? "" : (const char *)s.spec.body.data());
+	} else if (spec.method == "PUT" || spec.method == "DELETE") {
+		if (!s.spec.body.empty()) {
+			s.Set(CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)s.spec.body.size());
+			s.Set(CURLOPT_POSTFIELDS, (const char *)s.spec.body.data());
+		}
+		s.Set(CURLOPT_CUSTOMREQUEST, s.spec.method.c_str());
 	} else if (spec.method != "GET") return CURLE_BAD_FUNCTION_ARGUMENT;
 	for (const auto &[name, value] : spec.headers) {
 		auto *list = curl_slist_append(s.headers, (name + ": " + value).c_str());

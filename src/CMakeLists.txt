@@ -4,6 +4,7 @@
 add_library(pspc_common STATIC
 	common/log.cpp
 	common/fileutil.cpp
+	common/app_paths.cpp
 	common/host_file.cpp
 	common/host.cpp
 	common/json.cpp
@@ -58,5 +59,8 @@ endforeach()
 add_executable(pspc-iso frontend/iso_tool.cpp)
 target_link_libraries(pspc-iso PRIVATE pspc_fs pspc_common)
 
-add_library(pspc_game_library STATIC frontend/game_library.cpp)
+add_library(pspc_game_library STATIC frontend/game_library.cpp frontend/native_cache.cpp)
 target_link_libraries(pspc_game_library PUBLIC pspc_fs)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+	target_sources(pspc_game_library PRIVATE frontend/child_process.cpp)
+endif()

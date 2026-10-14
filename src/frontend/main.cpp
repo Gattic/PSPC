@@ -17,6 +17,7 @@
 #endif
 
 #include "common/fileutil.h"
+#include "common/app_paths.h"
 #include "common/log.h"
 #include "common/settings.h"
 #include "net/adhoc_server.h"
@@ -66,7 +67,7 @@ static void Usage() {
 	        "Usage: pspc [options] <EBOOT.PBP | game.iso | game.cso | program.prx | program.elf>\n"
 	        "  --headless           no window/audio (tests, batch runs)\n"
 	        "  --interp             interpreter only (ignore AOT-compiled modules)\n"
-	        "  --aot-dir <dir>      directory of AOT module DLLs (default: <exe>/cache/aot)\n"
+	        "  --aot-dir <dir>      native module cache (Linux: XDG cache/pspc/aot; Windows: <exe>/cache/aot)\n"
 	        "  --fast-time          skip idle time instead of sleeping\n"
 	        "  --timeout <sec>      stop after this many seconds\n"
 	        "  --exit-vblank <n>    stop after VBlank n (game time, unlike --timeout; exit code 124)\n"
@@ -78,17 +79,18 @@ static void Usage() {
 	        "  --no-large-mem       keep user memory at 24 MB, also for the XMB\n"
 	        "  --user-mem-end <addr> with large memory, end user memory there (e.g. 0x0BB00000)\n"
 	        "  --strict-mem         treat bad guest memory accesses as fatal\n"
-	        "  --memstick <dir>     memory stick root (default: <exe>/ms0)\n"
-	        "  --plugins <dir>      M33 plugins folder laid over ms0: (default: the nearest plugins\\)\n"
+	        "  --memstick <dir>     memory stick root (Linux: XDG data/pspc/ms0; Windows: <exe>/ms0)\n"
+	        "  --plugins <dir>      M33 plugin overlay (Linux: XDG data/pspc/plugins; Windows: nearest plugins)\n"
 	        "  --no-plugins         don't load M33 plugins, nor lay their folder over ms0:\n"
-	        "  --flash0 <dir>       flash0 root (default: <exe>/flash0)\n"
+	        "  --flash0 <dir>       flash0 root (Linux: XDG data/pspc/flash0; Windows: <exe>/flash0)\n"
 	        "  --host0 <dir>        host0: root (default: the program's folder)\n"
 	        "  --umd <image>        insert a disc image while running a .prx/.elf/.pbp\n"
 	        "  --osk-text <text>    headless: what the on-screen keyboard returns (a|b|c: one per keyboard in turn)\n"
 	        "  --fw <ver>           firmware version reported to games, e.g. 6.60 or 4.01\n"
 	        "  --scale <n>          window scale (default 2)\n"
 	        "  --version            print PSPC's version\n"
-	        "  --config <file>      settings file (default: <exe>/pspc.ini; \"none\": built-in defaults)\n"
+	        "  --config <file>      settings (Linux: XDG config/pspc/pspc.ini; Windows: <exe>/pspc.ini)\n"
+	        "                       \"none\": built-in defaults\n"
 	        "  --set <key>=<value>  override one setting of that file, e.g. --set fullscreen=1\n"
 	        "  --log <level>        trace|debug|info|warn|error (default info)\n"
 	        "  --log-file <path>    write the log to a file\n"
@@ -347,14 +349,14 @@ static int Main(int argc, char **argv) {
 	}
 	runtime::Options o;
 	fs::path exeDir = ExecutableDir();
-	o.aotDir = PathToUtf8(exeDir / "cache" / "aot");
-	o.memstickDir = PathToUtf8(exeDir / "ms0");
-	o.flash0Dir = PathToUtf8(exeDir / "flash0");
-	o.flash1Dir = PathToUtf8(exeDir / "flash1");
-	o.dataDir = PathToUtf8(exeDir / "data");
+	o.aotDir = PathToUtf8(apppaths::CacheRoot() / "aot");
+	o.memstickDir = PathToUtf8(apppaths::DataRoot() / "ms0");
+	o.flash0Dir = PathToUtf8(apppaths::DataRoot() / "flash0");
+	o.flash1Dir = PathToUtf8(apppaths::DataRoot() / "flash1");
+	o.dataDir = PathToUtf8(apppaths::ResourceRoot(exeDir) / "data");
 	o.decryptTool = PathToUtf8(exeDir / (std::string("pspc-decrypt") + hostsys::ExecutableSuffix));
-	o.decryptCacheDir = PathToUtf8(exeDir / "cache" / "decrypted");
-	o.screenshotDir = PathToUtf8(exeDir / "screenshots");
+	o.decryptCacheDir = PathToUtf8(apppaths::CacheRoot() / "decrypted");
+	o.screenshotDir = PathToUtf8(apppaths::DataRoot() / "screenshots");
 	LogLevel level = LogLevel::Info;
 	std::string logFile;
 
@@ -381,6 +383,10 @@ static int Main(int argc, char **argv) {
 		}
 	}
 	ApplySettings(cfg, o);
+#ifndef _WIN32
+	o.gamesDir = PathToUtf8(apppaths::DataPath(cfg.gamesDir.empty() ? "Games" : cfg.gamesDir));
+	o.pluginsDir = PathToUtf8(apppaths::DataPath(cfg.pluginsDir.empty() ? "plugins" : cfg.pluginsDir));
+#endif
 
 	for (int i = 1; i < argc; i++) {
 		std::string a = argv[i];
@@ -472,6 +478,7 @@ static int Main(int argc, char **argv) {
 		Usage();
 		return 1;
 	}
+#ifdef _WIN32
 	if (!fs::exists(fs::u8path(o.dataDir) / "nids.csv")) {
 		// Running from the build tree: use the repository's data directory.
 		for (fs::path p = exeDir; !p.empty() && p != p.root_path(); p = p.parent_path()) {
@@ -502,6 +509,7 @@ static int Main(int argc, char **argv) {
 			}
 		}
 	}
+#endif
 	logging::Init(level, logFile.empty() ? nullptr : logFile.c_str());
 	if (cfgLoaded) LOGI("CONFIG", "Settings from %s", cfgPath.c_str());
 	else if (cfgExplicit && cfgPath != "none") LOGW("CONFIG", "Settings file %s not found; using defaults", cfgPath.c_str());
@@ -570,5 +578,12 @@ static int Main(int argc, char **argv) {
 #ifdef _WIN32
 int wmain(int argc, wchar_t **argv) { return RunUtf8Main(Main, argc, argv); }
 #else
-int main(int argc, char **argv) { return Main(argc, argv); }
+int main(int argc, char **argv) {
+	try {
+		return Main(argc, argv);
+	} catch (const std::exception &error) {
+		fprintf(stderr, "%s\n", error.what());
+		return 1;
+	}
+}
 #endif

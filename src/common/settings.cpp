@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "common/settings.h"
+#include "common/app_paths.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -94,7 +95,7 @@ Settings::Settings() {
 	}
 }
 
-fs::path DefaultPath() { return ExecutableDir() / "pspc.ini"; }
+fs::path DefaultPath() { return apppaths::ConfigRoot() / "pspc.ini"; }
 
 std::vector<std::string> SplitList(const std::string &value) {
 	std::vector<std::string> out;

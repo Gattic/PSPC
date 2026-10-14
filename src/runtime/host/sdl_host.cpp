@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "common/fileutil.h"
+#include "common/app_paths.h"
 #include "common/log.h"
 #include "common/host.h"
 #include "common/settings.h"
@@ -127,7 +128,7 @@ void SaveScreenshot(const Config &cfg, const u32 *px, int w, int h) {
 		LOGW("HOST", "Screenshot: nothing has been displayed yet");
 		return;
 	}
-	fs::path dir = cfg.screenshotDir.empty() ? ExecutableDir() / "screenshots" : fs::u8path(cfg.screenshotDir);
+	fs::path dir = cfg.screenshotDir.empty() ? apppaths::DataRoot() / "screenshots" : fs::u8path(cfg.screenshotDir);
 	std::error_code ec;
 	fs::create_directories(dir, ec);
 	time_t now = time(nullptr);

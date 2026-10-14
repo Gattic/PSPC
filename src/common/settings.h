@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// pspc.ini: the user settings next to pspc.exe (window, audio, input mapping, native code,
+// pspc.ini: user settings (XDG config on Linux, next to pspc.exe on Windows; window, audio, input, native code,
 // firmware version). pspc reads it at startup (command-line options override it); the launcher's
 // Settings dialog writes it. The file is plain "key=value" lines; a line starting with '#' or ';'
 // is a comment.
@@ -70,7 +70,7 @@ struct Settings {
 	Settings();
 };
 
-// The settings file of this installation: <directory of the running exe>\pspc.ini.
+// The platform's user settings file (see common/app_paths.h).
 fs::path DefaultPath();
 
 // Reads `file` over the values already in `s`. Returns false if the file can't be read.

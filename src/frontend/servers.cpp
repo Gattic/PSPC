@@ -1,10 +1,21 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
 // The servers pspc-launcher runs (see servers.h).
+#ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#else
+#include "frontend/child_process.h"
+#include <glib.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <thread>
+#endif
 
 #include "frontend/servers.h"
+#include "common/app_paths.h"
 
 #include <algorithm>
 #include <cmath>
@@ -12,23 +23,34 @@
 #include <ctime>
 
 #include "common/json.h"
+#include "common/host.h"
 #include "net/host_net.h"
 
+#ifdef _WIN32
 #pragma comment(lib, "ws2_32.lib")
+#endif
 
 namespace servers {
 
 namespace {
 
 fs::path g_exeDir;
+#ifdef _WIN32
 HANDLE g_job = nullptr;
-
 struct Proc {
 	HANDLE process = nullptr;
 	State state = State::Stopped;
-	DWORD exitCode = 0;
+	unsigned exitCode = 0;
 	int port = 0;
 };
+#else
+struct Proc {
+	std::unique_ptr<frontend::ChildProcess> process;
+	State state = State::Stopped;
+	unsigned exitCode = 0;
+	int port = 0;
+};
+#endif
 Proc g_procs[kKinds];
 
 struct Python {
@@ -40,23 +62,41 @@ fs::path g_serverDir;
 
 std::wstring Widen(const std::string &s) {
 	if (s.empty()) return {};
+#ifndef _WIN32
+	auto *ucs = g_utf8_to_ucs4(s.c_str(), -1, nullptr, nullptr, nullptr);
+	if (!ucs) return L"Invalid UTF-8";
+	std::wstring w;
+	for (auto *p = ucs; *p; ++p) w.push_back((wchar_t)*p);
+	g_free(ucs);
+	return w;
+#else
 	int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
 	std::wstring w((size_t)n, L'\0');
 	MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), w.data(), n);
 	return w;
+#endif
 }
 
 std::string Narrow(const std::wstring &w) {
 	if (w.empty()) return {};
+#ifndef _WIN32
+	std::vector<gunichar> ucs(w.begin(), w.end());
+	ucs.push_back(0);
+	auto *utf8 = g_ucs4_to_utf8(ucs.data(), -1, nullptr, nullptr, nullptr);
+	std::string s = utf8 ? utf8 : "Invalid Unicode";
+	g_free(utf8);
+	return s;
+#else
 	int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
 	std::string s((size_t)n, '\0');
 	WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), s.data(), n, nullptr, nullptr);
 	return s;
+#endif
 }
 
 // A command-line argument in quotes (the paths here have no quotes or trailing backslashes).
 std::wstring Q(const std::wstring &s) { return L"\"" + s + L"\""; }
-std::wstring Q(const fs::path &p) { return Q(p.wstring()); }
+std::wstring Q(const fs::path &p) { return Q(Widen(PathToUtf8(p))); }
 
 const wchar_t *FileName(Kind k) {
 	return k == Kind::Network ? L"pspc_network" : k == Kind::Sfco ? L"sfco" : k == Kind::GameSpy ? L"gamespy" : L"adhoc";
@@ -68,6 +108,13 @@ fs::path StatusPath(Kind k) { return DataDir() / (std::wstring(FileName(k)) + L"
 // The Python that comes with PSPC, else the newest Python 3.9+ installed for this user or for all,
 // else the py launcher, else python.exe on PATH (not the Microsoft Store's stand-in).
 Python FindPython() {
+#ifndef _WIN32
+	char *python = g_find_program_in_path("python3");
+	Python result;
+	if (python) result.exe = python;
+	g_free(python);
+	return result;
+#else
 	std::error_code ec;
 	fs::path bundled = g_exeDir / "python" / "python.exe";
 	if (fs::exists(bundled, ec)) return {bundled, L""};
@@ -93,19 +140,37 @@ Python FindPython() {
 	wchar_t found[MAX_PATH];
 	if (SearchPathW(nullptr, L"python.exe", nullptr, MAX_PATH, found, nullptr) && !wcsstr(found, L"WindowsApps")) return {found, L""};
 	return {};
+#endif
 }
 
 fs::path FindServerDir() {
+#ifndef _WIN32
+	auto path = apppaths::ResourceRoot(g_exeDir) / "server";
+	return fs::is_regular_file(path / "pspc_network/__main__.py") ? path : fs::path();
+#else
 	std::error_code ec;
 	for (fs::path p = g_exeDir; !p.empty(); p = p.parent_path()) {
 		if (fs::exists(p / "server" / "pspc_network" / "__main__.py", ec)) return p / "server";
 		if (p == p.root_path()) break;
 	}
 	return {};
+#endif
 }
 
 // Whether something on this PC accepts TCP connections on the port.
 bool PortOpen(int port) {
+#ifndef _WIN32
+	int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+	if (fd < 0) return false;
+	sockaddr_in a{};
+	a.sin_family = AF_INET; a.sin_port = htons(port); a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	connect(fd, (sockaddr *)&a, sizeof(a));
+	pollfd p{fd, POLLOUT, 0};
+	int error = 1; socklen_t size = sizeof(error);
+	bool open = poll(&p, 1, 100) > 0 && getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size) == 0 && error == 0;
+	close(fd);
+	return open;
+#else
 	SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 	if (sock == INVALID_SOCKET) return false;
 	u_long nonBlocking = 1;
@@ -124,14 +189,21 @@ bool PortOpen(int port) {
 	bool open = select(0, nullptr, &writable, &failed, &tv) > 0 && FD_ISSET(sock, &writable);
 	closesocket(sock);
 	return open;
+#endif
 }
 
 std::wstring ComputerName() {
+#ifndef _WIN32
+	char name[256]{};
+	return gethostname(name, sizeof(name) - 1) == 0 ? Widen(name) : L"this PC";
+#else
 	wchar_t name[MAX_COMPUTERNAME_LENGTH + 1] = {};
 	DWORD n = MAX_COMPUTERNAME_LENGTH + 1;
 	return GetComputerNameW(name, &n) ? std::wstring(name) : L"this PC";
+#endif
 }
 
+#ifdef _WIN32
 void AppendLog(Kind k, const std::string &line) {
 	if (FILE *f = _wfopen(LogPath(k).c_str(), L"ab")) {
 		fwrite(line.data(), 1, line.size(), f);
@@ -155,6 +227,8 @@ std::wstring TicketServer(const settings::Settings &s) {
 	if (st == State::Running || st == State::Starting) return NetworkUrl(s, true);
 	return Widen(s.npServer);
 }
+
+#endif
 
 // ---- JSON out (infrastructure.json)
 
@@ -198,7 +272,13 @@ bool ListsId(const json::Value &game, const std::string &discId) {
 	return false;
 }
 
-fs::path RedirectFile() { return g_exeDir / "infrastructure.json"; }
+fs::path RedirectFile() {
+#ifdef _WIN32
+	return g_exeDir / "infrastructure.json";
+#else
+	return apppaths::ConfigRoot() / "infrastructure.json";
+#endif
+}
 
 std::string ReadText(const fs::path &p) {
 	std::vector<u8> d;
@@ -210,10 +290,13 @@ std::string ReadText(const fs::path &p) {
 
 void Init(const fs::path &exeDir) {
 	g_exeDir = exeDir;
+#ifdef _WIN32
 	WSADATA wsa;
 	WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
 	g_python = FindPython();
 	g_serverDir = FindServerDir();
+#ifdef _WIN32
 	// Children: unbuffered UTF-8 output for the logs, and no __pycache__ in PSPC's folder (also given
 	// on their command lines: the Python that comes with PSPC ignores these, isolated by its ._pth file).
 	SetEnvironmentVariableW(L"PYTHONUNBUFFERED", L"1");
@@ -226,6 +309,7 @@ void Init(const fs::path &exeDir) {
 		info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
 		SetInformationJobObject(g_job, JobObjectExtendedLimitInformation, &info, sizeof(info));
 	}
+#endif
 }
 
 std::wstring PythonCommand() {
@@ -235,7 +319,7 @@ std::wstring PythonCommand() {
 
 std::wstring Missing(Kind k) {
 	std::error_code ec;
-	if (k == Kind::Adhoc) return fs::exists(g_exeDir / "pspc.exe", ec) ? L"" : L"pspc.exe isn't next to the launcher.";
+	if (k == Kind::Adhoc) return fs::exists(g_exeDir / (std::string("pspc") + hostsys::ExecutableSuffix), ec) ? L"" : L"The PSPC runtime isn't next to the launcher.";
 	if (g_serverDir.empty()) return L"The server's files (the server folder) aren't with this copy of PSPC.";
 	if (g_python.exe.empty())
 		return L"This server needs Python 3, which isn't installed. The PSPC installer brings its own; or install Python from "
@@ -243,8 +327,20 @@ std::wstring Missing(Kind k) {
 	return L"";
 }
 
-fs::path DataDir() { return g_exeDir / "servers"; }
-fs::path LogPath(Kind k) { return DataDir() / (std::wstring(FileName(k)) + L".log"); }
+fs::path DataDir() {
+#ifdef _WIN32
+	return g_exeDir / "servers";
+#else
+	return apppaths::DataRoot() / "servers";
+#endif
+}
+fs::path LogPath(Kind k) {
+#ifdef _WIN32
+	return DataDir() / (std::wstring(FileName(k)) + L".log");
+#else
+	return apppaths::StateRoot() / "servers" / (std::wstring(FileName(k)) + L".log");
+#endif
+}
 
 int Port(Kind k, const settings::Settings &s) {
 	return k == Kind::Network ? s.hostNetworkPort : k == Kind::Sfco ? 10071 : k == Kind::GameSpy ? 29900 : kAdhocPort;
@@ -256,6 +352,7 @@ std::string Status(Kind k) {
 	return ReadText(StatusPath(k));
 }
 
+#ifdef _WIN32
 bool Start(Kind k, const settings::Settings &s, const std::wstring &umd, std::wstring *error) {
 	Proc &p = g_procs[Index(k)];
 	Poll(k);
@@ -364,7 +461,7 @@ bool AnyRunning() {
 	return false;
 }
 
-DWORD ExitCode(Kind k) { return g_procs[Index(k)].exitCode; }
+unsigned ExitCode(Kind k) { return g_procs[Index(k)].exitCode; }
 
 std::wstring LogTail(Kind k, int lines) {
 	std::string text = ReadText(LogPath(k));
@@ -455,6 +552,111 @@ bool Admin(Kind k, const std::vector<std::wstring> &args, std::string *out, cons
 	return code == 0;
 }
 
+#else
+bool Start(Kind k, const settings::Settings &s, const std::wstring &umd, std::wstring *error) {
+	auto &p = g_procs[Index(k)];
+	Poll(k);
+	if (p.process) return true;
+	*error = Missing(k);
+	if (!error->empty()) return false;
+	p.port = Port(k, s);
+	if (PortOpen(p.port)) { *error = L"Port " + std::to_wstring(p.port) + L" is already in use."; return false; }
+	std::error_code ec;
+	fs::create_directories(DataDir(), ec);
+	if (ec) { *error = Widen(ec.message()); return false; }
+	std::vector<std::string> args;
+	fs::path cwd;
+	if (k == Kind::Adhoc) {
+		args = {(g_exeDir / "pspc").string(), "--adhoc-server", "--adhoc-port", std::to_string(kAdhocPort)};
+		cwd = g_exeDir;
+	} else {
+		args = {g_python.exe.string(), "-u", "-B", "-X", "utf8", "-m", Narrow(Module(k)), "--db", Database(k).string(), "serve"};
+		cwd = g_serverDir;
+		if (k == Kind::Network) {
+			args.insert(args.end(), {"--listen", std::string(s.hostNetworkLan ? "0.0.0.0:" : "127.0.0.1:") + std::to_string(p.port),
+			                         "--name", "PSPC Network on " + Narrow(ComputerName())});
+		} else {
+			const auto &address = k == Kind::GameSpy ? s.hostGameSpyAddress : s.hostSfcoAddress;
+			args.insert(args.end(), {"--public-host", address.empty() ? Narrow(LanAddress()) : address});
+			if (k == Kind::GameSpy) {
+				args.insert(args.end(), {"--status-file", StatusPath(k).string()});
+				std::error_code ec; fs::remove(StatusPath(k), ec);
+			} else {
+				if (!umd.empty()) args.insert(args.end(), {"--umd", Narrow(umd)});
+				bool localNetwork = g_procs[Index(Kind::Network)].process != nullptr;
+				std::string tickets = localNetwork ? Narrow(NetworkUrl(s, true)) : s.npServer;
+				if (!tickets.empty()) {
+					args.insert(args.end(), {"--network", tickets});
+					if (s.hostSfcoAllowLocal) args.push_back("--allow-local");
+				}
+			}
+		}
+	}
+	auto child = std::make_unique<frontend::ChildProcess>();
+	std::string why;
+	if (!child->Start(args, cwd, LogPath(k), &why)) { *error = Widen(why); return false; }
+	p.process = std::move(child);
+	p.state = State::Starting;
+	p.exitCode = 0;
+	return true;
+}
+void Stop(Kind k) {
+	auto &p = g_procs[Index(k)];
+	if (p.process) p.process->Cancel();
+}
+void StopAll() {
+	for (auto &p : g_procs) { p.process.reset(); p.state = State::Stopped; }
+}
+State Poll(Kind k) {
+	auto &p = g_procs[Index(k)];
+	if (!p.process) return p.state;
+	p.process->Poll();
+	if (!p.process->Running()) {
+		p.exitCode = p.process->ExitCode();
+		p.state = p.process->Cancelled() ? State::Stopped : State::Failed;
+		p.process.reset();
+	} else if (p.state == State::Starting && PortOpen(p.port)) p.state = State::Running;
+	return p.state;
+}
+bool AnyRunning() {
+	for (auto &p : g_procs) if (p.process) return true;
+	return false;
+}
+unsigned ExitCode(Kind k) { return g_procs[Index(k)].exitCode; }
+std::wstring LogTail(Kind k, int lines) {
+	std::string text = ReadText(LogPath(k));
+	size_t start = text.size();
+	for (int i = 0; i < lines && start; ++i) {
+		size_t pos = text.rfind('\n', start - 1);
+		start = pos == std::string::npos ? 0 : pos;
+	}
+	text = text.substr(start);
+	char *valid = g_utf8_make_valid(text.data(), text.size());
+	auto result = Widen(valid);
+	g_free(valid);
+	return result;
+}
+bool Admin(Kind k, const std::vector<std::wstring> &args, std::string *out, const std::string &input) {
+	if (k == Kind::Adhoc) { *out = "The ad hoc server has no administration commands."; return false; }
+	auto missing = Missing(k);
+	if (!missing.empty()) { *out = Narrow(missing); return false; }
+	std::error_code ec;
+	fs::create_directories(DataDir(), ec);
+	frontend::ChildProcess process;
+	std::vector<std::string> command{g_python.exe.string(), "-B", "-X", "utf8", "-m", Narrow(Module(k)), "--db", Database(k).string()};
+	for (const auto &arg : args) command.push_back(Narrow(arg));
+	if (!process.Start(command, g_serverDir, {}, out, input.empty() ? "" : input + "\n")) return false;
+	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+	while (process.Running()) {
+		process.Poll();
+		if (std::chrono::steady_clock::now() > deadline) process.Cancel();
+		std::this_thread::sleep_for(std::chrono::milliseconds(5));
+	}
+	*out = process.Output();
+	return process.ExitCode() == 0;
+}
+#endif
+
 std::wstring LanAddress() {
 	hostnet::HostConfig hc = hostnet::QueryHostConfig();
 	return hc.valid && hc.ip ? Widen(hostnet::Ipv4ToString(hc.ip)) : L"127.0.0.1";
@@ -477,7 +679,7 @@ bool SetRedirect(const std::string &gameName, const std::string &discId, const s
 	std::string old = ReadText(RedirectFile());
 	json::Value root = json::Value::Parse(old);
 	if (!old.empty() && root.IsNull()) {
-		*error = L"infrastructure.json next to pspc.exe isn't valid JSON; fix or delete it first.";
+		*error = L"The user infrastructure.json isn't valid JSON; fix it before changing routes.";
 		return false;
 	}
 	std::vector<std::string> members;
@@ -523,7 +725,7 @@ bool SetRedirect(const std::string &gameName, const std::string &discId, const s
 	for (size_t i = 0; i < members.size(); i++) text += members[i] + (i + 1 < members.size() ? ",\n" : "\n");
 	text += "}\n";
 	if (!WriteWholeFile(RedirectFile(), text.data(), text.size())) {
-		*error = L"Couldn't write " + RedirectFile().wstring();
+		*error = L"Couldn't write " + Widen(PathToUtf8(RedirectFile()));
 		return false;
 	}
 	return true;

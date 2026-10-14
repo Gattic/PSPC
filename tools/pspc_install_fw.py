@@ -9,12 +9,12 @@ Input: the tree `pspc-decrypt psar 401.PBP <dir>` writes (<dir>/flash0 with ever
 decrypted), and optionally the M33 modules extracted by tools/m33extract.py (<dir>/m33).
 
 What it does:
-  1. Copies flash0/{vsh,font,dic,data,kd} into <pspc dir>/flash0. The kernel modules (kd) are
+  1. Copies flash0/{vsh,font,dic,data,kd} into <data dir>/flash0. The kernel modules (kd) are
      never run - PSPC's kernel is native - but the boot configuration (pspbtcnf) says which
      modules boot the XMB, and the XMB loads some drivers by path.
   2. Copies M33's user-mode UI modules (satelite.prx = the VSH menu, recovery.prx) into
      flash0/vsh/module, as the M33 installer does.
-  3. Prepares <pspc dir>/flash1 (registry/, vsh/theme/, ...). flash1/registry/init.dat must not
+  3. Prepares <data dir>/flash1 (registry/, vsh/theme/, ...). flash1/registry/init.dat must not
      exist: the XMB reads it as "reset the registry".
   4. AOT-compiles the user-mode firmware modules (vsh/module/*.prx, satelite, recovery) with
      tools/pspc_build.py into the AOT cache, so the XMB runs as native code.
@@ -30,6 +30,7 @@ import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+EXE_SUFFIX = '.exe' if sys.platform == 'win32' else ''
 FLASH0_DIRS = ('vsh', 'font', 'dic', 'data', 'kd')
 M33_UI_MODULES = ('satelite.prx', 'recovery.prx')
 FLASH1_DIRS = ('registry', 'vsh/theme', 'dic', 'net/http', 'gps')
@@ -71,8 +72,9 @@ def main():
                     help='decrypted firmware tree containing flash0/ (default: private/fw/401)')
     ap.add_argument('--m33', default=None, help='extracted M33 modules (default: <fw>/m33)')
     ap.add_argument('--build-dir', default=None,
-                    help='build tree with pspc.exe and pspc-recomp.exe (default: build/RelWithDebInfo)')
-    ap.add_argument('--pspc-dir', default=None, help='where flash0/flash1 go (default: <build dir>/bin)')
+                    help='build tree with pspc and pspc-recomp (default: build/RelWithDebInfo)')
+    ap.add_argument('--pspc-dir', default=None, help='PSPC executables/installed SDK (default: auto-detect or <build dir>/bin)')
+    ap.add_argument('--data-dir', help='writable parent of flash0/flash1 (required on Linux; Windows default: <pspc dir>)')
     ap.add_argument('--cache', default=None, help='AOT cache (default: <pspc dir>/cache/aot)')
     ap.add_argument('--work', default=None, help='pspc_build.py work directory')
     ap.add_argument('--no-aot', action='store_true', help='copy files only')
@@ -83,6 +85,11 @@ def main():
     ap.add_argument('--jobs', type=int, default=4)
     ap.add_argument('--force', action='store_true', help='recompile modules that are up to date')
     args = ap.parse_args()
+    if sys.platform != 'win32':
+        if not args.data_dir:
+            ap.error('--data-dir is required on Linux; use the runtime user-data directory')
+        if not args.no_aot and (not args.cache or not args.work):
+            ap.error('Linux firmware AOT requires writable --cache and --work paths')
 
     fw = pathlib.Path(args.fw)
     flash0 = fw / 'flash0'
@@ -92,13 +99,14 @@ def main():
     if module_info(vshmain.read_bytes()) is None:
         sys.exit('%s is not a decrypted module (run pspc-decrypt psar on the update first)' % vshmain)
     build = pathlib.Path(args.build_dir) if args.build_dir else ROOT / 'build' / 'RelWithDebInfo'
-    pspc_dir = pathlib.Path(args.pspc_dir) if args.pspc_dir else (ROOT if (ROOT / 'pspc.exe').is_file() else build / 'bin')
+    pspc_dir = pathlib.Path(args.pspc_dir) if args.pspc_dir else (ROOT if (ROOT / ('pspc' + EXE_SUFFIX)).is_file() else build / 'bin')
+    data_dir = pathlib.Path(args.data_dir) if args.data_dir else pspc_dir
     bundled = not args.build_dir and (pspc_dir / 'aot').is_dir()
-    if not (pspc_dir / 'pspc.exe').exists():
-        print('warning: no pspc.exe in %s' % pspc_dir)
+    if not (pspc_dir / ('pspc' + EXE_SUFFIX)).exists():
+        print('warning: no pspc%s in %s' % (EXE_SUFFIX, pspc_dir))
 
     # 1. flash0
-    dst0 = pspc_dir / 'flash0'
+    dst0 = data_dir / 'flash0'
     stats = {'copied': 0, 'same': 0}
     for d in FLASH0_DIRS:
         if (flash0 / d).is_dir():
@@ -118,7 +126,7 @@ def main():
     print('M33: %s' % (', '.join(p.name for p in m33_mods) if m33_mods else 'not found (%s)' % m33))
 
     # 3. flash1
-    dst1 = pspc_dir / 'flash1'
+    dst1 = data_dir / 'flash1'
     for d in FLASH1_DIRS:
         (dst1 / d).mkdir(parents=True, exist_ok=True)
     if (fw / 'flash1').is_dir():

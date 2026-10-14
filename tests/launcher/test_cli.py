@@ -19,6 +19,9 @@ def run(*args):
 
 
 with tempfile.TemporaryDirectory(prefix='pspc launcher ') as work:
+    env['HOME'] = work
+    for kind in ('CONFIG', 'DATA', 'CACHE', 'STATE'):
+        env['XDG_' + kind + '_HOME'] = str(Path(work) / kind.lower())
     games = Path(work) / 'games λ'
     games.mkdir()
     game = games / '日本語 homebrew.ELF'

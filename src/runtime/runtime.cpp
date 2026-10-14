@@ -12,6 +12,7 @@
 #include <thread>
 
 #include "common/fileutil.h"
+#include "common/app_paths.h"
 #include "common/log.h"
 #include "fs/block_device.h"
 #include "fs/iso_fs.h"
@@ -123,7 +124,13 @@ bool SfoWantsLargeMemory(const u8 *data, size_t size) {
 
 fs::path Host0Root(const Options &o) {
 	if (!o.host0Dir.empty()) return fs::u8path(o.host0Dir);
-	if (o.file.empty()) return ExecutableDir();
+	if (o.file.empty()) {
+#ifdef _WIN32
+		return ExecutableDir();
+#else
+		return apppaths::DataRoot() / "host0";
+#endif
+	}
 	return fs::u8path(o.file).parent_path();
 }
 

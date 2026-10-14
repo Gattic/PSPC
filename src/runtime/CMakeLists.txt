@@ -90,8 +90,11 @@ if(WIN32)
 	target_compile_definitions(pspc-launcher PRIVATE UNICODE _UNICODE)
 else()
 	pkg_check_modules(PSPC_GTK REQUIRED IMPORTED_TARGET gtk+-3.0>=3.22)
-	add_executable(pspc-launcher ${CMAKE_SOURCE_DIR}/src/frontend/launcher_gtk.cpp)
-	target_link_libraries(pspc-launcher PRIVATE PkgConfig::PSPC_GTK)
+	add_executable(pspc-launcher
+		${CMAKE_SOURCE_DIR}/src/frontend/launcher_gtk.cpp
+		${CMAKE_SOURCE_DIR}/src/frontend/gtk_dialogs.cpp
+		${CMAKE_SOURCE_DIR}/src/frontend/servers.cpp)
+	target_link_libraries(pspc-launcher PRIVATE PkgConfig::PSPC_GTK pspc_net)
 endif()
 target_link_libraries(pspc-launcher PRIVATE pspc_game_library)
 # PSPC_SEM_VERSION: the launcher tells current AOT DLLs from stale ones; pspc_version.h.

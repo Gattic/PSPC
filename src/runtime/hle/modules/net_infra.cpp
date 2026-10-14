@@ -5,8 +5,8 @@
 //
 // The table is a list of games, each with the disc IDs it covers, host names mapped to addresses
 // ("domains") and/or a revival DNS server that answers for all of the game's names ("dns"). It is
-// read from, in order (the first entry naming the running game wins): infrastructure.json next to
-// pspc.exe (the player's own), data/infrastructure.json (shipped), and PPSSPP's infra-dns.json in
+// read from, in order (the first entry naming the running game wins): infrastructure.json in the
+// user's config root, data/infrastructure.json (shipped), and PPSSPP's infra-dns.json in
 // either place, whose format this is (games[].known_working_ids / other_ids / not_working_ids,
 // domains, dns). pspc.ini infra_dns= is a revival DNS server for every game.
 //
@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "common/fileutil.h"
+#include "common/app_paths.h"
 #include "common/json.h"
 #include "common/log.h"
 #include "net/dns.h"
@@ -110,9 +111,9 @@ void LoadLocked() {
 	g_loaded = true;
 	const Config &cfg = CurrentConfig();
 	const std::string discId = media::DiscId();
-	std::vector<fs::path> files = {ExecutableDir() / "infrastructure.json"};
+	std::vector<fs::path> files = {apppaths::ConfigRoot() / "infrastructure.json"};
 	if (!cfg.dataDir.empty()) files.push_back(fs::u8path(cfg.dataDir) / "infrastructure.json");
-	files.push_back(ExecutableDir() / "infra-dns.json");
+	files.push_back(apppaths::ConfigRoot() / "infra-dns.json");
 	if (!cfg.dataDir.empty()) files.push_back(fs::u8path(cfg.dataDir) / "infra-dns.json");
 	for (const fs::path &f : files) {
 		if (ReadTable(f, discId, &g_entry)) {
