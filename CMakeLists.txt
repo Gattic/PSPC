@@ -60,6 +60,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 	install(FILES tools/pspc-decrypt/COPYING tools/pspc-decrypt/libkirk/NOTICE
 		DESTINATION licenses/pspc-decrypt COMPONENT AOT)
 	install(FILES docs/linux-port.md docs/RECOMPILER.md DESTINATION docs COMPONENT AOT)
+	if(PSPC_BUILD_RUNTIME)
+		include(cmake/LinuxPackage.cmake)
+	endif()
 endif()
 
 if(PSPC_BUILD_TESTS)

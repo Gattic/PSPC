@@ -125,5 +125,16 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 		add_test(NAME launcher_cli COMMAND ${Python3_EXECUTABLE} -I
 			${CMAKE_CURRENT_SOURCE_DIR}/launcher/test_cli.py $<TARGET_FILE:pspc-launcher>)
 		set_tests_properties(launcher_cli PROPERTIES TIMEOUT 30)
+		add_test(NAME launcher_paths COMMAND ${Python3_EXECUTABLE} -I
+			${CMAKE_CURRENT_SOURCE_DIR}/launcher/test_paths.py --build-dir ${CMAKE_BINARY_DIR}
+			--compiler ${CMAKE_CXX_COMPILER})
+		set_tests_properties(launcher_paths PROPERTIES TIMEOUT 120)
+		add_test(NAME runtime_package COMMAND ${Python3_EXECUTABLE} -I
+			${CMAKE_CURRENT_SOURCE_DIR}/launcher/test_package.py --build-dir ${CMAKE_BINARY_DIR}
+			--compiler ${CMAKE_CXX_COMPILER})
+		set_tests_properties(runtime_package PROPERTIES TIMEOUT 240)
+		add_test(NAME desktop_integration COMMAND ${Python3_EXECUTABLE} -I
+			${CMAKE_CURRENT_SOURCE_DIR}/launcher/test_desktop.py --build-dir ${CMAKE_BINARY_DIR})
+		set_tests_properties(desktop_integration PROPERTIES TIMEOUT 90)
 	endif()
 endif()

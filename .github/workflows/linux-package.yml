@@ -1,0 +1,56 @@
+name: Linux runtime package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      JOBS: '2'
+      CC: gcc
+      CXX: g++
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install host build and integration dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config python3 python3-gi \
+            libsdl2-dev libgtk-3-dev libavcodec-dev libavformat-dev libavutil-dev \
+            libswscale-dev libswresample-dev libgl1-mesa-dev libcurl4-openssl-dev \
+            desktop-file-utils libglib2.0-bin bubblewrap dbus-x11 xvfb xauth \
+            gir1.2-gtk-3.0 gir1.2-atspi-2.0
+      - name: Build and exercise fixture-free runtime, package and desktop integration
+        run: bash tools/ci_linux.sh
+      - name: Preserve bounded verification logs (including failures)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: linux-package-evidence
+          path: build/LinuxCI/ci-evidence/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Upload host-dependent test package (not a published release)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pspc-ubuntu-24.04-x86_64-${{ github.sha }}
+          path: |
+            build/LinuxCI/package/*.tar.gz
+            build/LinuxCI/package/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
