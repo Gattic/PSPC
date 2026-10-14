@@ -616,6 +616,9 @@ int Run(const Options &o) {
 				g_exitToVsh = true;
 				code = 0;
 			}
+			// Pool destructors return guest memory to the partition allocators. Destroy
+			// them now, not after those allocators in cross-TU static destruction.
+			kernel::DestroyAll();
 			return code;
 		},
 		[]() { sched::PostFromHost([]() { sched::RequestStop(0); }); });

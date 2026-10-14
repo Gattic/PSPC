@@ -231,10 +231,7 @@ void RunInterrupts() {
 void FreeDeadFibers() {
 	for (void *f : g_deadFibers) hostsys::FreeFiber(f);
 	g_deadFibers.clear();
-	for (PspThread *t : g_pendingDelete) {
-		RemoveFromReady(t);
-		kernel::Destroy(t->uid);
-	}
+	for (PspThread *t : g_pendingDelete) DeleteThread(t);
 	g_pendingDelete.clear();
 }
 
