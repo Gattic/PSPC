@@ -46,6 +46,22 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tools/CMakeLists.txt)
 	add_subdirectory(tools)
 endif()
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+	# A relocatable, source-tree-independent AOT SDK, not a runtime/system installer.
+	# Python and a compatible C++20 toolchain remain host dependencies.
+	install(TARGETS pspc-recomp pspc-iso pspc-decrypt RUNTIME DESTINATION . COMPONENT AOT)
+	install(TARGETS pspc_sem pspc_common ARCHIVE DESTINATION aot/lib COMPONENT AOT)
+	install(DIRECTORY src/allegrex DESTINATION aot/src COMPONENT AOT)
+	install(FILES src/common/common.h DESTINATION aot/src/common COMPONENT AOT)
+	install(FILES src/recomp/codegen.cpp DESTINATION aot/src/recomp COMPONENT AOT)
+	install(FILES ${CMAKE_BINARY_DIR}/generated/pspc_sem_version.h DESTINATION aot/generated COMPONENT AOT)
+	install(FILES tools/pspc_build.py DESTINATION tools COMPONENT AOT)
+	install(FILES LICENSE THIRD_PARTY.md DESTINATION . COMPONENT AOT)
+	install(FILES tools/pspc-decrypt/COPYING tools/pspc-decrypt/libkirk/NOTICE
+		DESTINATION licenses/pspc-decrypt COMPONENT AOT)
+	install(FILES docs/linux-port.md docs/RECOMPILER.md DESTINATION docs COMPONENT AOT)
+endif()
+
 if(PSPC_BUILD_TESTS)
 	enable_testing()
 	add_subdirectory(tests)

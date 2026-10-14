@@ -1,12 +1,13 @@
 ﻿#!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Ahead-of-time build: recompile PSP modules to native DLLs for pspc.
+"""Ahead-of-time build: recompile PSP modules to native DLLs or Linux .so modules for pspc.
 
 Usage: pspc_build.py [options] <module.prx|.elf|EBOOT.PBP> [...]
 
 For each input the plain ELF is located (PBP: DATA.PSP; encrypted ~PSP files go through
-pspc-decrypt), recompiled with pspc-recomp, compiled with clang-cl (or cl) into <sha1>.dll and
-copied into the AOT cache that pspc.exe searches (default: <pspc dir>/cache/aot).
+pspc-decrypt), recompiled with pspc-recomp, compiled with a host C++ compiler and copied into
+the AOT cache that pspc searches (default: <pspc dir>/cache/aot). Linux installations use the
+system toolchain; Windows installations use the bundled LLVM/MinGW toolchain.
 
 The cache's games.json records, per input (disc image, PBP or module file), the modules it was
 built from and their SHA-1s, so the launcher can tell which games have native code.
@@ -112,17 +113,20 @@ def bundled_env():
 
 
 def configure_bundle(root):
-    """The installed SDK is relocatable and never searches for a source tree or Visual Studio."""
+    """Use only the installed PSPC tools, headers and archives, never a developer build tree."""
     global BIN, LIB, SEM_HEADER, LINK_LIBS, SRC, TOOLCHAIN
     BIN = root
     sdk = root / 'aot'
     LIB, SRC = sdk / 'lib', sdk / 'src'
     SEM_HEADER = sdk / 'generated' / 'pspc_sem_version.h'
-    LINK_LIBS = ('pspc_aot.a',)
-    TOOLCHAIN = sdk / 'toolchain'
-    for p in (BIN / 'pspc-recomp.exe', BIN / 'pspc-iso.exe', BIN / 'pspc-decrypt.exe',
-              LIB / LINK_LIBS[0], SEM_HEADER, SRC / 'allegrex' / 'sem.h', SRC / 'recomp' / 'codegen.cpp',
-              TOOLCHAIN / 'bin' / 'x86_64-w64-mingw32-clang++.exe'):
+    LINK_LIBS = ('pspc_aot.a',) if WINDOWS else ('libpspc_sem.a', 'libpspc_common.a')
+    TOOLCHAIN = sdk / 'toolchain' if WINDOWS else None
+    required = [BIN / (name + EXE_SUFFIX) for name in ('pspc-recomp', 'pspc-iso', 'pspc-decrypt')]
+    required += [LIB / name for name in LINK_LIBS]
+    required += [SEM_HEADER, SRC / 'allegrex/sem.h', SRC / 'common/common.h', SRC / 'recomp/codegen.cpp']
+    if TOOLCHAIN:
+        required.append(TOOLCHAIN / 'bin/x86_64-w64-mingw32-clang++.exe')
+    for p in required:
         if not p.is_file():
             raise RuntimeError('AOT installation is incomplete (%s missing). Repair or reinstall PSPC.' % p)
 
@@ -431,7 +435,12 @@ def build_one(args, env, path):
     else:
         dll = build_with_cmake(args, env, src, sha) if args.cmake else build_direct(args, env, src, sha)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(dll, dest)
+    # Running games may still map the old inode. Stage on the cache filesystem so
+    # publication is atomic even when the build workspace is on another device.
+    with tempfile.TemporaryDirectory(prefix='.publish-', dir=dest.parent) as staging:
+        staged = pathlib.Path(staging) / dest.name
+        shutil.copy2(dll, staged)
+        os.replace(staged, dest)
     stamp.write_text(args.sem_version + '\n')
     if not args.keep_src:
         shutil.rmtree(src, ignore_errors=True)
@@ -447,8 +456,8 @@ def main():
     ap.add_argument('--build-dir', default=None,
                     help='build tree for pspc-recomp, the link libraries and the semantics version '
                          '(default: build/RelWithDebInfo)')
-    ap.add_argument('--pspc-dir', help='installed PSPC folder (default: auto-detect next to this script)')
-    ap.add_argument('--cache', default=None, help='AOT cache (default: <build dir>/bin/cache/aot)')
+    ap.add_argument('--pspc-dir', help='installed PSPC/AOT SDK folder (default: auto-detect next to this script)')
+    ap.add_argument('--cache', default=None, help='AOT cache (default: <pspc dir>/cache/aot)')
     ap.add_argument('--work', help='temporary build parent (default: cache/aot-work in an install)')
     ap.add_argument('--decrypt', default=None)
     ap.add_argument('--compiler', choices=['clang', 'msvc', 'gcc'], default='clang')
@@ -463,20 +472,20 @@ def main():
     if args.jobs < 1 or args.modules_in_parallel < 1:
         ap.error('--jobs and --modules-in-parallel must be positive')
     installed = pathlib.Path(args.pspc_dir).resolve() if args.pspc_dir else ROOT
-    bundled = args.pspc_dir or (not args.build_dir and (installed / 'pspc.exe').exists())
-    if bundled:
-        if not WINDOWS:
-            ap.error('the bundled toolchain is only supported on Windows')
-        if args.build_dir or args.cmake or args.compiler != 'clang':
-            ap.error('the bundled toolchain cannot be combined with --build-dir, --cmake or a compiler other than clang')
+    installed_sdk = args.pspc_dir or (not args.build_dir and (installed / 'aot').is_dir())
+    if installed_sdk:
+        if args.build_dir:
+            ap.error('an installed SDK cannot be combined with --build-dir')
+        if WINDOWS and (args.cmake or args.compiler != 'clang'):
+            ap.error('the bundled toolchain cannot be combined with --cmake or a compiler other than clang')
         configure_bundle(installed)
     if args.build_dir:
         tree = pathlib.Path(args.build_dir).resolve()
         BIN, LIB, SEM_HEADER = tree / 'bin', tree / 'lib', tree / 'generated' / 'pspc_sem_version.h'
     args.cache = args.cache or str(BIN / 'cache' / 'aot')
     args.decrypt = args.decrypt or str(BIN / ('pspc-decrypt' + EXE_SUFFIX))
-    args.work = args.work or str(installed / 'cache' / 'aot-work' if bundled else ROOT / 'build' / 'aot-work')
-    if bundled:
+    args.work = args.work or str(installed / 'cache' / 'aot-work' if installed_sdk else ROOT / 'build' / 'aot-work')
+    if TOOLCHAIN:
         env = bundled_env()
     else:
         env = vs_env() if WINDOWS else os.environ.copy()

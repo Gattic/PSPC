@@ -73,9 +73,6 @@ if(WIN32)
 		COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SDL2_ROOT}/lib/x64/SDL2.dll $<TARGET_FILE_DIR:pspc>)
 endif()
 
-add_executable(pspc-iso ${CMAKE_SOURCE_DIR}/src/frontend/iso_tool.cpp)
-target_link_libraries(pspc-iso PRIVATE pspc_fs pspc_common)
-
 if(WIN32)
 	add_executable(pspc-launcher WIN32
 		${CMAKE_SOURCE_DIR}/src/frontend/launcher.cpp

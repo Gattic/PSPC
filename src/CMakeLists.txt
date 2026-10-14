@@ -54,5 +54,9 @@ foreach(component ${PSPC_COMPONENTS})
 	endif()
 endforeach()
 
+# Disc extraction is needed by the AOT SDK even in a tools-only build.
+add_executable(pspc-iso frontend/iso_tool.cpp)
+target_link_libraries(pspc-iso PRIVATE pspc_fs pspc_common)
+
 add_library(pspc_game_library STATIC frontend/game_library.cpp)
 target_link_libraries(pspc_game_library PUBLIC pspc_fs)

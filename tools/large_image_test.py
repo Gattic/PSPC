@@ -139,7 +139,7 @@ def expected(iso, info, commands):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument('--pspc', default=str(ROOT / 'build' / 'RelWithDebInfo' / 'bin' / 'pspc.exe'))
+    ap.add_argument('--pspc', default=str(ROOT / 'build' / 'RelWithDebInfo' / 'bin' / ('pspc.exe' if sys.platform == 'win32' else 'pspc')))
     ap.add_argument('--aot', action='store_true',
                     help='native code, built fresh for the run, instead of the interpreter')
     ap.add_argument('--keep', action='store_true', help='keep the image (build/large-image/large.iso)')

@@ -230,14 +230,14 @@ def run_one(args, rel, prx, exp):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--pspc', default=str(ROOT / 'build' / 'RelWithDebInfo' / 'bin' / 'pspc.exe'))
+    ap.add_argument('--pspc', default=str(ROOT / 'build' / 'RelWithDebInfo' / 'bin' / ('pspc.exe' if sys.platform == 'win32' else 'pspc')))
     ap.add_argument('--tests', default=str(ROOT / 'reference' / 'pspautotests' / 'tests'))
     ap.add_argument('--jobs', type=int, default=max(1, (os.cpu_count() or 4) - 2))
     ap.add_argument('--timeout', type=int, default=20)
     ap.add_argument('--aot', action='store_true', help='allow AOT modules (default: interpreter only)')
     ap.add_argument('--json', default=None)
     ap.add_argument('--verbose', '-v', action='store_true')
-    ap.add_argument('--flash0', default=None, help="pspc's flash0 (default: the one next to pspc.exe)")
+    ap.add_argument('--flash0', default=None, help="pspc's flash0 (default: the one next to the pspc executable)")
     ap.add_argument('--mode', choices=('emulator', 'display', 'psp'),
                     help='run every selected test in this mode instead of its own (see ENVIRONMENT)')
     ap.add_argument('filters', nargs='*')

@@ -10,7 +10,6 @@ player's first build is), and its output must equal expected.txt. Tests whose pr
 are skipped. tests/guest/large_image has its own runner (tools/large_image_test.py).
 """
 import argparse
-import os
 import pathlib
 import shutil
 import subprocess
@@ -28,7 +27,8 @@ def build_native(prx, aot_dir, build_dir):
         r = subprocess.run([sys.executable, '-I', str(ROOT / 'tools' / 'pspc_build.py'), str(prx),
                             '--build-dir', str(build_dir), '--cache', str(aot_dir), '--work', str(work), '--force'],
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
-        if r.returncode != 0 or not any(pathlib.Path(aot_dir).glob('*.dll')):
+        modules = pathlib.Path(aot_dir).glob('*.dll' if sys.platform == 'win32' else '*.so')
+        if r.returncode != 0 or not any(modules):
             return 'pspc_build.py failed:\n' + '\n'.join(r.stdout.splitlines()[-10:])
         return None
     finally:
@@ -55,7 +55,7 @@ def run_pspc(pspc, target, timeout, aot_dir=None, extra=()):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument('--pspc', default=str(ROOT / 'build' / 'RelWithDebInfo' / 'bin' / 'pspc.exe'))
+    ap.add_argument('--pspc', default=str(ROOT / 'build' / 'RelWithDebInfo' / 'bin' / ('pspc.exe' if sys.platform == 'win32' else 'pspc')))
     ap.add_argument('--timeout', type=int, default=120)
     ap.add_argument('--interp-only', action='store_true')
     ap.add_argument('names', nargs='*')
