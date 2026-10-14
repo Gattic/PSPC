@@ -1,7 +1,7 @@
 # PSPC
 
-PSPC runs PlayStation Portable software as native Windows programs. Game and homebrew code
-(Allegrex MIPS) is **recompiled ahead of time into C++ and compiled into DLLs**, with an
+PSPC runs PlayStation Portable software as native PC programs. Game and homebrew code
+(Allegrex MIPS) is **recompiled ahead of time into C++ and compiled into DLLs (Windows) or `.so` modules (Linux)**, with an
 interpreter as a fallback. The PSP OS, as of firmware 4.01 with the M33 custom firmware, is
 **reimplemented natively**, using the decompiled firmware as its specification.
 
@@ -9,6 +9,13 @@ Read [PLAN.md](PLAN.md) for the goals and phases, and [docs/ARCHITECTURE.md](doc
 and [docs/RECOMPILER.md](docs/RECOMPILER.md) for how it works.
 
 ## Installing
+
+For Linux source builds, the OpenGL renderer and GTK launcher, see
+[Linux build instructions and validation limits](docs/linux-port.md). Runtime builds also provide a
+[relocatable Linux runtime archive/install](docs/linux-package.md) using host libraries, Python and
+a compiler, with optional [per-user menu registration](docs/linux-package.md#application-menu-registration)
+and a [fixture-free Linux CI gate](docs/linux-package.md#fixture-free-ci). The MSI and
+bundled-toolchain instructions below are Windows-only.
 
 1. Download `PSPC-<version>-x64.msi` from the [Releases page](https://github.com/Gattic/PSPC/releases)
    and open it. PSPC installs for your Windows account in `%LOCALAPPDATA%\Programs\PSPC`, without
@@ -51,7 +58,7 @@ recorded hardware differences), with identical results in the interpreter and as
 | Allegrex CPU: decoder, interpreter, FPU, VFPU (bit-exact hardware model) | Working. `cpu/` 42/42 |
 | AOT recompiler (`pspc-recomp`) + DLL pipeline | Working. 99%+ code coverage on retail games, whole discs build in about a minute |
 | Kernel: threads (fibers), sync objects, memory, modules, interrupts, timing | Working. `threads/` 152/158; ctrl, power, RTC, intr, modules all complete |
-| GE graphics: multithreaded software renderer (default, reference) and optional Direct3D 11 renderer: 1-16x resolution (up to 8K, supersampled to the window), xBR texture upscaling, texture filtering | Working. `gpu/` 111/111 (software) |
+| GE graphics: multithreaded software renderer (default, reference) and optional Direct3D 11 (Windows) and OpenGL (Linux) renderers: 1-16x resolution (up to 8K, supersampled to the window), xBR texture upscaling, texture filtering | Working. `gpu/` 111/111 (software) |
 | Audio (sceAudio, SAS, ATRAC3/3+, MP3, AAC, audiocodec) | Working. `audio/` 73/74 |
 | I/O, UMD, memory stick, ISO/CSO/ZSO/DAX | Working |
 | sceUtility (save data, dialogs, OSK), fonts (PGF) | Working |
@@ -130,8 +137,8 @@ Useful options (`pspc --help` lists them all):
 | `--memstick <dir>`, `--flash0 <dir>`, `--host0 <dir>` | device roots |
 | `--plugins <dir>`, `--no-plugins` | M33 plugins folder laid over ms0: (default: `plugins`), or none |
 | `--umd <image>` | insert a disc while running a .prx/.elf/.pbp |
-| `--renderer software\|d3d11`, `--render-scale <1-16>` | GE renderer: software (default) or the GPU; d3d11 renders at 1-16 times 480x272 (8 = 4K, 16 = 8K) |
-| `--texture-upscale <1-4>`, `--texture-filter auto\|nearest\|linear` | d3d11 textures: scaled up with xBR; filtering as the game sets it, or forced |
+| `--renderer software\|opengl\|d3d11`, `--render-scale <1-16>` | Software (default), OpenGL (Linux) or D3D11 (Windows); GPU renderers support 1-16 times 480x272 (8 = 4K, 16 = 8K) |
+| `--texture-upscale <1-4>`, `--texture-filter auto\|nearest\|linear` | GPU textures: scaled up with xBR; filtering as the game sets it, or forced |
 | `--osk-text <text>` | headless: what the on-screen keyboard returns (e.g. a character name) |
 | `--config <file\|none>`, `--set key=value` | settings file to use (default `pspc.ini`), or override one entry |
 | `--fw 6.60` | firmware version reported to games |
@@ -150,7 +157,7 @@ fullscreen=0       # 1 = borderless fullscreen
 vsync=1
 aot=1              # 0 = interpreter only (like --interp)
 fw=6.60            # firmware version reported to games (like --fw)
-renderer=d3d11     # software (default) or d3d11 (GPU renderer; needs D3D11.3 rasterizer-ordered views)
+renderer=d3d11     # software (default), opengl (Linux: GL 4.5 + fragment interlock), d3d11 (Windows: D3D11.3 ROVs)
 render_scale=8     # d3d11 internal resolution, 1-16 times 480x272: 4 = 1920x1088, 8 = 3840x2176 (4K),
                    # 16 = 7680x4352 (8K); above the window's size it is averaged down (supersampling)
 texture_upscale=4  # d3d11: 1 = off, 2-4 = textures scaled up with xBR (smooth edges instead of blocky texels)

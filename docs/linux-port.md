@@ -140,7 +140,7 @@ ctest --test-dir build/LinuxRuntime --output-on-failure -R '^net_recvmsg_'
 
 In addition to the foundation dependencies, install development packages for SDL2,
 FFmpeg (`libavcodec`, `libavutil`, `libswresample`, `libswscale`), FreeType, fontconfig,
-libcurl 7.85+, GTK 3.22+, and pkg-config. With native system packages:
+libcurl 7.85+, GTK 3.22+, OpenGL development libraries, and pkg-config. With native system packages:
 
 ```sh
 cmake -S . -B build/LinuxRuntime -G Ninja \
@@ -188,11 +188,10 @@ Checks completed:
   muted; this does not verify audible output quality.
 - The tools-only build and all three of its CTest entries still pass.
 
-The GTK frontend provides title/icon browsing and search, play/interpreter actions,
-native-build invocation, XMB invocation, and opening the settings file. This is **not**
-the full Windows launcher UI: dedicated settings/plugin/network/online/server dialogs,
-firmware-install workflow, artwork/native-cache status UI, and their end-to-end workflow
-validation remain outstanding. GUI startup and CLI checks do not establish those actions.
+The GTK frontend now includes settings/input, plugins, account/friends, server/admin/routing,
+artwork, native-cache status, build-before-play and firmware-install workflows. See the
+[implementation and synthetic verification](#linux-renderer-and-launcher-workflows) below;
+the earlier startup smoke alone did not establish these actions.
 
 ### Bounded retail interpreter smoke
 
@@ -656,17 +655,370 @@ Current retention is **45/45 cases**, about **1.71/2 GiB**. All case slots are o
 no further gameplay run or retention increase is authorized. Native combat completion,
 valve progression and a distinguishable checkpoint/restart/resume roundtrip remain unproven.
 
+## Shared GPU preparation
+
+The D3D11 geometry preparation, packed draw state, texture atlas layout, texture-data
+hashing and reference-sampler decoding now live in portable `src/gpu/hw/draw_data.{h,cpp}`.
+D3D11 uses that shared implementation. Six `gpu_draw_data` unit tests run on Linux and
+cover primitives, batch boundaries, packed state, texture options and decoding all eleven
+texture formats against the software sampler, including swizzling, palettes and bounded
+reads. The runtime-enabled Linux build and all 16 CTests passed after the extraction.
+
+The extraction itself did not establish acceleration. The Linux backend below now uses
+this layer too. Windows build and D3D11 execution were not tested by these Linux runs.
+
+## Linux renderer and launcher workflows
+
+### OpenGL hardware renderer
+
+`--renderer opengl` selects the Linux GPU backend. It requires OpenGL 4.5 and
+`GL_ARB_fragment_shader_interlock`; unsupported drivers produce a diagnostic and fall
+back to software. Software remains the default. `PSPC_RENDERER_REQUIRE=1` makes an
+unavailable requested OpenGL backend fatal, for validation rather than silent skips.
+
+The backend uses ordered integer color/depth images, shared GE preparation and GLSL
+generated from the D3D11 shader arithmetic. It supports 1–16× internal resolution,
+nearest/linear/game-selected filtering, xBR texture upscaling, framebuffer feedback,
+scaled display readback, presentation and overlays. Unsupported raster states or aliased
+color/depth storage use the software reference. VRAM synchronization is eager, including
+CPU writes and transfers; Linux does not install D3D11-style page-fault handlers. This
+prioritizes correctness, not a claim of equivalent D3D11 performance.
+
+Focused tests ran on Intel UHD Graphics (CML GT2), Mesa. They compare color/depth output
+against software, exercise filtering/xBR, direct and indexed/swizzled framebuffer feedback,
+GE transfers, CPU edits, mirrored VRAM, surface eviction and scales through 16×. A separate
+SDL test covers preserving a peer context, worker-thread presentation, resizing and
+idempotent release. Disabling the interlock extension in a fresh Mesa process verified
+explicit capability rejection and context restoration. A separate bounded CLI run verifies
+that unavailable interlock selects software and continues running the native synthetic
+program without bad memory accesses (expected timeout status 124). Neither rejection case
+is a GPU-rendering pass.
+
+```sh
+PSPC_RENDERER_REQUIRE=1 build/LinuxRuntime/bin/pspc_unittests gpu_hardware
+PSPC_RENDERER_REQUIRE=1 build/LinuxRuntime/bin/pspc_unittests gpu_opengl
+```
+
+These synthetic scenes do not establish retail GPU correctness, driver-wide compatibility,
+performance, or screenshot/overlay pixel parity. D3D11 and WARP remain Windows-only.
+
+### GTK workflows and native builds
+
+The GTK launcher provides:
+
+- Search, icons, artwork, persistent folder selection and file reveal.
+- Shared settings validation, graphics/audio/network controls, keyboard/controller
+  bindings and per-list plugin editing.
+- Network registration/sign-in/out, friends, owned servers, bounded logs, routing and
+  named account/mission/news/board/GameSpy admin operations, plus custom arguments.
+- Shared Windows/Linux cache inspection: platform module suffixes, semantics stamps,
+  newer hints, duplicate modules, failed/partial/stale results and moved-disc matching.
+- Build-before-play choices, forced rebuilding, progress, cancellation and stopping the
+  owned runtime. Builds use the existing compiler pipeline and private temporary work
+  directories, removed after the child group has stopped.
+- Sony 4.01 extraction/install steps, optional firmware AOT, progress/error output and
+  XMB launch. A successful real Sony installation/XMB run remains **unverified**.
+
+Native building requires the source tree and development tools; a missing builder is
+reported explicitly. Child commands use argv/stdin, not shell command interpolation.
+Their process groups are owned and reaped; shutdown never targets arbitrary matching
+process names. Captured output is bounded to 256 KiB, with 2 MiB disk logs and one rotated
+copy per role. Admin output remains parseable rather than including lifecycle log markers.
+
+The local server integration tests cover routing preservation, accounts/friends,
+password reset, ban/unban, JSON administration and start/stop cleanup. They exposed and
+fixed missing Linux HTTP PUT/DELETE support. AT-SPI testing also exposed modal actions
+holding the accessibility D-Bus dispatcher open; button actions now leave that dispatcher
+before opening dialogs, and form entries have explicit accessible names.
+
+```sh
+build/LinuxRuntime/bin/pspc_unittests launcher_
+build/LinuxRuntime/bin/pspc_unittests native_cache
+# Opt-in: real X11, PyGObject, Atspi 2 and Gdk/GdkX11 3 typelibs.
+# This combined GPU/fault-injection check requires Mesa with GL 4.5 + interlock.
+python3 tests/launcher/test_ui.py --build-dir build/LinuxRuntime \
+  --evidence-dir build/linux-parity-review
+```
+
+The UI check uses one disposable installation, a synthetic ELF and a loopback-only
+account server, with isolated HOME/XDG directories. It exercises persisted graphics settings,
+plugins, accounts, server/admin and routing actions, firmware missing-tool errors and chooser
+cancellation, build-before-play/cancel selection, failed-build cleanup without launching,
+real native compilation, OpenGL startup with native registration and zero interpreted
+instructions/bad accesses, Stop game and launcher close with server cleanup. It does not
+use retail assets, existing installation data or global key events. The GTK layout is not a pixel
+copy of the Windows UI; firmware installation and every admin mutation are not covered by
+this UI check.
+
+The full runtime regression passed **16/16 CTests** with hardware availability required;
+the tools-only build passed **3/3 CTests**. Focused launcher checks follow the final
+process-ownership and raw-admin-output changes. Local evidence is under
+`build/linux-parity-review/`. Canonical checks are CTest and the explicit drivers above:
+the generic test-runner's inferred `pytest -q` command is not applicable to the repository's
+argument-taking CLI drivers and failed collection. Existing reference-dependent VFPU
+skips remain; no assertions or reference baselines were weakened.
+
+## Linux scripts and delivery tooling
+
+The script audit found that `tools/guest_tests.py` rejected successful Linux native builds
+because it looked only for `.dll` files. It now checks the host's module suffix (`.so` on
+Linux, `.dll` on Windows); `large_image_test.py --aot` uses the same corrected helper.
+`guest_tests.py`, `run_autotests.py` and `large_image_test.py` also select the host executable
+name rather than always defaulting to `pspc.exe`. Their default build tree remains
+`build/RelWithDebInfo`; pass `--pspc` when using the separate runtime tree:
+
+```sh
+python3 -I tools/guest_tests.py --pspc "$PWD/build/LinuxRuntime/bin/pspc"
+python3 -I tools/run_autotests.py --pspc "$PWD/build/LinuxRuntime/bin/pspc" --jobs 2
+python3 -I tools/large_image_test.py --pspc "$PWD/build/LinuxRuntime/bin/pspc" --aot
+```
+
+These are asset-dependent validation commands, not a fixture-free CI gate. The first and
+third require guest programs built with `tools/build_guest_tests.sh` and pspdev; the second
+requires the pspautotests reference tree and any per-test firmware/rebuilt fixtures. The
+large-image test creates an 8.75 GB sparse image, so check filesystem support and available
+space before running it. Missing guest programs reported as `SKIP` are not validation passes.
+
+The fixture-free `aot_pipeline` CTest now calls the real guest native-build helper with a
+synthetic ELF and executes its output through the native module probe. It reproduced the
+false failure before the suffix fix. This covers the shared helper without PSP tools or
+firmware, not the full guest/reference/large-image suites.
+
+The delivery audit also leaves these explicit follow-ups under roadmap item 3.1.2:
+
+- `build.sh`, guest-build shell scripts, smoke/network helpers and the native builder have
+  Linux entry points. Ghidra's headless/JDK discovery still assumes Windows. The firmware
+  helper now distinguishes executables from writable firmware/cache/work destinations;
+  successful installation/boot with Sony assets remains unverified.
+- `tools/make_installer.py` and its bundled-toolchain release test are Windows-only. The
+  Linux AOT SDK component below installs PSPC's build dependencies, but is not a full
+  application package or a self-contained compiler distribution by itself. Runtime builds now
+  also provide the [full application install/archive](linux-package.md), with matching source,
+  system-library dependencies, no installed RUNPATH and XDG writes. Explicit per-user
+  [desktop registration](linux-package.md#application-menu-registration) handles relocation,
+  version switching and removal without touching user data. Distro-specific package hooks,
+  broader ABI baselines and automated upgrade/uninstall integration remain pending.
+- The [fixture-free Linux package CI workflow](linux-package.md#fixture-free-ci) builds on
+  Ubuntu 24.04 and requires synthetic install/archive, isolation and real GTK desktop
+  activation checks. M33 decrypt tests are explicitly excluded, reference-dependent unit
+  omissions remain visible, and required GPU/retail validation is separate. Hosted Actions
+  execution/artifact upload has not yet been observed; local rehearsal is not a hosted pass.
+- General README/architecture/networking documentation still contains Windows-specific
+  examples and historical validation claims; this document remains the Linux status source.
+
+### Relocatable Linux AOT SDK
+
+The Linux `AOT` CMake install component provides the PSPC-specific dependencies needed to
+build native modules without the source or build tree. It works with the tools-only
+configuration above; `pspc-iso` is now built independently of the runtime:
+
+```sh
+./build.sh RelWithDebInfo --target pspc_aot_probe
+ctest --test-dir build/RelWithDebInfo --output-on-failure -R '^(aot_install|aot_pipeline)$'
+cmake --install build/RelWithDebInfo --component AOT --prefix "$HOME/PSPC-AOT"
+python3 -I "$HOME/PSPC-AOT/tools/pspc_build.py" --compiler gcc /path/to/module.elf
+```
+
+Choose a dedicated prefix, not `/usr` or `/usr/local`: the SDK has a flat, relocatable
+layout, not an FHS `bin/lib/share` layout. Its contents are:
+
+- `pspc-recomp`, `pspc-iso`, `pspc-decrypt`: native host tools;
+- `aot/lib/libpspc_sem.a`, `aot/lib/libpspc_common.a`: matching native archives;
+- `aot/src/allegrex`, `aot/src/common/common.h`, `aot/src/recomp/codegen.cpp` and
+  `aot/generated/pspc_sem_version.h`: compilation and semantics-hash inputs;
+- `tools/pspc_build.py`, documentation, license and third-party notices.
+
+The installed script auto-detects `aot/`; `--pspc-dir /path/to/SDK` selects an explicit
+installation. It uses only that installation's PSPC dependencies and checks the semantics
+hash before using the cache. Do not mix installed mode with `--build-dir`. The default
+cache/work roots are `cache/aot` and `cache/aot-work` inside the SDK; for a read-only SDK,
+pass **both** writable paths (and point the runtime at that cache with `--aot-dir`):
+
+```sh
+python3 -I /opt/PSPC-AOT/tools/pspc_build.py --compiler gcc \
+  --cache "$HOME/.cache/pspc/aot" --work "$HOME/.cache/pspc/aot-work" /path/to/module.elf
+```
+
+The SDK does **not** bundle Python, a compiler, system headers, libc, libstdc++/libgcc,
+CMake or Ninja. Python 3 and a compatible C++20 GCC/Clang toolchain must be installed;
+Clang is the default, `--compiler gcc` selects GCC, and `CXX` overrides either selection.
+Direct builds need no CMake/Ninja; `--cmake` additionally requires both. Built tools,
+archives and modules remain tied to the host architecture and Linux ABI baseline. This
+is not an AppImage, cross-distribution binary guarantee, or replacement for the Windows
+private LLVM/MinGW compiler bundle. No firmware, games, saves or caches are installed.
+The GTK launcher uses the installed SDK when `aot/` is beside its executable, otherwise the
+development build tree. It explicitly supplies the runtime's user cache and temporary work
+paths. Standalone SDK CLI defaults remain SDK-local; pass `--cache`/`--work` to share the
+runtime's XDG cache. The SDK component still does not install the runtime or launcher.
+
+`aot_install` stages the actual CMake component in a temporary directory outside the
+repository, relocates it to a path with spaces/non-ASCII text, builds three synthetic ELFs
+and executes their native output. It covers auto-detection, explicit installed mode,
+warm-cache reuse, a read-only SDK with external cache/work paths through the CMake route,
+and rejection of missing archives, stale semantics and conflicting build-tree arguments.
+Temporary files are removed on exit. Both tools-only and runtime builds passed, followed
+by tools-only `aot_install`/`aot_pipeline` (2/2) and runtime
+`aot_install`/`aot_pipeline`/`aot_runtime`/`launcher_cli` (4/4). Python diagnostics and Ruff
+F checks passed. These are fixture-free checks, not retail AOT or successful
+firmware-install evidence. Evidence: `build/linux-aot-install-review/`.
+
+### Linux runtime and GTK user-data paths
+
+`common/app_paths` is the shared Linux path policy for the runtime, GTK launcher/settings,
+plugin editor and hosted servers. Linux no longer reads or writes executable-local user
+settings/data by default, even in development builds. Windows keeps its existing layout.
+
+| Root | Default when the XDG variable is unset/empty | PSPC contents |
+| --- | --- | --- |
+| `$XDG_CONFIG_HOME/pspc` | `$HOME/.config/pspc` | `pspc.ini`, user `infrastructure.json` and `infra-dns.json` |
+| `$XDG_DATA_HOME/pspc` | `$HOME/.local/share/pspc` | `ms0`, `ms1`, `flash0`, `flash1`, `Games`, `plugins`, `screenshots`, hosted-server databases in `servers`; `host0` when booting without a program file |
+| `$XDG_CACHE_HOME/pspc` | `$HOME/.cache/pspc` | `aot`, `decrypted`, temporary native-build and firmware work directories |
+| `$XDG_STATE_HOME/pspc` | `$HOME/.local/state/pspc` | launcher/runtime job logs in `logs`, hosted-server logs in `servers` |
+
+Only absolute XDG overrides are used; relative overrides are ignored as required by XDG,
+not resolved against the caller's working directory. If a fallback is needed but HOME is
+missing/relative, PSPC fails with an actionable error instead of writing in the working
+or installation directory. Relative `games_dir`/`plugins_dir` settings are resolved against
+the user data root in both runtime and GTK. Absolute configured paths and explicit runtime
+CLI paths (`--config`, `--memstick`, `--flash0`, `--flash1`, `--aot-dir`, etc.) remain honored.
+
+Executables and the AOT SDK remain installation resources. The nearest executable ancestor
+containing `data/nids.csv` identifies the immutable resource root (`data/`, `tools/`,
+`server/`); this supports the flat installed layout and normal source builds without using
+cwd. GTK uses per-user working directories for children, keeps the installed server package
+as Python's import directory, and sends database/log/firmware/build output elsewhere.
+User routing overrides are written by GTK and read by the runtime from the same config root.
+
+On Linux the firmware CLI requires `--data-dir`, and AOT additionally requires explicit
+`--cache` and `--work`; `--pspc-dir` identifies executables/SDK, not a firmware destination.
+GTK supplies these automatically. For a source build, for example:
+
+```sh
+python3 -I tools/pspc_install_fw.py --fw /path/to/decrypted/firmware \
+  --pspc-dir "$PWD/build/LinuxRuntime/bin" --build-dir "$PWD/build/LinuxRuntime" \
+  --data-dir "${XDG_DATA_HOME:-$HOME/.local/share}/pspc" \
+  --cache "${XDG_CACHE_HOME:-$HOME/.cache}/pspc/aot" \
+  --work "${XDG_CACHE_HOME:-$HOME/.cache}/pspc/firmware-work" --aot-core
+```
+
+#### Existing Linux data: migrate explicitly before using the new defaults
+
+No automatic copying, deletion or merge of old executable-relative user data occurs.
+**Back up and migrate existing saves/settings before launching against the new defaults.**
+Stop all PSPC processes and servers, choose the destination XDG roots above, then transfer
+these items from the old executable directory to **empty destinations**:
+
+- `pspc.ini`, `infrastructure.json`, `infra-dns.json` → the config root;
+- `ms0`, `ms1`, `flash0`, `flash1`, `plugins`, `Games`, `screenshots`, and server databases
+  (including SQLite sidecars if any) → their names under the data root;
+- `cache/aot` and `cache/decrypted` → `aot` and `decrypted` under the cache root, or rebuild them;
+- `logs` → the state root's `logs`; old `servers/*.log` → the state root's `servers`.
+
+Do not overwrite/merge an already-used destination blindly. Keep the old copy until save
+loading and server accounts are confirmed. Adjust relative game/plugin settings when their
+files stay elsewhere; absolute paths can keep large game libraries in place. Old folders
+are not a secondary live data source, so there is only one active set of user data.
+
+#### Focused installed-layout verification
+
+`launcher_paths` stages the actual complete CMake installation (no manually copied runtime
+binaries/resources), relocates and seals it read-only, and uses disposable HOME/XDG roots. It tests
+settings shared between CLI/runtime/GTK, absolute overrides and HOME defaults, ignored
+relative XDG values, default/relative game folders, memory-stick override precedence,
+existing-save preservation and synthetic firmware copy/AOT output outside the installation.
+It checks the payload hashes remain unchanged. No Sony firmware is needed.
+
+```sh
+ctest --test-dir build/LinuxRuntime --output-on-failure -R '^(launcher_paths|launcher_cli)$'
+python3 -I tests/launcher/test_ui.py --build-dir build/LinuxRuntime \
+  --evidence-dir build/linux-user-path-review/ui
+```
+
+The opt-in GTK check uses the same read-only installed layout, with writable isolated XDG
+roots. It checks actual settings/plugin/routing writes, hosted accounts/server/admin/logs,
+missing-tool errors, firmware chooser cancellation, installed-SDK native build/play,
+live rebuild and owned shutdown. Missing tools are injected between actions; the payload
+is read-only during every application action and its final hashes must match.
+
+The [runtime package](linux-package.md) uses these install rules for a complete CPack archive,
+including Runtime, AOT and Sources. Installed executables have no RPATH/RUNPATH: SDL2, GTK3,
+OpenGL, fontconfig/FreeType, curl, FFmpeg and C/C++ runtime libraries must come from the host.
+`runtime_package` tests the archive itself; its explicit `--isolate` gate hides the repository
+and build/dependency tree while checking native startup and installed resource/server operations.
+These synthetic checks establish a relocatable **host-dependent** installation, not an AppImage,
+other-distro ABI compatibility, a bundled compiler/Python, Sony firmware/XMB or Windows evidence.
+See the package guide for manual update/removal semantics and remaining delivery scope.
+
+## Ghidra headless tooling
+
+`tools/ghidra/ghidra_analyze.py` now selects Linux's `support/analyzeHeadless`
+and `java`/`javac`, retaining Windows's `.bat`/`.exe` selection. The personal
+Windows Ghidra-directory default is removed: pass `--ghidra` or set
+`GHIDRA_INSTALL_DIR`. JDK selection uses `--java-home`, `PSPC_JAVA_HOME`,
+`JAVA_HOME`, Windows installation discovery, then `javac` on `PATH`; Linux
+alternatives/symlinks resolve to the JDK home. Invalid configured homes and
+missing/nonexecutable launchers produce explicit failures. Linux dry runs use
+POSIX quoting. The Windows wrapper delegates JDK discovery to the same helper.
+See [firmware tooling](firmware-tooling.md) for usage and prerequisites.
+
+The new fixture-only `ghidra_headless` CTest executes the Python CLI against a
+recording launcher using temporary JDKs and original module headers. All 11
+tests pass, covering user/kernel/raw grouping, analysis/export options, paths
+with spaces/Unicode/shell characters, JDK precedence and alternatives, explicit
+errors, dry-run behavior, child exit propagation and simulated Windows selection.
+The tools build and all five tools CTests passed, including this new gate.
+No games, saves, firmware or existing Ghidra projects are opened by these tests.
+Actual Ghidra/Allegrex analysis and native Windows batch execution remain unrun;
+these tests establish the helper's launch contract, not full analysis parity.
+
+## Sony 4.01 firmware installation and XMB validation
+
+A bounded Linux run installed genuine Sony 4.01 PSP-2000/02g assets into a fresh,
+XDG-isolated profile. The archive linked from `fwdownloads.txt` confirmed the cached
+`401.PBP` MD5 (`c593abc023aa9b215710df6e263b3fff`); extraction produced 300 files,
+with all 205 modules decrypted and no failures. Installation delivered 301 flash0
+files, including M33's `satelite.prx` and `recovery.prx`. All 16 core firmware AOT
+modules compiled successfully with one compiler worker.
+
+The interpreter boot reached Sony's real XMB and navigated its category bar. An
+initial windowed run also opened/closed the M33 menu but crashed during process
+exit. Firmware-free regressions isolated two host lifetime defects: deferred thread
+deletion bypassed scheduler pointer cleanup, and kernel pools outlived the partition
+allocators their destructors use. Deferred deletion now uses `DeleteThread`, and the
+runtime destroys kernel objects before leaving the emulation callback. Plain and
+Memcheck regression cases cover both paths.
+
+After repair, a fresh windowed X11/software-renderer run loaded eight firmware/M33
+modules natively, navigated to Settings, opened and closed the M33 menu, and exited
+cleanly at the requested VBlank 1440 (intentional code 124). It took 39.1 seconds,
+logged only four interpreted instructions and zero bad guest memory accesses, and
+produced 12 guest captures plus a host-renderer capture. Images were inspected for
+actual XMB/menu contents, not merely nonblank output. This validates the installed
+Sony user-mode XMB over PSPC's native kernel, not execution of Sony kernel modules.
+
+Evidence is local and ignored under `build/linux-firmware-validation/`: extraction
+and installation results, `aot-result.json`, four bounded run cases, red/green
+lifetime regressions and the final runtime CTest log. The task preserves the original
+firmware, settings and saves; no gameplay acceptance runs were added. The GTK install
+dialog, changed-setting persistence, XMB game launch/return, hardware GE rendering,
+physical audio/controller behavior and other firmware versions remain untested by
+this validation. See [VSH boot](vsh-boot.md) for the workflow and architecture.
+
 ## Work still required
 
-- Complete and validate the launcher workflows listed above, including native game builds.
+- Validate real Ghidra/Allegrex imports and analysis on Linux; fixture headless tests
+  cover the helper's orchestration only.
+- Validate the GTK firmware-install dialog, XMB setting persistence and game launch/return,
+  other firmware versions, additional desktop/driver combinations, and remaining UI/admin paths.
 - Validate Combat Ops editor manipulation/playable missions, a progressed Dark Mirror
   checkpoint resume, and later Logan's Shadow checkpoints. Draft persistence and the
   initial Logan's Shadow story checkpoint now pass within the limits above.
 - Validate physical controllers and audio quality/synchronization. Basic movement/aiming/
   firing in Dark Mirror and Logan's Shadow is established by the earlier bounded replays.
-- Validate firmware/XMB, retail AOT/relocatable PRX loading and fallback, and checkpoint-reference runs
-  with the required firmware and reference assets. Resolve exercised game-specific HLE
+- Validate the remaining firmware/XMB paths above, retail-game AOT/relocatable PRX loading
+  and fallback, and checkpoint-reference runs with the required assets. Resolve exercised game-specific HLE
   gaps rather than masking unresolved-import warnings.
-- Linux currently uses the software GPU renderer; D3D11 remains Windows-only.
+- Validate retail OpenGL rendering, overlays/captures, performance and additional GPU drivers;
+  the default software renderer and synthetic hardware checks are not retail parity proof.
 - Finish remaining script, packaging/install and CI portability.
 - Run a Windows build and regression tests before claiming Windows support is preserved.
