@@ -171,8 +171,8 @@ bool Set(Settings &s, const std::string &rawKey, const std::string &rawValue, st
 		s.fw = v;
 	} else if (key == "renderer") {
 		std::string l = ToLower(v);
-		if (!l.empty() && l != "software" && l != "d3d11" && l != "d3d11-warp")
-			return fail("want software, d3d11 or d3d11-warp");
+		if (!l.empty() && l != "software" && l != "opengl" && l != "d3d11" && l != "d3d11-warp")
+			return fail("want software, opengl, d3d11 or d3d11-warp");
 		s.renderer = l;
 	} else if (key == "games_dir") {
 		s.gamesDir = v;

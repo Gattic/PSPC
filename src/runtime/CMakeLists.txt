@@ -53,6 +53,11 @@ if(TARGET pspc_gpu_hw)
 	target_compile_definitions(pspc_runtime PUBLIC PSPC_HAVE_GPU_HW=1)
 endif()
 
+if(TARGET pspc_gpu_gl)
+	target_link_libraries(pspc_runtime PUBLIC pspc_gpu_gl)
+	target_compile_definitions(pspc_runtime PUBLIC PSPC_HAVE_GPU_GL=1)
+endif()
+
 # pspc_version.h: the version in CMakeLists.txt, for the programs and their resources.
 file(WRITE ${CMAKE_BINARY_DIR}/generated/pspc_version.h.tmp
 	"#pragma once\n#define PSPC_VERSION \"${PROJECT_VERSION}\"\n#define PSPC_VERSION_MAJOR ${PROJECT_VERSION_MAJOR}\n"

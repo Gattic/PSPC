@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// The D3D11 renderer backend against the software renderer (the reference): the same display lists,
-// guest VRAM compared afterwards. Uses the WARP device, so it runs without a GPU.
-#if PSPC_TEST_GPU_HW
-#include <windows.h>
+// Hardware backends against the software reference: the same display lists and guest VRAM.
+// Windows uses WARP; Linux uses a real OpenGL device when available.
+#if PSPC_TEST_GPU_HW || PSPC_TEST_GPU_GL
+#include "test_guest_memory.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -15,12 +15,33 @@
 #include "gpu/backend.h"
 #include "gpu/ge.h"
 #include "gpu/ge_constants.h"
+#ifdef _WIN32
 #include "gpu/hw/d3d11_backend.h"
+#else
+#include "gpu/hw/opengl_backend.h"
+#include <SDL.h>
+#endif
 #include "testing.h"
 
 using namespace gpu;
 
 namespace {
+#ifdef _WIN32
+using BackendOptions = hw::D3D11Options;
+auto MakeBackend(const BackendOptions &o, std::string *err) { return hw::CreateD3D11Backend(o,err); }
+#else
+using BackendOptions = hw::OpenGLOptions;
+auto MakeBackend(const BackendOptions &o, std::string *err) {
+	struct Video {
+		bool initialized = SDL_InitSubSystem(SDL_INIT_VIDEO) == 0;
+		~Video() { if (initialized) SDL_QuitSubSystem(SDL_INIT_VIDEO); }
+	};
+	static Video video;
+	auto backend = hw::CreateOpenGLBackend(o,err);
+	if (!backend && getenv("PSPC_RENDERER_REQUIRE")) { printf("OpenGL unavailable: %s\n",err->c_str()); CHECK(backend != nullptr); }
+	return backend;
+}
+#endif
 
 constexpr u32 VRAM = 0x04000000;
 constexpr u32 RAM = 0x08000000;
@@ -35,10 +56,10 @@ struct Env {
 	u8 *mem = nullptr;
 	u8 *saved = nullptr;
 	Env() {
-		mem = (u8 *)VirtualAlloc(nullptr, 0x0A000000, MEM_RESERVE, PAGE_NOACCESS);
-		VirtualAlloc(mem + VRAM, 0x200000, MEM_COMMIT, PAGE_READWRITE);
-		VirtualAlloc(mem + RAM, RAM_SIZE, MEM_COMMIT, PAGE_READWRITE);
-		VirtualAlloc(mem + 0x10000, 0x4000, MEM_COMMIT, PAGE_READWRITE);
+		mem = gputest::Reserve(0x0A000000);
+		gputest::Commit(mem + VRAM, 0x200000);
+		gputest::Commit(mem + RAM, RAM_SIZE);
+		gputest::Commit(mem + 0x10000, 0x4000);
 		saved = g_membase;
 		g_membase = mem;
 		SetRamSize(RAM_SIZE);
@@ -50,7 +71,7 @@ struct Env {
 		SetRenderBackend(nullptr);
 		Shutdown();
 		g_membase = saved;
-		VirtualFree(mem, 0, MEM_RELEASE);
+		gputest::Release(mem, 0x0A000000);
 	}
 };
 
@@ -253,11 +274,13 @@ std::vector<u8> Render(int fbFmt, int scale) {
 	Env env;
 	std::unique_ptr<RenderBackend> backend;
 	if (scale > 0) {
-		hw::D3D11Options o;
+		BackendOptions o;
 		o.scale = scale;
+#ifdef _WIN32
 		o.warp = true;
+#endif
 		std::string err;
-		backend = hw::CreateD3D11Backend(o, &err);
+		backend = MakeBackend(o, &err);
 		if (!backend) {
 			printf("  (D3D11 WARP unavailable: %s)\n", err.c_str());
 			return {};
@@ -272,7 +295,7 @@ std::vector<u8> Render(int fbFmt, int scale) {
 
 }  // namespace
 
-TEST(gpu_d3d11_matches_software) {
+TEST(gpu_hardware_matches_software) {
 	for (int fmt : { GE_FORMAT_8888, GE_FORMAT_565, GE_FORMAT_5551, GE_FORMAT_4444 }) {
 		const std::vector<u8> sw = Render(fmt, 0);
 		const std::vector<u8> hw1 = Render(fmt, 1);
@@ -310,13 +333,15 @@ namespace {
 // over mid gray at render scale 4. Returns the display image at outScale (0: the render scale).
 std::vector<u32> RenderDiagonal(int textureFilter, int textureUpscale, int outScale, int *w, int *h) {
 	Env env;
-	hw::D3D11Options o;
+	BackendOptions o;
 	o.scale = 4;
+#ifdef _WIN32
 	o.warp = true;
+#endif
 	o.textureFilter = textureFilter;
 	o.textureUpscale = textureUpscale;
 	std::string err;
-	std::unique_ptr<RenderBackend> backend = hw::CreateD3D11Backend(o, &err);
+	std::unique_ptr<RenderBackend> backend = MakeBackend(o, &err);
 	if (!backend)
 		return {};
 	SetRenderBackend(backend.get());
@@ -340,8 +365,9 @@ std::vector<u32> RenderDiagonal(int textureFilter, int textureUpscale, int outSc
 	Run();
 	DrawSync(0);
 	std::vector<u32> img;
-	if (!backend->GetDisplayImage(VRAM, 512, GE_FORMAT_8888, 480, 272, img, w, h, outScale))
-		img.clear();
+	bool displayed = backend->GetDisplayImage(VRAM, 512, GE_FORMAT_8888, 480, 272, img, w, h, outScale);
+	CHECK(displayed);
+	if (!displayed) img.clear();
 	SetRenderBackend(nullptr);
 	return img;
 }
@@ -368,12 +394,12 @@ void DiagonalShape(const std::vector<u32> &img, int w, int *maxStep, int *blende
 
 }  // namespace
 
-TEST(gpu_d3d11_texture_upscaling_and_filtering) {
+TEST(gpu_hardware_texture_upscaling_and_filtering) {
 	int w = 0, h = 0, step = 0, blended = 0;
 	// The game's nearest filtering at 4x: a staircase, 4 render pixels a texel.
 	std::vector<u32> plain = RenderDiagonal(0, 1, 0, &w, &h);
 	if (plain.empty()) {
-		printf("  (D3D11 WARP unavailable)\n");
+		printf("  (hardware device unavailable)\n");
 		return;
 	}
 	CHECK(w == 1920 && h == 1088);
@@ -397,5 +423,113 @@ TEST(gpu_d3d11_texture_upscaling_and_filtering) {
 		CHECK((half[(size_t)(130 * 2) * w + 130 * 2] & 0xFFFFFF) == 0x000000);
 		CHECK((half[(size_t)(20 * 2) * w + 20 * 2] & 0xFFFFFF) == 0x808080);
 	}
+}
+
+TEST(gpu_hardware_framebuffer_feedback_and_transfer) {
+	for (int mode = 0; mode < 3; ++mode) {
+		Env env;
+		BackendOptions options; options.scale = mode == 2 ? 16 : 3;
+#ifdef _WIN32
+		options.warp = true;
+#endif
+		std::string error;
+		auto backend = MakeBackend(options, &error);
+		if (!backend) { printf("  hardware feedback test unavailable: %s\n", error.c_str()); return; }
+		auto draw = [&](gpu::RenderBackend *renderer) {
+			gpu::SetRenderBackend(nullptr);
+			gpu::Shutdown(); gpu::Init();
+			memset(GPtr(VRAM), 0, 2 * 1024 * 1024);
+			gpu::SetRenderBackend(renderer);
+			for (u32 i = 0; i < 256; ++i) GWrite32(CLUTA + i * 4, 0xFF000000 | (i << 8));
+			GWrite32(TEX, 0xAA443322);
+			DL dl;
+			dl.C(GE_CMD_FRAMEBUFPTR, 0).C(GE_CMD_FRAMEBUFWIDTH, 64).C(GE_CMD_FRAMEBUFPIXFORMAT, GE_FORMAT_8888);
+			dl.C(GE_CMD_ZBUFPTR, 0x100000).C(GE_CMD_ZBUFWIDTH, 64);
+			dl.C(GE_CMD_SCISSOR1, 0).C(GE_CMD_SCISSOR2, 31 | (31 << 10)).C(GE_CMD_REGION2, 31 | (31 << 10));
+			TVert clear[2] = {{0x01010101, 0, 0, 0, 0}, {0x01010101, 32, 32, 0, 0}};
+			memcpy(GPtr(VERTS), clear, sizeof(clear));
+			dl.C(GE_CMD_CLEARMODE, 1 | (7 << 8)).C(GE_CMD_VERTEXTYPE, VT_C8888_P16);
+			dl.Prim(GE_PRIM_RECTANGLES, 2, VERTS).C(GE_CMD_CLEARMODE, 0);
+			// A guest block transfer changes one pixel of the just-rendered source.
+			dl.C(GE_CMD_TRANSFERSRC, TEX & 0xFFFFF0).C(GE_CMD_TRANSFERSRCW, 1 | ((TEX >> 8) & 0xFF0000));
+			dl.C(GE_CMD_TRANSFERDST, 0).C(GE_CMD_TRANSFERDSTW, 64 | ((VRAM >> 8) & 0xFF0000));
+			dl.C(GE_CMD_TRANSFERSRCPOS, 0).C(GE_CMD_TRANSFERDSTPOS, 4 | (5 << 10));
+			dl.C(GE_CMD_TRANSFERSIZE, 0).C(GE_CMD_TRANSFERSTART, 1);
+			dl.C(GE_CMD_FRAMEBUFPTR, 0x20000).C(GE_CMD_TEXTUREMAPENABLE, 1);
+			dl.C(GE_CMD_TEXFORMAT, mode ? GE_TFMT_CLUT8 : GE_TFMT_8888).C(GE_CMD_TEXMODE, mode == 2 ? 1 : 0);
+			dl.C(GE_CMD_TEXADDR0, 0).C(GE_CMD_TEXBUFWIDTH0, (mode ? 256 : 64) | ((VRAM >> 8) & 0x0F0000));
+			dl.C(GE_CMD_TEXSIZE0, 5 | (5 << 8)).C(GE_CMD_TEXFILTER, 0).C(GE_CMD_TEXWRAP, 0x101);
+			dl.C(GE_CMD_TEXFUNC, GE_TEXFUNC_REPLACE | 0x100);
+			dl.Addr(GE_CMD_CLUTADDR, CLUTA).C(GE_CMD_CLUTADDRUPPER, (CLUTA >> 8) & 0x0F0000);
+			dl.C(GE_CMD_CLUTFORMAT, GE_CMODE_32BIT_ABGR8888 | (0xFF << 8)).C(GE_CMD_LOADCLUT, 32);
+			TTVert sprite[2] = {{0, 0, 0xFFFFFFFF, 0, 0, 0, 0}, {32, 32, 0xFFFFFFFF, 32, 32, 0, 0}};
+			memcpy(GPtr(VERTS + 0x1000), sprite, sizeof(sprite));
+			dl.C(GE_CMD_VERTEXTYPE, VT_T16_C8888_P16).Prim(GE_PRIM_RECTANGLES, 2, VERTS + 0x1000);
+			dl.C(GE_CMD_FINISH).C(GE_CMD_END);
+			EnqueueList(dl.start, 0, -1, 0, false); Run(); DrawSync(0);
+			std::vector<u32> pixels;
+			for (int y = 0; y < 32; ++y) for (int x = 0; x < 32; ++x)
+				pixels.push_back(GRead32(VRAM + 0x20000 + (y * 64 + x) * 4));
+			gpu::SetRenderBackend(nullptr);
+			return pixels;
+		};
+		auto reference = draw(nullptr), actual = draw(backend.get());
+		CHECK(reference[0] != 0);
+		CHECK(reference == actual);
+	}
+}
+
+TEST(gpu_hardware_memory_coherence) {
+	Env env;
+	BackendOptions options;
+	options.scale = 3;
+#ifdef _WIN32
+	options.warp = true;
+#endif
+	std::string error;
+	auto backend = MakeBackend(options, &error);
+	if (!backend) return;
+	auto clear = [&](u32 offset, u32 color, bool depth = false) {
+		RasterState state{};
+		state.throughMode = true;
+		state.scissor = {0, 0, 32 * SUBPIX - 1, 32 * SUBPIX - 1};
+		state.pix.fb = GPtr(VRAM + offset);
+		state.pix.fbOffset = offset;
+		state.pix.fbStride = state.pix.zbStride = 64;
+		state.pix.zbOffset = 0x180000;
+		state.pix.fbFormat = GE_FORMAT_8888;
+		state.pix.clearMode = state.pix.colorClear = state.pix.stencilClear = true;
+		state.pix.depthClear = depth;
+		state.pix.depthTestFunc = GE_COMP_ALWAYS;
+		BatchPrim prim{};
+		prim.type = PrimType::ClearRect;
+		prim.range = state.scissor;
+		prim.v[0].color0 = prim.v[1].color0 = color;
+		prim.v[1].x = prim.v[1].y = 32 * SUBPIX;
+		backend->DrawBatch(&prim, 1, &state, 1);
+	};
+	clear(0, 0xFF332211);
+	backend->SyncRange(VRAM, 8192);
+	CHECK(GRead32(VRAM + (5 * 64 + 5) * 4) == 0xFF332211);
+	GWrite32(VRAM + (5 * 64 + 5) * 4, 0xFF776655);
+	backend->Invalidate(VRAM + (5 * 64 + 5) * 4, 4);
+	std::vector<u32> image;
+	int w = 0, h = 0;
+	CHECK(backend->GetDisplayImage(VRAM + 0x200000, 64, GE_FORMAT_8888, 32, 32, image, &w, &h, 0));
+	CHECK(w == 96 && h == 96);
+	if (image.size() == 96 * 96) {
+		CHECK(image[16 * w + 16] == 0xFF776655);
+		CHECK(image[16 * w + 20] == 0xFF332211);
+	}
+	// Revisit the oldest color target while creating a new depth target. Eviction
+	// must never destroy a surface still in use by this draw.
+	for (u32 offset : {0x20000, 0x40000, 0x60000}) clear(offset, 0xFF010203);
+	clear(0, 0xFF998877, true);
+	backend->Sync();
+	CHECK(GRead32(VRAM + (8 * 64 + 8) * 4) == 0xFF998877);
+	CHECK(backend->GetDisplayImage(VRAM, 64, GE_FORMAT_8888, 32, 32, image, &w, &h, 1));
+	if (image.size() == 32 * 32) CHECK(image[8 * 32 + 8] == 0xFF998877);
+	backend->ReleaseWindow();
+	backend->ReleaseWindow();
 }
 #endif

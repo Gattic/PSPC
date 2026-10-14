@@ -45,6 +45,9 @@
 #include "gpu/backend.h"
 #include "gpu/ge.h"
 #endif
+#if PSPC_HAVE_GPU_GL
+#include "gpu/hw/opengl_backend.h"
+#endif
 #if PSPC_HAVE_GPU_HW
 #include "gpu/hw/d3d11_backend.h"
 #endif
@@ -307,6 +310,30 @@ void SetUpRenderer(const Options &o) {
 	gpu::SetRenderBackend(nullptr);
 	if (name == "software")
 		return;
+#if PSPC_HAVE_GPU_GL
+	if (name == "opengl") {
+		if (!g_renderBackend) {
+			gpu::hw::OpenGLOptions gl;
+			gl.scale = scale;
+			gl.textureFilter = o.textureFilter == "nearest" ? 1 : o.textureFilter == "linear" ? 2 : 0;
+			gl.textureUpscale = o.textureUpscale;
+			gl.window = host::NativeWindow();
+			gl.vsync = o.vsync;
+			std::string error;
+			g_renderBackend = gpu::hw::CreateOpenGLBackend(gl, &error);
+			if (!g_renderBackend) {
+				if (getenv("PSPC_RENDERER_REQUIRE")) Fatal("OpenGL renderer unavailable: %s", error.c_str());
+				LOGW("RUNTIME", "OpenGL renderer unavailable (%s); using software", error.c_str());
+				return;
+			}
+			if (gl.window) host::SetFramePresenter([](const u32 *px, int w, int h, int stride) {
+				return g_renderBackend && g_renderBackend->PresentImage(px, w, h, stride);
+			});
+		}
+		gpu::SetRenderBackend(g_renderBackend.get());
+		return;
+	}
+#endif
 #if PSPC_HAVE_GPU_HW
 	if (name == "d3d11" || name == "d3d11-warp") {
 		if (!g_renderBackend) {
@@ -546,7 +573,7 @@ int Run(const Options &o) {
 	hc.pads = o.padBindings;
 	hc.padStick = o.padStick;
 	hc.screenshotDir = o.screenshotDir;
-	hc.gpuPresent = RendererName(o).rfind("d3d11", 0) == 0;
+	hc.gpuPresent = RendererName(o).rfind("d3d11", 0) == 0 || RendererName(o) == "opengl";
 	{
 		// Screenshot names: the game file's name (its folder's for EBOOT.PBP).
 		fs::path f = fs::u8path(o.file.empty() ? std::string("xmb") : o.file);

@@ -16,7 +16,7 @@
 
 namespace gpu::hw {
 
-// Matches DrawStateGpu in d3d11_internal.h.
+// Matches DrawStateGpu in draw_data.h.
 static const char kCommon[] = R"HLSL(
 #define F_ALPHA_BLEND   0x0001
 #define F_LOGIC_OP      0x0002

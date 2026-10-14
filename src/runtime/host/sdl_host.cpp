@@ -32,7 +32,7 @@ namespace {
 
 bool g_headless = true;
 Config g_cfg;
-void *g_hwnd = nullptr;  // Only the Windows hardware renderer needs a native handle.
+void *g_hwnd = nullptr;  // Windows: HWND; Linux: SDL_Window for the OpenGL context.
 std::atomic<int> g_fitScale{0};
 std::mutex g_frameMutex;
 std::vector<u32> g_frame;
@@ -164,8 +164,23 @@ int Run(const Config &cfg, const std::function<int()> &emulation, const std::fun
 	ResolveBindings(cfg);
 	g_volume = std::clamp(cfg.volume, 0, 100);
 	Uint32 winFlags = SDL_WINDOW_RESIZABLE | (cfg.fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+#ifndef _WIN32
+	if (cfg.gpuPresent) {
+		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
+		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 5);
+		SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+		winFlags |= SDL_WINDOW_OPENGL;
+	}
+#endif
 	SDL_Window *win = SDL_CreateWindow(cfg.title.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
 	                                   480 * cfg.windowScale, 272 * cfg.windowScale, winFlags);
+#ifndef _WIN32
+	if (!win && cfg.gpuPresent) {
+		LOGW("HOST", "OpenGL window unavailable (%s); creating a software window", SDL_GetError());
+		win = SDL_CreateWindow(cfg.title.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+		                       480 * cfg.windowScale, 272 * cfg.windowScale, winFlags & ~SDL_WINDOW_OPENGL);
+	}
+#endif
 	if (cfg.fullscreen) SDL_ShowCursor(SDL_DISABLE);
 	// FitScale is read by the emulation thread; keep all SDL window queries on this thread.
 	auto updateFitScale = [&]() {
@@ -179,6 +194,8 @@ int Run(const Config &cfg, const std::function<int()> &emulation, const std::fun
 	SDL_SysWMinfo wm;
 	SDL_VERSION(&wm.version);
 	if (win && SDL_GetWindowWMInfo(win, &wm) && wm.subsystem == SDL_SYSWM_WINDOWS) g_hwnd = wm.info.win.window;
+#else
+	g_hwnd = win;
 #endif
 	// The SDL renderer, unless a GPU renderer will present instead (then made once a frame comes here).
 	SDL_Renderer *ren = nullptr;

@@ -12,7 +12,7 @@
 #include <vector>
 
 #include "common/common.h"
-#include "gpu/render.h"
+#include "gpu/hw/draw_data.h"
 
 namespace gpu::hw {
 
@@ -23,89 +23,6 @@ using Microsoft::WRL::ComPtr;
 enum class ShaderKind { Vertex, Pixel, Compute, Upscale, Present };
 // The HLSL source for a kind of shader (d3d11_shaders.cpp).
 std::string ShaderSource(ShaderKind kind);
-
-// The largest texture side D3D11 allows.
-constexpr int MAX_TEXTURE_SIDE = 16384;
-
-// The factor textures of an atlas this size are scaled up by, at texture upscaling `setting` (1 = off):
-// within the largest texture D3D11 allows.
-inline int TextureUpscale(int setting, int atlasW, int atlasH) {
-	int f = setting;
-	while (f > 1 && (atlasW * f > MAX_TEXTURE_SIDE || atlasH * f > MAX_TEXTURE_SIDE))
-		--f;
-	return f > 1 ? f : 1;
-}
-
-// Per-draw state for the pixel shader; matches DrawState in the HLSL.
-struct DrawStateGpu {
-	u32 flags;
-	u32 alphaTest;
-	u32 colorTestFunc;
-	u32 colorTestRef;
-	u32 colorTestMask;
-	u32 stencilTest;
-	u32 stencilOps;
-	u32 depthFunc;
-	u32 minz;
-	u32 maxz;
-	u32 blend;
-	u32 fixA;
-	u32 fixB;
-	u32 fogColor;
-	u32 writeMask;
-	u32 logicOp;
-	u32 texFunc;
-	u32 texEnv;
-	u32 dither0;
-	u32 dither1;
-	u32 texMode;
-	s32 texLevelOffset;
-	s32 lodSlopeLog;
-	u32 rtt;  // format | 0x100 (render to texture) | texture scale << 12
-	u32 texLevels[8];
-	u32 rttY;
-	u32 pad2[3];
-};
-static_assert(sizeof(DrawStateGpu) == 144, "DrawStateGpu layout");
-
-enum : u32 {
-	F_ALPHA_BLEND = 0x0001,
-	F_LOGIC_OP = 0x0002,
-	F_FOG = 0x0004,
-	F_COLOR_TEST = 0x0008,
-	F_STENCIL_TEST = 0x0010,
-	F_DEPTH_RANGE = 0x0020,
-	F_DITHER = 0x0040,
-	F_WRITE_MASK = 0x0080,
-	F_ALPHA_MASK = 0x0100,
-	F_STENCIL_MASK = 0x0200,
-	F_DEPTH_WRITE = 0x0400,
-	F_COLOR_CLEAR = 0x0800,
-	F_STENCIL_CLEAR = 0x1000,
-	F_DEPTH_CLEAR = 0x2000,
-	F_DBL_SEC = 0x4000,
-};
-
-// A vertex as the GPU takes it: screen space, already divided by w; s, t and q interpolate linearly
-// in screen space and the texel coordinate is (s/q, t/q), as on the GE.
-struct GpuVertex {
-	float x, y;      // PSP pixels
-	float z, fog;    // 0-65535, 0-255
-	u32 c0, c1;      // RGBA
-	float s, t, q;
-	u32 state;
-	float lod;       // the primitive's mip level gradient (same at every vertex), see the pixel shader
-};
-static_assert(sizeof(GpuVertex) == 44, "GpuVertex layout");
-
-// The texture atlas layout of a sampler state's levels (each level at most 512 x 512, side by side):
-// DrawStateGpu::texLevels. Returns the atlas size.
-void TextureAtlasLayout(const SamplerState &ss, u32 levels[8], int *atlasW, int *atlasH);
-
-// A 64-bit hash of guest memory (texture validation).
-u64 HashBytes(const u8 *p, size_t n, u64 seed);
-
-class Device;
 
 // Decoded textures, keyed by address, format, size and CLUT, validated by hashing the texel data
 // (d3d11_texcache.cpp).

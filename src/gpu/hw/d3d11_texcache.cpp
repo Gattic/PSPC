@@ -19,92 +19,6 @@ namespace gpu::hw {
 
 namespace {
 
-// log2 of a power of two (texture sizes are 1 << n).
-inline u32 Log2Pow2(u32 v) {
-	u32 n = 0;
-	while (n < 31 && (v >> n) > 1)
-		++n;
-	return n;
-}
-
-inline u64 Rotl(u64 x, int r) {
-	return (x << r) | (x >> (64 - r));
-}
-
-constexpr u64 P1 = 0x9E3779B185EBCA87ULL;
-constexpr u64 P2 = 0xC2B2AE3D27D4EB4FULL;
-constexpr u64 P3 = 0x165667B19E3779F9ULL;
-
-inline u64 Round(u64 acc, u64 v) {
-	return Rotl(acc + v * P2, 31) * P1;
-}
-
-typedef void (*DecodeFn)(const SamplerState &ss, int level, int w, int h, u32 *out, size_t pitch);
-
-// One level's first w x h texels (the sampler never reads past 512 in either direction).
-template <int fmt, bool swz>
-void DecodeLevelT(const SamplerState &ss, int level, int w, int h, u32 *out, size_t pitch) {
-	for (int v = 0; v < h; ++v) {
-		u32 *row = out + (size_t)v * pitch;
-		for (int u = 0; u < w; ++u)
-			row[u] = FetchTexelT<fmt, swz>(ss, level, u, v);
-	}
-}
-
-// Linear direct-color levels whose rows are all in memory: whole rows at a time (same results).
-template <int fmt>
-void DecodeLinearDirect(const SamplerState &ss, int level, int w, int h, u32 *out, size_t pitch) {
-	const TexLevel &lv = ss.levels[level];
-	constexpr int bpp = fmt == GE_TFMT_8888 ? 4 : 2;
-	if (!lv.ptr || (u64)(h - 1) * lv.bufw * bpp + (u64)w * bpp + 4 > lv.validBytes) {
-		DecodeLevelT<fmt, false>(ss, level, w, h, out, pitch);
-		return;
-	}
-	for (int v = 0; v < h; ++v) {
-		const u8 *src = lv.ptr + (size_t)v * lv.bufw * bpp;
-		u32 *row = out + (size_t)v * pitch;
-		if constexpr (fmt == GE_TFMT_8888) {
-			memcpy(row, src, (size_t)w * 4);
-		} else {
-			const u16 *s16 = (const u16 *)src;
-			for (int u = 0; u < w; ++u) {
-				if constexpr (fmt == GE_TFMT_5650)
-					row[u] = RGB565ToRGBA8888(s16[u]);
-				else if constexpr (fmt == GE_TFMT_5551)
-					row[u] = RGBA5551ToRGBA8888(s16[u]);
-				else
-					row[u] = RGBA4444ToRGBA8888(s16[u]);
-			}
-		}
-	}
-}
-
-template <int fmt>
-DecodeFn PickDecode(bool swizzle) {
-	if constexpr (fmt <= GE_TFMT_8888) {
-		if (!swizzle)
-			return &DecodeLinearDirect<fmt>;
-	}
-	return swizzle ? &DecodeLevelT<fmt, true> : &DecodeLevelT<fmt, false>;
-}
-
-DecodeFn GetDecodeFn(int texfmt, bool swizzle) {
-	switch (texfmt) {
-	case GE_TFMT_5650: return PickDecode<GE_TFMT_5650>(swizzle);
-	case GE_TFMT_5551: return PickDecode<GE_TFMT_5551>(swizzle);
-	case GE_TFMT_4444: return PickDecode<GE_TFMT_4444>(swizzle);
-	case GE_TFMT_8888: return PickDecode<GE_TFMT_8888>(swizzle);
-	case GE_TFMT_CLUT4: return PickDecode<GE_TFMT_CLUT4>(swizzle);
-	case GE_TFMT_CLUT8: return PickDecode<GE_TFMT_CLUT8>(swizzle);
-	case GE_TFMT_CLUT16: return PickDecode<GE_TFMT_CLUT16>(swizzle);
-	case GE_TFMT_CLUT32: return PickDecode<GE_TFMT_CLUT32>(swizzle);
-	// DXT isn't swizzled; invalid formats have no texel pointer and read 0 (sampler.cpp).
-	case GE_TFMT_DXT1: return &DecodeLevelT<GE_TFMT_DXT1, false>;
-	case GE_TFMT_DXT3: return &DecodeLevelT<GE_TFMT_DXT3, false>;
-	default: return &DecodeLevelT<GE_TFMT_DXT5, false>;
-	}
-}
-
 // The bytes a level's texel lookups can reach (binner.cpp AddTextureReads).
 u32 LevelBytes(const SamplerState &ss, const TexLevel &lv) {
 	if (!lv.ptr)
@@ -116,58 +30,11 @@ u32 LevelBytes(const SamplerState &ss, const TexLevel &lv) {
 
 }  // namespace
 
-u64 HashBytes(const u8 *p, size_t n, u64 seed) {
-	u64 a = seed + P1 + P2, b = seed + P2, c = seed, d = seed - P1;
-	size_t i = 0;
-	for (; i + 32 <= n; i += 32) {
-		u64 w[4];
-		memcpy(w, p + i, 32);
-		a = Round(a, w[0]);
-		b = Round(b, w[1]);
-		c = Round(c, w[2]);
-		d = Round(d, w[3]);
-	}
-	u64 h = Rotl(a, 1) + Rotl(b, 7) + Rotl(c, 12) + Rotl(d, 18) + (u64)n;
-	for (; i + 8 <= n; i += 8) {
-		u64 w;
-		memcpy(&w, p + i, 8);
-		h ^= Round(0, w);
-		h = Rotl(h, 27) * P1 + P3;
-	}
-	for (; i < n; ++i) {
-		h ^= p[i] * P3;
-		h = Rotl(h, 11) * P1;
-	}
-	h ^= h >> 33;
-	h *= P2;
-	h ^= h >> 29;
-	h *= P3;
-	h ^= h >> 32;
-	return h;
-}
-
 size_t TextureCache::KeyHash::operator()(const Key &k) const {
 	u64 h = (u64)k.addr * P1;
 	h ^= ((u64)k.fmt | ((u64)k.levels << 8) | ((u64)k.flags << 16) | ((u64)k.bufw << 24) | ((u64)k.w << 40)) * P2;
 	h ^= ((u64)k.h << 7) ^ k.clutHash;
 	return (size_t)(h ^ (h >> 29));
-}
-
-void TextureAtlasLayout(const SamplerState &ss, u32 levels[8], int *atlasW, int *atlasH) {
-	int x = 0, h = 1;
-	for (int i = 0; i < 8; ++i) {
-		const TexLevel &lv = ss.levels[i];
-		if (i > ss.maxLevel) {
-			levels[i] = levels[i > 0 ? i - 1 : 0];
-			continue;
-		}
-		const int ws = lv.w ? (int)Log2Pow2(lv.w) : 0, hs = lv.h ? (int)Log2Pow2(lv.h) : 0;
-		levels[i] = (u32)x | ((u32)ws << 16) | ((u32)hs << 20);
-		x += std::min<int>(lv.w, 512);
-		h = std::max(h, std::min<int>(lv.h, 512));
-	}
-	*atlasW = std::max(x, 1);
-	*atlasH = h;
 }
 
 ID3D11ShaderResourceView *TextureCache::Lookup(const SamplerState &ss, u64 runSeq, void (*syncRange)(void *, u32, u32), void *user) {
@@ -239,10 +106,9 @@ ID3D11ShaderResourceView *TextureCache::Lookup(const SamplerState &ss, u64 runSe
 
 	// Decode every level into the atlas.
 	decodeBuf_.assign((size_t)w * h, 0);
-	const DecodeFn decode = GetDecodeFn(ss.texfmt, ss.swizzle);
 	for (int i = 0; i < levels; ++i) {
 		const TexLevel &lv = ss.levels[i];
-		decode(ss, i, std::min<int>(lv.w, 512), std::min<int>(lv.h, 512), decodeBuf_.data() + (layout[i] & 0xFFFF), (size_t)w);
+		DecodeTextureLevel(ss, i, std::min<int>(lv.w, 512), std::min<int>(lv.h, 512), decodeBuf_.data() + (layout[i] & 0xFFFF), (size_t)w);
 	}
 	decodeTexels += (u64)w * h;
 	decodeSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();

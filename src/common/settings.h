@@ -38,10 +38,10 @@ struct Settings {
 	bool vsync = true;
 	bool aot = true;                // use AOT-compiled module DLLs (false = interpreter only)
 	std::string fw = "6.60";        // firmware version reported to games
-	std::string renderer;           // "software", "d3d11", "d3d11-warp"; "" = $PSPC_RENDERER or software
-	int renderScale = 0;            // d3d11 internal resolution 1-16 (8 = 4K, 16 = 8K); 0 = default (1)
-	std::string textureFilter = "auto";  // d3d11: "auto" (as the game sets it), "nearest", "linear"
-	int textureUpscale = 1;         // d3d11: 1 = off, 2-4 = textures upscaled with xBR
+	std::string renderer;           // "software", "opengl", "d3d11", "d3d11-warp"; "" = $PSPC_RENDERER or software
+	int renderScale = 0;            // GPU internal resolution 1-16 (8 = 4K, 16 = 8K); 0 = default (1)
+	std::string textureFilter = "auto";  // GPU: "auto" (as the game sets it), "nearest", "linear"
+	int textureUpscale = 1;         // GPU: 1 = off, 2-4 = textures upscaled with xBR
 	std::string gamesDir;           // folder of game images the XMB lists ("" = the Games folder)
 	bool plugins = true;            // load M33 plugins (seplugins/game.txt, vsh.txt, pops.txt)
 	std::string pluginsDir;         // overlaid onto ms0: ("" = the plugins folder)

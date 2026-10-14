@@ -4,6 +4,7 @@ add_library(pspc_gpu STATIC
 	ge_core.cpp
 	ge_state.cpp
 	gemath.cpp
+	hw/draw_data.cpp
 	raster_state.cpp
 	rasterizer.cpp
 	sampler.cpp
@@ -18,6 +19,4 @@ if(MSVC)
 	target_compile_options(pspc_gpu PRIVATE $<$<CONFIG:RelWithDebInfo>:/O2 /Ob2>)
 endif()
 
-if(WIN32)
-	add_subdirectory(hw)
-endif()
+add_subdirectory(hw)

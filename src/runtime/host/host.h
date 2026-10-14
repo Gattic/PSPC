@@ -46,7 +46,7 @@ void PresentFrame(const u32 *rgba, int width, int height, int stride);
 CtrlState GetCtrl();
 bool IsHeadless();
 
-// The window's native handle (HWND) once Run has made it; nullptr headless.
+// The renderer's window handle (HWND on Windows, SDL_Window on Linux); nullptr headless.
 void *NativeWindow();
 // The smallest whole multiple of 480x272 that covers the picture in the window (at least 1); 0 headless.
 int FitScale();

@@ -44,7 +44,6 @@
 #include <algorithm>
 #include <chrono>
 #include <climits>
-#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -52,7 +51,6 @@
 #include <thread>
 
 #include "common/log.h"
-#include "gpu/gemath.h"
 #include "gpu/hw/d3d11_internal.h"
 
 namespace gpu::hw {
@@ -122,105 +120,6 @@ void WriteBmp(const char *path, const u8 *rgba, int w, int h, size_t pitch) {
 	}
 }
 
-// rasterizer.cpp ClampFogDepth: the fog factor 0-255 from a vertex's fog depth.
-inline float ClampFogDepth(float fogdepth) {
-	const u32 u = FloatBits(fogdepth);
-	const u32 exp = u >> 23;
-	if ((u & 0x80000000) != 0 || exp <= 126 - 8)
-		return 0.0f;
-	if (exp > 126)
-		return 255.0f;
-	const u32 mantissa = (u & 0x007FFFFF) | 0x00800000;
-	return (float)(u8)(mantissa >> (16 + 126 - exp));
-}
-
-// A linear function of screen subpixels through three points (a sprite's UV planes).
-struct LinearFn {
-	double a = 0, b = 0, c = 0;
-	double At(double x, double y) const { return a + b * x + c * y; }
-};
-
-LinearFn PlaneThrough(const int64_t X[3], const int64_t Y[3], const double F[3]) {
-	LinearFn f;
-	const double det = (double)(X[1] - X[0]) * (double)(Y[2] - Y[0]) - (double)(X[2] - X[0]) * (double)(Y[1] - Y[0]);
-	if (det == 0.0) {
-		f.a = F[0];
-		return f;
-	}
-	f.b = ((F[1] - F[0]) * (double)(Y[2] - Y[0]) - (F[2] - F[0]) * (double)(Y[1] - Y[0])) / det;
-	f.c = ((F[2] - F[0]) * (double)(X[1] - X[0]) - (F[1] - F[0]) * (double)(X[2] - X[0])) / det;
-	f.a = F[0] - f.b * (double)X[0] - f.c * (double)Y[0];
-	return f;
-}
-
-// The pixels DrawRectangle (rasterizer.cpp) fills, inclusive.
-bool RectBounds(const RVertex &v0, const RVertex &v1, const Range &range, int *px0, int *py0, int *px1, int *py1) {
-	const int entireX1 = std::min(v0.x, v1.x);
-	const int entireY1 = std::min(v0.y, v1.y);
-	const int entireX2 = std::max(v0.x, v1.x) - 1;
-	const int entireY2 = std::max(v0.y, v1.y) - 1;
-	int minX = std::max(entireX1 & ~(SUBPIX - 1), range.x1) | (SUBPIX / 2 - 1);
-	int minY = std::max(entireY1 & ~(SUBPIX - 1), range.y1) | (SUBPIX / 2 - 1);
-	const int maxX = std::min(entireX2 - 1, range.x2);
-	const int maxY = std::min(entireY2 - 1, range.y2);
-	if (minX < entireX1 - 2)
-		minX += SUBPIX;
-	const bool rotated = v0.x < v1.x && v0.y > v1.y;
-	if (minY < entireY1 - (rotated ? 2 : 1))
-		minY += SUBPIX;
-	if (minX > maxX || minY > maxY)
-		return false;
-	*px0 = minX / SUBPIX;
-	*py0 = minY / SUBPIX;
-	*px1 = *px0 + (maxX - minX) / SUBPIX;
-	*py1 = *py0 + (maxY - minY) / SUBPIX;
-	return true;
-}
-
-// The pixels ClearRectangle (rasterizer.cpp) fills, inclusive.
-bool ClearBounds(const RVertex &v0, const RVertex &v1, const Range &range, int *px0, int *py0, int *px1, int *py1) {
-	const int entireX1 = std::min(v0.x, v1.x);
-	const int entireY1 = std::min(v0.y, v1.y);
-	const int entireX2 = std::max(v0.x, v1.x) - 1;
-	const int entireY2 = std::max(v0.y, v1.y) - 1;
-	int minX = std::max(entireX1 & ~(SUBPIX - 1), range.x1) | (SUBPIX / 2 - 1);
-	int minY = std::max(entireY1 & ~(SUBPIX - 1), range.y1) | (SUBPIX / 2 - 1);
-	const int maxX = std::min(entireX2, range.x2);
-	const int maxY = std::min(entireY2, range.y2);
-	if (minX < entireX1 - 1)
-		minX += SUBPIX;
-	if (minY < entireY1 - 1)
-		minY += SUBPIX;
-	*px0 = minX / SUBPIX;
-	*py0 = minY / SUBPIX;
-	*px1 = (maxX - SUBPIX / 2) / SUBPIX;
-	*py1 = (maxY - SUBPIX / 2) / SUBPIX;
-	return *px1 >= *px0 && *py1 >= *py0;
-}
-
-bool SameTexture(const SamplerState &a, const SamplerState &b) {
-	if (a.texfmt != b.texfmt || a.swizzle != b.swizzle || a.maxLevel != b.maxLevel || a.clut != b.clut ||
-		a.clutfmt != b.clutfmt || a.clutShift != b.clutShift || a.clutMask != b.clutMask || a.clutOffset != b.clutOffset ||
-		a.useSharedClut != b.useSharedClut)
-		return false;
-	for (int i = 0; i <= a.maxLevel; ++i) {
-		const TexLevel &x = a.levels[i], &y = b.levels[i];
-		if (x.addr != y.addr || x.bufw != y.bufw || x.w != y.w || x.h != y.h)
-			return false;
-	}
-	return a.clampS == b.clampS && a.clampT == b.clampT && a.minFilt == b.minFilt && a.magFilt == b.magFilt && a.mipFilt == b.mipFilt;
-}
-
-// Whether two states can share a draw call.
-bool Compatible(const RasterState &a, const RasterState &b) {
-	if (a.pix.fbFormat != b.pix.fbFormat || a.pix.clearMode != b.pix.clearMode)
-		return false;
-	const bool ta = a.enableTextures && !a.pix.clearMode, tb = b.enableTextures && !b.pix.clearMode;
-	if (ta != tb || memcmp(&a.scissor, &b.scissor, sizeof(Range)) != 0)
-		return false;
-	return !ta || SameTexture(a.samp, b.samp);
-}
-
 struct Surface {
 	u32 addr = 0;  // VRAM offset
 	int stride = 0;
@@ -275,15 +174,7 @@ void WriteVram(u32 off, const u8 *in, u32 n) {
 		memcpy(v, in + first, n - first);
 }
 
-float TriangleLodImpl(const GpuVertex *v, const SamplerState &ss, int scale);
-
-struct Segment {
-	u32 first, count;
-	u32 state, lastState;
-	bool lines;
-};
-
-class D3D11Backend final : public RenderBackend {
+class D3D11Backend final : public RenderBackend, private DrawData {
 public:
 	~D3D11Backend() override;
 	bool Init(const D3D11Options &o, std::string *err);
@@ -338,13 +229,6 @@ private:
 	void RunCompute(ID3D11ComputeShader *cs, ID3D11ShaderResourceView *srv, ID3D11UnorderedAccessView *uav, const CopyCB &cb, UINT gx, UINT gy);
 	static void SyncRangeThunk(void *user, u32 addr, u32 size) { static_cast<D3D11Backend *>(user)->SyncRange(addr, size); }
 
-	void BuildVertices(const BatchPrim *prims, size_t n, const RasterState *states);
-	float TriangleLod(const GpuVertex *v, const SamplerState &ss) const { return TriangleLodImpl(v, ss, scale_); }
-	void EmitTriangle(const BatchPrim &p, const RasterState &st);
-	void EmitRect(const BatchPrim &p, const RasterState &st, bool clear);
-	void EmitPoint(const BatchPrim &p, const RasterState &st);
-	void EmitLine(const BatchPrim &p, const RasterState &st);
-	void FillStates(const RasterState *states, size_t n);
 	void BindDraw(Surface *color, Surface *depth);
 	Surface *FindTextureSurface(const SamplerState &ss, int *x0, int *y0);
 	void ResolveRenderToTexture(const RasterState *states, size_t n);
@@ -360,10 +244,7 @@ private:
 	bool UploadImage(const u32 *rgba, int width, int height, int stride, ComPtr<ID3D11Texture2D> &tex, ComPtr<ID3D11ShaderResourceView> &srv,
 	                 int *texW, int *texH);
 
-	int scale_ = 1;
 	int maxSurfaceW_ = MAX_SURFACE_W;
-	int texFilter_ = 0;  // D3D11Options::textureFilter
-	int texUpscale_ = 1;
 	bool loggedAllocFailure_ = false;
 	ComPtr<ID3D11Device> dev_;
 	ComPtr<ID3D11DeviceContext> ctx_;
@@ -395,9 +276,6 @@ private:
 	ComPtr<ID3D11Texture2D> feedbackTex_;
 	ComPtr<ID3D11ShaderResourceView> feedbackSrv_;
 	int feedbackW_ = 0, feedbackH_ = 0;
-	std::vector<GpuVertex> verts_;
-	std::vector<Segment> segs_;
-	std::vector<DrawStateGpu> gpuStates_;
 	std::vector<u32> uploadBuf_;
 	std::vector<u8> rowTmp_, rowTmp2_;
 
@@ -1187,331 +1065,6 @@ void D3D11Backend::PrintStats() {
 	LOGI("d3d11", "  %llu draws textured from surfaces, %llu guest faults", (unsigned long long)stats_.rttDraws, (unsigned long long)faults_);
 	LOGI("d3d11", "  texture hash %.3fs (pure %.3fs, %.1f MB), decode %.3fs (%.1f Mtexels)", texCache_->hashSeconds, texCache_->pureHashSeconds, texCache_->hashBytes / 1e6,
 		texCache_->decodeSeconds, texCache_->decodeTexels / 1e6);
-}
-
-// --- Primitives ---
-
-void TexCoordsPerspective(const RVertex &v, bool proj, GpuVertex &g) {
-	const float w24 = TruncateToFloat24(v.clipw);
-	double r;
-	if (w24 > 0.0f && IsFiniteF(w24))
-		r = GERecip(w24);
-	else
-		r = v.clipw != 0.0f ? 1.0 / v.clipw : 1.0;
-	g.s = (float)(v.s * r);
-	g.t = (float)(v.t * r);
-	g.q = (float)((proj ? v.q : 1.0f) * r);
-}
-
-// rasterizer.cpp UVPlaneGradient for a triangle: the largest s and t plane gradient, in texels per
-// pixel (of the render scale).
-float TriangleLodImpl(const GpuVertex *v, const SamplerState &ss, int scale) {
-	const double x1 = v[1].x - v[0].x, y1 = v[1].y - v[0].y, x2 = v[2].x - v[0].x, y2 = v[2].y - v[0].y;
-	const double det = x1 * y2 - x2 * y1;
-	if (det == 0.0)
-		return 0.0f;
-	auto grad = [&](double f0, double f1, double f2) {
-		const double d1 = f1 - f0, d2 = f2 - f0;
-		const double kx = (d1 * y2 - d2 * y1) / det, ky = (d2 * x1 - d1 * x2) / det;
-		return std::max(std::abs(kx), std::abs(ky));
-	};
-	const double gs = grad(v[0].s, v[1].s, v[2].s) * (double)(1 << ss.width0Shift);
-	const double gt = grad(v[0].t, v[1].t, v[2].t) * (double)(1 << ss.height0Shift);
-	return (float)(std::max(gs, gt) / scale);
-}
-
-void D3D11Backend::EmitTriangle(const BatchPrim &p, const RasterState &st) {
-	const bool textured = st.enableTextures && !st.pix.clearMode;
-	const bool flat = !st.shadeGouraud;
-	const bool proj = st.textureProj && !st.throughMode;
-	const RVertex &pv = p.v[2];
-	float iw = 1.0f, ih = 1.0f;
-	if (textured && st.throughMode) {
-		iw = 1.0f / (float)(1 << st.samp.width0Shift);
-		ih = 1.0f / (float)(1 << st.samp.height0Shift);
-	}
-	for (int k = 0; k < 3; ++k) {
-		const RVertex &v = p.v[k];
-		GpuVertex g;
-		g.x = (float)v.x * (1.0f / SUBPIX);
-		g.y = (float)v.y * (1.0f / SUBPIX);
-		g.z = (float)v.z;
-		g.fog = st.pix.applyFog ? ClampFogDepth(v.fog) : 255.0f;
-		g.c0 = flat ? pv.color0 : v.color0;
-		g.c1 = flat ? pv.color1 : v.color1;
-		g.s = g.t = 0.0f;
-		g.q = 1.0f;
-		if (textured) {
-			if (st.throughMode) {
-				g.s = v.s * iw;
-				g.t = v.t * ih;
-			} else {
-				TexCoordsPerspective(v, proj, g);
-			}
-		}
-		g.state = p.stateIndex;
-		g.lod = 0.0f;
-		verts_.push_back(g);
-	}
-	if (textured) {
-		const float lod = TriangleLod(&verts_[verts_.size() - 3], st.samp);
-		for (size_t k = verts_.size() - 3; k < verts_.size(); ++k)
-			verts_[k].lod = lod;
-	}
-}
-
-void D3D11Backend::EmitRect(const BatchPrim &p, const RasterState &st, bool clear) {
-	const RVertex &v0 = p.v[0], &v1 = p.v[1];
-	int px0, py0, px1, py1;
-	if (clear ? !ClearBounds(v0, v1, p.range, &px0, &py0, &px1, &py1) : !RectBounds(v0, v1, p.range, &px0, &py0, &px1, &py1))
-		return;
-	GpuVertex base{};
-	base.z = (float)v1.z;
-	base.fog = st.pix.applyFog ? ClampFogDepth(v1.fog) : 255.0f;
-	base.c0 = v1.color0;
-	base.c1 = clear ? 0 : v1.color1;
-	base.q = 1.0f;
-	base.state = p.stateIndex;
-	const bool textured = !clear && st.enableTextures && !st.pix.clearMode;
-	LinearFn fs, ft, fq;
-	if (textured) {
-		// rasterizer.cpp DrawRectangle: UV planes from three corners whose s, t and q come from the two
-		// vertices component by component (gpu/probe exp57, exp122, exp129).
-		float tc0s = v0.s, tc0t = v0.t, tc1s = v1.s, tc1t = v1.t;
-		if (st.throughMode) {
-			const float iw = 1.0f / (float)(1 << st.samp.width0Shift), ih = 1.0f / (float)(1 << st.samp.height0Shift);
-			tc0s *= iw;
-			tc1s *= iw;
-			tc0t *= ih;
-			tc1t *= ih;
-		}
-		const bool right = v0.x < v1.x, down = v0.y < v1.y;
-		const bool swapST = right != down;
-		const RVertex *vv[2] = { &v0, &v1 };
-		double S[2], T[2], Q[2];
-		for (int k = 0; k < 2; ++k) {
-			const double r = st.throughMode ? 1.0 : GERecip(TruncateToFloat24(vv[k]->clipw));
-			Q[k] = r;
-			S[k] = (double)(k == 0 ? tc0s : tc1s) * r;
-			T[k] = (double)(k == 0 ? tc0t : tc1t) * r;
-		}
-		const int64_t left = std::min(v0.x, v1.x), top = std::min(v0.y, v1.y);
-		const int64_t rightX = std::max(v0.x, v1.x), bottom = std::max(v0.y, v1.y);
-		const bool bottomLeftFirst = right && !down;
-		const int64_t CX[3] = { left, rightX, bottomLeftFirst ? rightX : left };
-		const int64_t CY[3] = { bottomLeftFirst ? bottom : top, top, bottom };
-		double cs[3], ct[3], cq[3];
-		for (int k = 0; k < 3; ++k) {
-			const int xs = CX[k] == v0.x ? 0 : 1, ys = CY[k] == v0.y ? 0 : 1;
-			cs[k] = S[swapST ? ys : xs];
-			ct[k] = T[swapST ? xs : ys];
-			cq[k] = Q[xs];
-		}
-		fs = PlaneThrough(CX, CY, cs);
-		ft = PlaneThrough(CX, CY, ct);
-		fq = PlaneThrough(CX, CY, cq);
-		// rasterizer.cpp UVPlaneGradient: texels per pixel.
-		const double gs = std::max(std::abs(fs.b), std::abs(fs.c)) * SUBPIX * (double)(1 << st.samp.width0Shift);
-		const double gt = std::max(std::abs(ft.b), std::abs(ft.c)) * SUBPIX * (double)(1 << st.samp.height0Shift);
-		base.lod = (float)(std::max(gs, gt) / scale_);
-	}
-	const int xs[2] = { px0, px1 + 1 }, ys[2] = { py0, py1 + 1 };
-	GpuVertex c[4];
-	for (int k = 0; k < 4; ++k) {
-		c[k] = base;
-		c[k].x = (float)xs[k & 1];
-		c[k].y = (float)ys[k >> 1];
-		if (textured) {
-			const double sx = (double)xs[k & 1] * SUBPIX, sy = (double)ys[k >> 1] * SUBPIX;
-			c[k].s = (float)fs.At(sx, sy);
-			c[k].t = (float)ft.At(sx, sy);
-			c[k].q = (float)fq.At(sx, sy);
-		}
-	}
-	verts_.push_back(c[0]);
-	verts_.push_back(c[1]);
-	verts_.push_back(c[2]);
-	verts_.push_back(c[2]);
-	verts_.push_back(c[1]);
-	verts_.push_back(c[3]);
-}
-
-void D3D11Backend::EmitPoint(const BatchPrim &p, const RasterState &st) {
-	const RVertex &v = p.v[0];
-	const int px = v.x / SUBPIX, py = v.y / SUBPIX;
-	GpuVertex base{};
-	base.z = (float)v.z;
-	base.fog = st.pix.applyFog ? ClampFogDepth(v.fog) : 255.0f;
-	base.c0 = v.color0;
-	base.c1 = v.color1 & 0x00FFFFFF;
-	base.q = 1.0f;
-	base.state = p.stateIndex;
-	base.lod = -1e-30f;
-	if (st.enableTextures && !st.pix.clearMode) {
-		if (st.throughMode) {
-			base.s = GETruncateTexCoord(v.s) * (1.0f / (float)(1 << st.samp.width0Shift));
-			base.t = GETruncateTexCoord(v.t) * (1.0f / (float)(1 << st.samp.height0Shift));
-		} else {
-			// The level's q is 1/w (rasterizer.cpp DrawPoint).
-			const double r = v.clipw != 0.0f ? 1.0 / v.clipw : 1.0;
-			base.s = (float)(v.s * r);
-			base.t = (float)(v.t * r);
-			base.q = (float)((st.textureProj ? v.q : 1.0f) * r);
-		}
-	}
-	GpuVertex c[4];
-	for (int k = 0; k < 4; ++k) {
-		c[k] = base;
-		c[k].x = (float)(px + (k & 1));
-		c[k].y = (float)(py + (k >> 1));
-	}
-	verts_.push_back(c[0]);
-	verts_.push_back(c[1]);
-	verts_.push_back(c[2]);
-	verts_.push_back(c[2]);
-	verts_.push_back(c[1]);
-	verts_.push_back(c[3]);
-}
-
-void D3D11Backend::EmitLine(const BatchPrim &p, const RasterState &st) {
-	const bool textured = st.enableTextures && !st.pix.clearMode;
-	const RVertex &v0 = p.v[0], &v1 = p.v[1];
-	const bool interpolate = st.shadeGouraud && !(v0.color0 == v1.color0 && v0.color1 == v1.color1);
-	const bool proj = st.textureProj && !st.throughMode;
-	for (int k = 0; k < 2; ++k) {
-		const RVertex &v = p.v[k];
-		GpuVertex g;
-		g.x = (float)v.x * (1.0f / SUBPIX);
-		g.y = (float)v.y * (1.0f / SUBPIX);
-		g.z = (float)v.z;
-		g.fog = st.pix.applyFog ? ClampFogDepth(v.fog) : 255.0f;
-		g.c0 = interpolate ? v.color0 : v1.color0;
-		g.c1 = interpolate ? v.color1 : v1.color1;
-		g.s = g.t = 0.0f;
-		g.q = 1.0f;
-		if (textured) {
-			if (st.throughMode) {
-				g.s = v.s * (1.0f / (float)(1 << st.samp.width0Shift));
-				g.t = v.t * (1.0f / (float)(1 << st.samp.height0Shift));
-			} else {
-				TexCoordsPerspective(v, proj, g);
-			}
-		}
-		g.state = p.stateIndex;
-		g.lod = 0.0f;
-		verts_.push_back(g);
-	}
-	if (textured) {
-		// The texel step along the line (rasterizer.cpp DrawLine's ds, dt).
-		GpuVertex *a = &verts_[verts_.size() - 2], *b = a + 1;
-		const float steps = std::max(1.0f, std::max(std::abs(b->x - a->x), std::abs(b->y - a->y)));
-		const float ua = a->q != 0.0f ? a->s / a->q : 0.0f, ub = b->q != 0.0f ? b->s / b->q : 0.0f;
-		const float va = a->q != 0.0f ? a->t / a->q : 0.0f, vb = b->q != 0.0f ? b->t / b->q : 0.0f;
-		const float grad = std::max(std::abs(ub - ua) * (float)(1 << st.samp.width0Shift), std::abs(vb - va) * (float)(1 << st.samp.height0Shift)) / steps;
-		a->lod = b->lod = -std::max(grad / (float)scale_, 1e-30f);
-	}
-}
-
-void D3D11Backend::BuildVertices(const BatchPrim *prims, size_t n, const RasterState *states) {
-	verts_.clear();
-	segs_.clear();
-	for (size_t i = 0; i < n; ++i) {
-		const BatchPrim &p = prims[i];
-		const RasterState &st = states[p.stateIndex];
-		const bool lines = p.type == PrimType::Line;
-		if (segs_.empty() || segs_.back().lines != lines ||
-			(p.stateIndex != segs_.back().lastState && !Compatible(states[segs_.back().state], st))) {
-			segs_.push_back({ (u32)verts_.size(), 0, p.stateIndex, p.stateIndex, lines });
-		}
-		Segment &seg = segs_.back();
-		seg.lastState = p.stateIndex;
-		const size_t before = verts_.size();
-		switch (p.type) {
-		case PrimType::Triangle: EmitTriangle(p, st); break;
-		case PrimType::Rect: EmitRect(p, st, false); break;
-		case PrimType::ClearRect: EmitRect(p, st, true); break;
-		case PrimType::Point: EmitPoint(p, st); break;
-		case PrimType::Line: EmitLine(p, st); break;
-		}
-		seg.count += (u32)(verts_.size() - before);
-	}
-}
-
-void D3D11Backend::FillStates(const RasterState *states, size_t n) {
-	gpuStates_.resize(n);
-	for (size_t i = 0; i < n; ++i) {
-		const RasterState &rs = states[i];
-		const PixelState &ps = rs.pix;
-		DrawStateGpu &d = gpuStates_[i];
-		memset(&d, 0, sizeof(d));
-		u32 f = 0;
-		if (ps.alphaBlend) f |= F_ALPHA_BLEND;
-		if (ps.applyLogicOp) f |= F_LOGIC_OP;
-		if (ps.applyFog) f |= F_FOG;
-		if (ps.colorTest) f |= F_COLOR_TEST;
-		if (ps.stencilTest) f |= F_STENCIL_TEST;
-		if (ps.applyDepthRange) f |= F_DEPTH_RANGE;
-		if (ps.dithering) f |= F_DITHER;
-		if (ps.applyColorWriteMask) f |= F_WRITE_MASK;
-		if (ps.hasAlphaTestMask) f |= F_ALPHA_MASK;
-		if (ps.hasStencilTestMask) f |= F_STENCIL_MASK;
-		if (ps.depthWrite) f |= F_DEPTH_WRITE;
-		if (ps.colorClear) f |= F_COLOR_CLEAR;
-		if (ps.stencilClear) f |= F_STENCIL_CLEAR;
-		if (ps.depthClear) f |= F_DEPTH_CLEAR;
-		const bool textured = rs.enableTextures && !ps.clearMode;
-		if (textured && rs.samp.useColorDoubling) f |= F_DBL_SEC;
-		d.flags = f;
-		d.alphaTest = (u32)ps.alphaTestFunc | ((u32)ps.alphaTestRef << 8) | ((u32)ps.alphaTestMask << 16);
-		d.colorTestFunc = ps.colorTestFunc;
-		d.colorTestRef = ps.colorTestRef;
-		d.colorTestMask = ps.colorTestMask;
-		d.stencilTest = (u32)ps.stencilTestFunc | ((u32)ps.stencilTestRef << 8) | ((u32)ps.stencilRef << 16) | ((u32)ps.stencilTestMask << 24);
-		d.stencilOps = (u32)ps.sFail | ((u32)ps.zFail << 4) | ((u32)ps.zPass << 8);
-		d.depthFunc = ps.depthTestFunc;
-		d.minz = (u32)ps.minz;
-		d.maxz = (u32)ps.maxz;
-		d.blend = (u32)ps.blendEq | ((u32)ps.blendSrc << 4) | ((u32)ps.blendDst << 8);
-		d.fixA = ps.fixA;
-		d.fixB = ps.fixB;
-		d.fogColor = ps.fogColor;
-		d.writeMask = ps.colorWriteMask;
-		d.logicOp = ps.logicOp;
-		if (ps.dithering) {
-			for (int k = 0; k < 16; ++k) {
-				const u32 nib = (u32)(u8)ps.ditherMatrix[k] & 0xF;
-				if (k < 8)
-					d.dither0 |= nib << (k * 4);
-				else
-					d.dither1 |= nib << ((k - 8) * 4);
-			}
-		}
-		if (textured) {
-			const SamplerState &ss = rs.samp;
-			d.texFunc = (u32)ss.texFunc | (ss.useTextureAlpha ? 0x10u : 0u) | (ss.useColorDoubling ? 0x20u : 0u);
-			d.texEnv = ss.texBlendColor;
-			// Texture filtering as the game sets it, or always nearest / linear.
-			u32 filt = (ss.minFilt ? 4u : 0u) | (ss.magFilt ? 8u : 0u);
-			if (texFilter_ == 1)
-				filt = 0;
-			else if (texFilter_ == 2)
-				filt = 12;
-			d.texMode = (ss.clampS ? 1u : 0u) | (ss.clampT ? 2u : 0u) | filt | (ss.mipFilt ? 0x10u : 0u) | ((u32)(ss.maxLevel & 7) << 5) |
-				((u32)(ss.texLevelMode & 3) << 8);
-			d.texLevelOffset = ss.texLevelOffset;
-			d.lodSlopeLog = GELog16(ss.lodSlope);
-			int aw, ah;
-			TextureAtlasLayout(ss, d.texLevels, &aw, &ah);
-			// The texture cache's textures are upscaled: sampled at their scale (render to texture replaces
-			// this below).
-			const int up = TextureUpscale(texUpscale_, aw, ah);
-			if (up > 1) {
-				for (u32 &lv : d.texLevels)
-					lv = (lv & 0xFFFF0000u) | ((lv & 0xFFFFu) * (u32)up);
-				d.rtt = (u32)up << 12;
-			}
-		}
-	}
 }
 
 // A texture that is (part of) a surface the GPU holds, in the same pixel format and row length: it's
