@@ -51,7 +51,7 @@ void CheckRender(u32 scratch, bool native) {
 	gpu::SetRamSize(32 * 1024 * 1024);
 	gpu::Init();
 	gpu::SetRenderThreads(1);
-	for (int scale : {1, 2, 4, 8}) {
+	for (int scale : {1, 2, 4, 8, 16}) {
 		gpu::hw::OpenGLOptions options;
 		options.scale = scale;
 		std::string error;

@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <mutex>
 #include <stdexcept>
 
@@ -137,6 +138,7 @@ class OpenGLBackend final : public RenderBackend, private DrawData {
 	SDL_Window *window_ = nullptr;
 	SDL_GLContext context_ = nullptr;
 	bool ownedWindow_ = false, ownedVideo_ = false, visible_ = false;
+	bool serialFragments_ = false;
 	std::recursive_mutex mutex_;
 	GLuint dummyDepth_ = 0, vao_ = 0, vb_ = 0, sb_ = 0, fbo_ = 0, programs_[16] = {}, expand_ = 0, reduce_ = 0,
 		   display_ = 0, upscale_ = 0, present_ = 0;
@@ -332,8 +334,12 @@ class OpenGLBackend final : public RenderBackend, private DrawData {
 		context_ = SDL_GL_CreateContext(window_);
 		if (!context_)
 			throw std::runtime_error(SDL_GetError());
-		if (!SDL_GL_ExtensionSupported("GL_ARB_fragment_shader_interlock"))
+		const char *serial = getenv("PSPC_GL_SERIAL_FRAGMENTS");
+		serialFragments_ = serial && std::string(serial) == "1";
+		if (!serialFragments_ && !SDL_GL_ExtensionSupported("GL_ARB_fragment_shader_interlock"))
 			throw std::runtime_error("OpenGL ordered fragment shader interlock is unavailable");
+		if (serialFragments_)
+			LOGW("opengl", "Serial fragment verification mode: one primitive per draw with memory barriers");
 		GLint side = 0;
 		glGetIntegerv(GL_MAX_TEXTURE_SIZE, &side);
 		if (side < MAX_TEXTURE_SIDE)
@@ -342,8 +348,9 @@ class OpenGLBackend final : public RenderBackend, private DrawData {
 		SDL_GL_SetSwapInterval(o.vsync ? 1 : 0);
 		for (int fmt = 0; fmt < 4; ++fmt)
 			for (int variant = 0; variant < 3; ++variant) {
-				std::string prefix =
-					"#version 450 core\n#extension GL_ARB_fragment_shader_interlock : require\n#define FMT " +
+				std::string prefix = std::string("#version 450 core\n") +
+					(serialFragments_ ? "#define PSPC_GL_SERIAL_FRAGMENTS 1\n" :
+					 "#extension GL_ARB_fragment_shader_interlock : require\n") + "#define FMT " +
 					std::to_string(fmt) + "\n#define TEX " + std::to_string(variant == 1) + "\n#define CLEAR " +
 					std::to_string(variant == 2) + "\n";
 				programs_[fmt * 4 + variant] = Program(vertex, prefix + kGLPixel);
@@ -501,8 +508,19 @@ class OpenGLBackend final : public RenderBackend, private DrawData {
 			glBindTextureUnit(1, feedback);
 			glBindImageTexture(0, color->texture, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
 			glBindImageTexture(1, depth ? depth->texture : dummyDepth_, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
-			glDrawArrays(seg.lines ? GL_LINES : GL_TRIANGLES, seg.first, seg.count);
-			Barrier();
+			const GLenum primitive = seg.lines ? GL_LINES : GL_TRIANGLES;
+			if (serialFragments_) {
+				// Each primitive covers a pixel at most once (multisampling is off).
+				// Complete its image writes before drawing the next overlapping primitive.
+				const u32 vertices = seg.lines ? 2 : 3;
+				for (u32 first = seg.first; first < seg.first + seg.count; first += vertices) {
+					glDrawArrays(primitive, first, vertices);
+					Barrier();
+				}
+			} else {
+				glDrawArrays(primitive, seg.first, seg.count);
+				Barrier();
+			}
 			glDeleteTextures(1, &texture);
 			glDeleteTextures(1, &feedback);
 		}

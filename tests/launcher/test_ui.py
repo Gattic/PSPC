@@ -513,6 +513,7 @@ def main():
                     env, MESA_EXTENSION_OVERRIDE="-GL_ARB_fragment_shader_interlock"
                 )
                 fallback_env.pop("PSPC_RENDERER_REQUIRE", None)
+                fallback_env.pop("PSPC_GL_SERIAL_FRAGMENTS", None)
                 with (evidence / "opengl-runtime-fallback.log").open(
                     "w"
                 ) as fallback_log:

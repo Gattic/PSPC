@@ -120,7 +120,12 @@ pixel = re.sub(r"(fbuf|zbuf)\[hp\]", r"imageLoad(\1, ivec2(hp)).r", pixel)
 fragment = (
     dialect(common)
     + """
+#ifdef PSPC_GL_SERIAL_FRAGMENTS
+#define beginInvocationInterlockARB()
+#define endInvocationInterlockARB()
+#else
 layout(pixel_interlock_ordered) in;
+#endif
 layout(std430, binding=0) readonly buffer DrawStates { DrawState states[]; };
 layout(binding=0) uniform usampler2D tex;
 layout(binding=1) uniform usampler2D rttTex;
