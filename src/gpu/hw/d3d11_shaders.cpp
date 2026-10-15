@@ -321,7 +321,18 @@ int ClampUV(int v, int size, int limit) {
 }
 int WrapUV(int v, int size, int limit) {
 	int period = min(size, limit + 1);
-	return ((v % period) + period) % period;
+	// Ordinary textures and power-of-two render/upscale factors wrap with a mask, including negative
+	// coordinates. Keep one unsigned remainder for factors such as 3x; two remainders per tap are costly
+	// at high resolutions. The branch is uniform across a draw's texture samples.
+	[branch] if ((period & (period - 1)) == 0)
+		return v & (period - 1);
+	else {
+		// Unsigned magnitude also defines negative-coordinate wrapping in GLSL, whose signed
+		// remainder is undefined for negative operands. The subtraction handles INT_MIN too.
+		uint magnitude = v < 0 ? 0u - (uint)v : (uint)v;
+		int r = (int)(magnitude % (uint)period);
+		return v < 0 && r != 0 ? period - r : r;
+	}
 }
 uint4 TexelFromRaw(uint raw, uint fmt) {
 	uint c = fmt == 0 ? RGB565ToRGBA8888(raw) : fmt == 1 ? RGBA5551ToRGBA8888(raw) : fmt == 2 ? RGBA4444ToRGBA8888(raw) : raw;
@@ -345,7 +356,9 @@ void TexelPair(float st, int size, bool clampIt, int limit, out int c0, out int 
 		c1 = max(min(base + 1, hi), 0);
 	} else {
 		c0 = WrapUV(base, size, limit);
-		c1 = WrapUV(base + 1, size, limit);
+		// The adjacent bilinear tap wraps only at the end of the same period.
+		c1 = c0 + 1;
+		if (c1 == min(size, limit + 1)) c1 = 0;
 	}
 }
 uint4 SampleLevel(DrawState st, float s, float t, int level, bool bilinear) {
@@ -440,7 +453,6 @@ int4 TextureFunction(DrawState st, int4 p, int4 t) {
 void PSMain(PSIn i) {
 	DrawState st = states[i.state];
 	uint2 hp = uint2(i.pos.xy);
-	uint2 pp = hp / scale;
 	int z = clamp((int)floor(i.zf.x + 0.002), 0, 65535);
 	int4 prim = clamp((int4)floor(i.c0 + 0.002), 0, 255);
 	int4 c;
@@ -526,7 +538,8 @@ void PSMain(PSIn i) {
 
 	uint oldColor = ExpandColor(oldRaw);
 	int dith = 0;
-	if (st.flags & F_DITHER) {
+	[branch] if (st.flags & F_DITHER) {
+		uint2 pp = hp / scale;
 		uint idx = (pp.y & 3) * 4 + (pp.x & 3);
 		uint word = idx < 8 ? st.dither0 : st.dither1;
 		uint raw4 = (word >> ((idx & 7) * 4)) & 0xF;

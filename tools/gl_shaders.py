@@ -86,7 +86,7 @@ def dialect(s):
     ]:
         s = re.sub(r"\b" + old + r"\b", new, s)
     s = s.replace("asuint(", "floatBitsToUint(").replace("lerp(", "mix(")
-    s = re.sub(r"\[(?:loop|unroll)\]", "", s)
+    s = re.sub(r"\[(?:loop|unroll|branch)\]", "", s)
     s = re.sub(r"\((st\.(?:flags|rtt) & [\w]+)\)(?!\s*(?:!=|==))", r"((\1) != 0)", s)
     s = re.sub(r"\((wrapMode & [12])\) \?", r"((\1) != 0u) ?", s)
     s = s.replace("if (src >> 15)", "if ((src >> 15) != 0u)").replace(

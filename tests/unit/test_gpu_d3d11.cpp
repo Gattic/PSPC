@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -480,12 +481,98 @@ TEST(gpu_hardware_framebuffer_feedback_and_transfer) {
 	}
 }
 
+// Repeating a texture by whole periods must produce identical tiles even across negative UVs.
+// Exercise both taps at the bilinear seam and non-power-of-two xBR/RTT periods.
+TEST(gpu_hardware_texture_wrap_periods) {
+	for (int mode = 0; mode < 6; ++mode) {
+		Env env;
+		BackendOptions options;
+		options.scale = mode == 0 ? 1 : mode == 5 ? 16 : (mode & 1) ? 3 : 4;
+		options.textureUpscale = mode == 1 ? 3 : mode == 2 ? 4 : 1;
+#ifdef _WIN32
+		options.warp = true;
+#endif
+		std::string error;
+		auto backend = MakeBackend(options, &error);
+		if (!backend) { printf("  hardware wrapping test unavailable: %s\n", error.c_str()); return; }
+		SetRenderBackend(backend.get());
+		const bool rtt = mode >= 3;
+		const u32 texture = rtt ? VRAM + 0x20000 : TEX;
+		for (int y = 0; y < 32; ++y) for (int x = 0; x < 32; ++x)
+			GWrite32(texture + (y * 64 + x) * 4, 0xFF000000u | (x * 7) | ((y * 7) << 8) | (((x ^ y) * 7) << 16));
+		DL dl;
+		dl.C(GE_CMD_FRAMEBUFWIDTH, 512).C(GE_CMD_FRAMEBUFPIXFORMAT, GE_FORMAT_8888).C(GE_CMD_ZWRITEDISABLE, 1);
+		dl.C(GE_CMD_SCISSOR1, 0).C(GE_CMD_SCISSOR2, 159 | (31 << 10)).C(GE_CMD_REGION2, 159 | (31 << 10));
+		if (rtt) {
+			// Touch the source with the GE so it is sampled as a rendered surface at the render scale.
+			dl.C(GE_CMD_FRAMEBUFPTR, 0x20000).C(GE_CMD_FRAMEBUFWIDTH, 64);
+			TVert clear[2] = {{0xFF000000u, 0, 0, 0, 0}, {0xFF000000u, 1, 1, 0, 0}};
+			memcpy(GPtr(VERTS + 0x10000), clear, sizeof(clear));
+			dl.C(GE_CMD_CLEARMODE, 1 | (3 << 8)).C(GE_CMD_VERTEXTYPE, VT_C8888_P16);
+			dl.Prim(GE_PRIM_RECTANGLES, 2, VERTS + 0x10000).C(GE_CMD_CLEARMODE, 0);
+		}
+		dl.C(GE_CMD_FRAMEBUFPTR, 0).C(GE_CMD_FRAMEBUFWIDTH, 512);
+		dl.C(GE_CMD_TEXTUREMAPENABLE, 1).C(GE_CMD_TEXFORMAT, GE_TFMT_8888).C(GE_CMD_TEXMODE, 0);
+		dl.C(GE_CMD_TEXADDR0, texture & 0xFFFFF0).C(GE_CMD_TEXBUFWIDTH0, 64 | ((texture >> 8) & 0x0F0000));
+		dl.C(GE_CMD_TEXSIZE0, 5 | (5 << 8)).C(GE_CMD_TEXFUNC, GE_TEXFUNC_REPLACE | 0x100).C(GE_CMD_TEXWRAP, 0);
+		struct V { float u, v; u32 color; float x, y, z; };
+		const float coords[] = {0, 0.25f, 15.5f, 31.75f};
+		for (int filter = 0; filter < 2; ++filter) {
+			dl.C(GE_CMD_TEXFILTER, filter ? 0x101 : 0);
+			for (int row = 0; row < 16; ++row)
+			for (int tile = 0; tile < 5; ++tile) {
+				// Constant UVs avoid interpolation rounding differences across the sign boundary. These
+				// exact quarter-texel coordinates exercise bilinear wrap seams at every tested scale.
+				const float u = (float)((tile - 2) * 32) + coords[row % 4], v = (float)((2 - tile) * 64) + coords[row / 4];
+				const float y = (float)(filter * 16 + row);
+				V verts[2] = {{u, v, 0xFFFFFFFFu, (float)(tile * 32), y, 0},
+					{u, v, 0xFFFFFFFFu, (float)((tile + 1) * 32), y + 1, 0}};
+				const u32 addr = VERTS + ((filter * 16 + row) * 5 + tile) * sizeof(verts);
+				memcpy(GPtr(addr), verts, sizeof(verts));
+				dl.C(GE_CMD_VERTEXTYPE, GE_VTYPE_THROUGH | GE_VTYPE_TC_FLOAT | GE_VTYPE_COL_8888 | GE_VTYPE_POS_FLOAT);
+				dl.Prim(GE_PRIM_RECTANGLES, 2, addr);
+			}
+		}
+		dl.C(GE_CMD_FINISH).C(GE_CMD_END);
+		EnqueueList(dl.start, 0, -1, 0, false); Run(); DrawSync(0);
+		std::vector<u32> image;
+		int w = 0, h = 0;
+		if (options.scale == 1) {
+			w = 160; h = 32;
+			for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x)
+				image.push_back(GRead32(VRAM + (y * 512 + x) * 4));
+		} else {
+			CHECK(backend->GetDisplayImage(VRAM, 512, GE_FORMAT_8888, 160, 32, image, &w, &h, 0));
+		}
+		SetRenderBackend(nullptr);
+		if (image.empty()) return;
+		const int side = 32 * options.scale;
+		int diffs = 0;
+		for (int y = 0; y < h; ++y) for (int x = 0; x < side; ++x) for (int tile = 1; tile < 5; ++tile) {
+			if (image[(size_t)y * w + x] != image[(size_t)y * w + tile * side + x]) {
+				diffs++;
+			}
+		}
+		if (diffs) printf("  wrap mode %d: %d differing repeated pixels\n", mode, diffs);
+		CHECK(diffs == 0);
+		CHECK((image[(size_t)(side / 2) * w + side / 2] & 0xFFFFFF) != 0);
+	}
+}
+
 // Opt-in, bounded benchmark. Shader compilation and warm-up are outside the timer;
 // reading VRAM forces completion on D3D11 as well as OpenGL. Use the hardware
 // adapter, not WARP, when measuring Windows resolution scaling.
 TEST(gpu_hardware_resolution_perf) {
 	if (!getenv("GPU_HW_BENCH")) return;
-	for (int scale : {1, 2, 4, 8}) {
+	const int onlyScale = getenv("GPU_HW_BENCH_SCALE") ? atoi(getenv("GPU_HW_BENCH_SCALE")) : 0;
+	const int frames = getenv("GPU_HW_BENCH_FRAMES") ? std::clamp(atoi(getenv("GPU_HW_BENCH_FRAMES")), 21, 10000) : 121;
+	std::vector<int> scales{1, 2, 3, 4, 8, 16};
+	if (onlyScale) {
+		CHECK(onlyScale >= 1 && onlyScale <= 16);
+		if (onlyScale < 1 || onlyScale > 16) return;
+		scales = {onlyScale};
+	}
+	for (int scale : scales) {
 		Env env;
 		BackendOptions options;
 		options.scale = scale;
@@ -513,11 +600,21 @@ TEST(gpu_hardware_resolution_perf) {
 			EnqueueList(dl.start, 0, -1, 0, false); Run(); DrawSync(0);
 			backend->SyncRange(VRAM, 512 * 272 * 4);
 		};
-		for (int i = 0; i < 3; ++i) frame();
-		const auto start = std::chrono::steady_clock::now();
-		for (int i = 0; i < 12; ++i) frame();
-		const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() / 12;
-		printf("  resolution %dx: %.3f ms/frame (4 full-screen wrapped bilinear blended sprites)\n", scale, ms);
+		// A sustained warm-up lets a laptop GPU leave its idle clocks before sampling.
+		const auto warmEnd = std::chrono::steady_clock::now() + std::chrono::milliseconds(750);
+		do { frame(); } while (std::chrono::steady_clock::now() < warmEnd);
+		std::vector<double> times;
+		for (int i = 0; i < frames; ++i) {
+			const auto start = std::chrono::steady_clock::now();
+			frame();
+			times.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+		}
+		std::sort(times.begin(), times.end());
+		double mean = 0, variance = 0;
+		for (double t : times) mean += t / times.size();
+		for (double t : times) variance += (t - mean) * (t - mean) / (times.size() - 1);
+		printf("  resolution %dx: median %.3f p99 %.3f stddev %.3f ms/frame (%d frames, 4 full-screen wrapped bilinear blended sprites)\n",
+			scale, times[times.size() / 2], times[(times.size() - 1) * 99 / 100], std::sqrt(variance), frames);
 		CHECK(GRead32(VRAM + (136 * 512 + 240) * 4) != 0);
 		SetRenderBackend(nullptr);
 	}

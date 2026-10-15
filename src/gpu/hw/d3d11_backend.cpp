@@ -47,6 +47,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <thread>
 
@@ -234,6 +235,10 @@ private:
 	void ResolveRenderToTexture(const RasterState *states, size_t n);
 	ID3D11ShaderResourceView *FeedbackCopy(Surface *s);
 	void PrintStats();
+	// Optional GPU timestamps (PSPC_GPU_PROFILE): collect completed queries without stalling draws.
+	void BeginGpuSample(int category);
+	void EndGpuSample();
+	void CollectGpuSamples();
 	Surface *DisplaySurface(u32 addr, int stride, int format, int width);
 	bool ReadDisplay(Surface *s, int width, int height, int format, int outScale, std::vector<u32> &out);
 	bool EnsureSwapChain();
@@ -321,6 +326,16 @@ private:
 		u64 rttDraws = 0;
 	} stats_;
 	bool printStats_ = false;
+	bool profileGpu_ = false;
+	struct GpuSample {
+		ComPtr<ID3D11Query> disjoint, start, end;
+		int category = 0;
+	};
+	std::deque<GpuSample> gpuPending_;
+	std::vector<GpuSample> gpuFree_;
+	bool gpuSampleActive_ = false;
+	u64 gpuSkipped_ = 0, gpuDisjoint_ = 0, gpuFailed_ = 0;
+	struct GpuTiming { double ms = 0; u64 count = 0; } gpuTiming_[6];
 	std::chrono::steady_clock::time_point statsStart_ = std::chrono::steady_clock::now();
 };
 
@@ -361,6 +376,76 @@ D3D11Backend::~D3D11Backend() {
 	if (ctx_) {
 		ctx_->ClearState();
 		ctx_->Flush();
+		if (profileGpu_ && texCache_) {
+			const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+			while (!gpuPending_.empty() && std::chrono::steady_clock::now() < deadline) {
+				CollectGpuSamples();
+				if (!gpuPending_.empty()) std::this_thread::yield();
+			}
+			PrintStats();
+		}
+	}
+}
+
+void D3D11Backend::BeginGpuSample(int category) {
+	if (!profileGpu_) return;
+	CollectGpuSamples();
+	// Bound diagnostic memory even if the GPU stops making progress.
+	if (gpuPending_.size() >= 512) { gpuSkipped_++; return; }
+	GpuSample sample;
+	if (!gpuFree_.empty()) {
+		sample = std::move(gpuFree_.back());
+		gpuFree_.pop_back();
+	} else {
+		D3D11_QUERY_DESC desc{D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+		if (FAILED(dev_->CreateQuery(&desc, &sample.disjoint))) { gpuFailed_++; return; }
+		desc.Query = D3D11_QUERY_TIMESTAMP;
+		if (FAILED(dev_->CreateQuery(&desc, &sample.start)) || FAILED(dev_->CreateQuery(&desc, &sample.end))) {
+			gpuFailed_++;
+			return;
+		}
+	}
+	sample.category = category;
+	gpuPending_.push_back(std::move(sample));
+	auto &q = gpuPending_.back();
+	ctx_->Begin(q.disjoint.Get());
+	ctx_->End(q.start.Get());
+	gpuSampleActive_ = true;
+}
+
+void D3D11Backend::EndGpuSample() {
+	if (!gpuSampleActive_) return;
+	auto &q = gpuPending_.back();
+	ctx_->End(q.end.Get());
+	ctx_->End(q.disjoint.Get());
+	gpuSampleActive_ = false;
+}
+
+void D3D11Backend::CollectGpuSamples() {
+	while (!gpuPending_.empty()) {
+		auto &q = gpuPending_.front();
+		D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint{};
+		UINT64 start = 0, end = 0;
+		const UINT flags = D3D11_ASYNC_GETDATA_DONOTFLUSH;
+		HRESULT status = ctx_->GetData(q.disjoint.Get(), &disjoint, sizeof(disjoint), flags);
+		if (status == S_OK) status = ctx_->GetData(q.start.Get(), &start, sizeof(start), flags);
+		if (status == S_OK) status = ctx_->GetData(q.end.Get(), &end, sizeof(end), flags);
+		if (status == S_FALSE) break;
+		if (FAILED(status)) {
+			// Device/query failures cannot become ready later; discard rather than clogging the queue.
+			gpuFailed_++;
+			gpuPending_.pop_front();
+			continue;
+		}
+		if (!disjoint.Disjoint && disjoint.Frequency && end >= start) {
+			auto &t = gpuTiming_[q.category];
+			t.ms += (double)(end - start) * 1000.0 / (double)disjoint.Frequency;
+			t.count++;
+		} else {
+			gpuDisjoint_++;
+		}
+		gpuFree_.push_back(std::move(q));
+		gpuPending_.pop_front();
 	}
 }
 
@@ -487,6 +572,7 @@ bool D3D11Backend::Init(const D3D11Options &o, std::string *err) {
 	texUpscale_ = std::clamp(o.textureUpscale, 1, 4);
 	window_ = (HWND)o.window;
 	printStats_ = getenv("PSPC_GPU_STATS") != nullptr;
+	profileGpu_ = getenv("PSPC_GPU_PROFILE") != nullptr;
 	g_vram = o.privateVram ? o.privateVram : VramPtr();
 	const char *syncMode = getenv("PSPC_D3D11_SYNC");
 	guard_ = o.privateVram && !(syncMode && !strcmp(syncMode, "eager")) && !g_guarded;
@@ -790,7 +876,9 @@ void D3D11Backend::RunCompute(ID3D11ComputeShader *cs, ID3D11ShaderResourceView 
 	ctx_->CSSetConstantBuffers(0, 1, copyCB_.GetAddressOf());
 	ctx_->CSSetShaderResources(0, 1, &srv);
 	ctx_->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+	BeginGpuSample(cs == csExpand_.Get() ? 3 : cs == csReduce_.Get() ? 4 : 5);
 	ctx_->Dispatch(gx, gy, 1);
+	EndGpuSample();
 	ID3D11ShaderResourceView *nullSrv = nullptr;
 	ID3D11UnorderedAccessView *nullUav = nullptr;
 	ctx_->CSSetShaderResources(0, 1, &nullSrv);
@@ -1065,6 +1153,15 @@ void D3D11Backend::PrintStats() {
 	LOGI("d3d11", "  %llu draws textured from surfaces, %llu guest faults", (unsigned long long)stats_.rttDraws, (unsigned long long)faults_);
 	LOGI("d3d11", "  texture hash %.3fs (pure %.3fs, %.1f MB), decode %.3fs (%.1f Mtexels)", texCache_->hashSeconds, texCache_->pureHashSeconds, texCache_->hashBytes / 1e6,
 		texCache_->decodeSeconds, texCache_->decodeTexels / 1e6);
+	if (profileGpu_) {
+		CollectGpuSamples();
+		const char *names[] = {"textured draws", "untextured draws", "clears", "upload expansion", "readback reduction", "display"};
+		for (int i = 0; i < 6; ++i)
+			LOGI("d3d11", "  GPU %s: %.3f ms / %llu samples", names[i], gpuTiming_[i].ms, (unsigned long long)gpuTiming_[i].count);
+		if (gpuSkipped_ || gpuDisjoint_ || gpuFailed_ || !gpuPending_.empty())
+			LOGI("d3d11", "  GPU samples: %llu skipped, %llu disjoint, %llu failed, %zu pending", (unsigned long long)gpuSkipped_,
+				(unsigned long long)gpuDisjoint_, (unsigned long long)gpuFailed_, gpuPending_.size());
+	}
 }
 
 // A texture that is (part of) a surface the GPU holds, in the same pixel format and row length: it's
@@ -1296,7 +1393,9 @@ void D3D11Backend::DrawBatch(const BatchPrim *prims, size_t n, const RasterState
 		MarkDirty(color, minRow, maxRow);
 		if (depth && writesDepth)
 			MarkDirty(depth, minRow, maxRow);
+		BeginGpuSample(st.pix.clearMode ? 2 : textured ? 0 : 1);
 		ctx_->Draw(seg.count, seg.first);
+		EndGpuSample();
 		stats_.draws++;
 		pendingDraws_ = true;
 	}
@@ -1461,7 +1560,9 @@ void D3D11Backend::DrawPresent(ID3D11ShaderResourceView *src, int srcW, int srcH
 	ctx_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
 	ctx_->OMSetDepthStencilState(noDepth_.Get(), 0);
 	ctx_->OMSetRenderTargets(1, backRtv_.GetAddressOf(), nullptr);
+	BeginGpuSample(5);
 	ctx_->Draw(3, 0);
+	EndGpuSample();
 	ID3D11ShaderResourceView *nullSrvs[2] = {};
 	ctx_->PSSetShaderResources(0, 2, nullSrvs);
 	// Diagnostics: PSPC_HOST_SNAPSHOT=<file.bmp> saves the window's image of the 600th presented frame, or
