@@ -116,9 +116,15 @@ void UpdateInput() {
 	g_digitalLy = axis[1];
 }
 
-void SetFullscreen(SDL_Window *win, bool on) {
-	if (SDL_SetWindowFullscreen(win, on ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0) != 0)
+void SetFullscreen(SDL_Window *win, bool on, int &windowedW, int &windowedH) {
+	if (on) SDL_GetWindowSize(win, &windowedW, &windowedH);
+	if (SDL_SetWindowFullscreen(win, on ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0) != 0) {
 		LOGW("HOST", "Fullscreen switch failed: %s", SDL_GetError());
+		return;
+	}
+	// SDL's OpenGL presenter can recreate the native window while fullscreen,
+	// losing SDL's saved windowed size. Keep our own geometry across that recreation.
+	if (!on) SDL_SetWindowSize(win, windowedW, windowedH);
 	SDL_ShowCursor(on ? SDL_DISABLE : SDL_ENABLE);
 }
 
@@ -166,7 +172,9 @@ int Run(const Config &cfg, const std::function<int()> &emulation, const std::fun
 	}
 	ResolveBindings(cfg);
 	g_volume = std::clamp(cfg.volume, 0, 100);
-	Uint32 winFlags = SDL_WINDOW_RESIZABLE | (cfg.fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+	// Establish the windowed geometry before entering fullscreen. Older SDL/X11
+	// otherwise remembers the desktop size as the size to restore on F11.
+	Uint32 winFlags = SDL_WINDOW_RESIZABLE;
 #ifndef _WIN32
 	if (cfg.gpuPresent) {
 		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
@@ -184,7 +192,8 @@ int Run(const Config &cfg, const std::function<int()> &emulation, const std::fun
 		                       480 * cfg.windowScale, 272 * cfg.windowScale, winFlags & ~SDL_WINDOW_OPENGL);
 	}
 #endif
-	if (cfg.fullscreen) SDL_ShowCursor(SDL_DISABLE);
+	int windowedW = 480 * cfg.windowScale, windowedH = 272 * cfg.windowScale;
+	if (win && cfg.fullscreen) SetFullscreen(win, true, windowedW, windowedH);
 	// FitScale is read by the emulation thread; keep all SDL window queries on this thread.
 	auto updateFitScale = [&]() {
 		int w = 0, h = 0;
@@ -256,7 +265,8 @@ int Run(const Config &cfg, const std::function<int()> &emulation, const std::fun
 				bool down = ev.type == SDL_KEYDOWN;
 				if (k == SDLK_F11 || k == SDLK_F12 || (k == SDLK_q && down && (ev.key.keysym.mod & KMOD_CTRL))) {
 					if (down && !ev.key.repeat) {
-						if (k == SDLK_F11) SetFullscreen(win, !(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN_DESKTOP));
+					if (k == SDLK_F11)
+						SetFullscreen(win, !(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN_DESKTOP), windowedW, windowedH);
 						else if (k == SDLK_F12 && g_hasPresenter) g_screenshotRequested = true;
 						else if (k == SDLK_F12) screenshot = true;
 						else quit();

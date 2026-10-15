@@ -50,6 +50,9 @@ add_test(NAME firmware_discovery COMMAND ${Python3_EXECUTABLE} -I
 set_tests_properties(firmware_discovery PROPERTIES TIMEOUT 30)
 
 if(TARGET pspc_runtime)
+	# Opt-in native-window check; run explicitly because it changes desktop fullscreen state.
+	add_executable(pspc_host_fullscreen_tests host/test_fullscreen.cpp)
+	target_link_libraries(pspc_host_fullscreen_tests PRIVATE pspc_runtime)
 	add_executable(pspc_host_audio_tests host/test_audio.cpp)
 	target_link_libraries(pspc_host_audio_tests PRIVATE pspc_runtime)
 	if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -106,7 +109,7 @@ if(TARGET pspc_runtime)
 	add_test(NAME interrupt_context_fast_busy COMMAND pspc_interrupt_context_tests busy fast)
 	set_tests_properties(interrupt_context_fast_busy PROPERTIES TIMEOUT 5)
 	if(WIN32)
-		foreach(test_target IN ITEMS pspc_host_audio_tests pspc_scheduler_tests pspc_interp_tests pspc_display_pacing_tests pspc_interrupt_context_tests pspc_lifetime_tests)
+		foreach(test_target IN ITEMS pspc_host_fullscreen_tests pspc_host_audio_tests pspc_scheduler_tests pspc_interp_tests pspc_display_pacing_tests pspc_interrupt_context_tests pspc_lifetime_tests)
 			add_custom_command(TARGET ${test_target} POST_BUILD
 				COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_RUNTIME_DLLS:${test_target}>
 					$<TARGET_FILE_DIR:${test_target}>
