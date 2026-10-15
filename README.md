@@ -286,6 +286,9 @@ The guest programs are built with pspdev by `tools/build_guest_tests.sh` (under 
 Checkpoints are listed in `tools/checkpoints.txt`; the reference frames stay on your machine
 (`build/checkpoints`). Disc images past 1.8 GB: [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md#large-disc-images).
 
+Interpreter throughput, high-resolution GPU benchmarks and AOT rendering checks:
+[docs/performance.md](docs/performance.md).
+
 ## Disclaimer
 
 This project is intended for interoperability, research, preservation, and compatibility purposes. It does not include, distribute, or require copyrighted software, firmware, cryptographic keys, or proprietary libraries. Users are responsible for ensuring that any binaries used with this project are obtained and used in accordance with applicable laws and their respective license terms.

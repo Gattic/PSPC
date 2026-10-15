@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Exercise the real module loader, CPU/dispatch bridge and interpreter without game assets.
 #include "common/fileutil.h"
+#include "gpu/backend.h"
+#include "gpu/ge.h"
+#include "gpu/hw/opengl_backend.h"
 #include "runtime/core/cpu.h"
 #include "runtime/core/dispatch.h"
 #include "runtime/core/interp.h"
@@ -10,6 +13,7 @@
 #include "runtime/kernel/sysmem.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -40,6 +44,53 @@ void Execute(u32 entry, u32 scratch, u32 input, u32 addend, bool native) {
 	std::printf("entry=%08x result=%u interpreted=%llu\n", entry, c.r[2], (unsigned long long)interpreted);
 }
 
+// Opt-in GPU integration: the real guest function supplies a different color
+// each frame, via AOT or the interpreter. Both modes must retain that result at
+// every render scale, including GPU writeback and full-resolution display reads.
+void CheckRender(u32 scratch, bool native) {
+	gpu::SetRamSize(32 * 1024 * 1024);
+	gpu::Init();
+	gpu::SetRenderThreads(1);
+	for (int scale : {1, 2, 4, 8}) {
+		gpu::hw::OpenGLOptions options;
+		options.scale = scale;
+		std::string error;
+		auto backend = gpu::hw::CreateOpenGLBackend(options, &error);
+		Require(backend != nullptr, error.c_str());
+		gpu::RasterState state{};
+		state.throughMode = true;
+		state.scissor = {0, 0, 480 * gpu::SUBPIX - 1, 272 * gpu::SUBPIX - 1};
+		state.pix.fb = GPtr(0x04000000);
+		state.pix.fbStride = 512;
+		state.pix.fbFormat = gpu::GE_FORMAT_8888;
+		state.pix.clearMode = state.pix.colorClear = state.pix.stencilClear = true;
+		state.pix.depthTestFunc = gpu::GE_COMP_ALWAYS;
+		gpu::BatchPrim prim{};
+		prim.type = gpu::PrimType::ClearRect;
+		prim.range = state.scissor;
+		prim.v[1].x = 480 * gpu::SUBPIX;
+		prim.v[1].y = 272 * gpu::SUBPIX;
+		u32 color = 0;
+		for (u32 frame = 0; frame < 3; ++frame) {
+			Execute(kEntry, scratch, frame + 20, 7, native);
+			color = 0xFF000000 | (GRead32(scratch + 4) * 0x010203);
+			prim.v[0].color0 = prim.v[1].color0 = color;
+			backend->DrawBatch(&prim, 1, &state, 1);
+			backend->SyncRange(0x04000000, 512 * 272 * 4);
+			Require(GRead32(0x04000000 + (136 * 512 + 240) * 4) == color, "render writeback mismatch");
+		}
+		std::vector<u32> image;
+		int w = 0, h = 0;
+		Require(backend->GetDisplayImage(0x04000000, 512, gpu::GE_FORMAT_8888, 480, 272, image, &w, &h, 0),
+		        "high-resolution display image missing");
+		Require(w == 480 * scale && h == 272 * scale && image.size() == (size_t)w * h, "render scale mismatch");
+		for (u32 pixel : image) Require(pixel == color, "high-resolution guest result mismatch");
+		std::printf("%s render %dx: %dx%d, guest-generated color and writeback passed\n",
+		            native ? "AOT" : "interpreter", scale, w, h);
+	}
+	gpu::Shutdown();
+}
+
 void Check(const char *elfPath, const char *cache, const std::string &mode) {
 	constexpr u32 ramSize = 32 * 1024 * 1024;
 	Require(mem::Init(ramSize), "cannot initialize guest memory");
@@ -64,6 +115,8 @@ void Check(const char *elfPath, const char *cache, const std::string &mode) {
 	Require((dispatch::Lookup(kEntry) != nullptr) == native &&
 	        (dispatch::LookupBody(kCallee) != nullptr) == native, "incorrect native registration");
 	Execute(kEntry, scratch, 20, 7, native);
+	if (std::getenv("PSPC_AOT_RENDER_TEST") && (native || mode == "disabled"))
+		CheckRender(scratch, native);
 
 	if (native) {
 		Require(kernel::InvalidateNativeCode(kEntry, module->memSize) == 0,

@@ -145,7 +145,12 @@ void OnEnterVblank() {
 		g_latchPending = false;
 	}
 	homemenu::OnVblank();
-	Present();
+	// Replaying obsolete presentations makes a slow GPU fall further behind:
+	// each catch-up VBlank would spend more host time displaying the same image.
+	// Keep every guest VBlank/interrupt, but only present the current real-time
+	// frame. Fast-time runs retain every presentation for deterministic capture.
+	if (sched::FastTime() || EnterUs(g_frames) > sched::NowUs())
+		Present();
 	if (g_vblankHook) g_vblankHook();
 
 	// Which vblank a wait is for is decided now; the interrupt releases the waiters at its end.

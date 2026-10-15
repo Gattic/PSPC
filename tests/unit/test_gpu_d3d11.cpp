@@ -5,6 +5,7 @@
 #include "test_guest_memory.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -476,6 +477,49 @@ TEST(gpu_hardware_framebuffer_feedback_and_transfer) {
 		auto reference = draw(nullptr), actual = draw(backend.get());
 		CHECK(reference[0] != 0);
 		CHECK(reference == actual);
+	}
+}
+
+// Opt-in, bounded benchmark. Shader compilation and warm-up are outside the timer;
+// reading VRAM forces completion on D3D11 as well as OpenGL. Use the hardware
+// adapter, not WARP, when measuring Windows resolution scaling.
+TEST(gpu_hardware_resolution_perf) {
+	if (!getenv("GPU_HW_BENCH")) return;
+	for (int scale : {1, 2, 4, 8}) {
+		Env env;
+		BackendOptions options;
+		options.scale = scale;
+		std::string error;
+		auto backend = MakeBackend(options, &error);
+		CHECK(backend != nullptr);
+		if (!backend) { printf("  benchmark unavailable: %s\n", error.c_str()); return; }
+		SetRenderBackend(backend.get());
+		for (u32 i = 0; i < 256 * 256; ++i)
+			GWrite32(TEX + i * 4, 0x80000000 | ((i * 2654435761u) & 0xFFFFFF));
+		DL dl;
+		dl.C(GE_CMD_FRAMEBUFPTR, 0).C(GE_CMD_FRAMEBUFWIDTH, 512).C(GE_CMD_FRAMEBUFPIXFORMAT, GE_FORMAT_8888);
+		dl.C(GE_CMD_SCISSOR1, 0).C(GE_CMD_SCISSOR2, 479 | (271 << 10)).C(GE_CMD_REGION2, 479 | (271 << 10));
+		dl.C(GE_CMD_ZWRITEDISABLE, 1);
+		dl.C(GE_CMD_TEXTUREMAPENABLE, 1).C(GE_CMD_TEXFORMAT, GE_TFMT_8888).C(GE_CMD_TEXMODE, 0);
+		dl.C(GE_CMD_TEXADDR0, TEX & 0xFFFFF0).C(GE_CMD_TEXBUFWIDTH0, 256 | ((TEX >> 8) & 0x0F0000));
+		dl.C(GE_CMD_TEXSIZE0, 8 | (8 << 8)).C(GE_CMD_TEXFUNC, GE_TEXFUNC_REPLACE | 0x100).C(GE_CMD_TEXFILTER, 0x101);
+		dl.C(GE_CMD_ALPHABLENDENABLE, 1).C(GE_CMD_BLENDMODE, GE_BLEND_SRCALPHA | (GE_BLEND_INVSRCALPHA << 4));
+		TTVert verts[2] = {{0, 0, 0xFFFFFFFF, 0, 0, 0, 0}, {512, 512, 0xFFFFFFFF, 480, 272, 0, 0}};
+		memcpy(GPtr(VERTS), verts, sizeof(verts));
+		dl.C(GE_CMD_VERTEXTYPE, VT_T16_C8888_P16);
+		for (int i = 0; i < 4; ++i) dl.Prim(GE_PRIM_RECTANGLES, 2, VERTS);
+		dl.C(GE_CMD_FINISH).C(GE_CMD_END);
+		auto frame = [&] {
+			EnqueueList(dl.start, 0, -1, 0, false); Run(); DrawSync(0);
+			backend->SyncRange(VRAM, 512 * 272 * 4);
+		};
+		for (int i = 0; i < 3; ++i) frame();
+		const auto start = std::chrono::steady_clock::now();
+		for (int i = 0; i < 12; ++i) frame();
+		const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() / 12;
+		printf("  resolution %dx: %.3f ms/frame (4 full-screen wrapped bilinear blended sprites)\n", scale, ms);
+		CHECK(GRead32(VRAM + (136 * 512 + 240) * 4) != 0);
+		SetRenderBackend(nullptr);
 	}
 }
 
