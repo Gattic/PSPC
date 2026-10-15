@@ -74,3 +74,84 @@ this recovery path. Normal fullscreen transitions need not reset the device.
 
 Native Windows execution, exclusive fullscreen, and extended gameplay were not
 validated here. A crash in PSPC's direct D3D11 GE backend still needs its own trace.
+
+## Native Windows follow-up (2026-10-15)
+
+The Windows build was revalidated on an NVIDIA GeForce RTX 4060 Laptop GPU, driver
+32.0.15.8157, with a 1920x1200 desktop and the bundled SDL 2.32.10. The opt-in native
+window fixture runs the actual SDL host loop, substitutes F11 event delivery, and
+checks fullscreen flags and restored window dimensions after each transition:
+
+```bat
+build\RelWithDebInfo\bin\pspc_host_fullscreen_tests.exe windowed 1 sdl
+build\RelWithDebInfo\bin\pspc_host_fullscreen_tests.exe fullscreen 16 d3d11
+```
+
+Both startup modes, both presentation paths (`sdl` and direct `d3d11`), and frame
+scales 1, 4, 8 and 16 passed eight transitions each: 128 transitions, including
+restoration to the original 960x544 window. These use synthetic frames and native
+swapchains; they do not reproduce GPU device removal or exercise physical key delivery.
+
+Daxter also ran fullscreen for 180 seconds at D3D11 scale 8 in the interpreter,
+capturing 17 distinct frames and reporting zero bad guest-memory accesses. Fresh AOT
+builds of Daxter at scale 16 and Combat Ops at scale 8 reached their requested VBlank
+limits with zero bad accesses. Their captured images were 7680x4352 and 3840x2176.
+The visible runs reached menus/save dialogs, so they do not establish sustained
+high-resolution gameplay. Separately, both games matched all 11 existing headless
+software-renderer gameplay checkpoints with fresh native modules.
+
+No crash occurred in these checks. Extended high-resolution gameplay, minimize/restore,
+exclusive fullscreen and forced native Windows device loss remain unverified.
+
+## Ubuntu/WSLg follow-up (2026-10-15)
+
+The same native-window fixture now supports Linux OpenGL presentation. Ubuntu 22.04
+under WSLg, SDL 2.0.20 and a 1920x1200 desktop passed both startup modes, both `sdl`
+and `opengl` presenters, and scales 1, 4, 8 and 16: **128 fullscreen transitions**.
+Each return to windowed mode restored 960x544. The final host change also passed the
+same 128-transition Windows matrix again.
+
+This exposed a startup-fullscreen restore bug in the older SDL/X11 path: creating
+a fullscreen window, or recreating it for SDL's OpenGL presenter, could retain the
+desktop dimensions as the windowed size. The host now creates the requested windowed
+geometry first and preserves its size across fullscreen transitions. The fixture
+waits up to two seconds for asynchronous window-manager geometry changes while
+continuing to pump native events.
+
+WSL's hardware drivers here expose OpenGL 4.1/4.2, and llvmpipe exposes OpenGL 4.5
+without fragment-shader interlock. These OpenGL checks therefore explicitly used
+`LIBGL_ALWAYS_SOFTWARE=1 PSPC_GL_SERIAL_FRAGMENTS=1`. The latter is an opt-in
+verification path that submits one primitive per draw with image-memory barriers;
+the normal renderer still requires ordered fragment interlock. This validates
+software OpenGL execution, not hardware acceleration on a native Linux GPU.
+
+```sh
+export LIBGL_ALWAYS_SOFTWARE=1 PSPC_GL_SERIAL_FRAGMENTS=1 SDL_AUDIODRIVER=dummy
+build/LinuxRuntimeValidation/bin/pspc_host_fullscreen_tests fullscreen 16 opengl
+PSPC_AOT_RENDER_TEST=1 PSPC_RENDERER_REQUIRE=1 \
+  ctest --test-dir build/LinuxRuntimeValidation -V -R '^aot_runtime$'
+```
+
+The AOT runtime probe checked three guest-generated colors, GPU writeback and every
+display-image pixel at 1x, 2x, 4x, 8x and 16x in both native and interpreter modes.
+The 16x image was 7680x4352. Strict OpenGL unit/reference comparisons also passed.
+Evidence is retained in `build/linux-fullscreen-matrix-final.log`,
+`build/validation-linux/fullscreen/`, `build/linux-aot-render.log`, and
+`build/linux-ctest.log`. These synthetic checks do not establish sustained retail
+gameplay, physical key delivery or native GPU performance.
+
+Separate 30-second WSLg fullscreen boot runs of Combat Ops (configured scale 4)
+and Daxter (configured scale 8) completed at their requested timeouts with zero
+bad guest-memory accesses. Their eight and two captures respectively showed boot
+screens at 480x272; these runs do not prove high-resolution retail GE rendering.
+An additional Openbox/Xvfb native-window check passed after the harness waited for
+the window manager to become ready before creating SDL windows. Evidence is under
+`build/validation-linux/retail/`, `build/linux-retail-wslg.log` and
+`build/linux-openbox-ready.log`.
+
+Both retail cases also passed under an isolated Xvfb/Openbox desktop once the
+window manager was ready. Each accepted four F11 events sent through X11, with
+`_NET_WM_STATE_FULLSCREEN` checked after every transition. Both reached their
+30-second timeouts with zero bad accesses; captured frames again showed native-size
+boot screens. See `build/linux-retail-x11-final.log` and
+`build/validation-linux/retail-x11/` for these eight additional transitions.

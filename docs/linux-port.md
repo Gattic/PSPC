@@ -2,8 +2,58 @@
 
 The Linux runtime and native GTK game-library launcher build and pass the scoped checks
 summarized below. The port is **in progress**, not full Windows feature parity or a supported
-release. Windows backends remain in the source tree, but have not been built or tested on
-Windows after these changes.
+release. The 2026-10-15 follow-up below also covers a Windows regression build.
+
+## Ubuntu/WSL revalidation (2026-10-15)
+
+The pulled `985c673` tree plus the local regression fixes built on Ubuntu 22.04
+under WSLg with GCC 11.4. All **33 runtime CTests** passed, including strict OpenGL
+comparisons, AOT pipeline/runtime/loading, relocated packaging, desktop integration,
+launcher paths, network cancellation and SDL device-reset recovery. The PSP suite
+passed **539/559**, with 20 existing known differences, zero unexpected failures and
+zero skips, matching the Windows run. Its final run used a disposable copy on the
+native Linux filesystem; the WSL shared mount produced slow savedata timeouts and
+left stale file-test artifacts. Test outputs and expectations were not relaxed.
+
+The default GTK native-build path additionally required Clang. After installing it,
+the opt-in GTK workflow passed settings/plugins, firmware selection/deletion,
+accounts/server/admin/routing, failed build recovery, native build/play, live native
+rebuild, stop and owned close against a read-only relocated installation. Its AT-SPI
+checks now use role enums so that older libraries' `push button` name works as well.
+Nonfatal GTK notebook/theme warnings were logged by the older desktop libraries.
+
+Installed dependencies include SDL 2.0.20, GTK 3.24.33, OpenGL/FreeType/fontconfig
+development libraries, Clang 14, X11/AT-SPI test tools and the build toolchain.
+Ubuntu 22.04's curl and FFmpeg packages were too old for this runtime. Official curl
+8.23.0 and FFmpeg 8.1.3 sources were built into `/opt/pspc-deps`; source hashes and
+build/install logs are under `build/linux-dependency-source-sha256.txt` and
+`build/linux-*-build.log`. The custom library directory is registered with `ldconfig`.
+Reconfigure using:
+
+```sh
+export PKG_CONFIG_PATH=/opt/pspc-deps/lib/pkgconfig
+cmake -S . -B build/LinuxRuntimeValidation -G Ninja \
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo -DPSPC_BUILD_RUNTIME=ON \
+  -DCMAKE_PREFIX_PATH=/opt/pspc-deps
+cmake --build build/LinuxRuntimeValidation --parallel 4
+```
+
+The older headers exposed two build issues, now fixed: a newer GLib enum alias and
+an unguarded Windows SDL hint. The autotest fixture helper now sets Linux file dates
+and HostFS's creation-time xattr rather than calling Win32 unconditionally.
+
+WSL's available GPU drivers do not satisfy the normal OpenGL renderer's extension
+requirements. Explicit llvmpipe serial-fragment verification passed all strict GPU
+unit cases, 128 native-window fullscreen transitions through 16x, and AOT/interpreter
+render/writeback pixel checks through 7680x4352. See
+[the fullscreen follow-up](fullscreen-validation.md#ubuntuwslg-follow-up-2026-10-15)
+for commands and limits. Native Linux hardware acceleration and sustained retail
+OpenGL gameplay remain unverified in this environment.
+
+Windows also built successfully and passed all 20 CTests, 128 fullscreen transitions
+and the same PSP-suite totals. Evidence for this follow-up is retained locally in
+`build/validation-linux/`, `build/linux-ctest.log`, `build/linux-autotests-native-final.log`
+and `build/remaining-windows-*.log`.
 
 ## Current Linux milestone
 
@@ -1092,4 +1142,5 @@ above remain separate evidence, not outcomes of this GUI run.
 - Validate remaining asset-dependent scripts, distro-native packaging/upgrade integration and
   broader ABI baselines; observe hosted CI/artifact upload before claiming a hosted pass.
   Release distribution/signing remain outside the demonstrated local package gates.
-- Run a Windows build and regression tests before claiming Windows support is preserved.
+- Extend Windows validation beyond the tested RTX 4060 setup, including forced GPU
+  device loss, minimize/restore and extended high-resolution gameplay.
