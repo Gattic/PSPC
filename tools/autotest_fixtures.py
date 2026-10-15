@@ -14,8 +14,10 @@
 """
 
 import ctypes
+import os
 import re
 import struct
+import time
 import zlib
 from ctypes import wintypes
 
@@ -30,7 +32,13 @@ class _SYSTEMTIME(ctypes.Structure):
 
 
 def set_local_time(path, year, month, day, hour, minute, second):
-    """Sets a file's creation and last-write time to a local wall-clock time."""
+    """Set local file times, including HostFS's Linux PSP creation-time metadata."""
+    if os.name != 'nt':
+        # Match HostFS's persistent PSP creation time on Linux.
+        stamp = time.mktime((year, month, day, hour, minute, second, -1, -1, -1))
+        os.utime(path, (stamp, stamp))
+        os.setxattr(path, 'user.pspc.created', struct.pack('=q', round(stamp * 1000000)))
+        return
     k32 = ctypes.WinDLL('kernel32', use_last_error=True)
     k32.CreateFileW.restype = wintypes.HANDLE
     local = _SYSTEMTIME(year, month, 0, day, hour, minute, second, 0)

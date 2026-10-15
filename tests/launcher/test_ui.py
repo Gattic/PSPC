@@ -261,18 +261,18 @@ def main():
                         n
                         for n in reversed(nodes())  # deepest modal wins when buttons share a name
                         if n.get_name() == name
-                        and (role is None or n.get_role_name() == role)
+                        and (role is None or n.get_role() == role)
                     ),
                     None,
                 )
 
             def click(name):
-                node = wait(lambda: find(name, "button"))
+                node = wait(lambda: find(name, Atspi.Role.PUSH_BUTTON))
                 assert Atspi.Action.do_action(node, 0), name
                 time.sleep(0.1)
 
             def text(name, value):
-                node = wait(lambda: find(name, "text") or find(name, "password text"))
+                node = wait(lambda: find(name, Atspi.Role.TEXT) or find(name, Atspi.Role.PASSWORD_TEXT))
                 assert Atspi.EditableText.set_text_contents(node, value), name
 
             def contains(value):
@@ -349,7 +349,7 @@ def main():
                 wait(lambda: contains("Switch to another firmware"))
                 click("Close")
                 def choose_profile(name):
-                    label = wait(lambda: find(name, "label"))
+                    label = wait(lambda: find(name, Atspi.Role.LABEL))
                     row = label.get_parent()
                     assert Atspi.Selection.select_child(row.get_parent(), row.get_index_in_parent())
                 choose_profile("6.61")
@@ -554,6 +554,10 @@ def main():
                     "Read-only relocated GTK UI: firmware selection/deletion safeguards, XDG settings, plugins, local account/server/admin/routing, build-before-play, live native rebuild, native startup/stop and owned close passed"
                 )
             except Exception:
+                for name in ("native-build", "runtime"):
+                    failed_log = state / f"logs/{name}.log"
+                    if failed_log.is_file():
+                        shutil.copy2(failed_log, evidence / f"gtk-failure-{name}.log")
                 if process.poll() is None:
                     with (evidence / "gtk-ui-stack.txt").open("w") as stack:
                         subprocess.run(
