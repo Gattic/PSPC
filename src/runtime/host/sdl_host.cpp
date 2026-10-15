@@ -204,7 +204,6 @@ int Run(const Config &cfg, const std::function<int()> &emulation, const std::fun
 	auto makeRenderer = [&]() {
 		ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | (cfg.vsync ? SDL_RENDERER_PRESENTVSYNC : 0));
 		SDL_RenderSetLogicalSize(ren, 480, 272);
-		tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, 480, 272);
 	};
 	if (!cfg.gpuPresent || !g_hwnd) makeRenderer();
 
@@ -237,9 +236,18 @@ int Run(const Config &cfg, const std::function<int()> &emulation, const std::fun
 	while (!done) {
 		SDL_Event ev;
 		bool screenshot = false;
+		bool present = false;
 		while (SDL_PollEvent(&ev)) {
 			switch (ev.type) {
 			case SDL_QUIT: quit(); break;
+			case SDL_RENDER_DEVICE_RESET:
+				// Fullscreen/resize can reset SDL's device. The texture handle survives, but its
+				// driver resources do not; even a same-size frame must use a new texture.
+				SDL_DestroyTexture(tex);
+				tex = nullptr;
+				present = !shown.empty();  // Restore the last frame even when emulation is paused.
+				LOGI("HOST", "SDL render device reset; recreating the frame texture");
+				break;
 			case SDL_KEYDOWN:
 			case SDL_KEYUP: {
 				SDL_Keycode k = ev.key.keysym.sym;
@@ -303,7 +311,6 @@ int Run(const Config &cfg, const std::function<int()> &emulation, const std::fun
 			}
 		}
 		updateFitScale();
-		bool present = false;
 		{
 			std::lock_guard<std::mutex> lock(g_frameMutex);
 			if (g_frameDirty) {
@@ -319,8 +326,8 @@ int Run(const Config &cfg, const std::function<int()> &emulation, const std::fun
 		if (present && ren) {
 			// A GPU renderer at a render scale above 1 presents larger frames: the texture follows.
 			int texW = 0, texH = 0;
-			SDL_QueryTexture(tex, nullptr, nullptr, &texW, &texH);
-			if ((shownW != texW || shownH != texH) && shownW > 0 && shownH > 0) {
+			if (tex) SDL_QueryTexture(tex, nullptr, nullptr, &texW, &texH);
+			if ((!tex || shownW != texW || shownH != texH) && shownW > 0 && shownH > 0) {
 				SDL_DestroyTexture(tex);
 				tex = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, shownW, shownH);
 				SDL_SetTextureScaleMode(tex, shownW > 480 ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
