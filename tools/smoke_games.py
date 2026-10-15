@@ -16,9 +16,9 @@ look at. A checkpoint passes when its frame is identical to the reference or, fo
 when at most N% of its pixels differ (a screen that animates differently from run to run). Games
 without checkpoints run --seconds of wall time and only report how far they got.
 
-pspc always gets a firmware flash0 (fonts, modules): --flash0, else the one next to pspc.exe if it
-has files, else build/RelWithDebInfo's. Games take other paths without one, so the references note
-the flash0 they were made with and a check with another one says so.
+Firmware roots come from the runtime's selected profile, with --flash0 overriding its read-only
+tree. Discovery/migration runs once before the parallel guests; other user settings remain
+ignored. References record the resolved flash0 so a check with another one says so.
 
 The report lists each game's exit status (crash / timeout / exit), the last frame dumped, how many
 distinct frames there were (a frozen screen shows up as 1-2), the checkpoints, and the first lines
@@ -39,6 +39,9 @@ import sys
 import tempfile
 import zlib
 from functools import reduce
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))  # also with python -I
+from firmware_paths import resolve_firmware  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 EXE_SUFFIX = '.exe' if sys.platform == 'win32' else ''
@@ -88,15 +91,6 @@ def disc_id(pspc_dir, game):
         if line.startswith('DISC_ID='):
             return line.split('=', 1)[1].strip()
     return ''
-
-
-def find_flash0(arg, pspc_dir):
-    if arg:
-        return pathlib.Path(arg).resolve()
-    for d in (pspc_dir / 'flash0', ROOT / 'build' / 'RelWithDebInfo' / 'bin' / 'flash0'):
-        if d.is_dir() and any(d.iterdir()):
-            return d.resolve()
-    return None
 
 
 def read_bmp(path):
@@ -161,8 +155,7 @@ def run_one(args, game, presses, points, flash0):
         seconds = args.seconds
         cmd += ['--dump-every', str(args.every)]
     cmd += ['--timeout', str(seconds)]
-    if flash0:
-        cmd += ['--flash0', str(flash0)]
+    cmd += ['--flash0', str(flash0), '--flash1', args.flash1]
     if args.aot_dir:
         cmd += ['--aot-dir', args.aot_dir]
     if args.interp:
@@ -240,7 +233,7 @@ def record(result, refs, args, flash0):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--pspc', default=str(ROOT / 'build' / 'RelWithDebInfo' / 'bin' / ('pspc' + EXE_SUFFIX)))
-    ap.add_argument('--flash0', help='firmware flash0 (default: next to pspc.exe, else build/RelWithDebInfo)')
+    ap.add_argument('--flash0', help="override flash0 (default: the runtime's selected firmware profile)")
     ap.add_argument('--aot-dir', help='AOT module DLLs (default: pspc\'s own cache)')
     ap.add_argument('--games', default=str(ROOT / 'Games'))
     ap.add_argument('--seconds', type=int, default=45, help='wall time for games without checkpoints')
@@ -256,9 +249,6 @@ def main():
     sys.stdout.reconfigure(errors='backslashreplace')
 
     pspc_dir = pathlib.Path(args.pspc).parent
-    flash0 = find_flash0(args.flash0, pspc_dir)
-    if not flash0:
-        print('warning: no firmware flash0 found; games take other paths without one (--flash0)')
     inputs = load_inputs(ROOT / 'tools' / 'smoke_inputs.txt')
     checkpoints = load_checkpoints(ROOT / 'tools' / 'checkpoints.txt')
     games = [g for g in sorted(pathlib.Path(args.games).rglob('*'))
@@ -267,6 +257,13 @@ def main():
     if not games:
         print('no games found in %s' % args.games)
         return 1
+    try:
+        args.flash0, args.flash1 = resolve_firmware(args.pspc, args.flash0)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        ap.error(str(error))
+    flash0 = pathlib.Path(args.flash0)
+    if not flash0.is_dir() or not any(flash0.iterdir()):
+        print('warning: no firmware files found in %s (--flash0)' % flash0)
     jobs = []
     for g in games:
         did = disc_id(pspc_dir, g).upper()

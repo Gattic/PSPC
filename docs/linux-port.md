@@ -901,7 +901,7 @@ settings/data by default, even in development builds. Windows keeps its existing
 | Root | Default when the XDG variable is unset/empty | PSPC contents |
 | --- | --- | --- |
 | `$XDG_CONFIG_HOME/pspc` | `$HOME/.config/pspc` | `pspc.ini`, user `infrastructure.json` and `infra-dns.json` |
-| `$XDG_DATA_HOME/pspc` | `$HOME/.local/share/pspc` | `ms0`, `ms1`, `flash0`, `flash1`, `Games`, `plugins`, `screenshots`, hosted-server databases in `servers`; `host0` when booting without a program file |
+| `$XDG_DATA_HOME/pspc` | `$HOME/.local/share/pspc` | `ms0`, `ms1`, `firmware/<profile>/flash0`, `firmware/<profile>/flash1`, `Games`, `plugins`, `screenshots`, hosted-server databases in `servers`; `host0` when booting without a program file |
 | `$XDG_CACHE_HOME/pspc` | `$HOME/.cache/pspc` | `aot`, `decrypted`, temporary native-build and firmware work directories |
 | `$XDG_STATE_HOME/pspc` | `$HOME/.local/state/pspc` | launcher/runtime job logs in `logs`, hosted-server logs in `servers` |
 
@@ -924,12 +924,17 @@ On Linux the firmware CLI requires `--data-dir`, and AOT additionally requires e
 GTK supplies these automatically. For a source build, for example:
 
 ```sh
-python3 -I tools/pspc_install_fw.py --fw /path/to/decrypted/firmware \
+python3 -I tools/pspc_install_fw.py --profile 4.01 --fw /path/to/decrypted/firmware \
   --pspc-dir "$PWD/build/LinuxRuntime/bin" --build-dir "$PWD/build/LinuxRuntime" \
   --data-dir "${XDG_DATA_HOME:-$HOME/.local/share}/pspc" \
   --cache "${XDG_CACHE_HOME:-$HOME/.cache}/pspc/aot" \
   --work "${XDG_CACHE_HOME:-$HOME/.cache}/pspc/firmware-work" --aot-core
 ```
+
+Select the installed profile in [Firmware Manager](firmware-manager.md), or use
+`pspc --set firmware=4.01 --vsh` for a one-off boot. Top-level flash trees already in
+the XDG data root are moved to `firmware/default` on first manager/default-path runtime
+use; the manager keeps each profile's registry separate.
 
 #### Existing Linux data: migrate explicitly before using the new defaults
 

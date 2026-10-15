@@ -259,7 +259,7 @@ def main():
                 return next(
                     (
                         n
-                        for n in nodes()
+                        for n in reversed(nodes())  # deepest modal wins when buttons share a name
                         if n.get_name() == name
                         and (role is None or n.get_role_name() == role)
                     ),
@@ -321,15 +321,54 @@ def main():
                 decrypt = binary / "pspc-decrypt"
                 disabled_decrypt = binary / "pspc-decrypt.disabled"
                 move_tool(decrypt, disabled_decrypt)
-                click("Install firmware")
+                click("Firmware Manager")
+                click("Build from update…")
                 wait(lambda: contains("Firmware installation needs pspc-decrypt"))
                 click("Close")
                 move_tool(disabled_decrypt, decrypt)
-                click("Install firmware")
-                wait(lambda: contains("Sony PSP 4.01 update EBOOT.PBP"))
+                click("Build from update…")
+                wait(lambda: contains("Sony PSP update EBOOT.PBP (4.01 recommended)"))
                 click("Cancel")
+                click("Close")
                 assert not (data / "flash0").exists()
                 assert not list(cache.glob("firmware-*"))
+                # Synthetic profiles exercise selection/persistence and both deletion responses.
+                for name in ("4.01", "6.61"):
+                    profile = data / "firmware" / name
+                    vsh = profile / "flash0/vsh/module/vshmain.prx"
+                    vsh.parent.mkdir(parents=True)
+                    vsh.write_bytes(b"synthetic UI fixture")
+                    registry = profile / "flash1/registry/keep"
+                    registry.parent.mkdir(parents=True)
+                    registry.write_bytes(name.encode())
+                click("Firmware Manager")
+                click("Use selected")
+                wait(lambda: contains("4.01 — Active"))
+                assert "firmware=4.01" in (config / "pspc.ini").read_text()
+                click("Delete…")
+                wait(lambda: contains("Switch to another firmware"))
+                click("Close")
+                def choose_profile(name):
+                    label = wait(lambda: find(name, "label"))
+                    row = label.get_parent()
+                    assert Atspi.Selection.select_child(row.get_parent(), row.get_index_in_parent())
+                choose_profile("6.61")
+                click("Use selected")
+                wait(lambda: contains("6.61 — Active"))
+                choose_profile("4.01")
+                click("Delete…")
+                wait(lambda: contains("Permanently delete firmware '4.01'?"))
+                click("Cancel")
+                assert (data / "firmware/4.01/flash1/registry/keep").exists()
+                choose_profile("4.01")
+                click("Delete…")
+                click("Delete permanently")
+                wait(lambda: not (data / "firmware/4.01").exists())
+                assert (data / "firmware/6.61/flash1/registry/keep").read_bytes() == b"6.61"
+                click("Close")
+                click("Firmware Manager")
+                wait(lambda: contains("6.61 — Active"))
+                click("Close")
                 assert "example.prx 1" in (plugins / "game.txt").read_text()
                 click("Online / Servers")
                 click("Start")
@@ -512,7 +551,7 @@ def main():
                 assert (data / "servers/pspc_network.sqlite").is_file()
                 assert (state / "servers/pspc_network.log").is_file()
                 print(
-                    "Read-only relocated GTK UI: XDG settings, plugins, local account/server/admin/routing, build-before-play, live native rebuild, native startup/stop and owned close passed"
+                    "Read-only relocated GTK UI: firmware selection/deletion safeguards, XDG settings, plugins, local account/server/admin/routing, build-before-play, live native rebuild, native startup/stop and owned close passed"
                 )
             except Exception:
                 if process.poll() is None:

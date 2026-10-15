@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Runtime/GTK CLI defaults in a read-only relocated layout and isolated XDG homes."""
 import argparse
+import json
 import os
 from pathlib import Path
 import runpy
@@ -21,6 +22,38 @@ def run(exe, args, env, cwd, expected=0):
     print(result.stdout + result.stderr, end='', flush=True)
     assert result.returncode == expected, (result.returncode, result.stdout, result.stderr)
     return result.stdout + result.stderr
+
+
+def verify_partial_flash_overrides(runtime, game, work):
+    for overrides in (('flash0',), ('flash1',), ('flash0', 'flash1')):
+        home = work / ('override-' + '-'.join(overrides))
+        data = home / 'data/pspc'
+        env = dict(os.environ, HOME=str(home))
+        for key in ('CONFIG', 'DATA', 'CACHE', 'STATE'):
+            env['XDG_' + key + '_HOME'] = str(home / key.lower())
+        for flash in ('flash0', 'flash1'):
+            sentinel = data / flash / 'keep.bin'
+            sentinel.parent.mkdir(parents=True)
+            sentinel.write_bytes(flash.encode())
+        base = ['--config', 'none', '--set', 'network=0', '--set', 'mute=1',
+                '--no-plugins', '--interp', '--headless', '--timeout', '1']
+        explicit = []
+        for flash in overrides:
+            # Relative explicit paths must also keep referring to the original tree.
+            explicit += ['--' + flash, os.path.relpath(data / flash, work)]
+        run(runtime, base + explicit + [game], env, work, expected=124)
+        paths = json.loads(run(runtime, ['--config', 'none', '--firmware-paths'] + explicit, env, work))
+        for flash in ('flash0', 'flash1'):
+            expected = data / flash if flash in overrides else data / 'firmware/default' / flash
+            assert (expected / 'keep.bin').read_bytes() == flash.encode(), 'explicit flash tree was relocated'
+            assert (work / paths[flash]).resolve() == expected
+            unused = data / 'firmware/default' / flash if flash in overrides else data / flash
+            assert not unused.exists(), 'migration touched an overridden tree or left a second live tree'
+        # A later default boot migrates the remaining tree without a conflict or lost settings.
+        run(runtime, base + [game], env, work, expected=124)
+        for flash in ('flash0', 'flash1'):
+            assert (data / 'firmware/default' / flash / 'keep.bin').read_bytes() == flash.encode()
+            assert not (data / flash).exists()
 
 
 def main():
@@ -79,21 +112,35 @@ def main():
                     elf[0x84:0x8D] = b'Synthetic'
                     vsh.write_bytes(elf)
                     installer = install / 'tools/pspc_install_fw.py'
-                    command = ['-I', installer, '--fw', firmware, '--pspc-dir', install]
+                    command = ['-I', installer, '--fw', firmware, '--pspc-dir', install, '--profile', '4.01']
                     run(sys.executable, command + ['--no-aot'], env, work, expected=2)
                     env['CXX'] = str(args.compiler.absolute())
                     run(sys.executable, command + ['--data-dir', roots['DATA'], '--aot-core', '--jobs', '2',
                         '--cache', roots['CACHE'] / 'aot', '--work', roots['CACHE'] / 'firmware-work'], env, work)
-                    assert (roots['DATA'] / 'flash0/vsh/module/vshmain.prx').read_bytes() == elf
-                    assert (roots['DATA'] / 'flash1/registry').is_dir()
+                    profile = roots['DATA'] / 'firmware/4.01'
+                    assert (profile / 'flash0/vsh/module/vshmain.prx').read_bytes() == elf
+                    assert (profile / 'flash1/registry').is_dir()
                     assert list((roots['CACHE'] / 'aot').glob('*.so'))
+                    registry = profile / 'flash1/registry/keep.bin'
+                    registry.write_bytes(b'profile-settings')
+                    run(sys.executable, command + ['--data-dir', roots['DATA'], '--rebuild', '--aot-core', '--jobs', '2',
+                        '--cache', roots['CACHE'] / 'aot', '--work', roots['CACHE'] / 'firmware-work'], env, work)
+                    assert registry.read_bytes() == b'profile-settings'
+                    with config.open('a') as f:
+                        f.write('\nfirmware=4.01\n')
                 with config.open('a') as f:
                     f.write('\ngames_dir=relative games λ\nplugins_dir=plugins\nnetwork=0\naot=0\nmute=1\n')
                 assert str(game) in run(launcher, ['--list'], env, work)
+                active = '4.01' if mode == 'explicit' else 'default'
+                paths = json.loads(run(runtime, ['--firmware-paths'], env, work))
+                assert paths == {flash: str(roots['DATA'] / 'firmware' / active / flash) for flash in ('flash0', 'flash1')}
                 output = run(runtime, ['--headless', '--timeout', '1', game], env, work, expected=124)
                 assert 'Settings from ' + str(config) in output
                 assert (roots['DATA'] / 'ms0/PSP/SAVEDATA').is_dir()
-                assert (roots['DATA'] / 'flash1').is_dir()
+                assert (roots['DATA'] / 'firmware' / active / 'flash1').is_dir()
+                assert not (roots['DATA'] / 'flash1').exists()
+                if mode == 'explicit':
+                    assert not (roots['DATA'] / 'firmware/default').exists(), 'runtime ignored the active profile'
                 # Existing data survives a second boot; explicit CLI roots still take precedence.
                 saved = roots['DATA'] / 'ms0/PSP/SAVEDATA/keep.bin'
                 saved.write_bytes(b'owned-save-sentinel')
@@ -101,6 +148,7 @@ def main():
                 run(runtime, ['--headless', '--timeout', '1', '--memstick', override, game], env, install, expected=124)
                 assert (override / 'PSP/SAVEDATA').is_dir()
                 assert saved.read_bytes() == b'owned-save-sentinel'
+            verify_partial_flash_overrides(runtime, game, work)
             assert not (work / 'relative-must-not-use-cwd').exists()
             assert fixture['snapshot'](install) == before, 'runtime/GTK changed the read-only installation'
         finally:

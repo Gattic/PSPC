@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "common/settings.h"
+#include "common/firmware.h"
 #include "common/app_paths.h"
 
 #include <cstdio>
@@ -120,7 +121,7 @@ std::string JoinList(const std::vector<std::string> &names) {
 }
 
 std::vector<std::string> Keys() {
-	std::vector<std::string> k = {"scale",  "fullscreen", "vsync",  "aot",  "fw",
+	std::vector<std::string> k = {"scale",  "fullscreen", "vsync",  "aot",  "fw", "firmware",
 	                              "renderer", "render_scale", "texture_filter", "texture_upscale", "games_dir", "plugins",
 	                              "plugins_dir", "volume", "mute",
 	                              "network", "adhoc_server", "np_server", "np_online_id", "np_token", "infra_dns",
@@ -167,6 +168,9 @@ bool Set(Settings &s, const std::string &rawKey, const std::string &rawValue, st
 	} else if (key == "adhoc_server") {
 		if (v.empty() || v.find_first_of(" \t/") != std::string::npos) return fail("want a host name or address");
 		s.adhocServer = v;
+	} else if (key == "firmware") {
+		if (!firmware::ValidName(v)) return fail("want a portable firmware profile name (e.g. 4.01)");
+		s.firmware = v;
 	} else if (key == "fw") {
 		if (!ValidFirmware(v)) return fail("want a version like 6.60");
 		s.fw = v;
@@ -235,6 +239,7 @@ std::string Get(const Settings &s, const std::string &key) {
 	if (key == "vsync") return B(s.vsync);
 	if (key == "aot") return B(s.aot);
 	if (key == "fw") return s.fw;
+	if (key == "firmware") return s.firmware;
 	if (key == "renderer") return s.renderer;
 	if (key == "games_dir") return s.gamesDir;
 	if (key == "plugins") return B(s.plugins);
@@ -303,6 +308,8 @@ std::string Template(const Settings &s) {
 	put("aot");
 	t += "\n# Firmware version reported to games.\n";
 	put("fw");
+	t += "\n# Installed firmware profile (separate from the version reported to games).\n";
+	put("firmware");
 	t += "\n# Graphics: renderer software (default, the accuracy reference) or d3d11 (GPU; faster, and\n"
 	     "# render_scale 1-16 renders at that many times the PSP's 480x272: 4 = 1920x1088, 8 = 3840x2176\n"
 	     "# (4K), 16 = 7680x4352 (8K); larger than the window, it is averaged down: supersampling).\n"

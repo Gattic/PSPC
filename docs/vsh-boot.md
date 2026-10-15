@@ -23,9 +23,9 @@ not establish every XMB feature described here or revalidate Windows after the L
 pspc-decrypt.exe psar 401.PBP private\fw\401 --model 02g
 python -I tools\m33extract.py reference\401M33\UPDATE\EBOOT.PBP -o private\fw\401\m33
 :: once per PSPC build tree: copy flash0, prepare flash1, compile the firmware modules
-python -I tools\pspc_install_fw.py --build-dir build\RelWithDebInfo
+python -I tools\pspc_install_fw.py --profile 4.01-m33 --build-dir build\RelWithDebInfo
 :: boot it (or "Boot XMB" in pspc-launcher)
-build\RelWithDebInfo\bin\pspc.exe --vsh
+build\RelWithDebInfo\bin\pspc.exe --set firmware=4.01-m33 --vsh
 ```
 
 UMD images (`.iso/.cso/.zso/.dax`) in `<pspc dir>\ms0\ISO` or in pspc's Games folder
@@ -54,11 +54,14 @@ with AOT DLLs.
 
 ## The install step: `tools/pspc_install_fw.py`
 
-1. Copies `flash0/{vsh,font,dic,data,kd}` of the decrypted firmware into `<pspc dir>\flash0`. The
+Select profiles persistently in [Firmware Manager](firmware-manager.md). The installer stages
+new profiles and refuses to overwrite existing ones; `--rebuild` updates only native code.
+
+1. Copies `flash0/{vsh,font,dic,data,kd}` of the decrypted firmware into `<data dir>\firmware\<profile>\flash0`. The
    kernel modules are never run, but `kd/pspbtcnf_02g.bin` says which modules boot the VSH and
    the XMB loads some drivers by path (they become native placeholders, see below).
 2. Copies M33's `satelite.prx` and `recovery.prx` into `flash0/vsh/module`, as M33's installer does.
-3. Creates `<pspc dir>\flash1\{registry,vsh\theme,dic,net\http,gps}`. `flash1:/registry/init.dat`
+3. Creates `<data dir>\firmware\<profile>\flash1\{registry,vsh\theme,dic,net\http,gps}`. `flash1:/registry/init.dat`
    must not exist (the VSH reads it as "reset the registry"); a stray one is moved aside.
 4. Runs `tools/pspc_build.py` on every user-mode module of `flash0/vsh/module` plus the two M33
    modules (85 modules, about 2 minutes on 14 cores; `--aot-core` builds only the 16 the XMB needs

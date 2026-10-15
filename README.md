@@ -32,7 +32,10 @@ bundled-toolchain instructions below are Windows-only.
    your friends, or points your games at someone else's (or, for GameSpy, at OpenSpy).
    Everything they need comes with PSPC.
 5. Optional: the PSP's own menu (the XMB) needs Sony's firmware, which PSPC can't include. With
-   Sony's PSP system software update 4.01 (its `EBOOT.PBP`), *Boot XMB* installs it. That also
+   Sony's PSP system software update 4.01 (its `EBOOT.PBP`), open **Firmware Manager** and
+   choose **Build from update…**. The manager also rebuilds, switches and deletes named
+   firmware profiles; **Boot XMB** starts the active one. See [Firmware Manager](docs/firmware-manager.md).
+   That also
    brings the PSP's system fonts, which some games draw their text with (without them that text
    doesn't show).
 
@@ -250,8 +253,8 @@ have it:
 
 ```bat
 build\RelWithDebInfo\bin\pspc-decrypt.exe psar 401.PBP private\fw\401 --model 02g
-python -I tools\pspc_install_fw.py                 :: flash0/flash1 + native code for the XMB
-build\RelWithDebInfo\bin\pspc.exe --vsh            :: the real XMB (or "Boot XMB" in the launcher)
+python -I tools\pspc_install_fw.py --profile 4.01  :: flash0/flash1 + native code for the XMB
+build\RelWithDebInfo\bin\pspc.exe --set firmware=4.01 --vsh            :: the real XMB (or "Boot XMB" in the launcher)
 ```
 
 UMD images in `ms0\ISO` show under Game > Memory Stick; SELECT opens M33's VSH menu, `--recovery`

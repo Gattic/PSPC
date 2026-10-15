@@ -2,6 +2,7 @@
 #include "common/fileutil.h"
 #include "common/app_paths.h"
 #include "common/settings.h"
+#include "common/firmware.h"
 #include "frontend/child_process.h"
 #include "frontend/game_library.h"
 #include "frontend/gtk_dialogs.h"
@@ -37,6 +38,7 @@ struct Job {
 	std::string role;
 	frontend::GameInfo game;
 	bool playAfter = false;
+	std::string selectFirmware;
 };
 std::unique_ptr<Job> build, gameJob;
 
@@ -49,9 +51,9 @@ frontend::NativeInfo Native(const frontend::GameInfo &game) {
 	return frontend::InspectNativeCache(apppaths::CacheRoot() / "aot", game, PSPC_SEM_VERSION);
 }
 void Status() {
-	std::string text;
+	std::string text = "Firmware: " + config.firmware + "\n";
 	if (build)
-		text = build->role + ": step " + std::to_string(build->step + 1) + "/" + std::to_string(build->steps.size()) +
+		text += build->role + ": step " + std::to_string(build->step + 1) + "/" + std::to_string(build->steps.size()) +
 			   " — " + build->game.title + "\n";
 	if (auto *game = Selected()) {
 		auto n = Native(*game);
@@ -60,8 +62,8 @@ void Status() {
 		if (!n.error.empty())
 			text += "\n" + n.error;
 	}
-	if (text.empty())
-		text = "Choose a games folder or install firmware to boot the XMB.";
+	if (!Selected() && !build)
+		text += "Choose a games folder or open Firmware Manager to boot the XMB.";
 	gtk_label_set_text(GTK_LABEL(status), text.c_str());
 }
 bool StartStep(Job &job) {
@@ -74,6 +76,10 @@ bool StartStep(Job &job) {
 	return true;
 }
 void LaunchGame(const frontend::GameInfo &game, bool interpreter) {
+	if (build && build->role == "firmware") {
+		Error("Finish or cancel the firmware build before starting a game.");
+		return;
+	}
 	if (gameJob) {
 		Error("Stop the running game before starting another.");
 		return;
@@ -149,60 +155,158 @@ void Play(bool interpreter = false) {
 	else if (answer == 1 || answer == 2)
 		LaunchGame(game, answer == 1);
 }
-void Firmware(bool bootAfter = false) {
+bool Firmware(const std::string &name, bool rebuild) {
 	if (build || gameJob) {
-		Error("Finish the running game/build before installing firmware.");
-		return;
+		Error("Finish the running game/build before changing firmware.");
+		return false;
+	}
+	auto profile = firmware::Profile(apppaths::DataRoot(), name);
+	if (!rebuild && fs::exists(profile)) {
+		Error("That profile already exists. Choose another name or rebuild its native code.");
+		return false;
 	}
 	auto script = resourceDir / "tools/pspc_install_fw.py";
 	if (!fs::is_regular_file(script) || !fs::exists(exeDir / "pspc-decrypt")) {
 		Error("Firmware installation needs pspc-decrypt and tools/pspc_install_fw.py.");
-		return;
+		return false;
 	}
-	auto pbp = gtkui::Choose(GTK_WINDOW(window), "Sony PSP 4.01 update EBOOT.PBP", GTK_FILE_CHOOSER_ACTION_OPEN);
-	if (pbp.empty())
-		return;
+	std::string pbp;
+	if (!rebuild) {
+		pbp = gtkui::Choose(GTK_WINDOW(window), "Sony PSP update EBOOT.PBP (4.01 recommended)", GTK_FILE_CHOOSER_ACTION_OPEN);
+		if (pbp.empty()) return false;
+	}
 	std::error_code ec;
 	fs::create_directories(apppaths::CacheRoot(), ec);
 	if (ec) {
 		Error(ec.message());
-		return;
+		return false;
 	}
-	auto available = fs::space(apppaths::CacheRoot(), ec).available;
-	if (ec || available < 512 * 1024 * 1024) {
-		Error("Firmware installation needs 512 MiB free disk space.");
-		return;
+	if (fs::space(apppaths::CacheRoot()).available < 512 * 1024 * 1024 ||
+		fs::space(apppaths::DataRoot()).available < 512 * 1024 * 1024) {
+		Error("Firmware installation needs 512 MiB free in both the data and cache filesystems.");
+		return false;
 	}
 	std::string temp = (apppaths::CacheRoot() / "firmware-XXXXXX").string();
 	if (!g_mkdtemp(temp.data())) {
 		Error("Cannot create a firmware work directory.");
-		return;
+		return false;
 	}
 	auto job = std::make_unique<Job>();
 	job->role = "firmware";
 	job->cleanup.path = temp;
-	job->playAfter = bootAfter;
-	job->steps.push_back({(exeDir / "pspc-decrypt").string(), "psar", pbp, temp, "--model", "02g"});
+	job->game.title = name;
+	if (!rebuild) {
+		job->selectFirmware = name;
+		job->steps.push_back({(exeDir / "pspc-decrypt").string(), "psar", pbp, temp, "--model", "02g"});
+	}
 	job->steps.push_back({"python3", "-I", "-u", script.string(), "--fw", temp, "--pspc-dir", exeDir.string(),
 		"--data-dir", apppaths::DataRoot().string(), "--cache", (apppaths::CacheRoot() / "aot").string(),
-		"--work", (fs::path(temp) / "aot-work").string()});
+		"--work", (fs::path(temp) / "aot-work").string(), "--profile", name});
+	if (rebuild)
+		job->steps.back().insert(job->steps.back().end(), {"--rebuild", "--force"});
 	bool installed = fs::is_directory(exeDir / "aot");
 	if (installed || fs::exists(exeDir.parent_path() / "lib/libpspc_sem.a")) {
 		job->steps.back().insert(job->steps.back().end(), {"--aot-core", "--jobs", "4", "--modules-in-parallel", "1"});
 		if (!installed)
 			job->steps.back().insert(job->steps.back().end(), {"--build-dir", exeDir.parent_path().string()});
+	} else if (rebuild) {
+		Error("Rebuilding firmware needs the AOT SDK or a PSPC build tree.");
+		return false;
 	} else
 		job->steps.back().push_back("--no-aot");
-	if (StartStep(*job))
-		build = std::move(job);
+	if (!StartStep(*job)) return false;
+	build = std::move(job);
+	Status();
+	return true;
+}
+void FirmwareManager() {
+	if (build || gameJob) {
+		Error("Stop the running game and finish/cancel the build before managing firmware.");
+		return;
+	}
+	try { firmware::Migrate(apppaths::DataRoot()); }
+	catch (const std::exception &error) { Error(error.what()); return; }
+	auto *dialog = gtk_dialog_new_with_buttons("Firmware Manager", GTK_WINDOW(window), GTK_DIALOG_MODAL,
+		"Close", GTK_RESPONSE_CLOSE, "Build from update…", 1, "Rebuild native", 2, "Use selected", 3, "Delete…", 4, nullptr);
+	gtk_window_set_default_size(GTK_WINDOW(dialog), 700, 400);
+	auto *content = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
+	gtk_container_set_border_width(GTK_CONTAINER(content), 12);
+	auto *help = gtk_label_new("Each profile keeps its own PSP settings. Game saves are shared.\n"
+		"PSPC implements 4.01/M33; other OS versions may not boot.\nStop other PSPC instances before changing firmware.");
+	gtk_box_pack_start(GTK_BOX(content), help, FALSE, FALSE, 8);
+	auto *profiles = gtk_list_box_new();
+	auto *scroll = gtk_scrolled_window_new(nullptr, nullptr);
+	gtk_container_add(GTK_CONTAINER(scroll), profiles);
+	gtk_box_pack_start(GTK_BOX(content), scroll, TRUE, TRUE, 8);
+	auto *name = gtk_entry_new();
+	gtk_entry_set_placeholder_text(GTK_ENTRY(name), "New profile name (e.g. 4.01 or 4.01-m33)");
+	gtk_entry_set_text(GTK_ENTRY(name), "4.01");
+	gtk_box_pack_start(GTK_BOX(content), name, FALSE, FALSE, 8);
+	bool done = false;
+	while (!done) {
+		bool responded = false;
+		try {
+			settings::Load(settings::DefaultPath(), config);
+			auto names = firmware::List(apppaths::DataRoot());
+			auto *children = gtk_container_get_children(GTK_CONTAINER(profiles));
+			for (auto *p = children; p; p = p->next) gtk_widget_destroy(GTK_WIDGET(p->data));
+			g_list_free(children);
+			int selected = 0;
+			for (size_t i = 0; i < names.size(); ++i) {
+				bool active = names[i] == config.firmware;
+				auto *label = gtk_label_new((names[i] + (active ? " — Active" : "")).c_str());
+				gtk_widget_set_margin_top(label, 8);
+				gtk_widget_set_margin_bottom(label, 8);
+				gtk_list_box_insert(GTK_LIST_BOX(profiles), label, -1);
+				if (active) selected = (int)i;
+			}
+			gtk_list_box_select_row(GTK_LIST_BOX(profiles), gtk_list_box_get_row_at_index(GTK_LIST_BOX(profiles), selected));
+			for (int response : {2, 3, 4})
+				gtk_dialog_set_response_sensitive(GTK_DIALOG(dialog), response, !names.empty());
+			gtk_widget_show_all(dialog);
+			int response = gtk_dialog_run(GTK_DIALOG(dialog));
+			responded = true;
+			auto *row = gtk_list_box_get_selected_row(GTK_LIST_BOX(profiles));
+			std::string chosen = row ? names.at(gtk_list_box_row_get_index(row)) : "";
+			if (response == 1)
+				done = Firmware(gtk_entry_get_text(GTK_ENTRY(name)), false);
+			else if (response == 2 && !chosen.empty())
+				done = Firmware(chosen, true);
+			else if (response == 3 && !chosen.empty())
+				firmware::Select(apppaths::DataRoot(), settings::DefaultPath(), config, chosen);
+			else if (response == 4 && !chosen.empty()) {
+				if (chosen == config.firmware) throw std::runtime_error("Switch to another firmware before deleting the active version.");
+				auto message = "Permanently delete firmware '" + chosen + "'?\n\n" +
+					firmware::Profile(apppaths::DataRoot(), chosen).string() +
+					"\n\nIts PSP settings/themes will also be deleted. Game saves and the shared native-code cache will be kept.";
+				auto *confirm = gtk_message_dialog_new(GTK_WINDOW(dialog), GTK_DIALOG_MODAL, GTK_MESSAGE_WARNING,
+					GTK_BUTTONS_NONE, "%s", message.c_str());
+				gtk_dialog_add_buttons(GTK_DIALOG(confirm), "Cancel", GTK_RESPONSE_CANCEL, "Delete permanently", GTK_RESPONSE_ACCEPT, nullptr);
+				gtk_dialog_set_default_response(GTK_DIALOG(confirm), GTK_RESPONSE_CANCEL);
+				int answer = gtk_dialog_run(GTK_DIALOG(confirm));
+				gtk_widget_destroy(confirm);
+				if (answer == GTK_RESPONSE_ACCEPT) {
+					settings::Load(settings::DefaultPath(), config);
+					firmware::Delete(apppaths::DataRoot(), config.firmware, chosen);
+				}
+			} else done = true;
+		} catch (const std::exception &error) {
+			gtkui::Message(GTK_WINDOW(dialog), error.what());
+			if (!responded) done = true; // A failed catalog read cannot be fixed by another dialog response.
+		}
+	}
+	gtk_widget_destroy(dialog);
 	Status();
 }
 void Xmb() {
-	if (!fs::exists(apppaths::DataRoot() / "flash0/vsh/module/vshmain.prx")) {
-		Firmware(true);
-		return;
-	}
-	LaunchGame({}, false);
+	try {
+		firmware::Migrate(apppaths::DataRoot());
+		if (!firmware::Installed(apppaths::DataRoot(), config.firmware)) {
+			FirmwareManager();
+			return;
+		}
+		LaunchGame({}, false);
+	} catch (const std::exception &error) { Error(error.what()); }
 }
 gboolean Filter(GtkListBoxRow *row, gpointer) {
 	const auto &game = games.at(gtk_list_box_row_get_index(row));
@@ -289,6 +393,10 @@ gboolean Tick(gpointer) {
 		bool success = job.process.ExitCode() == 0 && !job.process.Cancelled();
 		if (success && !closing && ++job.step < job.steps.size() && StartStep(job))
 			continue;
+		if (success && job.step == job.steps.size() && !job.selectFirmware.empty()) {
+			try { firmware::Select(apppaths::DataRoot(), settings::DefaultPath(), config, job.selectFirmware); }
+			catch (const std::exception &error) { Error(error.what()); }
+		}
 		bool play = success && job.playAfter && !closing && job.step == job.steps.size();
 		auto game = job.game;
 		owner->reset();
@@ -424,7 +532,7 @@ void Show() {
 			gameJob->process.Cancel();
 	});
 	gtkui::Button(actions, "Boot XMB", Xmb);
-	gtkui::Button(actions, "Install firmware", [] { Firmware(); });
+	gtkui::Button(actions, "Firmware Manager", FirmwareManager);
 	gtkui::Button(actions, "Show file", [] {
 		if (auto *game = Selected())
 			OpenPath(game->path.parent_path());

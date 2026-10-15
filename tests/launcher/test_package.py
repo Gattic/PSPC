@@ -123,7 +123,7 @@ def main():
         assert all((prefix / p).is_file() for p in required)
         for path in prefix.rglob('*'):
             assert not path.is_symlink(), path
-            assert path.name not in {'private', 'reference', 'Games', 'ms0', 'flash0', 'flash1', 'pspc.ini',
+            assert path.name not in {'private', 'reference', 'Games', 'ms0', 'firmware', 'flash0', 'flash1', 'pspc.ini',
                                      'build', 'cache', 'servers', '.git', '.pi', '__pycache__'}, path
             assert path.suffix not in {'.elf', '.prx', '.pbp', '.iso', '.cso', '.sqlite', '.pyc', '.log'}, path
         # The source snapshot must contain the actual compiled inputs, including pre-existing dirty edits.

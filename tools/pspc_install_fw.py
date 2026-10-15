@@ -3,18 +3,18 @@
 """Installs a decrypted PSP firmware for pspc: the files the XMB and games read from flash0/flash1,
 and native code for the firmware modules that run as guest code (pspc --vsh).
 
-Usage: pspc_install_fw.py [--fw private/fw/401] [--build-dir build/RelWithDebInfo] [options]
+Usage: pspc_install_fw.py --profile <name> [--fw private/fw/401] [--build-dir build/RelWithDebInfo] [options]
 
 Input: the tree `pspc-decrypt psar 401.PBP <dir>` writes (<dir>/flash0 with every module
 decrypted), and optionally the M33 modules extracted by tools/m33extract.py (<dir>/m33).
 
 What it does:
-  1. Copies flash0/{vsh,font,dic,data,kd} into <data dir>/flash0. The kernel modules (kd) are
+  1. Copies flash0/{vsh,font,dic,data,kd} into <data dir>/firmware/<profile>/flash0. The kernel modules (kd) are
      never run - PSPC's kernel is native - but the boot configuration (pspbtcnf) says which
      modules boot the XMB, and the XMB loads some drivers by path.
   2. Copies M33's user-mode UI modules (satelite.prx = the VSH menu, recovery.prx) into
      flash0/vsh/module, as the M33 installer does.
-  3. Prepares <data dir>/flash1 (registry/, vsh/theme/, ...). flash1/registry/init.dat must not
+  3. Prepares the profile's flash1 (registry/, vsh/theme/, ...). flash1/registry/init.dat must not
      exist: the XMB reads it as "reset the registry".
   4. AOT-compiles the user-mode firmware modules (vsh/module/*.prx, satelite, recovery) with
      tools/pspc_build.py into the AOT cache, so the XMB runs as native code.
@@ -24,10 +24,13 @@ Firmware files are copyrighted: they go only into the (git-ignored) pspc directo
 import argparse
 import filecmp
 import pathlib
+import re
+import signal
 import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 EXE_SUFFIX = '.exe' if sys.platform == 'win32' else ''
@@ -66,6 +69,12 @@ def copy_tree(src, dst, stats):
         stats['copied'] += 1
 
 
+def valid_name(name):
+    # Keep the on-disk name contract in sync with common/firmware.cpp.
+    return (re.fullmatch(r'[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?', name) is not None
+            and re.fullmatch(r'(con|prn|aux|nul|com[0-9]|lpt[0-9])', name.split('.')[0]) is None)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     ap.add_argument('--fw', default=str(ROOT / 'private' / 'fw' / '401'),
@@ -74,7 +83,9 @@ def main():
     ap.add_argument('--build-dir', default=None,
                     help='build tree with pspc and pspc-recomp (default: build/RelWithDebInfo)')
     ap.add_argument('--pspc-dir', default=None, help='PSPC executables/installed SDK (default: auto-detect or <build dir>/bin)')
-    ap.add_argument('--data-dir', help='writable parent of flash0/flash1 (required on Linux; Windows default: <pspc dir>)')
+    ap.add_argument('--data-dir', help='writable PSPC data root (required on Linux; Windows default: <pspc dir>)')
+    ap.add_argument('--profile', required=True, help='new firmware name, e.g. 4.01 or 4.01-m33; never overwrites an installation')
+    ap.add_argument('--rebuild', action='store_true', help='build native code for an installed profile without changing its flash files')
     ap.add_argument('--cache', default=None, help='AOT cache (default: <pspc dir>/cache/aot)')
     ap.add_argument('--work', default=None, help='pspc_build.py work directory')
     ap.add_argument('--no-aot', action='store_true', help='copy files only')
@@ -91,19 +102,43 @@ def main():
         if not args.no_aot and (not args.cache or not args.work):
             ap.error('Linux firmware AOT requires writable --cache and --work paths')
 
-    fw = pathlib.Path(args.fw)
-    flash0 = fw / 'flash0'
-    vshmain = flash0 / 'vsh' / 'module' / 'vshmain.prx'
-    if not vshmain.exists():
-        sys.exit('%s not found: give --fw the directory pspc-decrypt psar wrote' % vshmain)
-    if module_info(vshmain.read_bytes()) is None:
-        sys.exit('%s is not a decrypted module (run pspc-decrypt psar on the update first)' % vshmain)
+    if not valid_name(args.profile):
+        ap.error('invalid profile name: use 1-64 lowercase letters, digits, dots, hyphens or underscores; start/end with a letter or digit')
+    if args.rebuild and args.no_aot:
+        ap.error('--rebuild cannot be combined with --no-aot')
     build = pathlib.Path(args.build_dir) if args.build_dir else ROOT / 'build' / 'RelWithDebInfo'
     pspc_dir = pathlib.Path(args.pspc_dir) if args.pspc_dir else (ROOT if (ROOT / ('pspc' + EXE_SUFFIX)).is_file() else build / 'bin')
-    data_dir = pathlib.Path(args.data_dir) if args.data_dir else pspc_dir
+    data_root = pathlib.Path(args.data_dir) if args.data_dir else pspc_dir
+    store = data_root / 'firmware'
+    destination = store / args.profile
+    if store.is_symlink() or destination.is_symlink():
+        ap.error('firmware store/profile must not be a symbolic link')
+    if args.rebuild:
+        return install(args, destination, destination, build, pspc_dir)
+    if destination.exists():
+        ap.error('profile already exists; use --rebuild or choose a different name')
+    store.mkdir(parents=True, exist_ok=True)
+    # Publish only a complete install, on the same filesystem. Failed/cancelled builds leave
+    # the existing selection and every installed profile unchanged.
+    with tempfile.TemporaryDirectory(prefix='.building-' + args.profile + '-', dir=store) as temp:
+        rc = install(args, pathlib.Path(args.fw), pathlib.Path(temp), build, pspc_dir)
+        if rc:
+            return rc
+        if destination.exists() or destination.is_symlink():
+            ap.error('profile appeared during the build; refusing to overwrite it')
+        pathlib.Path(temp).rename(destination)
+    print('Installed firmware profile: %s (select it in Firmware Manager)' % args.profile)
+    return 0
+
+
+def install(args, fw, data_dir, build, pspc_dir):
+    flash0 = fw / 'flash0'
+    vshmain = flash0 / 'vsh/module/vshmain.prx'
+    if not vshmain.is_file() or module_info(vshmain.read_bytes()) is None:
+        raise ValueError('%s is missing or not a decrypted module' % vshmain)
     bundled = not args.build_dir and (pspc_dir / 'aot').is_dir()
-    if not (pspc_dir / ('pspc' + EXE_SUFFIX)).exists():
-        print('warning: no pspc%s in %s' % (EXE_SUFFIX, pspc_dir))
+    if args.rebuild:
+        return build_native(args, data_dir / 'flash0', build, pspc_dir, bundled)
 
     # 1. flash0
     dst0 = data_dir / 'flash0'
@@ -140,7 +175,11 @@ def main():
     if args.no_aot:
         return 0
 
-    # 4. Native code for the user-mode firmware modules.
+    return build_native(args, dst0, build, pspc_dir, bundled)
+
+
+def build_native(args, dst0, build, pspc_dir, bundled):
+    # 4. Native code for the user-mode firmware modules. Rebuilding never touches flash1.
     modules = []
     for p in sorted((dst0 / 'vsh' / 'module').glob('*.prx')):
         info = module_info(p.read_bytes())
@@ -170,4 +209,12 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    def cancelled(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, cancelled)
+    try:
+        sys.exit(main())
+    except (OSError, ValueError) as error:
+        sys.exit(str(error))
+    except KeyboardInterrupt:
+        sys.exit(130)

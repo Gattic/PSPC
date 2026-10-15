@@ -41,6 +41,13 @@ if(TARGET pspc-launcher AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
 	target_compile_definitions(pspc_unittests PRIVATE PSPC_TEST_LAUNCHER=1)
 endif()
 add_test(NAME unittests COMMAND pspc_unittests)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(NAME firmware_manager COMMAND ${Python3_EXECUTABLE} -I
+	${CMAKE_CURRENT_SOURCE_DIR}/tools/test_firmware_manager.py)
+set_tests_properties(firmware_manager PROPERTIES TIMEOUT 30)
+add_test(NAME firmware_discovery COMMAND ${Python3_EXECUTABLE} -I
+	${CMAKE_CURRENT_SOURCE_DIR}/tools/test_firmware_discovery.py)
+set_tests_properties(firmware_discovery PROPERTIES TIMEOUT 30)
 
 if(TARGET pspc_runtime)
 	add_executable(pspc_host_audio_tests host/test_audio.cpp)

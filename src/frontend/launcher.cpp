@@ -44,6 +44,8 @@ using std::min;
 
 #include "common/fileutil.h"
 #include "common/settings.h"
+#include "common/firmware.h"
+#include "frontend/dialog_util.h"
 #include "frontend/game_library.h"
 #include "frontend/native_cache.h"
 #include "frontend/network_dialog.h"
@@ -73,6 +75,7 @@ enum : int {
 	ID_OPEN_FOLDER,
 	ID_SETTINGS,
 	ID_BOOT_XMB,
+	ID_FIRMWARE,
 	ID_PLUGINS,
 	ID_NETWORK,
 	ID_LIBRARY,
@@ -104,12 +107,14 @@ struct BuildJob {
 	fs::path game;
 	bool playAfter;
 	bool firmware = false;  // installing the PSP firmware, not building a game
+	std::string selectFirmware;
 };
 
 HWND g_main = nullptr, g_list = nullptr, g_detail = nullptr;
 HIMAGELIST g_images = nullptr;
 std::vector<Game> g_games;
 std::vector<BuildJob> g_jobs;
+std::vector<HANDLE> g_guests;
 fs::path g_gamesDir, g_exeDir;
 settings::Settings g_settings;
 
@@ -372,6 +377,26 @@ bool CanBuild() {
 	return true;
 }
 
+void LaunchGuest(const std::wstring &args) {
+	for (const auto &job : g_jobs) {
+		if (job.firmware) {
+			MessageBoxW(g_main, L"Finish the firmware build before starting a game.", L"PSPC", MB_ICONINFORMATION);
+			return;
+		}
+	}
+	HANDLE process = nullptr;
+	if (Launch((g_exeDir / "pspc.exe").wstring(), args, false, &process)) g_guests.push_back(process);
+}
+
+bool FirmwareBusy() {
+	for (size_t i = 0; i < g_guests.size();) {
+		if (WaitForSingleObject(g_guests[i], 0) != WAIT_OBJECT_0) { ++i; continue; }
+		CloseHandle(g_guests[i]);
+		g_guests.erase(g_guests.begin() + i);
+	}
+	return !g_guests.empty() || !g_jobs.empty();
+}
+
 void Play(int idx, bool interp, bool offerBuild = true) {
 	if (idx < 0) return;
 	const Game &g = g_games[idx];
@@ -405,13 +430,13 @@ void Play(int idx, bool interp, bool offerBuild = true) {
 		}
 	}
 	std::wstring args = (interp ? L"--interp \"" : L"\"") + g.path.wstring() + L"\"";
-	Launch((g_exeDir / "pspc.exe").wstring(), args, false);
+	LaunchGuest(args);
 }
 
 // The firmware's XMB (pspc --vsh): needs tools\pspc_install_fw.py to have installed it.
 bool XmbInstalled() {
-	std::error_code ec;
-	return fs::exists(g_exeDir / "flash0" / "vsh" / "module" / "vshmain.prx", ec);
+	try { return firmware::Installed(g_exeDir, g_settings.firmware); }
+	catch (const std::exception &) { return false; }
 }
 
 // A file chosen with the Windows file dialog ("" if cancelled). filter: pairs of name, pattern.
@@ -439,40 +464,137 @@ fs::path PickFile(const wchar_t *title, const std::vector<COMDLG_FILTERSPEC> &fi
 	return out;
 }
 
-// Installs the PSP firmware from Sony's 4.01 update (its EBOOT.PBP): decrypted with pspc-decrypt into a
-// temporary folder, then tools\pspc_install_fw.py copies what the XMB needs next to pspc.exe (and builds
-// its native code when this copy of PSPC can). Runs in a console window, which shows the progress.
-void InstallFirmware() {
+// Build a new profile atomically, or rebuild only its native modules. Progress stays in its console.
+bool InstallFirmware(const std::string &name, bool rebuild) {
+	if (FirmwareBusy()) throw std::runtime_error("Stop running games and finish builds before managing firmware.");
+	auto profile = firmware::Profile(g_exeDir, name);
+	if (!rebuild && fs::exists(profile)) throw std::runtime_error("Profile already exists. Choose another name or rebuild it.");
 	fs::path script = FindUp(g_exeDir, fs::path("tools") / "pspc_install_fw.py");
 	std::wstring python = servers::PythonCommand();
-	std::error_code ec;
-	if (script.empty() || python.empty() || !fs::exists(g_exeDir / "pspc-decrypt.exe", ec)) {
-		MessageBoxW(g_main,
-		            L"This copy of PSPC can't install the firmware: it needs pspc-decrypt.exe, tools\\pspc_install_fw.py and "
-		            L"Python (an installed PSPC has them all).",
-		            L"PSPC", MB_ICONWARNING);
-		return;
+	if (script.empty() || python.empty() || !fs::exists(g_exeDir / "pspc-decrypt.exe"))
+		throw std::runtime_error("Firmware installation needs pspc-decrypt, tools/pspc_install_fw.py and Python.");
+	fs::path pbp;
+	if (!rebuild) {
+		pbp = PickFile(L"Sony PSP update EBOOT.PBP (4.01 recommended)", {{L"PSP update", L"*.PBP"}, {L"All files", L"*.*"}}, false);
+		if (pbp.empty()) return false;
 	}
-	fs::path pbp = PickFile(L"Sony's PSP system software update 4.01 (EBOOT.PBP)", {{L"PSP update (EBOOT.PBP)", L"*.PBP"}, {L"All files", L"*.*"}},
-	                        false);
-	if (pbp.empty()) return;
-	wchar_t temp[MAX_PATH] = {};
-	GetTempPathW(MAX_PATH, temp);
-	fs::path work = fs::path(temp) / ("pspc_firmware_" + std::to_string(GetCurrentProcessId()));
-	std::wstring args = L"--fw \"" + work.wstring() + L"\" --pspc-dir \"" + g_exeDir.wstring() + L"\"";
 	fs::path tree = g_exeDir.parent_path();
-	if (CanBuild() && BundledAot()) args += L" --aot-core";
-	else if (CanBuild() && fs::exists(tree / "lib" / "pspc_sem.lib", ec)) args += L" --build-dir \"" + tree.wstring() + L"\" --aot-core";
-	else args += L" --no-aot";
-	std::wstring steps = L"title Installing the PSP firmware for PSPC && echo Decrypting the update... && \"" + (g_exeDir / "pspc-decrypt.exe").wstring() +
-	                     L"\" psar \"" + pbp.wstring() + L"\" \"" + work.wstring() + L"\" --model 02g && echo. && echo Installing... && " + python +
-	                     L" -I -B -X utf8 \"" + script.wstring() + L"\" " + args;
-	std::wstring tail = L" & set \"rc=!errorlevel!\" & rmdir /s /q \"" + work.wstring() + L"\" 2>nul & if !rc! neq 0 (echo. & echo The install failed. & pause) & exit !rc!";
+	bool aot = CanBuild() && (BundledAot() || fs::exists(tree / "lib/pspc_sem.lib"));
+	if (rebuild && !aot) throw std::runtime_error("Rebuilding needs the AOT SDK or PSPC build tree.");
+	if (fs::space(g_exeDir).available < 512 * 1024 * 1024 || fs::space(fs::temp_directory_path()).available < 512 * 1024 * 1024)
+		throw std::runtime_error("Firmware builds need 512 MiB free in the data and temporary filesystems.");
+	wchar_t temp[MAX_PATH] = {}, unique[MAX_PATH] = {};
+	if (!GetTempPathW(MAX_PATH, temp) || !GetTempFileNameW(temp, L"psf", 0, unique))
+		throw std::runtime_error("Cannot create firmware work directory.");
+	fs::path work = unique;
+	fs::remove(work);
+	fs::create_directory(work);
+	std::wstring args = L"--fw \"" + work.wstring() + L"\" --pspc-dir \"" + g_exeDir.wstring() +
+		L"\" --data-dir \"" + g_exeDir.wstring() + L"\" --profile " + Widen(name) +
+		L" --work \"" + (work / "aot-work").wstring() + L"\" --cache \"" + CacheDir().wstring() + L"\"";
+	if (aot) {
+		args += L" --aot-core --jobs 4 --modules-in-parallel 1";
+		if (!BundledAot()) args += L" --build-dir \"" + tree.wstring() + L"\"";
+	} else args += L" --no-aot";
+	if (rebuild) args += L" --rebuild --force";
+	std::wstring steps = L"title Building PSP firmware && ";
+	if (!rebuild) steps += L"\"" + (g_exeDir / "pspc-decrypt.exe").wstring() + L"\" psar \"" + pbp.wstring() +
+		L"\" \"" + work.wstring() + L"\" --model 02g && ";
+	steps += python + L" -I -B -X utf8 \"" + script.wstring() + L"\" " + args;
+	std::wstring tail = L" & set \"rc=!errorlevel!\" & rmdir /s /q \"" + work.wstring() +
+		L"\" 2>nul & if !rc! neq 0 (echo. & echo The build failed. & pause) & exit !rc!";
 	HANDLE process = nullptr;
-	if (!Launch(L"C:\\Windows\\System32\\cmd.exe", L"/v:on /c \"" + steps + tail + L"\"", true, &process)) return;
-	g_jobs.push_back({process, fs::path(), false, true});
+	if (!Launch(L"C:\\Windows\\System32\\cmd.exe", L"/v:on /c \"" + steps + tail + L"\"", true, &process)) {
+		fs::remove_all(work);
+		return false;
+	}
+	g_jobs.push_back({process, {}, false, true, rebuild ? "" : name});
 	SetTimer(g_main, ID_TIMER_JOBS, 500, nullptr);
 	UpdateUi();
+	return true;
+}
+
+struct FirmwareDialog {
+	std::vector<std::string> names;
+	void Refresh(HWND dlg) {
+		settings::Load(settings::DefaultPath(), g_settings);
+		names = firmware::List(g_exeDir);
+		SendDlgItemMessageW(dlg, 1001, LB_RESETCONTENT, 0, 0);
+		int selected = 0;
+		for (size_t i = 0; i < names.size(); ++i) {
+			bool active = names[i] == g_settings.firmware;
+			auto text = Widen(names[i]) + (active ? L" — Active" : L"");
+			SendDlgItemMessageW(dlg, 1001, LB_ADDSTRING, 0, (LPARAM)text.c_str());
+			if (active) selected = (int)i;
+		}
+		SendDlgItemMessageW(dlg, 1001, LB_SETCURSEL, selected, 0);
+		for (int id : {1004, 1005, 1006}) EnableWindow(GetDlgItem(dlg, id), !names.empty());
+	}
+};
+INT_PTR CALLBACK FirmwareProc(HWND dlg, UINT msg, WPARAM wp, LPARAM lp) {
+	auto *state = (FirmwareDialog *)GetWindowLongPtrW(dlg, DWLP_USER);
+	try {
+		if (msg == WM_INITDIALOG) {
+			state = (FirmwareDialog *)lp;
+			SetWindowLongPtrW(dlg, DWLP_USER, lp);
+			using dlgutil::Control;
+			Control(dlg, L"STATIC", L"Each profile has separate PSP settings; game saves are shared.\nPSPC implements 4.01/M33; other OS versions may not boot.\nStop other PSPC instances before changing firmware.", SS_LEFT, 10, 8, 380, 38, -1);
+			Control(dlg, L"LISTBOX", L"", LBS_NOTIFY | WS_VSCROLL | WS_BORDER | WS_TABSTOP, 10, 50, 380, 112, 1001);
+			Control(dlg, L"STATIC", L"New profile name (e.g. 4.01 or 4.01-m33):", SS_LEFT, 10, 172, 270, 12, -1);
+			Control(dlg, L"EDIT", L"4.01", ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, 10, 188, 380, 15, 1002);
+			Control(dlg, L"BUTTON", L"Build from update...", WS_TABSTOP, 10, 218, 90, 18, 1003);
+			Control(dlg, L"BUTTON", L"Rebuild native", WS_TABSTOP, 104, 218, 76, 18, 1004);
+			Control(dlg, L"BUTTON", L"Use selected", WS_TABSTOP, 184, 218, 72, 18, 1005);
+			Control(dlg, L"BUTTON", L"Delete...", WS_TABSTOP, 260, 218, 60, 18, 1006);
+			Control(dlg, L"BUTTON", L"Close", WS_TABSTOP | BS_DEFPUSHBUTTON, 330, 218, 60, 18, IDCANCEL);
+			state->Refresh(dlg);
+			ui::ThemeDialog(dlg);
+			return TRUE;
+		}
+		if (msg == WM_COMMAND) {
+			int id = LOWORD(wp);
+			if (id == IDCANCEL) { EndDialog(dlg, 0); return TRUE; }
+			if (id < 1003 || id > 1006) return FALSE;
+			if (FirmwareBusy()) throw std::runtime_error("Stop running games and finish builds before managing firmware.");
+			int selected = (int)SendDlgItemMessageW(dlg, 1001, LB_GETCURSEL, 0, 0);
+			std::string name = selected >= 0 ? state->names.at(selected) : "";
+			if (id == 1003) {
+				wchar_t text[128] = {};
+				GetDlgItemTextW(dlg, 1002, text, 128);
+				if (InstallFirmware(PathToUtf8(fs::path(text)), false)) EndDialog(dlg, 0);
+			} else if (id == 1004 && !name.empty()) {
+				if (InstallFirmware(name, true)) EndDialog(dlg, 0);
+			} else if (id == 1005 && !name.empty()) {
+				firmware::Select(g_exeDir, settings::DefaultPath(), g_settings, name);
+				state->Refresh(dlg);
+			} else if (id == 1006 && !name.empty()) {
+				settings::Load(settings::DefaultPath(), g_settings);
+				if (name == g_settings.firmware) throw std::runtime_error("Switch to another firmware before deleting the active version.");
+				auto message = L"Permanently delete firmware '" + Widen(name) + L"'?\n\n" + firmware::Profile(g_exeDir, name).wstring() +
+					L"\n\nIts PSP settings/themes will be deleted. Game saves and the shared native-code cache will be kept.";
+				if (MessageBoxW(dlg, message.c_str(), L"Delete firmware", MB_YESNO | MB_DEFBUTTON2 | MB_ICONWARNING) == IDYES) {
+					settings::Load(settings::DefaultPath(), g_settings);
+					firmware::Delete(g_exeDir, g_settings.firmware, name);
+					state->Refresh(dlg);
+				}
+			}
+			return TRUE;
+		}
+	} catch (const std::exception &error) {
+		MessageBoxW(dlg, Widen(error.what()).c_str(), L"Firmware Manager", MB_ICONERROR);
+		if (msg == WM_INITDIALOG) EndDialog(dlg, 0);
+	}
+	return FALSE;
+}
+void FirmwareManager() {
+	try {
+		if (FirmwareBusy()) throw std::runtime_error("Stop running games and finish builds before managing firmware.");
+		firmware::Migrate(g_exeDir);
+		FirmwareDialog state;
+		auto tmpl = dlgutil::Template(L"Firmware Manager", 400, 246);
+		DialogBoxIndirectParamW(GetModuleHandleW(nullptr), (LPCDLGTEMPLATEW)tmpl.data(), g_main, FirmwareProc, (LPARAM)&state);
+		UpdateUi();
+	} catch (const std::exception &error) { MessageBoxW(g_main, Widen(error.what()).c_str(), L"Firmware Manager", MB_ICONERROR); }
 }
 
 void BootXmb() {
@@ -486,12 +608,12 @@ void BootXmb() {
 		                    L"The PSP's own menu (the XMB) needs Sony's PSP firmware, which PSPC can't come with. Games play "
 		                    L"without it, though the ones that use the PSP's system fonts show their text only with it.\n\n"
 		                    L"If you have Sony's PSP system software update 4.01 (its EBOOT.PBP), PSPC can install the "
-		                    L"firmware from it now.\n\nChoose the update file?",
+		                    L"firmware from it now.\n\nOpen Firmware Manager?",
 		                    L"PSPC", MB_YESNO | MB_ICONINFORMATION);
-		if (r == IDYES) InstallFirmware();
+		if (r == IDYES) FirmwareManager();
 		return;
 	}
-	Launch((g_exeDir / "pspc.exe").wstring(), L"--vsh", false);
+	LaunchGuest(L"--vsh");
 }
 
 // Polls the running builds; refreshes the status and starts games waiting for theirs.
@@ -507,9 +629,13 @@ void PollJobs() {
 		BuildJob job = g_jobs[i];
 		g_jobs.erase(g_jobs.begin() + i);
 		if (job.firmware) {
+			if (code == 0) {
+				try {
+					if (!job.selectFirmware.empty()) firmware::Select(g_exeDir, settings::DefaultPath(), g_settings, job.selectFirmware);
+					MessageBoxW(g_main, L"Firmware build completed. Use Firmware Manager to switch versions; Boot XMB starts the selected PSP OS.", L"PSPC", MB_ICONINFORMATION);
+				} catch (const std::exception &error) { MessageBoxW(g_main, Widen(error.what()).c_str(), L"Firmware Manager", MB_ICONERROR); }
+			}
 			UpdateUi();
-			if (code == 0 && XmbInstalled())
-				MessageBoxW(g_main, L"The PSP firmware is installed. Boot XMB starts the PSP's menu.", L"PSPC", MB_ICONINFORMATION);
 			continue;
 		}
 		RefreshNative();
@@ -1173,6 +1299,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		ReloadSettings();
 		g_nav.push_back(MakeButton(hwnd, ID_LIBRARY, L"Games", ui::Look::NavActive, ui::kIconGames));
 		g_nav.push_back(MakeButton(hwnd, ID_BOOT_XMB, L"Boot XMB", ui::Look::Nav, ui::kIconXmb, L""));
+		g_nav.push_back(MakeButton(hwnd, ID_FIRMWARE, L"Firmware Manager", ui::Look::Nav, ui::kIconBuild, L"Build, switch, delete"));
 		g_nav.push_back(MakeButton(hwnd, ID_PLUGINS, L"Plugins", ui::Look::Nav, ui::kIconPlugins, L"M33 plugins"));
 		g_nav.push_back(MakeButton(hwnd, ID_SETTINGS, L"Settings", ui::Look::Nav, ui::kIconSettings, L"Video, audio, controls"));
 		g_nav.push_back(MakeButton(hwnd, ID_ONLINE, L"Online", ui::Look::Nav, ui::kIconGlobe, L"Servers and sign-in"));
@@ -1312,6 +1439,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		case ID_PLUGINS: OpenPlugins(); break;
 		case ID_NETWORK: OpenNetwork(); break;
 		case ID_BOOT_XMB: BootXmb(); break;
+		case ID_FIRMWARE: FirmwareManager(); break;
 		case ID_LIBRARY: ShowPage(false); return 0;
 		case ID_ONLINE: ShowPage(true); return 0;
 		case ID_CHOOSE_GAMES: ChooseGamesFolder(); break;
@@ -1575,6 +1703,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int show) {
 		TranslateMessage(&m);
 		DispatchMessageW(&m);
 	}
+	for (HANDLE process : g_guests) CloseHandle(process);
 	g_games.clear();  // GDI+ bitmaps, before GDI+ goes away
 	Gdiplus::GdiplusShutdown(token);
 	return 0;

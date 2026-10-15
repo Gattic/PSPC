@@ -110,7 +110,7 @@ TOP_FILES = set(BINARIES) | {'README.md', 'LICENSE.txt', 'THIRD_PARTY.md'}
 TOP_DIRS = {'data', 'server', 'tools', 'python', 'docs', 'Games', 'plugins', 'aot'}
 SERVER_PACKAGES = ('pspc_network', 'pspc_medius', 'pspc_gamespy')
 # What pspc and the developer keep in bin\ (and what PSPC writes at run time): never packaged.
-FORBIDDEN_NAMES = {'flash0', 'flash1', 'ms0', 'cache', 'pspc.ini', 'screenshots', 'servers',
+FORBIDDEN_NAMES = {'firmware', 'flash0', 'flash1', 'ms0', 'cache', 'pspc.ini', 'screenshots', 'servers',
                    'pspc_unittests.exe', 'pspc_decrypt_tests.exe'}
 FORBIDDEN_SUFFIXES = {'.pdb', '.ilk', '.exp', '.lib', '.sqlite', '.sqlite-wal', '.sqlite-shm', '.log'}
 

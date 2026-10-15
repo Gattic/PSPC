@@ -246,20 +246,24 @@ Notes for that run:
 ## 7b. Installing the firmware for pspc -- `tools/pspc_install_fw.py`
 
 Copies the decrypted firmware's `flash0/{vsh,font,dic,data,kd}` and optional M33
-`satelite.prx` / `recovery.prx` into `flash0`, prepares `flash1`, and AOT-compiles the
+`satelite.prx` / `recovery.prx` into a named profile's `flash0`, prepares its `flash1`, and AOT-compiles the
 user-mode modules of `flash0/vsh/module` with `tools/pspc_build.py`. Then `pspc --vsh` boots
 the XMB ([VSH boot](vsh-boot.md)).
 
-On Linux, `--data-dir` is required for the writable parent of `flash0`/`flash1`; firmware AOT
+Profiles live under `<data dir>/firmware/<profile>`. Use [Firmware Manager](firmware-manager.md)
+to build, select, rebuild or delete them. The CLI requires `--profile`; existing names are
+not overwritten. Use `--rebuild` to update native code without resetting PSP settings.
+
+On Linux, `--data-dir` is required for the writable data root; firmware AOT
 also requires explicit writable `--cache` and `--work` paths. Use the runtime's
 [XDG user-data/cache roots](linux-port.md#linux-runtime-and-gtk-user-data-paths), not the installed
 executable directory. `--build-dir` or `--pspc-dir` selects the build/installed SDK separately.
 On Windows, the data directory defaults to `<pspc dir>`; the original examples below use that default:
 
 ```
-PY -I tools/pspc_install_fw.py --fw private/fw/401 --build-dir build/RelWithDebInfo
-PY -I tools/pspc_install_fw.py --aot-core      REM 14 Sony core modules, plus 2 M33 UI modules when present
-PY -I tools/pspc_install_fw.py --no-aot        REM files only
+PY -I tools/pspc_install_fw.py --profile 4.01 --fw private/fw/401 --build-dir build/RelWithDebInfo
+PY -I tools/pspc_install_fw.py --profile 4.01 --rebuild --aot-core  REM core native modules only
+PY -I tools/pspc_install_fw.py --profile 4.01-files --no-aot       REM new files-only profile
 ```
 
 `pspc-decrypt prx` also decrypts the XMB's index (`flash0/vsh/etc/index.dat`, a `PSPsysGP`

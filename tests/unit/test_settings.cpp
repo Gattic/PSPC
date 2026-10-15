@@ -64,6 +64,9 @@ TEST(settings_set_validates) {
 	CHECK(!settings::Set(s, "vsync", "maybe"));
 	CHECK(settings::Set(s, "fw", "5.50") && s.fw == "5.50");
 	CHECK(!settings::Set(s, "fw", "6.6") && !settings::Set(s, "fw", "x.yz") && s.fw == "5.50");
+	CHECK(settings::Set(s, "firmware", "4.01-m33") && s.firmware == "4.01-m33");
+	CHECK(!settings::Set(s, "firmware", "../outside") && s.firmware == "4.01-m33");
+	CHECK(settings::Get(s, "firmware") == "4.01-m33");
 	CHECK(settings::Set(s, "volume", "0") && s.volume == 0);
 	CHECK(settings::Set(s, "volume", "mute") && s.mute && s.volume == 0);
 	CHECK(!settings::Set(s, "volume", "101"));
@@ -103,12 +106,14 @@ TEST(settings_load_and_save_round_trip) {
 	fs::path ini = TempIni("new.ini");
 	settings::Settings s;
 	s.scale = 4;
+	s.firmware = "4.01";
 	s.keys[Index("cross")] = "Right Ctrl";
 	CHECK(settings::Save(ini, s));
 	settings::Settings back;
 	std::vector<std::string> warnings;
 	CHECK(settings::Load(ini, back, &warnings));
 	CHECK(warnings.empty());
+	CHECK(back.firmware == "4.01");
 	CHECK(back.scale == 4 && back.keys[Index("cross")] == "Right Ctrl" && back.keys == s.keys && back.pads == s.pads);
 	settings::Settings missing;
 	CHECK(!settings::Load(TempIni("missing.ini"), missing));

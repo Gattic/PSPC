@@ -5,6 +5,7 @@ add_library(pspc_common STATIC
 	common/log.cpp
 	common/fileutil.cpp
 	common/app_paths.cpp
+	common/firmware.cpp
 	common/host_file.cpp
 	common/host.cpp
 	common/json.cpp

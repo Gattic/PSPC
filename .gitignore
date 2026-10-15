@@ -21,6 +21,7 @@
 !/plugins/README.md
 
 # Runtime data written by pspc
+/firmware/
 /ms0/
 /cache/
 *.log

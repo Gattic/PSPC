@@ -20,6 +20,7 @@ import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))  # also when run with python -I
 import autotest_fixtures  # noqa: E402
+from firmware_paths import resolve_firmware  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -150,7 +151,7 @@ def normalize(text):
 
 def run_one(args, rel, prx, exp):
     env = ENVIRONMENT.get(rel, {})
-    flash0 = pathlib.Path(args.flash0) if args.flash0 else pathlib.Path(args.pspc).parent / 'flash0'
+    flash0 = pathlib.Path(args.flash0)
     missing = [n for n in env.get('needs', []) if not (flash0 / n).exists()]
     skip = 'needs %s in flash0' % ', '.join(missing) if missing else None
     if env.get('rebuilt'):
@@ -193,8 +194,7 @@ def run_one(args, rel, prx, exp):
             if prx.with_suffix(ext).exists():
                 cmd += ['--umd', str(prx.with_suffix(ext))]
                 break
-    if args.flash0:
-        cmd += ['--flash0', args.flash0]
+    cmd += ['--flash0', args.flash0, '--flash1', args.flash1]
     cmd.append(str(prx))
     start = time.time()
     try:
@@ -237,7 +237,7 @@ def main():
     ap.add_argument('--aot', action='store_true', help='allow AOT modules (default: interpreter only)')
     ap.add_argument('--json', default=None)
     ap.add_argument('--verbose', '-v', action='store_true')
-    ap.add_argument('--flash0', default=None, help="pspc's flash0 (default: the one next to the pspc executable)")
+    ap.add_argument('--flash0', default=None, help="override flash0 (default: the runtime's selected firmware profile)")
     ap.add_argument('--mode', choices=('emulator', 'display', 'psp'),
                     help='run every selected test in this mode instead of its own (see ENVIRONMENT)')
     ap.add_argument('filters', nargs='*')
@@ -249,6 +249,10 @@ def main():
     if not tests:
         print('no tests selected')
         return 1
+    try:
+        args.flash0, args.flash1 = resolve_firmware(args.pspc, args.flash0)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+        ap.error(str(error))
     args.discs = prepare_fixtures(pathlib.Path(args.tests))
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as ex:

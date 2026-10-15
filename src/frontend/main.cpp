@@ -20,6 +20,8 @@
 #include "common/app_paths.h"
 #include "common/log.h"
 #include "common/settings.h"
+#include "common/firmware.h"
+#include "common/json.h"
 #include "net/adhoc_server.h"
 #include "pspc_version.h"
 #include "net/np_client.h"
@@ -82,7 +84,9 @@ static void Usage() {
 	        "  --memstick <dir>     memory stick root (Linux: XDG data/pspc/ms0; Windows: <exe>/ms0)\n"
 	        "  --plugins <dir>      M33 plugin overlay (Linux: XDG data/pspc/plugins; Windows: nearest plugins)\n"
 	        "  --no-plugins         don't load M33 plugins, nor lay their folder over ms0:\n"
-	        "  --flash0 <dir>       flash0 root (Linux: XDG data/pspc/flash0; Windows: <exe>/flash0)\n"
+	        "  --flash0 <dir>       override the selected firmware profile's flash0 root\n"
+	        "  --flash1 <dir>       override the selected firmware profile's flash1 root\n"
+	        "  --firmware-paths     migrate default flash roots, print effective roots as JSON, then exit\n"
 	        "  --host0 <dir>        host0: root (default: the program's folder)\n"
 	        "  --umd <image>        insert a disc image while running a .prx/.elf/.pbp\n"
 	        "  --osk-text <text>    headless: what the on-screen keyboard returns (a|b|c: one per keyboard in turn)\n"
@@ -351,14 +355,14 @@ static int Main(int argc, char **argv) {
 	fs::path exeDir = ExecutableDir();
 	o.aotDir = PathToUtf8(apppaths::CacheRoot() / "aot");
 	o.memstickDir = PathToUtf8(apppaths::DataRoot() / "ms0");
-	o.flash0Dir = PathToUtf8(apppaths::DataRoot() / "flash0");
-	o.flash1Dir = PathToUtf8(apppaths::DataRoot() / "flash1");
+
 	o.dataDir = PathToUtf8(apppaths::ResourceRoot(exeDir) / "data");
 	o.decryptTool = PathToUtf8(exeDir / (std::string("pspc-decrypt") + hostsys::ExecutableSuffix));
 	o.decryptCacheDir = PathToUtf8(apppaths::CacheRoot() / "decrypted");
 	o.screenshotDir = PathToUtf8(apppaths::DataRoot() / "screenshots");
 	LogLevel level = LogLevel::Info;
 	std::string logFile;
+	bool firmwarePaths = false;
 
 	// Settings: pspc.ini (or --config <file>), then --set key=value, then the other options.
 	settings::Settings cfg;
@@ -417,6 +421,7 @@ static int Main(int argc, char **argv) {
 		else if (a == "--memstick") o.memstickDir = next();
 		else if (a == "--flash0") o.flash0Dir = next();
 		else if (a == "--flash1") o.flash1Dir = next();
+		else if (a == "--firmware-paths") firmwarePaths = true;
 		else if (a == "--no-plugins") o.plugins = false;
 		else if (a == "--plugins") o.pluginsDir = next();
 		else if (a == "--host0") o.host0Dir = next();
@@ -474,9 +479,19 @@ static int Main(int argc, char **argv) {
 			o.file = a;
 		}
 	}
-	if (o.file.empty() && !o.vsh && o.netSelftest.empty()) {
+	if (o.file.empty() && !o.vsh && o.netSelftest.empty() && !firmwarePaths) {
 		Usage();
 		return 1;
+	}
+	if (o.flash0Dir.empty() || o.flash1Dir.empty()) {
+		firmware::Migrate(apppaths::DataRoot(), o.flash0Dir.empty(), o.flash1Dir.empty());
+		auto profile = firmware::Profile(apppaths::DataRoot(), cfg.firmware);
+		if (o.flash0Dir.empty()) o.flash0Dir = PathToUtf8(profile / "flash0");
+		if (o.flash1Dir.empty()) o.flash1Dir = PathToUtf8(profile / "flash1");
+	}
+	if (firmwarePaths) {
+		printf("{\"flash0\":%s,\"flash1\":%s}\n", json::Quote(o.flash0Dir).c_str(), json::Quote(o.flash1Dir).c_str());
+		return 0;
 	}
 #ifdef _WIN32
 	if (!fs::exists(fs::u8path(o.dataDir) / "nids.csv")) {
