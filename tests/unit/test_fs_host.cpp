@@ -399,6 +399,24 @@ TEST(fs_host_readonly_and_host0) {
 	CHECK_EQ(host.Rename("/other/b.prx", "/nodir/b.prx"), SCE_ERRNO_ENOENT);
 }
 
+TEST(fs_host_rename_and_remove_open_file) {
+	fstest::TempDir tmp("open_rename");
+	HostFileSystem fs(tmp.Path());
+	s32 fd = fs.Open("/open.bin", PSP_O_RDWR | PSP_O_CREAT, 0777);
+	CHECK(fd > 0);
+	CHECK_EQ(fs.Write(fd, "hello", 5), (s64)5);
+	CHECK_EQ(fs.Rename("/open.bin", "renamed.bin"), 0);
+	CHECK(!sfs::exists(tmp.Path() / "open.bin"));
+	CHECK(sfs::exists(tmp.Path() / "renamed.bin"));
+	CHECK_EQ(fs.Remove("/renamed.bin"), 0);
+	CHECK(!sfs::exists(tmp.Path() / "renamed.bin"));
+	CHECK_EQ(fs.Seek(fd, 0, PSP_SEEK_SET), (s64)0);
+	char text[5]{};
+	CHECK_EQ(fs.Read(fd, text, sizeof(text)), (s64)5);
+	CHECK(!memcmp(text, "hello", sizeof(text)));
+	CHECK_EQ(fs.Close(fd), 0);
+}
+
 TEST(fs_fat_short_names) {
 	// Hardware values from pspautotests io/shortname, in creation order.
 	std::vector<std::string> names = {".", "..", "readme.txt", "UPPER.TXT", "MiXeD.txt", "LongFileName.txt", "LongFileName2.txt",

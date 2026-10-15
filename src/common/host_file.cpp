@@ -6,7 +6,6 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <io.h>
-#include <share.h>
 #else
 #include <unistd.h>
 #include <sys/xattr.h>
@@ -101,8 +100,20 @@ FILE *Open(const std::filesystem::path &path, bool read, bool write, bool create
 	if (create) flags |= O_CREAT;
 	if (exclusive) flags |= O_EXCL;
 #ifdef _WIN32
-	int fd = -1;
-	if (_wsopen_s(&fd, path.c_str(), flags | O_BINARY, _SH_DENYNO, _S_IREAD | _S_IWRITE)) return nullptr;
+	// PSP files can be renamed or removed while a guest still has them open.
+	// CRT sharing modes omit FILE_SHARE_DELETE, so retain that contract explicitly.
+	DWORD access = (read ? GENERIC_READ : 0) | (write ? GENERIC_WRITE : 0);
+	DWORD disposition = create ? (exclusive ? CREATE_NEW : OPEN_ALWAYS) : OPEN_EXISTING;
+	HANDLE handle = CreateFileW(path.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+	                            nullptr, disposition, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (handle == INVALID_HANDLE_VALUE) {
+		auto error = std::error_code(GetLastError(), std::system_category()).default_error_condition();
+		errno = error.category() == std::generic_category() ? error.value() : EIO;
+		return nullptr;
+	}
+	int fdFlags = (read && write ? O_RDWR : write ? O_WRONLY : O_RDONLY) | O_BINARY;
+	int fd = _open_osfhandle(reinterpret_cast<intptr_t>(handle), fdFlags);
+	if (fd == -1) { CloseHandle(handle); return nullptr; }
 	FILE *f = _fdopen(fd, read && write ? "r+b" : write ? "wb" : "rb");
 	if (!f) _close(fd);
 #else
