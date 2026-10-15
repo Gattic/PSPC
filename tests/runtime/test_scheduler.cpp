@@ -7,8 +7,46 @@
 
 #include <cstdio>
 #include <functional>
+#include <string>
 
-int main() {
+int ExitSwitchCost() {
+	constexpr u32 ramSize = 32 * 1024 * 1024;
+	if (!mem::Init(ramSize)) return 1;
+	kernel::InitMemoryPartitions(ramSize, false);
+	cpu::Init();
+	sched::Init(true);
+	u64 exitedAt = 0, resumedAt = 0;
+	auto *first = new kernel::PspThread;
+	auto *second = new kernel::PspThread;
+	for (auto *thread : {first, second}) {
+		thread->currentPriority = thread->initPriority = 32;
+		kernel::Register(thread);
+	}
+	const SceUID firstId = first->uid;
+	first->onFirstRun = [&] {
+		exitedAt = sched::NowCycles();
+		sched::ExitCurrentThread(0, true);
+	};
+	second->onFirstRun = [&] {
+		resumedAt = sched::NowCycles();
+		sched::RequestStop(0);
+	};
+	sched::LaunchThread(first);
+	sched::LaunchThread(second);
+	const int result = sched::Run();
+	const bool ok = result == 0 && !kernel::Get<kernel::PspThread>(firstId) && resumedAt - exitedAt == 4450;
+	std::printf("exit and dispatch: %llu cycles (expected 3300 + 1150)\n", resumedAt - exitedAt);
+	hostsys::FreeFiber(second->fiber);
+	second->fiber = nullptr;
+	sched::DeleteThread(second);
+	sched::Shutdown();
+	kernel::DestroyAll();
+	mem::Shutdown();
+	return ok ? 0 : 1;
+}
+
+int main(int argc, char **argv) {
+	if (argc == 2 && std::string(argv[1]) == "exit_switch") return ExitSwitchCost();
 	constexpr u32 ramSize = 32 * 1024 * 1024;
 	if (!mem::Init(ramSize)) return 1;
 	kernel::InitMemoryPartitions(ramSize, false);

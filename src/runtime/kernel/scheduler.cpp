@@ -69,7 +69,9 @@ void *g_mainFiber = nullptr;
 PspThread *g_current = nullptr;
 // Identity of the thread whose CPU work was interrupted, even on the scheduler fiber.
 PspThread *g_interrupted = nullptr;
-PspThread *g_lastRun = nullptr;  // last thread that had the CPU (for switch costs)
+// Keep the identity after deletion: switching away still costs time, while a raw
+// pointer would either dangle or lose that cost when teardown clears it.
+SceUID g_lastRun = 0;
 std::deque<PspThread *> g_ready[kNumPrio];
 int g_readyCount = 0;
 // Set when the current thread switched to the scheduler only so it could run due events while
@@ -243,12 +245,13 @@ void RunThread(PspThread *t) {
 	if (g_dispatchLatency >= 0) {
 		ChargeCycles(g_dispatchLatency);
 		g_dispatchLatency = -1;
-	} else if (g_lastRun != t && g_lastRun != nullptr) {
-		const bool preempts = g_lastRun->busy || (g_lastRun->status & (THREADSTATUS_READY | THREADSTATUS_RUNNING)) != 0;
+	} else if (g_lastRun != t->uid && g_lastRun != 0) {
+		PspThread *last = Get<PspThread>(g_lastRun);
+		const bool preempts = last && (last->busy || (last->status & (THREADSTATUS_READY | THREADSTATUS_RUNNING)) != 0);
 		ChargeCycles(kSwitchCycles + (t->timerWoken && preempts ? kTimerDispatchCycles : 0));
 	}
 	t->timerWoken = false;
-	g_lastRun = t;
+	g_lastRun = t->uid;
 	g_current = t;
 	t->status = (t->status & ~(THREADSTATUS_READY | THREADSTATUS_WAIT)) | THREADSTATUS_RUNNING;
 	cpu::SetCurrentCtx(&t->ctx);
@@ -331,9 +334,9 @@ bool RunBusy() {
 	// The interrupt returns to the busy call, not to a thread it woke.
 	g_dispatchLatency = -1;
 	// Getting back to the busy thread after another one ran costs a switch, as for any thread.
-	if (g_lastRun != busy) {
-		if (g_lastRun != nullptr) ChargeCycles(kSwitchCycles);
-		g_lastRun = busy;
+	if (g_lastRun != busy->uid) {
+		if (g_lastRun != 0) ChargeCycles(kSwitchCycles);
+		g_lastRun = busy->uid;
 	}
 	g_interrupted = busy;
 	SyncClock();
@@ -588,6 +591,7 @@ void Init(bool fastTime) {
 	g_clockStart = hostsys::MonotonicUs();
 	g_vcycles = 0;
 	g_lastIcount = interp::InstructionCount();
+	g_lastRun = 0;
 	memset(&g_intrCtx, 0, sizeof(g_intrCtx));
 	u32 stack = kernel::AllocKernelMemory(0x4000, "interrupt stack");
 	g_intrStackTop = stack + 0x4000 - 0x10;
@@ -1074,7 +1078,6 @@ void DeleteThread(PspThread *t) {
 	}
 	RemoveFromReady(t);
 	if (g_returnTo == t) g_returnTo = nullptr;
-	if (g_lastRun == t) g_lastRun = nullptr;
 	if (g_interrupted == t) g_interrupted = nullptr;
 	if (t->fiber) {
 		g_deadFibers.push_back(t->fiber);
