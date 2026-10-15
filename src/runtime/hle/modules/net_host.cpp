@@ -141,6 +141,7 @@ namespace {
 struct PendingWait {
 	SceUID tid;
 	u64 abortKey;
+	bool aborted = false;
 };
 std::map<SceUID, PendingWait> g_waits;  // wait id -> waiter (emulation thread only)
 u32 g_nextWaitId = 1;
@@ -181,9 +182,11 @@ WaitResult WaitHostEvents(const hostnet::EventHandle *events, size_t count, u64 
 	u64 until = now + (recheckUs ? recheckUs : 100000);
 	if (deadlineUs && deadlineUs < until) until = deadlineUs;
 	s32 r = until > now ? sched::WaitUntil(kernel::WAITTYPE_NET, waitId, until, false) : 0;
+	const bool aborted = g_waits.at(waitId).aborted;
 	g_waits.erase(waitId);
 	sched::HoldRealTime(false);
 	if (watch) hostnet::Unwatch(watch);
+	if (aborted) return HOSTWAIT_ABORTED;
 	if (r == HOSTWAIT_READY) return HOSTWAIT_READY;
 	if (r == HOSTWAIT_ABORTED || r < 0) return HOSTWAIT_ABORTED;  // aborted, or the wait was released
 	return HOSTWAIT_TIMEOUT;
@@ -192,7 +195,12 @@ WaitResult WaitHostEvents(const hostnet::EventHandle *events, size_t count, u64 
 void AbortWaits(u64 abortKey) {
 	std::vector<std::pair<SceUID, SceUID>> hit;
 	for (auto &w : g_waits)
-		if (w.second.abortKey == abortKey) hit.push_back({w.second.tid, w.first});
+		if (w.second.abortKey == abortKey) {
+			// The periodic recheck may already have made this thread ready. Retain
+			// cancellation until it resumes, even if WakeWaiter cannot wake it again.
+			w.second.aborted = true;
+			hit.push_back({w.second.tid, w.first});
+		}
 	for (auto &h : hit) WakeWaiter(h.first, h.second, HOSTWAIT_ABORTED);
 }
 
@@ -223,11 +231,12 @@ bool RunBlockingOnHost(std::function<void()> work, u64 deadlineUs, u64 abortKey)
 		u64 until = now + 100000;
 		if (deadlineUs && deadlineUs < until) until = deadlineUs;
 		s32 r = sched::WaitUntil(kernel::WAITTYPE_NET, waitId, until, false);
-		if (r == HOSTWAIT_ABORTED || r < 0) {
+		if (g_waits.at(waitId).aborted || r == HOSTWAIT_ABORTED || r < 0) {
 			ok = false;
 			break;
 		}
 	}
+	ok = ok && !g_waits.at(waitId).aborted;
 	g_waits.erase(waitId);
 	sched::HoldRealTime(false);
 	return ok && done->load();
