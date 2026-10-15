@@ -44,8 +44,13 @@ std::wstring QueryString(HINTERNET r, DWORD what) {
 HttpExchange::HttpExchange() = default;
 
 HttpExchange::~HttpExchange() {
-	std::lock_guard<std::mutex> lock(mu_);
-	CloseHandles();
+	{
+		std::lock_guard<std::mutex> lock(mu_);
+		deadlineStop_ = true;
+		CloseHandles();
+	}
+	deadlineCv_.notify_one();
+	if (deadlineThread_.joinable()) deadlineThread_.join();
 }
 
 void HttpExchange::CloseHandles() {
@@ -62,11 +67,76 @@ void HttpExchange::Cancel() {
 	CloseHandles();
 }
 
+u32 HttpExchange::CompletionError(u32 error) {
+	std::lock_guard<std::mutex> lock(mu_);
+	// Closing an in-flight WinHTTP handle may report INVALID_HANDLE or EOF as
+	// well as OPERATION_CANCELLED. Preserve the exchange's cancellation contract.
+	return cancelled_ ? ERROR_WINHTTP_OPERATION_CANCELLED : receiveTimedOut_ ? ERROR_WINHTTP_TIMEOUT : error;
+}
+
+void HttpExchange::WatchReceiveDeadline() {
+	std::unique_lock<std::mutex> lock(mu_);
+	deadlineStarted_ = true;
+	deadlineCv_.notify_one();
+	while (!deadlineStop_) {
+		deadlineCv_.wait(lock, [this] { return deadlineStop_ || receiving_; });
+		if (deadlineStop_) break;
+		const auto generation = receiveGeneration_;
+		const auto deadline = receiveDeadline_;
+		armedGeneration_ = generation;
+		deadlineCv_.notify_one();
+		if (deadlineCv_.wait_until(lock, deadline, [this, generation] {
+			return deadlineStop_ || !receiving_ || receiveGeneration_ != generation;
+		})) continue;
+		receiveTimedOut_ = true;
+		receiving_ = false;
+		// WinHTTP may leave a synchronous body read waiting beyond its configured
+		// receive timeout. Closing this handle interrupts it without losing ownership.
+		if (request_) WinHttpCloseHandle((HINTERNET)request_);
+		request_ = nullptr;
+	}
+}
+
+u32 HttpExchange::BeginReceive() {
+	{
+		std::unique_lock<std::mutex> lock(mu_);
+		if (cancelled_) return ERROR_WINHTTP_OPERATION_CANCELLED;
+		if (receiveTimedOut_) return ERROR_WINHTTP_TIMEOUT;
+		if (!request_) return ERROR_INVALID_HANDLE;
+		if (!deadlineThread_.joinable()) {
+			deadlineThread_ = std::thread(&HttpExchange::WatchReceiveDeadline, this);
+			// Ensure the timer is running before entering another WinHTTP call.
+			deadlineCv_.wait(lock, [this] { return deadlineStarted_; });
+		}
+		receiveDeadline_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(receiveTimeoutMs_);
+		++receiveGeneration_;
+		receiving_ = true;
+		deadlineCv_.notify_one();
+		deadlineCv_.wait(lock, [this] { return armedGeneration_ == receiveGeneration_; });
+	}
+	deadlineCv_.notify_one();
+	return 0;
+}
+
+u32 HttpExchange::EndReceive(u32 error) {
+	{
+		std::lock_guard<std::mutex> lock(mu_);
+		receiving_ = false;
+		if (cancelled_) error = ERROR_WINHTTP_OPERATION_CANCELLED;
+		else if (receiveTimedOut_) error = ERROR_WINHTTP_TIMEOUT;
+	}
+	deadlineCv_.notify_one();
+	return error;
+}
+
 u32 HttpExchange::Send(const HttpRequestSpec &spec) {
 	HINTERNET session, connect, request;
 	{
 		std::lock_guard<std::mutex> lock(mu_);
 		if (cancelled_) return ERROR_WINHTTP_OPERATION_CANCELLED;
+		receiveTimedOut_ = false;
+		receiving_ = false;
+		receiveTimeoutMs_ = spec.recvTimeoutMs ? spec.recvTimeoutMs : 30000;
 		CloseHandles();
 		status = 0;
 		statusLine.clear();
@@ -129,10 +199,29 @@ u32 HttpExchange::Send(const HttpRequestSpec &spec) {
 			return GetLastError();
 	}
 	// The network part runs without the lock, so Cancel can close the handles under it.
+	{
+		std::unique_lock<std::mutex> lock(mu_);
+		if (cancelled_) return ERROR_WINHTTP_OPERATION_CANCELLED;
+		if (!deadlineThread_.joinable()) {
+			deadlineThread_ = std::thread(&HttpExchange::WatchReceiveDeadline, this);
+			deadlineCv_.wait(lock, [this] { return deadlineStarted_; });
+		}
+	}
+	// WinHttpSendRequest can itself wait for response headers. Start their deadline
+	// when the request has actually been sent, rather than after SendRequest returns.
+	if (WinHttpSetStatusCallback(request,
+		+[](HINTERNET, DWORD_PTR context, DWORD notification, void *, DWORD) {
+			if (notification == WINHTTP_CALLBACK_STATUS_REQUEST_SENT && context)
+				reinterpret_cast<HttpExchange *>(context)->BeginReceive();
+		}, WINHTTP_CALLBACK_STATUS_REQUEST_SENT, 0) == WINHTTP_INVALID_STATUS_CALLBACK)
+		return CompletionError(GetLastError());
 	void *data = spec.body.empty() ? WINHTTP_NO_REQUEST_DATA : (void *)spec.body.data();
 	DWORD size = (DWORD)spec.body.size();
-	if (!WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, data, size, size, 0)) return GetLastError();
-	if (!WinHttpReceiveResponse(request, nullptr)) return GetLastError();
+	u32 sendError = WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, data, size, size,
+	                                  reinterpret_cast<DWORD_PTR>(this)) ? 0 : GetLastError();
+	if (sendError) return CompletionError(EndReceive(sendError));
+	u32 receiveError = WinHttpReceiveResponse(request, nullptr) ? 0 : GetLastError();
+	if ((receiveError = EndReceive(receiveError)) != 0) return receiveError;
 
 	std::lock_guard<std::mutex> lock(mu_);
 	if (cancelled_) return ERROR_WINHTTP_OPERATION_CANCELLED;
@@ -166,11 +255,17 @@ u32 HttpExchange::Read(u8 *buf, u32 size, u32 *got) {
 	{
 		std::lock_guard<std::mutex> lock(mu_);
 		if (cancelled_) return ERROR_WINHTTP_OPERATION_CANCELLED;
+		if (receiveTimedOut_) return ERROR_WINHTTP_TIMEOUT;
 		request = (HINTERNET)request_;
+		if (!request) return ERROR_INVALID_HANDLE;
+		if (!size) return 0;
 	}
-	if (!request) return ERROR_INVALID_HANDLE;
+	u32 error = BeginReceive();
+	if (error) return error;
 	DWORD n = 0;
-	if (!WinHttpReadData(request, buf, size, &n)) return GetLastError();
+	error = WinHttpReadData(request, buf, size, &n) ? 0 : GetLastError();
+	error = EndReceive(error);
+	if (error) return error;
 	*got = n;
 	return 0;
 }

@@ -10,6 +10,11 @@
 #include <string>
 #include <utility>
 #include <vector>
+#ifdef _WIN32
+#include <chrono>
+#include <condition_variable>
+#include <thread>
+#endif
 
 #include "common/common.h"
 
@@ -66,7 +71,20 @@ public:
 private:
 #ifdef _WIN32
 	void CloseHandles();
+	u32 CompletionError(u32 error);
+	void WatchReceiveDeadline();
+	u32 BeginReceive();
+	u32 EndReceive(u32 error);
+	// Handles, cancellation and deadline state share mu_. The deadline thread
+	// closes only the current request; it is stopped and joined before destruction.
 	std::mutex mu_;
+	std::condition_variable deadlineCv_;
+	std::thread deadlineThread_;
+	std::chrono::steady_clock::time_point receiveDeadline_;
+	u64 receiveGeneration_ = 0;
+	u64 armedGeneration_ = 0;
+	u32 receiveTimeoutMs_ = 30000;
+	bool deadlineStarted_ = false, deadlineStop_ = false, receiving_ = false, receiveTimedOut_ = false;
 	void *session_ = nullptr, *connect_ = nullptr, *request_ = nullptr;
 	bool cancelled_ = false;
 #else

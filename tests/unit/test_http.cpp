@@ -12,7 +12,7 @@ namespace {
 // A real loopback peer that can stall before headers or before the body. Every wait is bounded.
 class StalledServer {
 public:
-	explicit StalledServer(bool headers) {
+	explicit StalledServer(bool headers, const std::string &body = {}) {
 		int error;
 		listener_ = hostnet::OpenSocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, &error);
 		if (!listener_.Valid()) throw std::runtime_error("HTTP fixture socket failed");
@@ -25,7 +25,7 @@ public:
 		if (hostnet::GetSockName(listener_.s, (sockaddr *)&address, &length))
 			throw std::runtime_error("HTTP fixture address failed");
 		url = "http://127.0.0.1:" + std::to_string(ntohs(address.sin_port)) + "/";
-		worker_ = std::thread([this, headers] {
+		worker_ = std::thread([this, headers, body] {
 			if (!Ready(listener_.s)) return;
 			auto accepted = hostnet::Accept(listener_.s, nullptr, nullptr);
 			if (accepted == hostnet::InvalidSocket) return;
@@ -45,6 +45,7 @@ public:
 			if (headers && requested) {
 				const char *response = "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n";
 				hostnet::Send(client.s, response, (int)strlen(response), 0);
+				if (!body.empty()) hostnet::Send(client.s, body.data(), (int)body.size(), 0);
 			}
 			u64 until = hostsys::MonotonicUs() + 3000000;
 			while (!stop_ && hostsys::MonotonicUs() < until) hostsys::SleepMs(1);
@@ -85,19 +86,52 @@ TEST(http_headers_return_before_body_and_read_timeout) {
 	CHECK(exchange.haveContentLength && exchange.contentLength == 8);
 	u8 byte = 0;
 	u32 got = 99;
+	u64 started = hostsys::MonotonicUs();
 	CHECK_EQ(exchange.Read(&byte, 0, &got), 0u);
 	CHECK_EQ(got, 0u);
+	CHECK(hostsys::MonotonicUs() - started < 500000);
+	started = hostsys::MonotonicUs();
 	u32 error = exchange.Read(&byte, 1, &got);
+	if (hostnet::HttpExchange::ClassifyError(error) != hostnet::HttpFailure::Timeout)
+		printf("  body read returned %s (%u), %u bytes\n", hostnet::HttpExchange::ErrorName(error), error, got);
 	CHECK(hostnet::HttpExchange::ClassifyError(error) == hostnet::HttpFailure::Timeout);
+	CHECK(hostsys::MonotonicUs() - started < 1000000);
 	CHECK_EQ(got, 0u);
+	CHECK(hostnet::HttpExchange::ClassifyError(exchange.Read(&byte, 1, &got)) == hostnet::HttpFailure::Timeout);
 }
 
 TEST(http_receive_headers_timeout) {
 	StalledServer server(false);
 	hostnet::HttpExchange exchange;
+	u64 started = hostsys::MonotonicUs();
 	u32 error = exchange.Send(Request(server, 100));
+	if (hostnet::HttpExchange::ClassifyError(error) != hostnet::HttpFailure::Timeout)
+		printf("  headers returned %s (%u) after %llu us\n", hostnet::HttpExchange::ErrorName(error), error, hostsys::MonotonicUs() - started);
 	CHECK(server.requested);
 	CHECK(hostnet::HttpExchange::ClassifyError(error) == hostnet::HttpFailure::Timeout);
+	CHECK(hostsys::MonotonicUs() - started < 1000000);
+}
+
+TEST(http_reuse_after_timeout_and_partial_reads) {
+	hostnet::HttpExchange exchange;
+	u8 byte = 0;
+	u32 got = 0;
+	{
+		StalledServer server(true);
+		CHECK_EQ(exchange.Send(Request(server, 50)), 0u);
+		CHECK(hostnet::HttpExchange::ClassifyError(exchange.Read(&byte, 1, &got)) == hostnet::HttpFailure::Timeout);
+	}
+	StalledServer server(true, "payload!");
+	CHECK_EQ(exchange.Send(Request(server)), 0u);
+	std::string body;
+	for (int i = 0; i < 8; ++i) {
+		CHECK_EQ(exchange.Read(&byte, 1, &got), 0u);
+		CHECK_EQ(got, 1u);
+		body += (char)byte;
+	}
+	CHECK(body == "payload!");
+	CHECK_EQ(exchange.Read(&byte, 1, &got), 0u);
+	CHECK_EQ(got, 0u);
 }
 
 TEST(http_cancel_during_send_and_read_is_persistent) {
