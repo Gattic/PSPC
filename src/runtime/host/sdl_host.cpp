@@ -156,7 +156,9 @@ int Run(const Config &cfg, const std::function<int()> &emulation, const std::fun
 	g_cfg = cfg;
 	if (cfg.headless) return emulation();
 
+#ifdef _WIN32
 	SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
+#endif
 	if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
 		LOGE("HOST", "SDL_Init failed: %s; running headless", SDL_GetError());
 		g_headless = true;

@@ -444,7 +444,9 @@ State Poll(Kind k) {
 	Proc &p = g_procs[Index(k)];
 	if (!p.process) return p.state;
 	if (WaitForSingleObject(p.process, 0) == WAIT_OBJECT_0) {
-		GetExitCodeProcess(p.process, &p.exitCode);
+		DWORD exitCode = 0;
+		GetExitCodeProcess(p.process, &exitCode);
+		p.exitCode = exitCode;
 		CloseHandle(p.process);
 		p.process = nullptr;
 		p.state = State::Failed;

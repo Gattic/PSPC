@@ -43,7 +43,7 @@ GtkWidget *Button(GtkWidget *box, const char *label, std::function<void()> actio
 					delete pending;
 				});
 		})),
-		fn, +[](gpointer p, GClosure *) { delete static_cast<std::function<void()> *>(p); }, G_CONNECT_DEFAULT);
+		fn, +[](gpointer p, GClosure *) { delete static_cast<std::function<void()> *>(p); }, static_cast<GConnectFlags>(0));
 	gtk_box_pack_start(GTK_BOX(box), button, FALSE, FALSE, 0);
 	return button;
 }
@@ -116,7 +116,7 @@ bool Save(GtkWindow *parent, settings::Settings &destination, const settings::Se
 	return true;
 }
 void Work(GtkWindow *parent, const std::function<void()> &task) {
-	auto *dialog = gtk_dialog_new_with_buttons("Working…", parent, GTK_DIALOG_MODAL, nullptr);
+	auto *dialog = gtk_dialog_new_with_buttons("Working…", parent, GTK_DIALOG_MODAL, nullptr, nullptr);
 	auto *spinner = gtk_spinner_new();
 	gtk_spinner_start(GTK_SPINNER(spinner));
 	gtk_container_add(GTK_CONTAINER(gtk_dialog_get_content_area(GTK_DIALOG(dialog))), spinner);

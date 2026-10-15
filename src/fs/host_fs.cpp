@@ -37,8 +37,12 @@ void ToPspTime(s64 us, ScePspDateTime *out) {
 #else
 	if (!localtime_r(&sec, &t)) return;
 #endif
-	out->year = t.tm_year + 1900; out->month = t.tm_mon + 1; out->day = t.tm_mday;
-	out->hour = t.tm_hour; out->minute = t.tm_min; out->second = t.tm_sec;
+	out->year = static_cast<u16>(t.tm_year + 1900);
+	out->month = static_cast<u16>(t.tm_mon + 1);
+	out->day = static_cast<u16>(t.tm_mday);
+	out->hour = static_cast<u16>(t.tm_hour);
+	out->minute = static_cast<u16>(t.tm_min);
+	out->second = static_cast<u16>(t.tm_sec);
 	out->microsecond = (u32)((us % 1000000 + 1000000) % 1000000);
 }
 bool FromPspTime(const ScePspDateTime &in, s64 *us) {
