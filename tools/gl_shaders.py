@@ -108,7 +108,7 @@ common = (
     .split("cbuffer TargetCB")[0]
     .replace("uint3 pad2;", "uint pad2[3];")
 )
-pixel = block("kPixel1") + block("kPixel2")
+pixel = block("kColorConv") + block("kPixel1") + block("kPixel2")
 pixel = re.sub(
     r"StructuredBuffer<DrawState>[\s\S]*?RasterizerOrderedTexture2D<uint> zbuf : register\(u1\);",
     "",
