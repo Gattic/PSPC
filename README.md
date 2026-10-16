@@ -66,7 +66,7 @@ recorded hardware differences), with identical results in the interpreter and as
 | Allegrex CPU: decoder, interpreter, FPU, VFPU (bit-exact hardware model) | Working. `cpu/` 42/42 |
 | AOT recompiler (`pspc-recomp`) + DLL pipeline | Working. 99%+ code coverage on retail games, whole discs build in about a minute |
 | Kernel: threads (fibers), sync objects, memory, modules, interrupts, timing | Working. `threads/` 152/158; ctrl, power, RTC, intr, modules all complete |
-| GE graphics: multithreaded software renderer (default, reference) and optional Direct3D 11 (Windows) and OpenGL (Linux) renderers: 1-16x resolution (up to 8K, supersampled to the window), xBR texture upscaling, texture filtering | Working. `gpu/` 111/111 (software) |
+| GE graphics: multithreaded software renderer (default, reference) and optional Direct3D 11 (Windows) and OpenGL (Linux) renderers: 1-16x resolution (up to 8K, supersampled to the window), xBR texture upscaling, texture filtering. Vertex work runs in parallel on worker threads; with Direct3D 11, transform, lighting and clipping run on the GPU, bit for bit as on the CPU ([docs/gpu-transform.md](docs/gpu-transform.md)) | Working. `gpu/` 111/111 (software) |
 | Audio (sceAudio, SAS, ATRAC3/3+, MP3, AAC, audiocodec) | Working. `audio/` 73/74 |
 | I/O, UMD, memory stick, ISO/CSO/ZSO/DAX | Working |
 | sceUtility (save data, dialogs, OSK), fonts (PGF) | Working |

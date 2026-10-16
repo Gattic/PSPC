@@ -27,7 +27,19 @@ struct D3D11Options {
 	int textureFilter = 0;
 	// Texture upscaling, 1 (off) - 4: decoded textures are scaled up that many times with xBR.
 	int textureUpscale = 1;
+	// Vertex transform on the GPU (gpu/geometry.h; PSPC_GPU_TRANSFORM=0 turns it off). Until its shaders
+	// are compiled (once, then cached), the CPU transforms, unless waitForShaders (PSPC_GPU_TRANSFORM_WAIT).
+	// verifyTransform (PSPC_GPU_TRANSFORM_VERIFY): the CPU transforms too, and each job is compared.
+	bool gpuTransform = true;
+	bool waitForShaders = false;
+	bool verifyTransform = false;
 };
+
+// The GPU transform's counts so far (a D3D11 backend's; zeros for others).
+struct D3D11TransformStats {
+	u64 vertices = 0, jobs = 0, checked = 0, mismatches = 0;
+};
+D3D11TransformStats GetD3D11TransformStats(RenderBackend *backend);
 
 // Creates the backend; nullptr (with the reason in *error) when this machine can't run it (no D3D11
 // device with rasterizer-ordered views).

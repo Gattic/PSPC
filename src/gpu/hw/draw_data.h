@@ -100,19 +100,22 @@ struct Segment {
 	u32 first, count;
 	u32 state, lastState;
 	bool lines;
+	bool gpu = false;  // first, count: in the GPU-made vertices of the batch's geometry jobs
 };
 
 // GPU-independent post-transform preparation shared by the native backends.
 class DrawData {
 protected:
-	void BuildVertices(const BatchPrim *prims, size_t n, const RasterState *states);
+	// geo: the batch's geometry (PrimType::Geometry primitives), if any.
+	void BuildVertices(const BatchPrim *prims, size_t n, const RasterState *states, const GeometryBatch *geo = nullptr);
 	void FillStates(const RasterState *states, size_t n);
+	// One triangle's three vertices, appended to verts_.
+	void EmitTriangle(const BatchPrim &, const RasterState &);
 	int scale_ = 1, texFilter_ = 0, texUpscale_ = 1;
 	std::vector<GpuVertex> verts_;
 	std::vector<Segment> segs_;
 	std::vector<DrawStateGpu> gpuStates_;
 private:
-	void EmitTriangle(const BatchPrim &, const RasterState &);
 	void EmitRect(const BatchPrim &, const RasterState &, bool clear);
 	void EmitPoint(const BatchPrim &, const RasterState &);
 	void EmitLine(const BatchPrim &, const RasterState &);

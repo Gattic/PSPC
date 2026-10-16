@@ -19,10 +19,12 @@ namespace gpu::hw {
 using Microsoft::WRL::ComPtr;
 
 // Compute: surface uploads, write-backs and display images; Upscale: texture upscaling; Present: drawing
-// an image into the host window.
-enum class ShaderKind { Vertex, Pixel, Compute, Upscale, Present };
+// an image into the host window; Geometry: vertex transform and triangle assembly (gpu/geometry.h).
+enum class ShaderKind { Vertex, Pixel, Compute, Upscale, Present, Geometry };
 // The HLSL source for a kind of shader (d3d11_shaders.cpp).
 std::string ShaderSource(ShaderKind kind);
+// ShaderKind::Geometry's (d3d11_geometry.cpp).
+std::string GeometryShaderSource();
 
 // Decoded textures, keyed by address, format, size and CLUT, validated by hashing the texel data
 // (d3d11_texcache.cpp).

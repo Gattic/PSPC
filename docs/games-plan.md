@@ -271,6 +271,11 @@ What went in:
     | Battlefront II, Dagobah battle (7800-9600) | Direct3D 11 | 14.1-17.1 ms | 4.6-5.3 ms |
     | Battlefront II, Dagobah battle | software | 19.8-21.9 ms | 9.2-10.9 ms |
 
+- **Done (2026-10-16): with Direct3D 11, transform and lighting run on the GPU.**
+  - Transform-mode triangles are transformed, lit, clipped and culled in compute shaders, in the
+    GE's exact arithmetic: 102 million triangle jobs in Logan's Shadow and every D3D11 checkpoint
+    match the CPU bit for bit. [docs/gpu-transform.md](gpu-transform.md) has the design and the
+    measurements.
 - **Work, measured stage by stage with `PSPC_GPU_STATS`:**
   - (a) Bit-exact SIMD versions of `GERowSum4`, `GEDot3`, `GENormalize3` and the lighting loop.
     The exact path stays the definition: compare the two on every vertex in a test build.

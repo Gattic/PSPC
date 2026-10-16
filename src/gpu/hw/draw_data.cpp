@@ -467,17 +467,25 @@ void DrawData::EmitLine(const BatchPrim &p, const RasterState &st) {
 	}
 }
 
-void DrawData::BuildVertices(const BatchPrim *prims, size_t n, const RasterState *states) {
+void DrawData::BuildVertices(const BatchPrim *prims, size_t n, const RasterState *states, const GeometryBatch *geo) {
 	verts_.clear();
 	segs_.clear();
 	for (size_t i = 0; i < n; ++i) {
 		const BatchPrim &p = prims[i];
 		const RasterState &st = states[p.stateIndex];
-		const bool lines = p.type == PrimType::Line;
-		if (segs_.empty() || segs_.back().lines != lines ||
-			(p.stateIndex != segs_.back().lastState && !Compatible(states[segs_.back().state], st))) {
-			segs_.push_back({ (u32)verts_.size(), 0, p.stateIndex, p.stateIndex, lines });
+		auto compatible = [&] { return p.stateIndex == segs_.back().lastState || Compatible(states[segs_.back().state], st); };
+		if (p.type == PrimType::Geometry) {
+			// The jobs' vertices follow each other in the GPU's buffer.
+			const u32 first = geo->jobs[GeoFirstJob(p)].out, count = GeoJobCount(p) * GEO_JOB_VERTS;
+			if (segs_.empty() || !segs_.back().gpu || segs_.back().first + segs_.back().count != first || !compatible())
+				segs_.push_back({ first, 0, p.stateIndex, p.stateIndex, false, true });
+			segs_.back().lastState = p.stateIndex;
+			segs_.back().count += count;
+			continue;
 		}
+		const bool lines = p.type == PrimType::Line;
+		if (segs_.empty() || segs_.back().gpu || segs_.back().lines != lines || !compatible())
+			segs_.push_back({ (u32)verts_.size(), 0, p.stateIndex, p.stateIndex, lines });
 		Segment &seg = segs_.back();
 		seg.lastState = p.stateIndex;
 		const size_t before = verts_.size();
@@ -487,6 +495,7 @@ void DrawData::BuildVertices(const BatchPrim *prims, size_t n, const RasterState
 		case PrimType::ClearRect: EmitRect(p, st, true); break;
 		case PrimType::Point: EmitPoint(p, st); break;
 		case PrimType::Line: EmitLine(p, st); break;
+		case PrimType::Geometry: break;
 		}
 		seg.count += (u32)(verts_.size() - before);
 	}

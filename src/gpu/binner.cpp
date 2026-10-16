@@ -189,6 +189,9 @@ bool batchSingleThread = false;
 int batchMaxRow = -1;
 int batchMinRow = 1 << 30;
 u64 batchPixels = 0;
+size_t batchCount = 0;       // primitives
+// The batch's geometry for a backend that transforms it (geometry.h).
+GeometryBatch geometry;
 
 // CLUT snapshots (2 KB: the 1 KB palette twice, for index wrapping).
 std::vector<std::unique_ptr<u8[]>> clutPool;
@@ -464,12 +467,15 @@ inline Range Intersect(const Range &a, const Range &b) {
 	return { std::max(a.x1, b.x1), std::max(a.y1, b.y1), std::min(a.x2, b.x2), std::min(a.y2, b.y2) };
 }
 
-void Push(PrimType type, const Range &rawRange, const RVertex *v, int nv) {
+// geoDraw: for PrimType::Geometry, its GeDraw (whose state is set here); the range is the scissor.
+void Push(PrimType type, const Range &rawRange, const RVertex *v, int nv, u32 geoDraw = 0) {
 	const u32 idx = resolving ? PushSnapshot(pushSnapshot) : PushCurrent();
 	const RasterState &st = states[idx];
-	const Range range = Intersect(rawRange, st.scissor);
+	const Range range = Intersect(type == PrimType::Geometry ? st.scissor : rawRange, st.scissor);
 	if (range.Invalid())
 		return;
+	if (type == PrimType::Geometry)
+		geometry.draws[geoDraw].state = idx;
 	Prim p;
 	p.type = type;
 	p.stateIndex = idx;
@@ -482,14 +488,16 @@ void Push(PrimType type, const Range &rawRange, const RVertex *v, int nv) {
 	batchMaxRow = std::max(batchMaxRow, row2);
 	const u64 area = (u64)(range.x2 - range.x1 + 1) / SUBPIX * (u64)(range.y2 - range.y1 + 1) / SUBPIX;
 	batchPixels += area;
-	g_stats.prims++;
+	// A geometry run counts as one primitive toward the batch's size (the GPU bounds nothing here).
+	batchCount++;
+	g_stats.prims += type == PrimType::Geometry ? GeoJobCount(p) : 1;
 	g_stats.pixels += area;
 	// Pixels past the stride land in the next row, which another band may be drawing.
 	const PixelState &ps = st.pix;
 	const bool usesDepth = ps.depthWrite || ps.depthTestFunc != GE_COMP_ALWAYS || (ps.clearMode && ps.depthClear);
 	if (range.x2 / SUBPIX >= ps.fbStride || (usesDepth && range.x2 / SUBPIX >= ps.zbStride))
 		batchSingleThread = true;
-	if (prims.size() >= MAX_PRIMS)
+	if (batchCount >= MAX_PRIMS)
 		binner::Flush();
 }
 
@@ -515,6 +523,7 @@ void DrawPrim(const Prim &p, const Range &r, const RasterState &st) {
 	case PrimType::ClearRect: ClearRectangle(p.v[0], p.v[1], r, st); break;
 	case PrimType::Line: DrawLine(p.v[0], p.v[1], r, st); break;
 	case PrimType::Point: DrawPoint(p.v[0], r, st); break;
+	case PrimType::Geometry: break;  // only for a backend that transforms geometry
 	}
 }
 
@@ -543,7 +552,16 @@ void ResetBatch() {
 	batchMaxRow = -1;
 	batchMinRow = 1 << 30;
 	batchPixels = 0;
+	batchCount = 0;
 	batchEpoch++;
+	// Draws ResolvePendingDraws is still assembling keep their vertices and draw records.
+	if (resolving) {
+		geometry.jobs.clear();
+		geometry.expect.clear();
+		geometry.expectFirst.clear();
+	} else {
+		geometry.Clear();
+	}
 	// Keep only the latest CLUT snapshot (not while recorded draws still point at the others).
 	if (clutCount > 1 && !resolving) {
 		std::swap(clutPool[0], clutPool[clutCount - 1]);
@@ -650,6 +668,25 @@ void AddPoint(const RVertex &v0) {
 	Push(PrimType::Point, RangeOf(&v0, 1), &v0, 1);
 }
 
+bool TransformsGeometry() {
+	return g_backend && g_backend->TransformsGeometry();
+}
+
+bool VerifiesGeometry() {
+	return g_backend && g_backend->VerifiesGeometry();
+}
+
+GeometryBatch &Geometry() {
+	return geometry;
+}
+
+void AddGeometry(u32 geoDraw, u32 firstJob, u32 jobCount) {
+	RVertex v{};
+	v.x = (int)firstJob;
+	v.y = (int)jobCount;
+	Push(PrimType::Geometry, Range{}, &v, 1, geoDraw);
+}
+
 bool HasQueued() {
 	ResolvePendingDraws();
 	return !prims.empty();
@@ -663,7 +700,10 @@ void Flush() {
 	}
 	g_stats.flushes++;
 	if (g_backend) {
-		g_backend->DrawBatch(prims.data(), prims.size(), states.data(), states.size());
+		if (!geometry.Empty())
+			g_backend->DrawGeometryBatch(prims.data(), prims.size(), states.data(), states.size(), geometry);
+		else
+			g_backend->DrawBatch(prims.data(), prims.size(), states.data(), states.size());
 		ResetBatch();
 		return;
 	}

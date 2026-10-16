@@ -16,6 +16,7 @@
 
 #include "gpu/ge_state.h"
 #include "gpu/gemath_simd.h"
+#include "gpu/geometry.h"
 #include "gpu/render.h"
 #include "gpu/vertex.h"
 
@@ -194,6 +195,9 @@ struct PendingDraw {
 	float morph[8];
 	Carry carryIn;         // the UV and normal of formats without them
 	AssemblyCtx ctx;       // ctx.ts is set when assembling
+	// Transformed by the backend (geometry.h): its GeDraw, and where its slots are in the inputs.
+	bool gpu;
+	u32 geoDraw, geoBase;
 };
 
 std::vector<PendingDraw> pending;
@@ -208,6 +212,14 @@ GEPrimitiveType recPrevPrim = GE_PRIM_POINTS;
 // The pending draws whose last vertex carries the UV and the normal over, until a draw needs them
 // (carry holds them before): -1 if carry is up to date.
 int uvSource = -1, nrmSource = -1;
+
+// The backend transforms transform-mode triangles (geometry.h); when it verifies them, they're also
+// transformed here (for the resolve under way).
+bool gpuTransformVerify = false;
+// While assembling a draw for the backend: the vertex slots in data[] (-1: data[] holds the vertex).
+int dataSlot[4] = { -1, -1, -1, -1 };
+// The verification's triangles (after the winding test), instead of the binner.
+std::vector<RVertex> *captureTris = nullptr;
 
 std::vector<SimpleVertex> simple;
 
@@ -841,15 +853,28 @@ static void NearPoint(ClipVertex &dest, const ClipVertex &in, const ClipVertex &
 		dest.v.x = 0x7FFFFFFF;
 }
 
+// binner::AddTriangle's winding test.
+inline bool BinnerWinds(const RVertex &v0, const RVertex &v1, const RVertex &v2) {
+	const int64_t d01x = (int64_t)v0.x - v1.x, d01y = (int64_t)v0.y - v1.y;
+	const int64_t d02x = (int64_t)v0.x - v2.x, d02y = (int64_t)v0.y - v2.y;
+	return d01x * d02y - d01y * d02x > 0;
+}
+
 static void AddTriangleFlat(const RVertex &v0, const RVertex &v1, const RVertex &v2, const RVertex &provoking) {
+	RVertex corrected = v2;
 	if (!CtxGouraud()) {
-		RVertex corrected = v2;
 		corrected.color0 = provoking.color0;
 		corrected.color1 = provoking.color1;
-		binner::AddTriangle(v0, v1, corrected);
-	} else {
-		binner::AddTriangle(v0, v1, v2);
 	}
+	if (captureTris) {
+		if (BinnerWinds(v0, v1, corrected)) {
+			captureTris->push_back(v0);
+			captureTris->push_back(v1);
+			captureTris->push_back(corrected);
+		}
+		return;
+	}
+	binner::AddTriangle(v0, v1, corrected);
 }
 
 void ProcessTriangle(const ClipVertex &v0, const ClipVertex &v1, const ClipVertex &v2, const ClipVertex &provoking, bool reversed) {
@@ -1298,15 +1323,26 @@ void RecordDraw(const u8 *verts, const u8 *inds, GEPrimitiveType prim, int count
 	pending.push_back(d);
 }
 
-// Transforms slots [s0, s1) of d into pendingOut.
+// Transforms slots [s0, s1) of d into pendingOut; for the backend, decodes them into its inputs.
 void TransformSlots(const PendingDraw &d, u32 s0, u32 s1) {
 	const TransformState &s = tsSnaps[d.tsId];
 	const float *bones = BonesOf(d);
 	ClipVertex *out = pendingOut.data() + d.slotBase;
+	GeVertexIn *in = d.gpu ? binner::Geometry().inputs.data() + d.geoBase : nullptr;
 	SimpleVertex sv;
 	for (u32 slot = s0; slot < s1; ++slot) {
 		const int index = d.useCache ? d.lower + (int)slot : d.inds ? ReadIndex(d.inds, d.fmt.idx, (int)slot) : (int)slot;
 		DecodeVertex(d.fmt, d.verts, index, &sv, d.morph, bones);
+		if (in) {
+			GeVertexIn &g = in[slot];
+			memcpy(g.uv, sv.uv, sizeof(g.uv));
+			g.color = sv.color;
+			memcpy(g.nrm, sv.nrm, sizeof(g.nrm));
+			memcpy(g.pos, sv.pos, sizeof(g.pos));
+			g.draw = d.geoDraw;
+			if (!gpuTransformVerify)
+				continue;
+		}
 		Carry c = d.carryIn;
 		out[slot] = ReadVertex(s, sv, d.hasUV, d.hasNormal, d.hasColor, c);
 	}
@@ -1347,6 +1383,272 @@ inline bool InVram(const u8 *p) {
 	return p >= vram && p < vram + VRAM_SIZE;
 }
 
+// --- Geometry the backend transforms (geometry.h) ---
+
+void PackColor(GeColor4i &out, const Color4i &c) {
+	memcpy(out.c, c.c, sizeof(out.c));
+}
+
+// The light vector's matrix by column (GELightVector): the negated world rows, then translated.
+void PackLightVector(const TransformState &s, const float translated[3], float cols[3][4]) {
+	for (int c = 0; c < 3; ++c) {
+		for (int k = 0; k < 3; ++k)
+			cols[c][k] = s.negWorldRows[k][c];
+		cols[c][3] = translated[c];
+	}
+}
+
+void PackTransform(const TransformState &s, GeTransform &g) {
+	memset(&g, 0, sizeof(g));
+	for (int c = 0; c < 4; ++c) {
+		for (int k = 0; k < 4; ++k) {
+			g.mtxCols[c][k] = s.matrix[k * 4 + c];
+			g.tgenCols[c][k] = s.tgenRows[k][c];
+		}
+	}
+	for (int c = 0; c < 3; ++c) {
+		for (int k = 0; k < 3; ++k)
+			g.worldCols[c][k] = s.worldRows[k][c];
+	}
+	memcpy(g.viewZRows, s.viewZRows, sizeof(g.viewZRows));
+	memcpy(g.posToFog, s.posToFog, sizeof(g.posToFog));
+	memcpy(g.screenScale, s.screenScale, sizeof(s.screenScale));
+	memcpy(g.screenAdd, s.screenAdd, sizeof(s.screenAdd));
+	memcpy(g.uvScaleF, s.uvScaleF, sizeof(g.uvScaleF));
+	memcpy(g.viewDir, s.light.viewDir, sizeof(s.light.viewDir));
+	memcpy(g.uvScale, s.uvScale, sizeof(g.uvScale));
+	memcpy(g.uvOffset, s.uvOffset, sizeof(g.uvOffset));
+	g.fogEnd = s.fogEnd;
+	g.fogSlope = s.fogSlope;
+	g.specularExp = s.light.specularExp;
+	const LightState &l = s.light;
+	u32 f = 0;
+	if (s.enableLighting) f |= GT_LIGHTING;
+	if (s.enableFog) f |= GT_FOG;
+	if (s.fogGE) f |= GT_FOG_GE;
+	if (s.negateNormals) f |= GT_NEGATE_NORMALS;
+	if (s.depthClip) f |= GT_DEPTH_CLIP;
+	if (s.geUVScale) f |= GT_GE_UV_SCALE;
+	if (s.uvPrescale) f |= GT_UV_PRESCALE;
+	f |= (u32)(s.uvGenMode & 3) << GT_UV_GEN_SHIFT;
+	f |= (u32)(s.uvProjMode & 3) << GT_UV_PROJ_SHIFT;
+	if (l.colorForAmbient) f |= GT_COLOR_AMBIENT;
+	if (l.colorForDiffuse) f |= GT_COLOR_DIFFUSE;
+	if (l.colorForSpecular) f |= GT_COLOR_SPECULAR;
+	if (l.setColor1) f |= GT_SET_COLOR1;
+	if (l.addColor1) f |= GT_ADD_COLOR1;
+	if (l.usesWorldNormal) f |= GT_WORLD_NORMAL;
+	g.flags = f;
+	g.offsetX16 = s.offsetX16;
+	g.offsetY16 = s.offsetY16;
+	g.materialAmbientRGBA = s.materialAmbientRGBA;
+	g.materialEmissive = s.materialEmissive;
+	PackColor(g.materialAmbient, l.materialAmbient);
+	PackColor(g.materialDiffuse, l.materialDiffuse);
+	PackColor(g.materialSpecular, l.materialSpecular);
+	PackColor(g.baseAmbient, l.baseAmbient);
+	for (int i = 0; i < 4; ++i) {
+		const LightState::Light &ls = l.lights[i];
+		GeLight &gl = g.lights[i];
+		memcpy(gl.pos, ls.pos, sizeof(ls.pos));
+		PackLightVector(s, ls.translated, gl.vecCols);
+		memcpy(gl.att, ls.att, sizeof(ls.att));
+		memcpy(gl.spotDir, ls.spotDir, sizeof(ls.spotDir));
+		gl.spotDirRsqrt = ls.spotDirRsqrt;
+		gl.spotCutoff = ls.spotCutoff;
+		gl.spotExp = ls.spotExp;
+		u32 lf = 0;
+		if (ls.enabled) lf |= GL_ENABLED;
+		if (ls.spot) lf |= GL_SPOT;
+		if (ls.directional) lf |= GL_DIRECTIONAL;
+		if (ls.poweredDiffuse) lf |= GL_POWERED_DIFFUSE;
+		if (ls.ambient) lf |= GL_AMBIENT;
+		if (ls.diffuse) lf |= GL_DIFFUSE;
+		if (ls.specular) lf |= GL_SPECULAR;
+		gl.flags = lf;
+		PackColor(gl.ambient, ls.ambientColorFactor);
+		PackColor(gl.diffuse, ls.diffuseColorFactor);
+		PackColor(gl.specular, ls.specularColorFactor);
+	}
+	for (int k = 0; k < 2; ++k) {
+		const TransformState::ShadeLight &sl = s.shade[k];
+		GeShadeLight &gs = g.shade[k];
+		memcpy(gs.pos, sl.pos, sizeof(sl.pos));
+		PackLightVector(s, sl.translated, gs.vecCols);
+		gs.flags = (sl.directional ? (u32)GL_DIRECTIONAL : 0u) | (sl.specular ? (u32)GL_SPECULAR : 0u);
+	}
+}
+
+// The GeTransform of each tsSnaps entry in the batch's geometry (~0u: not packed yet).
+std::vector<u32> tsGeo;
+
+// Chooses the pending draws the backend transforms, and makes their draw records and vertex slots.
+void PrepareGeometry() {
+	const bool backend = binner::TransformsGeometry();
+	gpuTransformVerify = backend && binner::VerifiesGeometry();
+	GeometryBatch &geo = binner::Geometry();
+	tsGeo.assign(tsSnaps.size(), ~0u);
+	for (PendingDraw &d : pending) {
+		d.gpu = false;
+		// Triangles in transform mode that don't continue a draw before.
+		if (!backend || d.ctx.through || d.slots == 0 ||
+		    (d.prim != GE_PRIM_TRIANGLES && d.prim != GE_PRIM_TRIANGLE_STRIP && d.prim != GE_PRIM_TRIANGLE_FAN))
+			continue;
+		d.gpu = true;
+		d.geoBase = (u32)geo.inputs.size();
+		geo.inputs.resize(geo.inputs.size() + d.slots);
+		if (tsGeo[d.tsId] == ~0u) {
+			tsGeo[d.tsId] = (u32)geo.transforms.size();
+			geo.transforms.emplace_back();
+			PackTransform(tsSnaps[d.tsId], geo.transforms.back());
+		}
+		const RasterState &st = binner::Snapshot(d.stateId);
+		GeDraw gd{};
+		gd.transform = tsGeo[d.tsId];
+		u32 f = 0;
+		if (d.hasUV) f |= GD_HAS_UV;
+		if (d.hasNormal) f |= GD_HAS_NORMAL;
+		if (d.hasColor) f |= GD_HAS_COLOR;
+		if (d.ctx.depthClip) f |= GD_DEPTH_CLIP;
+		if (d.ctx.gouraud) f |= GD_GOURAUD;
+		if (st.enableTextures && !st.pix.clearMode) f |= GD_TEXTURED;
+		if (st.pix.applyFog) f |= GD_FOG;
+		if (st.textureProj && !st.throughMode) f |= GD_PROJ;
+		if (st.shadeGouraud) f |= GD_STATE_GOURAUD;
+		gd.flags = f;
+		gd.texShift = (u32)st.samp.width0Shift | ((u32)st.samp.height0Shift << 8);
+		memcpy(gd.carryUV, d.carryIn.uv, sizeof(d.carryIn.uv));
+		memcpy(gd.carryNormal, d.carryIn.normal, sizeof(d.carryIn.normal));
+		d.geoDraw = (u32)geo.draws.size();
+		geo.draws.push_back(gd);
+	}
+}
+
+// The CPU's transform of a backend draw's slot.
+ClipVertex CpuVertex(const PendingDraw &d, u32 slot) {
+	if (gpuTransformVerify)
+		return pendingOut[d.slotBase + slot];
+	const GeVertexIn &g = binner::Geometry().inputs[d.geoBase + slot];
+	SimpleVertex sv;
+	memcpy(sv.uv, g.uv, sizeof(sv.uv));
+	sv.color = g.color;
+	memcpy(sv.nrm, g.nrm, sizeof(sv.nrm));
+	memcpy(sv.pos, g.pos, sizeof(sv.pos));
+	Carry c = d.carryIn;
+	return ReadVertex(tsSnaps[d.tsId], sv, d.hasUV, d.hasNormal, d.hasColor, c);
+}
+
+// Assemble for a backend draw: the same triangles, as jobs, and the same assembly state left behind
+// (data[] as the slots in dataSlot, made real by MaterializeData).
+void AssembleJobs(const PendingDraw &d) {
+	GeometryBatch &geo = binner::Geometry();
+	const u32 firstJob = (u32)geo.jobs.size();
+	auto slotOf = [&](int vtx) -> u32 {
+		return d.geoBase + (u32)(d.useCache ? ReadIndex(d.inds, d.fmt.idx, vtx) - d.lower : vtx);
+	};
+	auto job = [&](u32 a, u32 b, u32 c, u32 prov, bool rev) {
+		GeJob j{};
+		j.v[0] = a;
+		j.v[1] = b;
+		j.v[2] = c;
+		j.provoking = prov;
+		j.draw = d.geoDraw;
+		j.reversed = rev ? 1 : 0;
+		j.out = (u32)geo.jobs.size() * GEO_JOB_VERTS;
+		if (gpuTransformVerify) {
+			geo.expectFirst.push_back((u32)geo.expect.size());
+			const ClipVertex *o = pendingOut.data() + d.slotBase;
+			captureTris = &geo.expect;
+			ProcessTriangle(o[a - d.geoBase], o[b - d.geoBase], o[c - d.geoBase], o[prov - d.geoBase], rev);
+			captureTris = nullptr;
+		}
+		geo.jobs.push_back(j);
+	};
+	// SendTriangle.
+	auto send = [&](CullType cull, const u32 *v, int provoking, bool rev) {
+		const u32 p = v[provoking];
+		if (cull == CullType::OFF) {
+			job(v[0], v[1], v[2], p, rev);
+			job(v[2], v[1], v[0], p, !rev);
+		} else if (cull == CullType::CW) {
+			job(v[2], v[1], v[0], p, !rev);
+		} else {
+			job(v[0], v[1], v[2], p, rev);
+		}
+	};
+
+	const CullType cullType = d.ctx.cull;
+	const int count = d.count;
+	u32 slots[3] = { ~0u, ~0u, ~0u };
+	dataIndex = 0;
+	prevPrim = d.prim;
+	switch (d.prim) {
+	case GE_PRIM_TRIANGLES:
+		for (int vtx = 0; vtx < count; ++vtx) {
+			slots[dataIndex++] = slotOf(vtx);
+			if (dataIndex < 3)
+				continue;
+			dataIndex = 0;
+			send(cullType, slots, 2, false);
+		}
+		break;
+	case GE_PRIM_TRIANGLE_STRIP: {
+		int skip_count = 2, start_vtx = 0;
+		for (int vtx = 0; vtx < count && skip_count > 0; ++vtx) {
+			slots[(dataIndex++) % 3] = slotOf(vtx);
+			--skip_count;
+			++start_vtx;
+		}
+		for (int vtx = start_vtx; vtx < count; ++vtx) {
+			const int provoking_index = (dataIndex++) % 3;
+			slots[provoking_index] = slotOf(vtx);
+			const int wind = (dataIndex - 1) % 2;
+			const CullType alt = cullType == CullType::OFF ? cullType : CullType((int)cullType ^ wind);
+			send(alt, slots, provoking_index, wind != 0);
+		}
+		break;
+	}
+	case GE_PRIM_TRIANGLE_FAN: {
+		int skip_count = 1, start_vtx = 0;
+		if (count > 0) {
+			slots[0] = slotOf(0);
+			dataIndex++;
+			start_vtx = 1;
+		}
+		for (int vtx = start_vtx; vtx < count && skip_count > 0; ++vtx) {
+			slots[2 - ((dataIndex++) % 2)] = slotOf(vtx);
+			--skip_count;
+			++start_vtx;
+		}
+		for (int vtx = start_vtx; vtx < count; ++vtx) {
+			const int provoking_index = 2 - ((dataIndex++) % 2);
+			slots[provoking_index] = slotOf(vtx);
+			const int wind = (dataIndex - 1) % 2;
+			const CullType alt = cullType == CullType::OFF ? cullType : CullType((int)cullType ^ wind);
+			send(alt, slots, provoking_index, wind != 0);
+		}
+		break;
+	}
+	default:
+		break;
+	}
+	for (int i = 0; i < 3; ++i)
+		dataSlot[i] = slots[i] == ~0u ? -1 : (int)(slots[i] - d.geoBase);
+	dataSlot[3] = -1;
+	const u32 jobs = (u32)geo.jobs.size() - firstJob;
+	if (jobs != 0)
+		binner::AddGeometry(d.geoDraw, firstJob, jobs);
+}
+
+// data[] as Assemble would have left it after backend draw d.
+void MaterializeData(const PendingDraw &d) {
+	for (int i = 0; i < 4; ++i) {
+		if (dataSlot[i] >= 0)
+			data[i] = CpuVertex(d, (u32)dataSlot[i]);
+		dataSlot[i] = -1;
+	}
+}
+
 }  // namespace
 
 void ResolvePendingDraws() {
@@ -1355,18 +1657,25 @@ void ResolvePendingDraws() {
 	resolvingDraws = true;
 	// The carry the draws leave, while their vertices are at hand.
 	MaterializeCarry(true, true);
+	PrepareGeometry();
 	if (pendingOut.size() < pendingSlots)
 		pendingOut.resize(pendingSlots);
 	TransformPending();
 
 	binner::BeginResolve();
-	for (PendingDraw &d : pending) {
+	for (size_t i = 0; i < pending.size(); ++i) {
+		PendingDraw &d = pending[i];
 		d.ctx.ts = &tsSnaps[d.tsId];
 		actx = &d.ctx;
 		binner::UseSnapshot(d.stateId);
 		const ClipVertex *out = pendingOut.data() + d.slotBase;
 		isImmDraw = false;
-		if (d.useCache) {
+		if (d.gpu) {
+			AssembleJobs(d);
+			// A draw continuing this one, or what comes after these draws, may read data[].
+			if (i + 1 == pending.size() || pending[i + 1].prim == GE_PRIM_KEEP_PREVIOUS)
+				MaterializeData(d);
+		} else if (d.useCache) {
 			const u8 *inds = d.inds;
 			const int idx = d.fmt.idx, lower = d.lower;
 			Assemble(d.prim, d.count, [&](int vtx) { return out[ReadIndex(inds, idx, vtx) - lower]; });

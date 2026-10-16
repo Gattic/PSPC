@@ -64,6 +64,8 @@ struct GERecipSegment {
 	int32_t m;
 };
 extern const GERecipSegment geRecipSegments[128];
+// GERsqrt's segments for even and odd exponents.
+extern const GERecipSegment geRsqrtSegments[2][128];
 
 inline float ScaleByPow2(float f, int n, u32 sign) {
 	return BitsFloat((u32)((int32_t)FloatBits(f) + n * (1 << 23)) | sign);

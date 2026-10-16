@@ -27,7 +27,7 @@ const GERecipSegment geRecipSegments[128] = {
 };
 
 // GERsqrt: segments for even and odd exponents.
-static const GERecipSegment geRsqrtSegments[2][128] = {
+const GERecipSegment geRsqrtSegments[2][128] = {
 	{
 		{ 131072, -127 }, { 130562, -125 }, { 130059, -124 }, { 129562, -122 }, { 129070, -121 }, { 128584, -120 }, { 128103, -118 }, { 127628, -117 },
 		{ 127158, -116 }, { 126693, -114 }, { 126233, -113 }, { 125778, -112 }, { 125328, -111 }, { 124883, -110 }, { 124443, -108 }, { 124007, -107 },

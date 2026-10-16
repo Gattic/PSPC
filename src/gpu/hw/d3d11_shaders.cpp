@@ -869,6 +869,7 @@ std::string ShaderSource(ShaderKind kind) {
 	case ShaderKind::Pixel: return std::string(kCommon) + kPixel1 + kPixel2;
 	case ShaderKind::Upscale: return kUpscale;
 	case ShaderKind::Present: return std::string(kDisplay) + kPresent;
+	case ShaderKind::Geometry: return GeometryShaderSource();
 	default: return std::string(kDisplay) + kCompute;
 	}
 }

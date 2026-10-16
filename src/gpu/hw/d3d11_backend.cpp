@@ -42,6 +42,7 @@
 #include <dxgi1_6.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <climits>
 #include <cstdio>
@@ -51,7 +52,9 @@
 #include <mutex>
 #include <thread>
 
+#include "common/app_paths.h"
 #include "common/log.h"
+#include "gpu/gemath.h"
 #include "gpu/hw/d3d11_internal.h"
 
 namespace gpu::hw {
@@ -185,6 +188,11 @@ public:
 		runSeq_++;
 	}
 	void DrawBatch(const BatchPrim *prims, size_t primCount, const RasterState *states, size_t stateCount) override;
+	bool TransformsGeometry() const override { return geoEnabled_.load(std::memory_order_acquire); }
+	bool VerifiesGeometry() const override { return geoVerify_; }
+	D3D11TransformStats TransformStats() const { return { geoVerts, geoJobs, geoChecked, geoMismatches }; }
+	void DrawGeometryBatch(const BatchPrim *prims, size_t primCount, const RasterState *states, size_t stateCount,
+	                       const GeometryBatch &geo) override;
 	void SyncRange(u32 addr, u32 size) override;
 	void Invalidate(u32 addr, u32 size) override;
 	void Sync() override;
@@ -209,6 +217,12 @@ public:
 
 private:
 	ComPtr<ID3DBlob> Compile(ShaderKind kind, const char *entry, const char *target, const D3D_SHADER_MACRO *defines, std::string *err);
+	void DrawBatchImpl(const BatchPrim *prims, size_t n, const RasterState *states, size_t ns, const GeometryBatch *geo);
+	// Geometry (gpu/geometry.h): CSVertex and CSTriangle over the batch's vertices and jobs, into geoOut_.
+	void InitGeometry(const D3D11Options &o);
+	bool CreateGeometryShaders(bool compile);
+	bool RunGeometry(const GeometryBatch &g);
+	void VerifyGeometry(const GeometryBatch &g, const RasterState *states);
 	ID3D11PixelShader *PixelShader(int fmt, bool clear, bool tex);
 	bool MakeTexture(int w, int h, bool staging, ComPtr<ID3D11Texture2D> *tex, ComPtr<ID3D11UnorderedAccessView> *uav, ComPtr<ID3D11ShaderResourceView> *srv);
 	bool EnsureScratch(ComPtr<ID3D11Texture2D> &tex, ComPtr<ID3D11UnorderedAccessView> *uav, ComPtr<ID3D11ShaderResourceView> *srv, int w, int h, int *curW, int *curH, bool staging);
@@ -267,6 +281,26 @@ private:
 	size_t stateCap_ = 0;
 	ComPtr<ID3D11Texture2D> dummyTex_;
 	ComPtr<ID3D11UnorderedAccessView> dummyUav_;
+
+	// Vertex transform on the GPU (geometry.h).
+	struct GeoBuffer {
+		ComPtr<ID3D11Buffer> buf;
+		ComPtr<ID3D11ShaderResourceView> srv;
+		ComPtr<ID3D11UnorderedAccessView> uav;
+		size_t bytes = 0;
+	};
+	// An upload buffer (structured, dynamic) for count elements of `stride` bytes, filled from data.
+	bool UploadGeo(GeoBuffer &b, const void *data, size_t count, size_t stride);
+	std::atomic<bool> geoEnabled_{ false };
+	bool geoVerify_ = false, geoDoubles_ = false;
+	std::thread geoCompile_;  // compiles the shaders the cache doesn't have
+	ComPtr<ID3D11ComputeShader> csGeoVertex_, csGeoTriangle_;
+	GeoBuffer geoInputs_, geoDraws_, geoTransforms_, geoJobs_;
+	GeoBuffer geoClip_;  // CSVertex's ClipVertex, structured, UAV and SRV
+	GeoBuffer geoOut_;   // CSTriangle's GPU vertices, raw UAV and vertex buffer
+	ComPtr<ID3D11Buffer> geoCB_, geoStaging_;
+	size_t geoStagingBytes_ = 0;
+	u64 geoJobs = 0, geoVerts = 0, geoChecked = 0, geoMismatches = 0;
 
 	// Scratch: 1x upload source, 1x reduce target, readback staging, display conversion.
 	ComPtr<ID3D11Texture2D> uploadTex_, reduceTex_, stagingTex_, displayTex_, displayStaging_;
@@ -363,6 +397,8 @@ LONG CALLBACK VramFaultHandler(EXCEPTION_POINTERS *ep) {
 }
 
 D3D11Backend::~D3D11Backend() {
+	if (geoCompile_.joinable())
+		geoCompile_.join();
 	if (guard_) {
 		std::lock_guard<std::recursive_mutex> lock(mu_);
 		for (auto &sp : surfaces_)
@@ -554,7 +590,9 @@ void D3D11Backend::Throttle() {
 ComPtr<ID3DBlob> D3D11Backend::Compile(ShaderKind kind, const char *entry, const char *target, const D3D_SHADER_MACRO *defines, std::string *err) {
 	const std::string src = ShaderSource(kind);
 	ComPtr<ID3DBlob> code, errors;
-	const HRESULT hr = D3DCompile(src.data(), src.size(), entry, defines, nullptr, entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors);
+	// The GE's arithmetic must stay as written (no reassociation, NaNs kept).
+	const UINT flags = D3DCOMPILE_OPTIMIZATION_LEVEL3 | (kind == ShaderKind::Geometry ? D3DCOMPILE_IEEE_STRICTNESS : 0);
+	const HRESULT hr = D3DCompile(src.data(), src.size(), entry, defines, nullptr, entry, target, flags, 0, &code, &errors);
 	if (FAILED(hr)) {
 		std::string msg = errors ? std::string((const char *)errors->GetBufferPointer(), errors->GetBufferSize()) : "D3DCompile failed";
 		if (err)
@@ -682,6 +720,7 @@ bool D3D11Backend::Init(const D3D11Options &o, std::string *err) {
 		}
 		LOGI("d3d11", "shaders compiled in %.0f ms", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
 	}
+	InitGeometry(o);
 
 	D3D11_RASTERIZER_DESC rd{};
 	rd.FillMode = D3D11_FILL_SOLID;
@@ -1151,6 +1190,9 @@ void D3D11Backend::PrintStats() {
 	LOGI("d3d11", "  download wait %.3fs, download copy %.3fs, validate %.3fs, textures %.3fs, build %.3fs, submit %.3fs (incl. textures/downloads), display %.3fs",
 		stats_.tDownloadWait, stats_.tDownloadCopy, stats_.tValidate, stats_.tTexture, stats_.tBuild, stats_.tSubmit, stats_.tDisplay);
 	LOGI("d3d11", "  %llu draws textured from surfaces, %llu guest faults", (unsigned long long)stats_.rttDraws, (unsigned long long)faults_);
+	if (geoEnabled_)
+		LOGI("d3d11", "  GPU transform: %llu vertices, %llu triangle jobs%s", (unsigned long long)geoVerts, (unsigned long long)geoJobs,
+		     geoVerify_ ? (", " + std::to_string(geoMismatches) + " of " + std::to_string(geoChecked) + " jobs differ from the CPU").c_str() : "");
 	LOGI("d3d11", "  texture hash %.3fs (pure %.3fs, %.1f MB), decode %.3fs (%.1f Mtexels)", texCache_->hashSeconds, texCache_->pureHashSeconds, texCache_->hashBytes / 1e6,
 		texCache_->decodeSeconds, texCache_->decodeTexels / 1e6);
 	if (profileGpu_) {
@@ -1254,6 +1296,14 @@ void D3D11Backend::BindDraw(Surface *color, Surface *depth) {
 }
 
 void D3D11Backend::DrawBatch(const BatchPrim *prims, size_t n, const RasterState *states, size_t ns) {
+	DrawBatchImpl(prims, n, states, ns, nullptr);
+}
+
+void D3D11Backend::DrawGeometryBatch(const BatchPrim *prims, size_t n, const RasterState *states, size_t ns, const GeometryBatch &geo) {
+	DrawBatchImpl(prims, n, states, ns, &geo);
+}
+
+void D3D11Backend::DrawBatchImpl(const BatchPrim *prims, size_t n, const RasterState *states, size_t ns, const GeometryBatch *geo) {
 	if (n == 0 || ns == 0)
 		return;
 	std::lock_guard<std::recursive_mutex> lock(mu_);
@@ -1287,17 +1337,27 @@ void D3D11Backend::DrawBatch(const BatchPrim *prims, size_t n, const RasterState
 
 	{
 		ScopedTimer tb(&stats_.tBuild);
-		BuildVertices(prims, n, states);
+		BuildVertices(prims, n, states, geo);
 		FillStates(states, ns);
 	}
-	if (verts_.empty())
+	if (segs_.empty())
 		return;
+	if (geo && !geo->Empty()) {
+		if (!RunGeometry(*geo)) {
+			if (!loggedAllocFailure_)
+				LOGE("d3d11", "GPU transform buffers can't be made; the batch isn't drawn");
+			loggedAllocFailure_ = true;
+			return;
+		}
+		if (geoVerify_)
+			VerifyGeometry(*geo, states);
+	}
 	ResolveRenderToTexture(states, ns);
 	stats_.verts += verts_.size();
 	ScopedTimer tsub(&stats_.tSubmit);
 
 	// Vertex and state buffers for the whole batch.
-	const size_t vbNeed = verts_.size() * sizeof(GpuVertex);
+	const size_t vbNeed = std::max<size_t>(verts_.size(), 1) * sizeof(GpuVertex);
 	if (vbBytes_ < vbNeed) {
 		size_t cap = std::max<size_t>(vbBytes_ * 2, 1 << 20);
 		while (cap < vbNeed)
@@ -1330,10 +1390,12 @@ void D3D11Backend::DrawBatch(const BatchPrim *prims, size_t n, const RasterState
 		stateCap_ = cap;
 	}
 	D3D11_MAPPED_SUBRESOURCE m{};
-	if (FAILED(ctx_->Map(vb_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
-		return;
-	memcpy(m.pData, verts_.data(), vbNeed);
-	ctx_->Unmap(vb_.Get(), 0);
+	if (!verts_.empty()) {
+		if (FAILED(ctx_->Map(vb_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+			return;
+		memcpy(m.pData, verts_.data(), verts_.size() * sizeof(GpuVertex));
+		ctx_->Unmap(vb_.Get(), 0);
+	}
 	if (FAILED(ctx_->Map(stateBuf_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
 		return;
 	memcpy(m.pData, gpuStates_.data(), ns * sizeof(DrawStateGpu));
@@ -1348,6 +1410,7 @@ void D3D11Backend::DrawBatch(const BatchPrim *prims, size_t n, const RasterState
 	BindDraw(color, depth);
 
 	D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+	bool gpuVb = false;  // BindDraw binds vb_
 	for (const Segment &seg : segs_) {
 		if (seg.count == 0)
 			continue;
@@ -1375,8 +1438,16 @@ void D3D11Backend::DrawBatch(const BatchPrim *prims, size_t n, const RasterState
 		ID3D11PixelShader *ps = PixelShader(st.pix.fbFormat, st.pix.clearMode, textured);
 		if (!ps)
 			continue;
-		if (omDirty_)
+		if (omDirty_) {
 			BindDraw(color, depth);
+			gpuVb = false;
+		}
+		if (seg.gpu != gpuVb) {
+			const UINT stride = sizeof(GpuVertex), offset = 0;
+			ID3D11Buffer *vb = seg.gpu ? geoOut_.buf.Get() : vb_.Get();
+			ctx_->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
+			gpuVb = seg.gpu;
+		}
 		ctx_->PSSetShader(ps, nullptr, 0);
 		ctx_->PSSetShaderResources(0, 1, &srv);
 		D3D11_RECT sc;
@@ -1402,6 +1473,307 @@ void D3D11Backend::DrawBatch(const BatchPrim *prims, size_t n, const RasterState
 	Protect(color);
 	if (depth)
 		Protect(depth);
+}
+
+// --- Vertex transform on the GPU (gpu/geometry.h) ---
+
+struct GeoCB {
+	u32 count;
+	u32 scale;
+	u32 base;  // CSVertex: the first input
+	u32 pad;
+};
+
+// Compiled geometry shaders, under the cache root, named by a hash of all that makes them.
+fs::path GeometryShaderCache(const char *entry, const std::string &src, bool doubles) {
+	u64 h = 0xCBF29CE484222325ULL;
+	auto mix = [&](const void *p, size_t n) {
+		for (size_t i = 0; i < n; ++i)
+			h = (h ^ ((const u8 *)p)[i]) * 0x100000001B3ULL;
+	};
+	mix(src.data(), src.size());
+	mix(entry, strlen(entry));
+	const u32 extra[2] = { doubles ? 1u : 0u, (u32)D3D_COMPILER_VERSION };
+	mix(extra, sizeof(extra));
+	char name[64];
+	snprintf(name, sizeof(name), "%s-%016llx.cso", entry, (unsigned long long)h);
+	return apppaths::CacheRoot() / "shaders" / name;
+}
+
+// The geometry shaders from the cache, or with compile, compiled (and cached) when the cache doesn't
+// have them or they don't load. True when both exist.
+bool D3D11Backend::CreateGeometryShaders(bool compile) {
+	const std::string src = ShaderSource(ShaderKind::Geometry);
+	const D3D_SHADER_MACRO defines[] = { { "DOUBLES", geoDoubles_ ? "1" : "0" }, { nullptr, nullptr } };
+	auto make = [&](const char *entry, ComPtr<ID3D11ComputeShader> *cs) {
+		const fs::path path = GeometryShaderCache(entry, src, geoDoubles_);
+		std::vector<u8> code;
+		std::error_code ec;
+		if (fs::exists(path, ec) && ReadWholeFile(path, code) && !code.empty() &&
+			SUCCEEDED(dev_->CreateComputeShader(code.data(), code.size(), nullptr, cs->ReleaseAndGetAddressOf())))
+			return true;
+		if (!compile)
+			return false;
+		ComPtr<ID3DBlob> blob = Compile(ShaderKind::Geometry, entry, "cs_5_0", defines, nullptr);
+		if (!blob || FAILED(dev_->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, cs->ReleaseAndGetAddressOf())))
+			return false;
+		// Written whole under a name of this process's, then renamed: other instances may do the same.
+		fs::create_directories(path.parent_path(), ec);
+		const fs::path tmp = path.string() + "." + std::to_string(GetCurrentProcessId()) + ".tmp";
+		if (WriteWholeFile(tmp, blob->GetBufferPointer(), blob->GetBufferSize()))
+			fs::rename(tmp, path, ec);
+		fs::remove(tmp, ec);
+		return true;
+	};
+	bool vertexOk = false;
+	// Both at once: the vertex shader takes several seconds to compile.
+	std::thread other([&] { vertexOk = make("CSVertex", &csGeoVertex_); });
+	const bool triangleOk = make("CSTriangle", &csGeoTriangle_);
+	other.join();
+	return vertexOk && triangleOk;
+}
+
+void D3D11Backend::InitGeometry(const D3D11Options &o) {
+	const char *env = getenv("PSPC_GPU_TRANSFORM");
+	if (!o.gpuTransform || (env && *env == '0'))
+		return;
+	geoVerify_ = o.verifyTransform || getenv("PSPC_GPU_TRANSFORM_VERIFY") != nullptr;
+	// The texture-level gradient and reciprocal w behind the camera are double divisions on the CPU.
+	D3D11_FEATURE_DATA_DOUBLES dbl{};
+	D3D11_FEATURE_DATA_D3D11_OPTIONS o1{};
+	geoDoubles_ = SUCCEEDED(dev_->CheckFeatureSupport(D3D11_FEATURE_DOUBLES, &dbl, sizeof(dbl))) && dbl.DoublePrecisionFloatShaderOps &&
+		SUCCEEDED(dev_->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &o1, sizeof(o1))) && o1.ExtendedDoublesShaderInstructions;
+	D3D11_BUFFER_DESC cbd{};
+	cbd.ByteWidth = sizeof(GeoCB);
+	cbd.Usage = D3D11_USAGE_DEFAULT;
+	cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	if (FAILED(dev_->CreateBuffer(&cbd, nullptr, &geoCB_)))
+		return;
+	auto ready = [this](double ms) {
+		LOGI("d3d11", "vertex transform on the GPU%s%s%s", geoDoubles_ ? "" : " (without double precision)",
+		     ms >= 0 ? (" (shaders compiled in " + std::to_string((int)ms) + " ms)").c_str() : "", geoVerify_ ? ", verified against the CPU" : "");
+		geoEnabled_.store(true, std::memory_order_release);
+	};
+	if (CreateGeometryShaders(false)) {
+		ready(-1);
+		return;
+	}
+	// Not compiled yet: the CPU transforms until the shaders are ready (PSPC_GPU_TRANSFORM_WAIT: wait).
+	auto compile = [this, ready] {
+		const auto t0 = std::chrono::steady_clock::now();
+		if (CreateGeometryShaders(true))
+			ready(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+		else
+			LOGW("d3d11", "vertex transform shaders unavailable; transforming on the CPU");
+	};
+	if (o.waitForShaders || getenv("PSPC_GPU_TRANSFORM_WAIT"))
+		compile();
+	else
+		geoCompile_ = std::thread(compile);
+}
+
+bool D3D11Backend::UploadGeo(GeoBuffer &b, const void *data, size_t count, size_t stride) {
+	const size_t need = std::max<size_t>(count, 1) * stride;
+	if (b.bytes < need) {
+		// A whole number of elements (structured buffers need that).
+		size_t cap = std::max<size_t>(b.bytes * 2, 64 * 1024);
+		while (cap < need)
+			cap *= 2;
+		cap = (cap + stride - 1) / stride * stride;
+		D3D11_BUFFER_DESC bd{};
+		bd.ByteWidth = (UINT)cap;
+		bd.Usage = D3D11_USAGE_DYNAMIC;
+		bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+		bd.StructureByteStride = (UINT)stride;
+		b = GeoBuffer{};
+		if (FAILED(dev_->CreateBuffer(&bd, nullptr, &b.buf)) || FAILED(dev_->CreateShaderResourceView(b.buf.Get(), nullptr, &b.srv)))
+			return false;
+		b.bytes = cap;
+	}
+	if (count == 0)
+		return true;
+	D3D11_MAPPED_SUBRESOURCE m{};
+	if (FAILED(ctx_->Map(b.buf.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+		return false;
+	memcpy(m.pData, data, count * stride);
+	ctx_->Unmap(b.buf.Get(), 0);
+	return true;
+}
+
+bool D3D11Backend::RunGeometry(const GeometryBatch &g) {
+	constexpr size_t CLIP_STRIDE = 56;  // ClipV in the HLSL
+	const size_t nIn = g.inputs.size(), nJobs = g.jobs.size(), nOut = nJobs * GEO_JOB_VERTS;
+	// A batch split while its draws were assembled shares their inputs with the batch before: only those
+	// from the first its jobs use are transformed again.
+	u32 firstIn = (u32)nIn;
+	for (const GeJob &j : g.jobs)
+		firstIn = std::min({ firstIn, j.v[0], j.v[1], j.v[2] });
+	if (!UploadGeo(geoInputs_, g.inputs.data(), nIn, sizeof(GeVertexIn)) || !UploadGeo(geoDraws_, g.draws.data(), g.draws.size(), sizeof(GeDraw)) ||
+		!UploadGeo(geoTransforms_, g.transforms.data(), g.transforms.size(), sizeof(GeTransform)) ||
+		!UploadGeo(geoJobs_, g.jobs.data(), nJobs, sizeof(GeJob)))
+		return false;
+	if (geoClip_.bytes < nIn * CLIP_STRIDE) {
+		size_t cap = std::max<size_t>(geoClip_.bytes * 2, 64 * 1024);
+		while (cap < nIn * CLIP_STRIDE)
+			cap *= 2;
+		cap = (cap / CLIP_STRIDE) * CLIP_STRIDE;
+		D3D11_BUFFER_DESC bd{};
+		bd.ByteWidth = (UINT)cap;
+		bd.Usage = D3D11_USAGE_DEFAULT;
+		bd.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+		bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+		bd.StructureByteStride = (UINT)CLIP_STRIDE;
+		geoClip_ = GeoBuffer{};
+		if (FAILED(dev_->CreateBuffer(&bd, nullptr, &geoClip_.buf)) || FAILED(dev_->CreateShaderResourceView(geoClip_.buf.Get(), nullptr, &geoClip_.srv)) ||
+			FAILED(dev_->CreateUnorderedAccessView(geoClip_.buf.Get(), nullptr, &geoClip_.uav)))
+			return false;
+		geoClip_.bytes = cap;
+	}
+	if (geoOut_.bytes < nOut * sizeof(GpuVertex)) {
+		size_t cap = std::max<size_t>(geoOut_.bytes * 2, 1 << 20);
+		while (cap < nOut * sizeof(GpuVertex))
+			cap *= 2;
+		cap &= ~(size_t)3;
+		D3D11_BUFFER_DESC bd{};
+		bd.ByteWidth = (UINT)cap;
+		bd.Usage = D3D11_USAGE_DEFAULT;
+		bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_VERTEX_BUFFER;
+		bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+		geoOut_ = GeoBuffer{};
+		D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+		ud.Format = DXGI_FORMAT_R32_TYPELESS;
+		ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+		ud.Buffer.NumElements = (UINT)(cap / 4);
+		ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+		if (FAILED(dev_->CreateBuffer(&bd, nullptr, &geoOut_.buf)) || FAILED(dev_->CreateUnorderedAccessView(geoOut_.buf.Get(), &ud, &geoOut_.uav)))
+			return false;
+		geoOut_.bytes = cap;
+		omDirty_ = true;  // the vertex buffer binding goes with the old buffer
+	}
+	// The vertex buffer can't stay bound while the shader writes it.
+	ID3D11Buffer *nullVb = nullptr;
+	const UINT zero = 0;
+	ctx_->IASetVertexBuffers(0, 1, &nullVb, &zero, &zero);
+	omDirty_ = true;
+
+	ID3D11ShaderResourceView *nullSrv[5] = {};
+	ID3D11UnorderedAccessView *nullUav[2] = {};
+	GeoCB cb{};
+	cb.count = (u32)nIn - firstIn;
+	cb.scale = (u32)scale_;
+	cb.base = firstIn;
+	ctx_->UpdateSubresource(geoCB_.Get(), 0, nullptr, &cb, 0, 0);
+	ctx_->CSSetConstantBuffers(0, 1, geoCB_.GetAddressOf());
+	if (cb.count != 0) {
+		ID3D11ShaderResourceView *srvs[3] = { geoInputs_.srv.Get(), geoDraws_.srv.Get(), geoTransforms_.srv.Get() };
+		ctx_->CSSetShader(csGeoVertex_.Get(), nullptr, 0);
+		ctx_->CSSetShaderResources(0, 3, srvs);
+		ctx_->CSSetUnorderedAccessViews(0, 1, geoClip_.uav.GetAddressOf(), nullptr);
+		ctx_->Dispatch((cb.count + 63) / 64, 1, 1);
+		ctx_->CSSetUnorderedAccessViews(0, 1, nullUav, nullptr);
+	}
+	cb.count = (u32)nJobs;
+	cb.base = 0;
+	ctx_->UpdateSubresource(geoCB_.Get(), 0, nullptr, &cb, 0, 0);
+	ID3D11ShaderResourceView *srvs[5] = { nullptr, geoDraws_.srv.Get(), geoTransforms_.srv.Get(), geoJobs_.srv.Get(), geoClip_.srv.Get() };
+	ctx_->CSSetShader(csGeoTriangle_.Get(), nullptr, 0);
+	ctx_->CSSetShaderResources(0, 5, srvs);
+	ctx_->CSSetUnorderedAccessViews(1, 1, geoOut_.uav.GetAddressOf(), nullptr);
+	ctx_->Dispatch((UINT)((nJobs + 63) / 64), 1, 1);
+	ctx_->CSSetUnorderedAccessViews(0, 2, nullUav, nullptr);
+	ctx_->CSSetShaderResources(0, 5, nullSrv);
+	geoJobs += nJobs;
+	geoVerts += nIn - firstIn;
+	return true;
+}
+
+// PSPC_GPU_TRANSFORM_VERIFY: the GPU's vertices against what transform.cpp and EmitTriangle make of the
+// same jobs (GeometryBatch::expect), bit for bit.
+void D3D11Backend::VerifyGeometry(const GeometryBatch &g, const RasterState *states) {
+	const size_t bytes = g.jobs.size() * GEO_JOB_VERTS * sizeof(GpuVertex);
+	if (bytes == 0)
+		return;
+	if (geoStagingBytes_ < bytes) {
+		D3D11_BUFFER_DESC bd{};
+		bd.ByteWidth = (UINT)bytes;
+		bd.Usage = D3D11_USAGE_STAGING;
+		bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		geoStaging_.Reset();
+		if (FAILED(dev_->CreateBuffer(&bd, nullptr, &geoStaging_)))
+			return;
+		geoStagingBytes_ = bytes;
+	}
+	D3D11_BOX box{ 0, 0, 0, (UINT)bytes, 1, 1 };
+	ctx_->CopySubresourceRegion(geoStaging_.Get(), 0, 0, 0, 0, geoOut_.buf.Get(), 0, &box);
+	D3D11_MAPPED_SUBRESOURCE m{};
+	if (FAILED(ctx_->Map(geoStaging_.Get(), 0, D3D11_MAP_READ, 0, &m)))
+		return;
+	const GpuVertex *gpu = (const GpuVertex *)m.pData;
+	// EmitTriangle appends to verts_, which holds the batch's own vertices: work past them.
+	const size_t keep = verts_.size();
+	static const char *const names[11] = { "x", "y", "z", "fog", "c0", "c1", "s", "t", "q", "state", "lod" };
+	u64 fieldMismatches[11] = {};
+	u64 bad = 0;
+	for (size_t j = 0; j < g.jobs.size() && j < g.expectFirst.size(); ++j) {
+		const GeJob &job = g.jobs[j];
+		const GeDraw &d = g.draws[job.draw];
+		const u32 e0 = g.expectFirst[j], e1 = j + 1 < g.expectFirst.size() ? g.expectFirst[j + 1] : (u32)g.expect.size();
+		// The CPU's triangles, made into GPU vertices, against the GPU's in order (a triangle the GPU
+		// leaves out is degenerate: every vertex at 0, 0).
+		std::vector<GpuVertex> want, got;
+		for (u32 e = e0; e + 3 <= e1; e += 3) {
+			BatchPrim p{};
+			p.type = PrimType::Triangle;
+			p.stateIndex = d.state;
+			for (int k = 0; k < 3; ++k)
+				p.v[k] = g.expect[e + k];
+			EmitTriangle(p, states[d.state]);
+			want.insert(want.end(), verts_.end() - 3, verts_.end());
+			verts_.resize(keep);
+		}
+		for (u32 t = 0; t < GEO_JOB_VERTS / 3; ++t) {
+			const GpuVertex *v = &gpu[job.out + t * 3];
+			bool degenerate = true;
+			for (int k = 0; k < 3; ++k)
+				degenerate = degenerate && FloatBits(v[k].x) == 0 && FloatBits(v[k].y) == 0;
+			if (!degenerate)
+				got.insert(got.end(), v, v + 3);
+		}
+		bool jobBad = false;
+		if (want.size() != got.size()) {
+			if (geoMismatches < 20)
+				LOGW("d3d11", "GPU transform: job %zu: GPU made %zu triangles, CPU %zu", j, got.size() / 3, want.size() / 3);
+			jobBad = true;
+		}
+		for (size_t k = 0; k < want.size() && k < got.size(); ++k) {
+			const u32 *a = (const u32 *)&got[k], *b = (const u32 *)&want[k];
+			for (int f = 0; f < 11; ++f) {
+				if (a[f] != b[f]) {
+					fieldMismatches[f]++;
+					if (!jobBad && geoMismatches < 20)
+						LOGW("d3d11", "GPU transform: job %zu vertex %zu %s: GPU %08x, CPU %08x", j, k, names[f], a[f], b[f]);
+					jobBad = true;
+				}
+			}
+		}
+		if (jobBad) {
+			bad++;
+			geoMismatches++;
+		}
+		geoChecked++;
+	}
+	ctx_->Unmap(geoStaging_.Get(), 0);
+	if (bad) {
+		std::string fields;
+		for (int f = 0; f < 11; ++f) {
+			if (fieldMismatches[f])
+				fields += std::string(fields.empty() ? "" : ", ") + names[f] + " " + std::to_string(fieldMismatches[f]);
+		}
+		LOGW("d3d11", "GPU transform: %llu of %zu jobs differ (%s); %llu of %llu so far", (unsigned long long)bad, g.jobs.size(), fields.c_str(),
+		     (unsigned long long)geoMismatches, (unsigned long long)geoChecked);
+	}
 }
 
 // The surface a displayed framebuffer is, when the GPU drew it; nullptr otherwise.
@@ -1687,6 +2059,11 @@ std::unique_ptr<RenderBackend> CreateD3D11Backend(const D3D11Options &opts, std:
 		return nullptr;
 	}
 	return b;
+}
+
+D3D11TransformStats GetD3D11TransformStats(RenderBackend *backend) {
+	auto *b = dynamic_cast<D3D11Backend *>(backend);
+	return b ? b->TransformStats() : D3D11TransformStats{};
 }
 
 }  // namespace gpu::hw

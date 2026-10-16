@@ -40,7 +40,8 @@ struct RVertex {
 	float fog;       // fog depth, 1 = no fog
 };
 
-enum class PrimType : u8 { Triangle, Rect, ClearRect, Line, Point };
+// Geometry: triangles a backend transforms itself (geometry.h).
+enum class PrimType : u8 { Triangle, Rect, ClearRect, Line, Point, Geometry };
 
 // Pixel range, inclusive, in screen subpixels (like PPSSPP's BinCoords).
 struct Range {
@@ -143,6 +144,8 @@ void DrawPoint(const RVertex &v0, const Range &range, const RasterState &state);
 
 void ComputeRasterState(RasterState *state, const u8 *clut);
 
+struct GeometryBatch;  // geometry.h
+
 // The worker threads (binner.cpp): runs fn(0..count-1) on them and on the calling thread, in the
 // caller's floating-point mode, and returns when all are done. Not reentrant.
 void ParallelFor(int count, const std::function<void(int)> &fn);
@@ -172,6 +175,12 @@ void AddRect(const RVertex &v0, const RVertex &v1);
 void AddClearRect(const RVertex &v0, const RVertex &v1);
 void AddLine(const RVertex &v0, const RVertex &v1);
 void AddPoint(const RVertex &v0);
+// Geometry the backend transforms (geometry.h): whether it does, the batch's geometry, and a run of its
+// jobs, all from one GeDraw, as a primitive.
+bool TransformsGeometry();
+bool VerifiesGeometry();
+GeometryBatch &Geometry();
+void AddGeometry(u32 geoDraw, u32 firstJob, u32 jobCount);
 // Draws everything queued.
 void Flush();
 bool HasQueued();

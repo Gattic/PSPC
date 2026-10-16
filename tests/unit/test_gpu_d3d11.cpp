@@ -620,6 +620,217 @@ TEST(gpu_hardware_resolution_perf) {
 	}
 }
 
+#ifdef _WIN32
+namespace {
+
+// Lit, textured, fogged 3D drawn in transform mode: four light kinds, material colors from the vertex
+// and not, specular as color 1 and added, a texture matrix and an environment map, skinning and
+// morphing, flat shading, every cull mode, lists, indexed strips and fans, and triangles through the
+// near plane with depth clipping on and off.
+void DrawLitScene() {
+	g_seed = 777;
+	for (int i = 0; i < 64 * 64; ++i)
+		GWrite16(TEX + i * 2, (u16)Rnd());
+	auto frand = [](float lo, float hi) { return lo + (hi - lo) * (float)(Rnd() % 10000) / 10000.0f; };
+	DL dl;
+	dl.C(GE_CMD_FRAMEBUFPTR, 0).C(GE_CMD_FRAMEBUFWIDTH, 512).C(GE_CMD_FRAMEBUFPIXFORMAT, GE_FORMAT_8888);
+	dl.C(GE_CMD_ZBUFPTR, ZBUF).C(GE_CMD_ZBUFWIDTH, 512);
+	dl.C(GE_CMD_SCISSOR1, 0).C(GE_CMD_SCISSOR2, 479 | (271 << 10)).C(GE_CMD_REGION1, 0).C(GE_CMD_REGION2, 479 | (271 << 10));
+	TVert clr[2] = { { 0xFF102030, 0, 0, 0, 0 }, { 0xFF102030, 480, 272, 0, 0 } };
+	memcpy(GPtr(VERTS + 0x70000), clr, sizeof(clr));
+	dl.C(GE_CMD_CLEARMODE, 1 | (7 << 8)).C(GE_CMD_VERTEXTYPE, VT_C8888_P16).Prim(GE_PRIM_RECTANGLES, 2, VERTS + 0x70000).C(GE_CMD_CLEARMODE, 0);
+
+	// A rotated world, the camera at the origin looking down -z, a perspective projection (near 1).
+	const float c = std::cos(0.6f), s = std::sin(0.6f);
+	const float world[12] = { c, 0, -s, 0.1f * s, 1, 0.2f, s, 0, c, 0.3f, -0.2f, -2.5f };
+	const float view[12] = { 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0 };
+	const float n = 1.0f, f = 50.0f;
+	const float proj[16] = { 1.2f, 0, 0, 0, 0, 2.0f, 0, 0, 0, 0, (f + n) / (n - f), -1, 0, 0, 2 * f * n / (n - f), 0 };
+	const float tgen[12] = { 0.5f, 0.1f, 0, 0.2f, 0.5f, 0, 0.1f, 0.3f, 1, 0.5f, 0.5f, 0 };
+	dl.C(GE_CMD_WORLDMATRIXNUMBER, 0);
+	for (float v : world) dl.F(GE_CMD_WORLDMATRIXDATA, v);
+	dl.C(GE_CMD_VIEWMATRIXNUMBER, 0);
+	for (float v : view) dl.F(GE_CMD_VIEWMATRIXDATA, v);
+	dl.C(GE_CMD_PROJMATRIXNUMBER, 0);
+	for (float v : proj) dl.F(GE_CMD_PROJMATRIXDATA, v);
+	dl.C(GE_CMD_TGENMATRIXNUMBER, 0);
+	for (float v : tgen) dl.F(GE_CMD_TGENMATRIXDATA, v);
+	// Two bones: nearly the identity, and turned and moved.
+	const float bones[2][12] = { { 1.0f, 0.05f, 0, 0, 1.0f, 0, 0, 0, 0.9f, 0, 0, 0 },
+	                             { 0.8f, -0.3f, 0.1f, 0.3f, 0.8f, 0, 0, 0.1f, 1.1f, 0.3f, -0.2f, 0.5f } };
+	dl.C(GE_CMD_BONEMATRIXNUMBER, 0);
+	for (const auto &bone : bones)
+		for (float v : bone) dl.F(GE_CMD_BONEMATRIXDATA, v);
+	dl.F(GE_CMD_VIEWPORTXSCALE, 240.0f).F(GE_CMD_VIEWPORTYSCALE, -136.0f).F(GE_CMD_VIEWPORTZSCALE, -30000.0f);
+	dl.F(GE_CMD_VIEWPORTXCENTER, 2048.0f).F(GE_CMD_VIEWPORTYCENTER, 2048.0f).F(GE_CMD_VIEWPORTZCENTER, 32000.0f);
+	dl.C(GE_CMD_OFFSETX, (2048 - 240) << 4).C(GE_CMD_OFFSETY, (2048 - 136) << 4);
+	dl.C(GE_CMD_MINZ, 0).C(GE_CMD_MAXZ, 0xFFFF).C(GE_CMD_ZTESTENABLE, 1).C(GE_CMD_ZTEST, GE_COMP_GEQUAL).C(GE_CMD_ZWRITEDISABLE, 0);
+	dl.C(GE_CMD_FOGENABLE, 1).F(GE_CMD_FOG1, 6.0f).F(GE_CMD_FOG2, 0.15f).C(GE_CMD_FOGCOLOR, 0x506070);
+	dl.C(GE_CMD_TEXTUREMAPENABLE, 1).C(GE_CMD_TEXFORMAT, GE_TFMT_5551).C(GE_CMD_TEXMODE, 0);
+	dl.C(GE_CMD_TEXADDR0, TEX & 0xFFFFF0).C(GE_CMD_TEXBUFWIDTH0, 64 | ((TEX >> 8) & 0x0F0000));
+	dl.C(GE_CMD_TEXSIZE0, 6 | (6 << 8)).C(GE_CMD_TEXFUNC, GE_TEXFUNC_MODULATE | 0x100).C(GE_CMD_TEXFILTER, 1 | (1 << 8));
+	dl.F(GE_CMD_TEXSCALEU, 1.5f).F(GE_CMD_TEXSCALEV, 0.75f).F(GE_CMD_TEXOFFSETU, 0.25f).F(GE_CMD_TEXOFFSETV, -0.125f);
+
+	// Lights: directional with specular, point with attenuation, spot with powered diffuse, point specular.
+	dl.C(GE_CMD_LIGHTINGENABLE, 1);
+	const u32 types[4] = { GE_LIGHTCOMP_BOTH | (GE_LIGHTTYPE_DIRECTIONAL << 8), GE_LIGHTCOMP_ONLYDIFFUSE | (GE_LIGHTTYPE_POINT << 8),
+	                       GE_LIGHTCOMP_ONLYPOWDIFFUSE | (GE_LIGHTTYPE_SPOT << 8), GE_LIGHTCOMP_BOTH | (GE_LIGHTTYPE_POINT << 8) };
+	const float lpos[4][3] = { { 0.3f, 0.8f, 0.5f }, { -1.0f, 1.0f, -1.5f }, { 0.5f, -0.5f, 0.0f }, { 1.5f, 0.5f, -3.0f } };
+	const float ldir[4][3] = { { 0, 0, 0 }, { 0, 0, 0 }, { -0.2f, 0.3f, -1.0f }, { 0, 0, 0 } };
+	const float latt[4][3] = { { 1, 0, 0 }, { 0.5f, 0.3f, 0.1f }, { 1.0f, 0.2f, 0.0f }, { 0.2f, 0.0f, 0.4f } };
+	const u32 lcol[4][3] = { { 0x202020, 0xC0C0C0, 0xFFFFFF }, { 0x101010, 0xFF8040, 0x000000 },
+	                         { 0x000000, 0x40FF40, 0x000000 }, { 0x080808, 0x6060FF, 0xFFE0C0 } };
+	for (int l = 0; l < 4; ++l) {
+		dl.C(GE_CMD_LIGHTENABLE0 + l, 1).C(GE_CMD_LIGHTTYPE0 + l, types[l]);
+		for (int i = 0; i < 3; ++i) {
+			dl.F(GE_CMD_LX0 + 3 * l + i, lpos[l][i]).F(GE_CMD_LDX0 + 3 * l + i, ldir[l][i]).F(GE_CMD_LKA0 + 3 * l + i, latt[l][i]);
+			dl.C(GE_CMD_LAC0 + 3 * l + i, lcol[l][i]);
+		}
+		dl.F(GE_CMD_LKS0 + l, 3.0f).F(GE_CMD_LKO0 + l, 0.6f);
+	}
+	dl.C(GE_CMD_MATERIALEMISSIVE, 0x101008).C(GE_CMD_MATERIALAMBIENT, 0x406080).C(GE_CMD_MATERIALALPHA, 0xC0);
+	dl.C(GE_CMD_MATERIALDIFFUSE, 0xE0C0A0).C(GE_CMD_MATERIALSPECULAR, 0xFFFFFF).F(GE_CMD_MATERIALSPECULARCOEF, 12.0f);
+	dl.C(GE_CMD_AMBIENTCOLOR, 0x303030).C(GE_CMD_AMBIENTALPHA, 0xFF);
+
+	// Format A: float UV, 8888 color, float normal and position (36 bytes).
+	struct VA { float u, v; u32 color; float nx, ny, nz, x, y, z; };
+	const u32 VT_A = GE_VTYPE_TC_FLOAT | GE_VTYPE_COL_8888 | GE_VTYPE_NRM_FLOAT | GE_VTYPE_POS_FLOAT;
+	auto randomA = [&](VA &v) {
+		v.u = frand(-0.5f, 1.5f);
+		v.v = frand(-0.5f, 1.5f);
+		v.color = 0x80000000u | (Rnd() << 8) | (Rnd() & 0xFF);
+		v.nx = frand(-1, 1);
+		v.ny = frand(-1, 1);
+		v.nz = frand(-1, 1);
+		v.x = frand(-2.5f, 2.5f);
+		v.y = frand(-1.5f, 1.5f);
+		v.z = frand(-2.0f, 2.4f);  // the world puts some of them behind the near plane
+	};
+	struct Case { u32 vtype; int prim; int count; bool indexed; u32 matUpdate, lightMode, texMap, cull, gouraud, depthClip, reverse; };
+	const Case cases[] = {
+		{ VT_A, GE_PRIM_TRIANGLES, 300, false, 0, 0, 0, 0, 1, 1, 0 },
+		{ VT_A, GE_PRIM_TRIANGLE_STRIP, 120, true, 7, 1, 0, 1, 1, 1, 0 },
+		{ VT_A, GE_PRIM_TRIANGLE_FAN, 40, false, 2, 1, GE_TEXMAP_TEXTURE_MATRIX | (GE_PROJMAP_NORMAL << 8), 2, 0, 1, 1 },
+		{ VT_A, GE_PRIM_TRIANGLES, 240, true, 1, 0, GE_TEXMAP_TEXTURE_MATRIX | (GE_PROJMAP_POSITION << 8), 3, 1, 0, 0 },
+		{ VT_A, GE_PRIM_TRIANGLE_STRIP, 90, false, 0, 1, GE_TEXMAP_ENVIRONMENT_MAP, 0, 1, 1, 0 },
+		{ VT_A, GE_PRIM_TRIANGLES, 150, false, 4, 0, GE_TEXMAP_TEXTURE_MATRIX | (GE_PROJMAP_NORMALIZED_NORMAL << 8), 1, 1, 1, 0 },
+	};
+	u32 at = VERTS;
+	for (const Case &k : cases) {
+		std::vector<VA> verts(k.indexed ? k.count / 2 + 3 : k.count);
+		for (VA &v : verts)
+			randomA(v);
+		memcpy(GPtr(at), verts.data(), verts.size() * sizeof(VA));
+		const u32 vaddr = at;
+		at += (u32)(verts.size() * sizeof(VA) + 64) & ~15u;
+		u32 vtype = k.vtype;
+		if (k.indexed) {
+			std::vector<u16> idx(k.count);
+			for (u16 &i : idx)
+				i = (u16)(Rnd() % verts.size());
+			memcpy(GPtr(at), idx.data(), idx.size() * 2);
+			dl.Addr(GE_CMD_IADDR, at);
+			at += (u32)(idx.size() * 2 + 64) & ~15u;
+			vtype |= GE_VTYPE_IDX_16BIT;
+		}
+		dl.C(GE_CMD_MATERIALUPDATE, k.matUpdate).C(GE_CMD_LIGHTMODE, k.lightMode).C(GE_CMD_TEXMAPMODE, k.texMap).C(GE_CMD_TEXSHADELS, 0 | (3 << 8));
+		dl.C(GE_CMD_CULLFACEENABLE, k.cull != 0).C(GE_CMD_CULL, k.cull & 1).C(GE_CMD_SHADEMODE, k.gouraud);
+		dl.C(GE_CMD_DEPTHCLIPENABLE, k.depthClip).C(GE_CMD_REVERSENORMAL, k.reverse);
+		dl.C(GE_CMD_VERTEXTYPE, vtype).Prim(k.prim, k.count, vaddr);
+	}
+
+	// Skinned (two float weights), then morphed (two frames of 16-bit position and 8-bit normal), unlit
+	// draws in between carrying the UV and normal over.
+	dl.C(GE_CMD_TEXMAPMODE, 0).C(GE_CMD_MATERIALUPDATE, 0).C(GE_CMD_CULLFACEENABLE, 0).C(GE_CMD_SHADEMODE, 1).C(GE_CMD_DEPTHCLIPENABLE, 1);
+	struct VS { float w0, w1, nx, ny, nz, x, y, z; };
+	std::vector<VS> skin(60);
+	for (VS &v : skin) {
+		v.w0 = frand(0, 1);
+		v.w1 = 1.0f - v.w0;
+		v.nx = frand(-1, 1);
+		v.ny = frand(-1, 1);
+		v.nz = frand(-1, 1);
+		v.x = frand(-2, 2);
+		v.y = frand(-1.5f, 1.5f);
+		v.z = frand(-1, 2);
+	}
+	memcpy(GPtr(at), skin.data(), skin.size() * sizeof(VS));
+	dl.C(GE_CMD_VERTEXTYPE, GE_VTYPE_WEIGHT_FLOAT | (1 << 14) | GE_VTYPE_NRM_FLOAT | GE_VTYPE_POS_FLOAT).Prim(GE_PRIM_TRIANGLES, (int)skin.size(), at);
+	at += (u32)(skin.size() * sizeof(VS) + 64) & ~15u;
+	struct VM { s8 nx, ny, nz, pad; s16 x, y, z; u16 pad2; };
+	std::vector<VM> morph(2 * 45);
+	for (VM &v : morph) {
+		v.nx = (s8)(Rnd() % 200 - 100);
+		v.ny = (s8)(Rnd() % 200 - 100);
+		v.nz = (s8)(Rnd() % 200 - 100);
+		v.pad = 0;
+		v.x = (s16)(Rnd() % 60000 - 30000);
+		v.y = (s16)(Rnd() % 40000 - 20000);
+		v.z = (s16)(Rnd() % 50000 - 20000);
+		v.pad2 = 0;
+	}
+	memcpy(GPtr(at), morph.data(), morph.size() * sizeof(VM));
+	dl.F(GE_CMD_MORPHWEIGHT0, 0.7f).F(GE_CMD_MORPHWEIGHT0 + 1, 0.4f);
+	dl.C(GE_CMD_LIGHTINGENABLE, 0).C(GE_CMD_VERTEXTYPE, GE_VTYPE_NRM_8BIT | GE_VTYPE_POS_16BIT | (1 << 18)).Prim(GE_PRIM_TRIANGLES, 45, at);
+	dl.C(GE_CMD_FINISH).C(GE_CMD_END);
+	EnqueueList(dl.start, 0, -1, 0, false);
+	Run();
+	DrawSync(0);
+}
+
+std::vector<u8> RenderLit(bool gpuTransform, hw::D3D11TransformStats *stats) {
+	Env env;
+	BackendOptions o;
+	o.scale = 1;
+	o.warp = true;
+	o.gpuTransform = gpuTransform;
+	o.waitForShaders = true;
+	o.verifyTransform = gpuTransform;
+	std::string err;
+	std::unique_ptr<RenderBackend> backend = MakeBackend(o, &err);
+	if (!backend)
+		return {};
+	SetRenderBackend(backend.get());
+	DrawLitScene();
+	std::vector<u8> vram(GPtr(VRAM), GPtr(VRAM) + 0x200000);
+	*stats = hw::GetD3D11TransformStats(backend.get());
+	SetRenderBackend(nullptr);
+	return vram;
+}
+
+}  // namespace
+
+// The GPU's vertex transform and triangle assembly (gpu/geometry.h) make what the CPU's do, bit for bit.
+TEST(gpu_hardware_transform_matches_cpu) {
+	hw::D3D11TransformStats cpuStats, gpuStats;
+	const std::vector<u8> cpu = RenderLit(false, &cpuStats);
+	const std::vector<u8> gpu = RenderLit(true, &gpuStats);
+	if (cpu.empty() || gpu.empty())
+		return;
+	printf("  GPU transform: %llu vertices, %llu jobs\n", (unsigned long long)gpuStats.vertices, (unsigned long long)gpuStats.jobs);
+	CHECK(cpuStats.jobs == 0);
+	CHECK(gpuStats.jobs > 500);
+	CHECK(gpuStats.checked == gpuStats.jobs);
+	if (gpuStats.mismatches)
+		printf("  %llu of %llu GPU transform jobs differ from the CPU\n", (unsigned long long)gpuStats.mismatches, (unsigned long long)gpuStats.jobs);
+	CHECK(gpuStats.mismatches == 0);
+	int diffs = 0;
+	for (size_t i = 0; i < cpu.size(); ++i)
+		diffs += cpu[i] != gpu[i];
+	if (diffs)
+		printf("  %d VRAM bytes differ\n", diffs);
+	CHECK(diffs == 0);
+	// The scene covers a good part of the screen.
+	u32 drawn = 0;
+	for (int i = 0; i < 480 * 272; ++i) {
+		u32 px;
+		memcpy(&px, &gpu[(size_t)(i / 480 * 512 + i % 480) * 4], 4);
+		drawn += px != 0xFF102030;
+	}
+	CHECK(drawn > 480 * 272 / 10);
+}
+#endif
+
 TEST(gpu_hardware_memory_coherence) {
 	Env env;
 	BackendOptions options;

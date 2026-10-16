@@ -439,6 +439,8 @@ class OpenGLBackend final : public RenderBackend, private DrawData {
 				case PrimType::Point:
 					DrawPoint(p.v[0], p.range, s);
 					break;
+				case PrimType::Geometry:  // this backend doesn't transform geometry
+					break;
 				}
 			}
 			return;

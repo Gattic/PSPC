@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "common/common.h"
+#include "gpu/geometry.h"
 #include "gpu/render.h"
 
 namespace gpu {
@@ -29,6 +30,11 @@ struct BatchPrim {
 	RVertex v[3];
 };
 
+// PrimType::Geometry: the batch's GeometryBatch jobs [GeoFirstJob, GeoFirstJob + GeoJobCount), whose
+// range is the state's scissor.
+inline u32 GeoFirstJob(const BatchPrim &p) { return (u32)p.v[0].x; }
+inline u32 GeoJobCount(const BatchPrim &p) { return (u32)p.v[0].y; }
+
 class RenderBackend {
 public:
 	virtual ~RenderBackend() = default;
@@ -39,6 +45,16 @@ public:
 	// Draws the primitives in order. All of them have the same render target (the binner flushes when
 	// the target changes); the states (and the CLUT snapshots they point to) are valid during the call.
 	virtual void DrawBatch(const BatchPrim *prims, size_t primCount, const RasterState *states, size_t stateCount) = 0;
+	// Whether the backend transforms vertices and assembles triangles itself (geometry.h): then batches
+	// may have PrimType::Geometry primitives, and come with their GeometryBatch here.
+	virtual bool TransformsGeometry() const { return false; }
+	// Whether the backend checks its geometry against the CPU's: then GeometryBatch::expect is filled.
+	virtual bool VerifiesGeometry() const { return false; }
+	virtual void DrawGeometryBatch(const BatchPrim *prims, size_t primCount, const RasterState *states, size_t stateCount,
+	                               const GeometryBatch &geo) {
+		(void)geo;
+		DrawBatch(prims, primCount, states, stateCount);
+	}
 	// The GE is about to read (CLUT load, block transfer source) or write (block transfer destination)
 	// guest memory [addr, addr + size) itself: guest memory there must hold the latest rendering.
 	virtual void SyncRange(u32 addr, u32 size) { (void)addr; (void)size; }
