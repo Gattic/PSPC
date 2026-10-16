@@ -3,6 +3,13 @@
 //
 // Vertex transform, lighting, near-plane clipping and primitive assembly, in the GE's arithmetic.
 // Port of GPU/Software/TransformUnit.cpp, Lighting.cpp and Clipper.cpp (scalar).
+//
+// Draws (PRIM) are recorded rather than transformed when they come: with a copy of what their vertices
+// and primitives depend on (the transform state, the raster state, morph weights, bones, the culling and
+// shading modes). When the binner's queue is next needed (ResolvePendingDraws), every recorded vertex is
+// transformed at once, spread over the worker threads (games draw thousands of small batches a frame,
+// too small to split one at a time), and the primitives are then assembled draw by draw, in order. A
+// vertex's result depends only on its draw, so the queue ends up exactly as with one draw at a time.
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -98,11 +105,21 @@ struct TransformState {
 	float uvScale[2], uvOffset[2];
 	float uvScaleF[4];
 	int offsetX16, offsetY16;
+	// What vertices read of gstate besides: the color of vertices without one, the emissive color, the
+	// texture projection source, and the environment map's two lights (UVLS0/1).
+	u32 materialAmbientRGBA, materialEmissive;
+	int uvProjMode;
+	struct ShadeLight {
+		float pos[3];
+		float translated[3];  // directional: unused
+		bool directional, specular;
+	} shade[2];
 };
 
 TransformState ts;
 bool tsDirty = true;
 u32 tsVType = 0xFFFFFFFF;
+u64 tsSerial = 0;  // counts the computations of ts
 VertexFormat vfmt;
 
 struct Carry {
@@ -117,7 +134,81 @@ GEPrimitiveType prevPrim = GE_PRIM_POINTS;
 bool isImmDraw = false;
 bool cullXY = true;
 
-std::vector<ClipVertex> cache;
+enum class CullType { CW = 0, CCW = 1, OFF = 2 };
+
+// What assembling a draw's primitives reads besides its vertices: the gstate and raster state of when
+// it was submitted. live: they're current (immediate vertices, curves), read them there.
+struct AssemblyCtx {
+	const TransformState *ts;
+	bool live;
+	bool through, textureProj, depthClip, gouraud, clearRect;
+	CullType cull;
+};
+const AssemblyCtx *actx = nullptr;
+
+inline bool CtxThrough() {
+	return actx->live ? binner::CurrentState().throughMode : actx->through;
+}
+inline bool CtxTextureProj() {
+	return actx->live ? binner::CurrentState().textureProj : actx->textureProj;
+}
+inline bool CtxDepthClip() {
+	return actx->live ? gstate.isDepthClipEnabled() : actx->depthClip;
+}
+inline bool CtxGouraud() {
+	return actx->live ? gstate.isShadeGouraud() : actx->gouraud;
+}
+// Through-mode rectangles in clear mode without dithering are clears.
+inline bool CtxClearRect() {
+	return actx->live ? gstate.isModeClear() && !gstate.isDitherEnabled() : actx->clearRect;
+}
+inline CullType GECullType() {
+	const bool skipCull = !gstate.isCullEnabled() || gstate.isModeClear();
+	return skipCull ? CullType::OFF : (gstate.getCullMode() ? CullType::CCW : CullType::CW);
+}
+inline CullType CtxCull() {
+	return actx->live ? GECullType() : actx->cull;
+}
+
+AssemblyCtx LiveCtx() {
+	AssemblyCtx c{};
+	c.ts = &ts;
+	c.live = true;
+	return c;
+}
+
+// --- Recorded draws ---
+
+struct PendingDraw {
+	const u8 *verts, *inds;
+	VertexFormat fmt;
+	GEPrimitiveType prim;  // as submitted: KEEP_PREVIOUS continues the previous one
+	int count;
+	int lower;             // useCache: the index range [lower, lower + slots) is transformed once
+	bool useCache;
+	bool hasUV, hasNormal, hasColor;
+	u32 tsId;              // tsSnaps
+	u32 stateId;           // binner::Snapshot
+	u32 boneOff;           // pendingBones, skinned formats
+	u32 slotBase, slots;   // transformed vertices, in pendingOut
+	float morph[8];
+	Carry carryIn;         // the UV and normal of formats without them
+	AssemblyCtx ctx;       // ctx.ts is set when assembling
+};
+
+std::vector<PendingDraw> pending;
+std::vector<TransformState> tsSnaps;
+u64 tsSnapSerial = ~0ull;  // tsSerial of tsSnaps.back()
+std::vector<float> pendingBones;
+std::vector<ClipVertex> pendingOut;
+u32 pendingSlots = 0;
+bool resolvingDraws = false;
+// The draw types record keeps, as Assemble resolves them (KEEP_PREVIOUS).
+GEPrimitiveType recPrevPrim = GE_PRIM_POINTS;
+// The pending draws whose last vertex carries the UV and the normal over, until a draw needs them
+// (carry holds them before): -1 if carry is up to date.
+int uvSource = -1, nrmSource = -1;
+
 std::vector<SimpleVertex> simple;
 
 static inline float Light24(u32 v) {
@@ -255,6 +346,9 @@ void ComputeTransformState(bool through, bool hasColor0) {
 		s.uvGenMode = GE_TEXMAP_TEXTURE_COORDS;
 	s.offsetX16 = gstate.getOffsetX16();
 	s.offsetY16 = gstate.getOffsetY16();
+	s.materialAmbientRGBA = gstate.getMaterialAmbientRGBA();
+	s.materialEmissive = gstate.getMaterialEmissive();
+	s.uvProjMode = gstate.getUVProjMode();
 
 	if (!s.enableTransform)
 		return;
@@ -270,6 +364,22 @@ void ComputeTransformState(bool through, bool hasColor0) {
 		viewDir[2] = 1.0f;
 	}
 	memcpy(s.light.viewDir, viewDir, sizeof(viewDir));
+
+	if (s.uvGenMode == GE_TEXMAP_ENVIRONMENT_MAP) {
+		const int ls[2] = { gstate.getUVLS0(), gstate.getUVLS1() };
+		for (int k = 0; k < 2; ++k) {
+			TransformState::ShadeLight &sl = s.shade[k];
+			const int l = ls[k];
+			for (int i = 0; i < 3; ++i)
+				sl.pos[i] = getFloat24(gstate.lpos[l * 3 + i]);
+			sl.directional = gstate.getLightType(l) == GE_LIGHTTYPE_DIRECTIONAL;
+			if (!sl.directional) {
+				for (int i = 0; i < 3; ++i)
+					sl.translated[i] = GEAddFloat24(sl.pos[i], -TruncateToFloat24(gstate.worldMatrix[9 + i]));
+			}
+			sl.specular = gstate.isUsingSpecularLight(l);
+		}
+	}
 
 	for (int k = 0; k < 4; ++k) {
 		for (int c = 0; c < 3; ++c)
@@ -337,13 +447,15 @@ void EnsureTransformState(bool through, bool hasColor0, u32 vtype) {
 		ComputeTransformState(through, hasColor0);
 		tsDirty = false;
 		tsVType = key;
+		tsSerial++;
 	}
 }
 
 constexpr float SCREEN_BOUND = 4095.0f + (15.5f / 16.0f);
 
 // alwaysCheckRange: for vertices made by clipping (no near-plane exemption).
-static inline void RoundToScreen(RVertex &v, const float scaled[3], const float clip[4], bool depthClamp, bool alwaysCheckRange, bool *outside) {
+static inline void RoundToScreen(const TransformState &s, RVertex &v, const float scaled[3], const float clip[4], bool depthClamp,
+                                 bool alwaysCheckRange, bool *outside) {
 	float z = scaled[2];
 	if (depthClamp) {
 		if ((alwaysCheckRange || !(clip[2] < -clip[3])) && !(scaled[0] < SCREEN_BOUND && scaled[1] < SCREEN_BOUND && scaled[0] >= 0 && scaled[1] >= 0))
@@ -355,36 +467,36 @@ static inline void RoundToScreen(RVertex &v, const float scaled[3], const float 
 	} else if (!(scaled[0] <= SCREEN_BOUND && scaled[1] < SCREEN_BOUND && scaled[0] >= 0 && scaled[1] >= 0 && z >= 0.0f && z < 65536.0f)) {
 		*outside = true;
 	}
-	v.x = (int)floorf(scaled[0] * 16.0f) - ts.offsetX16;
-	v.y = (int)floorf(scaled[1] * 16.0f) - ts.offsetY16;
+	v.x = (int)floorf(scaled[0] * 16.0f) - s.offsetX16;
+	v.y = (int)floorf(scaled[1] * 16.0f) - s.offsetY16;
 	v.z = (z >= 0.0f && z < 65536.0f) ? (int)(u16)(u32)z : 0;
 }
 
 // The screen position: each clip component times the GE's reciprocal of w, scaled and offset.
-static inline void Viewport(const float clip[4], float scaled[3]) {
+static inline void Viewport(const TransformState &s, const float clip[4], float scaled[3]) {
 	const float w = TruncateToFloat24(clip[3]);
 	if (!IsFiniteF(w) || fabsf(w) < FLT_MIN) {
 		for (int i = 0; i < 3; ++i)
-			scaled[i] = GEViewport(clip[i], clip[3], ts.screenScale[i], ts.screenAdd[i]);
+			scaled[i] = GEViewport(clip[i], clip[3], s.screenScale[i], s.screenAdd[i]);
 		scaled[2] = floorf(scaled[2]);
 		return;
 	}
 	const double r = GERecip(w);
 	for (int i = 0; i < 3; ++i) {
 		if (!IsFiniteF(clip[i])) {
-			scaled[i] = clip[i] * ts.screenScale[i] / clip[3] + ts.screenAdd[i];
+			scaled[i] = clip[i] * s.screenScale[i] / clip[3] + s.screenAdd[i];
 		} else {
 			const float ndc = ProductToFloat24((double)TruncateToFloat24(clip[i]) * r);
-			scaled[i] = GEAdd(ProductToFloat24((double)ndc * ts.screenScale[i]), ts.screenAdd[i]);
+			scaled[i] = GEAdd(ProductToFloat24((double)ndc * s.screenScale[i]), s.screenAdd[i]);
 		}
 	}
 	scaled[2] = floorf(scaled[2]);
 }
 
-static inline void ClipToScreen(RVertex &v, const float clip[4], bool alwaysCheck, bool *outside) {
+static inline void ClipToScreen(const TransformState &s, RVertex &v, const float clip[4], bool alwaysCheck, bool *outside) {
 	float scaled[3];
-	Viewport(clip, scaled);
-	RoundToScreen(v, scaled, clip, ts.depthClip, alwaysCheck, outside);
+	Viewport(s, clip, scaled);
+	RoundToScreen(s, v, scaled, clip, s.depthClip, alwaysCheck, outside);
 }
 
 // v . N for the unnormalized N, scaled by its reciprocal length.
@@ -393,9 +505,9 @@ static inline float GENormalDot(const float *v, const float *n, float nRsqrt) {
 }
 
 // The vector from a vertex to a point light (gpu/probe exp153-158).
-static inline void GELightVector(float out[3], const float translated[3], const float modelpos[4]) {
+static inline void GELightVector(const TransformState &s, float out[3], const float translated[3], const float modelpos[4]) {
 	alignas(16) float rows[4][4];
-	memcpy(rows, ts.negWorldRows, sizeof(float) * 12);
+	memcpy(rows, s.negWorldRows, sizeof(float) * 12);
 	rows[3][0] = translated[0];
 	rows[3][1] = translated[1];
 	rows[3][2] = translated[2];
@@ -407,18 +519,13 @@ static inline void GELightVector(float out[3], const float translated[3], const 
 	out[2] = r[2];
 }
 
-static float GEShadeMapCoord(int l, const float modelpos[4], const float worldnormal[3], float normalRsqrt, const float viewDir[3]) {
-	float L[3];
-	for (int i = 0; i < 3; ++i)
-		L[i] = getFloat24(gstate.lpos[l * 3 + i]);
-	if (gstate.getLightType(l) != GE_LIGHTTYPE_DIRECTIONAL) {
-		float tr[3];
-		for (int i = 0; i < 3; ++i)
-			tr[i] = GEAddFloat24(L[i], -TruncateToFloat24(gstate.worldMatrix[9 + i]));
-		GELightVector(L, tr, modelpos);
-	}
+static float GEShadeMapCoord(const TransformState &s, const TransformState::ShadeLight &sl, const float modelpos[4],
+                             const float worldnormal[3], float normalRsqrt, const float viewDir[3]) {
+	float L[3] = { sl.pos[0], sl.pos[1], sl.pos[2] };
+	if (!sl.directional)
+		GELightVector(s, L, sl.translated, modelpos);
 	GENormalize3(L);
-	if (gstate.isUsingSpecularLight(l)) {
+	if (sl.specular) {
 		for (int i = 0; i < 3; ++i)
 			L[i] = GEAddFloat24(L[i], viewDir[i]);
 		GENormalize3(L);
@@ -426,13 +533,14 @@ static float GEShadeMapCoord(int l, const float modelpos[4], const float worldno
 	return GEAddFloat24(GENormalDot(L, worldnormal, normalRsqrt), 1.0f) * 0.5f;
 }
 
-void ProcessLighting(RVertex &vertex, const float modelpos[4], const float worldnormal[3], float normalRsqrt, const LightState &state) {
+void ProcessLighting(const TransformState &s, RVertex &vertex, const float modelpos[4], const float worldnormal[3], float normalRsqrt) {
 	static const float zAxis[3] = { 0.0f, 0.0f, 1.0f };
+	const LightState &state = s.light;
 	Color4i colorFactor{};
 	if (state.colorForAmbient || state.colorForDiffuse || state.colorForSpecular)
 		colorFactor = ColorFactor(vertex.color0);
 
-	const u32 mecv = gstate.getMaterialEmissive();
+	const u32 mecv = s.materialEmissive;
 	const Color4i mac = state.colorForAmbient ? colorFactor : state.materialAmbient;
 	int final_color[4];
 	for (int i = 0; i < 4; ++i)
@@ -446,7 +554,7 @@ void ProcessLighting(RVertex &vertex, const float modelpos[4], const float world
 		float L[3] = { ls.pos[0], ls.pos[1], ls.pos[2] };
 		float att = 1.0f, spot = 1.0f;
 		if (!ls.directional) {
-			GELightVector(L, ls.translated, modelpos);
+			GELightVector(s, L, ls.translated, modelpos);
 			const float d2 = GEDot3(L, L);
 			const float d = GENormalize3(L, d2);
 			if (d == 0.0f)
@@ -526,73 +634,78 @@ void ProcessLighting(RVertex &vertex, const float modelpos[4], const float world
 	}
 }
 
-// One vertex through the pipeline. The SimpleVertex has morph and skinning applied.
-ClipVertex ReadVertex(const SimpleVertex &sv, bool hasUV, bool hasNormal, bool hasColor, Carry &cr) {
-	ClipVertex vertex;
-	const float pos[4] = { sv.pos[0], sv.pos[1], sv.pos[2], 1.0f };
-
+// What reading a vertex leaves for formats without UV or normal: its UV (prescaled) and normal.
+inline void UpdateCarry(const TransformState &s, const SimpleVertex &sv, bool hasUV, bool hasNormal, Carry &cr) {
 	if (hasUV) {
 		cr.uv[0] = sv.uv[0];
 		cr.uv[1] = sv.uv[1];
-		if (ts.uvPrescale) {
-			cr.uv[0] = cr.uv[0] * ts.uvScaleF[0] + ts.uvScaleF[2];
-			cr.uv[1] = cr.uv[1] * ts.uvScaleF[1] + ts.uvScaleF[3];
+		if (s.uvPrescale) {
+			cr.uv[0] = cr.uv[0] * s.uvScaleF[0] + s.uvScaleF[2];
+			cr.uv[1] = cr.uv[1] * s.uvScaleF[1] + s.uvScaleF[3];
 		}
 		cr.uv[2] = 0.0f;
 	}
+	if (hasNormal)
+		memcpy(cr.normal, sv.nrm, sizeof(cr.normal));
+}
+
+// One vertex through the pipeline. The SimpleVertex has morph and skinning applied.
+ClipVertex ReadVertex(const TransformState &s, const SimpleVertex &sv, bool hasUV, bool hasNormal, bool hasColor, Carry &cr) {
+	ClipVertex vertex;
+	const float pos[4] = { sv.pos[0], sv.pos[1], sv.pos[2], 1.0f };
+
+	UpdateCarry(s, sv, hasUV, hasNormal, cr);
 	vertex.v.s = cr.uv[0];
 	vertex.v.t = cr.uv[1];
 	vertex.v.q = cr.uv[2];
-	if (ts.geUVScale) {
+	if (s.geUVScale) {
 		float *tc[2] = { &vertex.v.s, &vertex.v.t };
 		for (int i = 0; i < 2; ++i) {
-			const float scaled = ProductToFloat24((double)TruncateToFloat24(*tc[i]) * ts.uvScale[i]);
-			*tc[i] = TruncateToFloat24(GEAdd(scaled, ts.uvOffset[i]));
+			const float scaled = ProductToFloat24((double)TruncateToFloat24(*tc[i]) * s.uvScale[i]);
+			*tc[i] = TruncateToFloat24(GEAdd(scaled, s.uvOffset[i]));
 		}
 	}
 
-	if (hasNormal)
-		memcpy(cr.normal, sv.nrm, sizeof(cr.normal));
 	float normal[3] = { cr.normal[0], cr.normal[1], cr.normal[2] };
-	if (ts.negateNormals) {
+	if (s.negateNormals) {
 		for (int i = 0; i < 3; ++i)
 			normal[i] = BitsFloat(FloatBits(normal[i]) ^ 0x80000000);
 	}
 
-	vertex.v.color0 = hasColor ? sv.color : gstate.getMaterialAmbientRGBA();
+	vertex.v.color0 = hasColor ? sv.color : s.materialAmbientRGBA;
 	vertex.v.color1 = 0;
 
-	if (ts.enableTransform) {
-		GERowSum4<4>(pos, (const float(*)[4])ts.matrix, vertex.clip);
+	if (s.enableTransform) {
+		GERowSum4<4>(pos, (const float(*)[4])s.matrix, vertex.clip);
 		float scaled[3];
-		Viewport(vertex.clip, scaled);
+		Viewport(s, vertex.clip, scaled);
 		bool outside = false;
-		RoundToScreen(vertex.v, scaled, vertex.clip, ts.depthClip, false, &outside);
+		RoundToScreen(s, vertex.v, scaled, vertex.clip, s.depthClip, false, &outside);
 		vertex.v.clipw = vertex.clip[3];
 		vertex.v.fog = 1.0f;
 		if (outside) {
 			vertex.v.x = 0x7FFFFFFF;
 			// Only a vertex the near plane clips away can still contribute (to new vertices).
-			if (!(ts.depthClip && vertex.clip[2] < -vertex.clip[3]))
+			if (!(s.depthClip && vertex.clip[2] < -vertex.clip[3]))
 				return vertex;
 		}
 
-		if (ts.enableFog && ts.fogGE) {
-			const float viewZ = GERow(pos, ts.viewZRows, 4);
-			const float f = ProductToFloat24((double)TruncateToFloat24(GEAdd(viewZ, ts.fogEnd)) * ts.fogSlope);
+		if (s.enableFog && s.fogGE) {
+			const float viewZ = GERow(pos, s.viewZRows, 4);
+			const float f = ProductToFloat24((double)TruncateToFloat24(GEAdd(viewZ, s.fogEnd)) * s.fogSlope);
 			vertex.v.fog = GEFogFactor(f) * (1.0f / 256.0f);
-		} else if (ts.enableFog) {
-			const float d = ts.posToFog[0] * pos[0] + ts.posToFog[1] * pos[1] + ts.posToFog[2] * pos[2] + ts.posToFog[3];
+		} else if (s.enableFog) {
+			const float d = s.posToFog[0] * pos[0] + s.posToFog[1] * pos[1] + s.posToFog[2] * pos[2] + s.posToFog[3];
 			vertex.v.fog = GEFogFactor(d) * (1.0f / 256.0f);
 		}
 
 		float worldnormal[3] = { 0.0f, 0.0f, 0.0f };
 		float normalRsqrt = 1.0f;
-		const bool usesWorldNormal = ts.enableLighting ? ts.light.usesWorldNormal : ts.uvGenMode == GE_TEXMAP_ENVIRONMENT_MAP;
+		const bool usesWorldNormal = s.enableLighting ? s.light.usesWorldNormal : s.uvGenMode == GE_TEXMAP_ENVIRONMENT_MAP;
 		if (usesWorldNormal) {
 			alignas(16) float wn[4];
 			const float n4[4] = { normal[0], normal[1], normal[2], 0.0f };
-			GERowSum4<3>(n4, ts.worldRows, wn);
+			GERowSum4<3>(n4, s.worldRows, wn);
 			worldnormal[0] = wn[0];
 			worldnormal[1] = wn[1];
 			worldnormal[2] = wn[2];
@@ -605,9 +718,9 @@ ClipVertex ReadVertex(const SimpleVertex &sv, bool hasUV, bool hasNormal, bool h
 			}
 		}
 
-		if (ts.uvGenMode == GE_TEXMAP_TEXTURE_MATRIX) {
+		if (s.uvGenMode == GE_TEXMAP_TEXTURE_MATRIX) {
 			float source[4] = { pos[0], pos[1], pos[2], 1.0f };
-			switch (gstate.getUVProjMode()) {
+			switch (s.uvProjMode) {
 			case GE_PROJMAP_POSITION:
 				break;
 			case GE_PROJMAP_UV:
@@ -624,17 +737,17 @@ ClipVertex ReadVertex(const SimpleVertex &sv, bool hasUV, bool hasNormal, bool h
 				break;
 			}
 			alignas(16) float out[4];
-			GERowSum4<4>(source, ts.tgenRows, out);
+			GERowSum4<4>(source, s.tgenRows, out);
 			vertex.v.s = out[0];
 			vertex.v.t = out[1];
 			vertex.v.q = out[2];
-		} else if (ts.uvGenMode == GE_TEXMAP_ENVIRONMENT_MAP) {
-			vertex.v.s = GEShadeMapCoord(gstate.getUVLS0(), pos, worldnormal, normalRsqrt, ts.light.viewDir);
-			vertex.v.t = GEShadeMapCoord(gstate.getUVLS1(), pos, worldnormal, normalRsqrt, ts.light.viewDir);
+		} else if (s.uvGenMode == GE_TEXMAP_ENVIRONMENT_MAP) {
+			vertex.v.s = GEShadeMapCoord(s, s.shade[0], pos, worldnormal, normalRsqrt, s.light.viewDir);
+			vertex.v.t = GEShadeMapCoord(s, s.shade[1], pos, worldnormal, normalRsqrt, s.light.viewDir);
 		}
 
-		if (ts.enableLighting)
-			ProcessLighting(vertex.v, pos, worldnormal, normalRsqrt, ts.light);
+		if (s.enableLighting)
+			ProcessLighting(s, vertex.v, pos, worldnormal, normalRsqrt);
 	} else {
 		vertex.v.x = (int)(pos[0] * SUBPIX);
 		vertex.v.y = (int)(pos[1] * SUBPIX);
@@ -722,14 +835,14 @@ static void NearPoint(ClipVertex &dest, const ClipVertex &in, const ClipVertex &
 	dest.v.t = res[1];
 	dest.v.q = res[2];
 	bool outside = false;
-	ClipToScreen(dest.v, dest.clip, true, &outside);
+	ClipToScreen(*actx->ts, dest.v, dest.clip, true, &outside);
 	dest.v.clipw = dest.clip[3];
 	if (outside)
 		dest.v.x = 0x7FFFFFFF;
 }
 
 static void AddTriangleFlat(const RVertex &v0, const RVertex &v1, const RVertex &v2, const RVertex &provoking) {
-	if (!gstate.isShadeGouraud()) {
+	if (!CtxGouraud()) {
 		RVertex corrected = v2;
 		corrected.color0 = provoking.color0;
 		corrected.color1 = provoking.color1;
@@ -741,8 +854,8 @@ static void AddTriangleFlat(const RVertex &v0, const RVertex &v1, const RVertex 
 
 void ProcessTriangle(const ClipVertex &v0, const ClipVertex &v1, const ClipVertex &v2, const ClipVertex &provoking, bool reversed) {
 	int mask = 0;
-	const bool through = binner::CurrentState().throughMode;
-	const bool depthClip = gstate.isDepthClipEnabled();
+	const bool through = CtxThrough();
+	const bool depthClip = CtxDepthClip();
 	if (!through) {
 		if (OutsideRangeBeforeClip(v0, depthClip) || OutsideRangeBeforeClip(v1, depthClip) || OutsideRangeBeforeClip(v2, depthClip))
 			return;
@@ -801,8 +914,6 @@ void ProcessTriangle(const ClipVertex &v0, const ClipVertex &v1, const ClipVerte
 	}
 }
 
-enum class CullType { CW = 0, CCW = 1, OFF = 2 };
-
 void SendTriangle(CullType cullType, const ClipVertex *verts, int provoking = 2, bool orderReversed = false) {
 	if (cullType == CullType::OFF) {
 		ProcessTriangle(verts[0], verts[1], verts[2], verts[provoking], orderReversed);
@@ -855,8 +966,7 @@ static void AddTriangleRect(const RVertex &v0, const RVertex &v1) {
 }
 
 void ProcessRect(const ClipVertex &v0, const ClipVertex &v1) {
-	const RasterState &st = binner::CurrentState();
-	if (!st.throughMode) {
+	if (!CtxThrough()) {
 		if (v0.OutsideRange() || v1.OutsideRange())
 			return;
 		if (OutsideMask(v0.clip) & OutsideMask(v1.clip))
@@ -882,20 +992,20 @@ void ProcessRect(const ClipVertex &v0, const ClipVertex &v1) {
 			vhalf1.t = v0.v.t;
 			RVertex vrev1 = v1.v;
 			vrev1.fog = v0.v.fog;
-			if (st.textureProj) {
+			if (CtxTextureProj()) {
 				AddTriangleRect(v0.v, vhalf0);
 				AddTriangleRect(vhalf1, vrev1);
 			} else {
 				binner::AddRect(v0.v, vhalf0);
 				binner::AddRect(vhalf1, vrev1);
 			}
-		} else if (st.textureProj) {
+		} else if (CtxTextureProj()) {
 			AddTriangleRect(v0.v, v1.v);
 		} else {
 			binner::AddRect(v0.v, v1.v);
 		}
 	} else {
-		if (gstate.isModeClear() && !gstate.isDitherEnabled())
+		if (CtxClearRect())
 			binner::AddClearRect(v0.v, v1.v);
 		else
 			binner::AddRect(v0.v, v1.v);
@@ -903,7 +1013,7 @@ void ProcessRect(const ClipVertex &v0, const ClipVertex &v1) {
 }
 
 void ProcessPoint(const ClipVertex &v0) {
-	if (!binner::CurrentState().throughMode) {
+	if (!CtxThrough()) {
 		if (v0.OutsideRange())
 			return;
 		if (OutsideMask(v0.clip))
@@ -913,11 +1023,11 @@ void ProcessPoint(const ClipVertex &v0) {
 }
 
 void ProcessLine(const ClipVertex &v0, const ClipVertex &v1) {
-	if (binner::CurrentState().throughMode) {
+	if (CtxThrough()) {
 		binner::AddLine(v0.v, v1.v);
 		return;
 	}
-	const bool depthClip = gstate.isDepthClipEnabled();
+	const bool depthClip = CtxDepthClip();
 	if (OutsideRangeBeforeClip(v0, depthClip) || OutsideRangeBeforeClip(v1, depthClip))
 		return;
 	if (OutsideMask(v0.clip) & OutsideMask(v1.clip))
@@ -940,7 +1050,7 @@ void ProcessLine(const ClipVertex &v0, const ClipVertex &v1) {
 		ClipVertex n;
 		LerpVertex(n, t, b, a);
 		bool outside = false;
-		ClipToScreen(n.v, n.clip, true, &outside);
+		ClipToScreen(*actx->ts, n.v, n.clip, true, &outside);
 		n.v.clipw = n.clip[3];
 		if (outside)
 			n.v.x = 0x7FFFFFFF;
@@ -952,7 +1062,7 @@ void ProcessLine(const ClipVertex &v0, const ClipVertex &v1) {
 		ClipVertex n;
 		LerpVertex(n, t, b, a);
 		bool outside = false;
-		ClipToScreen(n.v, n.clip, true, &outside);
+		ClipToScreen(*actx->ts, n.v, n.clip, true, &outside);
 		n.v.clipw = n.clip[3];
 		if (outside)
 			n.v.x = 0x7FFFFFFF;
@@ -971,8 +1081,7 @@ void Assemble(GEPrimitiveType primType, int count, ReadFn read) {
 	} else {
 		primType = prevPrim;
 	}
-	const bool skipCull = !gstate.isCullEnabled() || gstate.isModeClear();
-	const CullType cullType = skipCull ? CullType::OFF : (gstate.getCullMode() ? CullType::CCW : CullType::CW);
+	const CullType cullType = CtxCull();
 
 	switch (primType) {
 	case GE_PRIM_POINTS:
@@ -1100,15 +1209,190 @@ void Assemble(GEPrimitiveType primType, int count, ReadFn read) {
 	}
 }
 
+// --- Recorded draws ---
+
+inline const float *BonesOf(const PendingDraw &d) {
+	return d.boneOff != ~0u ? pendingBones.data() + d.boneOff : nullptr;
+}
+
+// The carry the last vertex (in draw order) of d leaves: its UV if uv, its normal if nrm.
+void LastVertexCarry(const PendingDraw &d, bool uv, bool nrm, Carry &cr) {
+	SimpleVertex sv;
+	const int last = d.inds ? ReadIndex(d.inds, d.fmt.idx, d.count - 1) : d.count - 1;
+	DecodeVertex(d.fmt, d.verts, last, &sv, d.morph, BonesOf(d));
+	UpdateCarry(tsSnaps[d.tsId], sv, uv, nrm, cr);
+}
+
+// Brings carry's UV (uv) and normal (nrm) up to date with the pending draws.
+void MaterializeCarry(bool uv, bool nrm) {
+	if (uv && uvSource >= 0) {
+		const bool both = nrm && nrmSource == uvSource;
+		LastVertexCarry(pending[uvSource], true, both, carry);
+		uvSource = -1;
+		if (both)
+			nrmSource = -1;
+	}
+	if (nrm && nrmSource >= 0) {
+		LastVertexCarry(pending[nrmSource], false, true, carry);
+		nrmSource = -1;
+	}
+}
+
+void RecordDraw(const u8 *verts, const u8 *inds, GEPrimitiveType prim, int count, const VertexFormat &fmt, int lower, int upper,
+                bool useCache) {
+	PendingDraw d;
+	// The raster state first: taking it may assemble the draws before (a texture copy must see them).
+	d.stateId = binner::SnapshotState();
+	if (tsSnaps.empty() || tsSnapSerial != tsSerial) {
+		tsSnaps.push_back(ts);
+		tsSnapSerial = tsSerial;
+	}
+	d.tsId = (u32)tsSnaps.size() - 1;
+	d.verts = verts;
+	d.inds = inds;
+	d.fmt = fmt;
+	d.prim = prim;
+	d.count = count;
+	d.lower = lower;
+	d.useCache = useCache;
+	d.hasUV = fmt.tc != 0;
+	d.hasNormal = fmt.nrm != 0;
+	d.hasColor = fmt.col != 0;
+	memcpy(d.morph, gstate_c.morphWeights, sizeof(d.morph));
+	d.boneOff = ~0u;
+	if (fmt.weighttype && !fmt.through) {
+		d.boneOff = (u32)pendingBones.size();
+		pendingBones.insert(pendingBones.end(), gstate.boneMatrix, gstate.boneMatrix + 12 * fmt.nweights);
+	}
+	// A format without UV or normal takes the last ones read.
+	if (!d.hasUV || !d.hasNormal)
+		MaterializeCarry(!d.hasUV, !d.hasNormal);
+	d.carryIn = carry;
+
+	// Assemble reads every vertex in order, unless the type (as KEEP_PREVIOUS continues it) is invalid.
+	GEPrimitiveType type = prim;
+	if (prim != GE_PRIM_KEEP_PREVIOUS)
+		recPrevPrim = prim;
+	else
+		type = recPrevPrim;
+	const bool assembles = (int)type >= (int)GE_PRIM_POINTS && (int)type <= (int)GE_PRIM_RECTANGLES;
+	d.slots = useCache ? (u32)(upper - lower + 1) : assembles ? (u32)count : 0;
+	d.slotBase = pendingSlots;
+	pendingSlots += d.slots;
+	if ((d.hasUV || d.hasNormal) && (useCache || assembles)) {
+		if (d.hasUV)
+			uvSource = (int)pending.size();
+		if (d.hasNormal)
+			nrmSource = (int)pending.size();
+	}
+
+	const RasterState &st = binner::Snapshot(d.stateId);
+	d.ctx.ts = nullptr;
+	d.ctx.live = false;
+	d.ctx.through = st.throughMode;
+	d.ctx.textureProj = st.textureProj;
+	d.ctx.depthClip = gstate.isDepthClipEnabled();
+	d.ctx.gouraud = gstate.isShadeGouraud();
+	d.ctx.clearRect = gstate.isModeClear() && !gstate.isDitherEnabled();
+	d.ctx.cull = GECullType();
+	pending.push_back(d);
+}
+
+// Transforms slots [s0, s1) of d into pendingOut.
+void TransformSlots(const PendingDraw &d, u32 s0, u32 s1) {
+	const TransformState &s = tsSnaps[d.tsId];
+	const float *bones = BonesOf(d);
+	ClipVertex *out = pendingOut.data() + d.slotBase;
+	SimpleVertex sv;
+	for (u32 slot = s0; slot < s1; ++slot) {
+		const int index = d.useCache ? d.lower + (int)slot : d.inds ? ReadIndex(d.inds, d.fmt.idx, (int)slot) : (int)slot;
+		DecodeVertex(d.fmt, d.verts, index, &sv, d.morph, bones);
+		Carry c = d.carryIn;
+		out[slot] = ReadVertex(s, sv, d.hasUV, d.hasNormal, d.hasColor, c);
+	}
+}
+
+// Transforms the pending draws' slots [g0, g1).
+void TransformRange(u32 g0, u32 g1) {
+	// The last draw starting at or before g0.
+	auto it = std::upper_bound(pending.begin(), pending.end(), g0, [](u32 v, const PendingDraw &d) { return v < d.slotBase; });
+	for (size_t i = (size_t)(it - pending.begin()) - 1; i < pending.size() && g0 < g1; ++i) {
+		const PendingDraw &d = pending[i];
+		const u32 end = d.slotBase + d.slots;
+		if (end <= g0)
+			continue;
+		const u32 stop = std::min(g1, end);
+		TransformSlots(d, g0 - d.slotBase, stop - d.slotBase);
+		g0 = stop;
+	}
+}
+
+constexpr u32 CHUNK_SLOTS = 128;
+
+void TransformPending() {
+	const int chunks = (int)((pendingSlots + CHUNK_SLOTS - 1) / CHUNK_SLOTS);
+	if (chunks <= 1) {
+		TransformRange(0, pendingSlots);
+		return;
+	}
+	static const std::function<void(int)> fn = [](int c) {
+		const u32 g0 = (u32)c * CHUNK_SLOTS;
+		TransformRange(g0, std::min(g0 + CHUNK_SLOTS, pendingSlots));
+	};
+	ParallelFor(chunks, fn);
+}
+
+inline bool InVram(const u8 *p) {
+	const u8 *vram = VramPtr();
+	return p >= vram && p < vram + VRAM_SIZE;
+}
+
 }  // namespace
+
+void ResolvePendingDraws() {
+	if (pending.empty() || resolvingDraws)
+		return;
+	resolvingDraws = true;
+	// The carry the draws leave, while their vertices are at hand.
+	MaterializeCarry(true, true);
+	if (pendingOut.size() < pendingSlots)
+		pendingOut.resize(pendingSlots);
+	TransformPending();
+
+	binner::BeginResolve();
+	for (PendingDraw &d : pending) {
+		d.ctx.ts = &tsSnaps[d.tsId];
+		actx = &d.ctx;
+		binner::UseSnapshot(d.stateId);
+		const ClipVertex *out = pendingOut.data() + d.slotBase;
+		isImmDraw = false;
+		if (d.useCache) {
+			const u8 *inds = d.inds;
+			const int idx = d.fmt.idx, lower = d.lower;
+			Assemble(d.prim, d.count, [&](int vtx) { return out[ReadIndex(inds, idx, vtx) - lower]; });
+		} else {
+			Assemble(d.prim, d.count, [&](int vtx) { return out[vtx]; });
+		}
+	}
+	binner::EndResolve();
+	actx = nullptr;
+	pending.clear();
+	tsSnaps.clear();
+	tsSnapSerial = ~0ull;
+	pendingBones.clear();
+	pendingSlots = 0;
+	resolvingDraws = false;
+}
 
 void TransformDirty() {
 	tsDirty = true;
 }
 
 void ResetPrimAssembly() {
+	ResolvePendingDraws();
 	dataIndex = 0;
 	prevPrim = GE_PRIM_POINTS;
+	recPrevPrim = GE_PRIM_POINTS;
 	carry = Carry{};
 	tsDirty = true;
 }
@@ -1119,7 +1403,7 @@ void SubmitPrimitive(const u8 *verts, const u8 *inds, GEPrimitiveType prim, int 
 	const VertexFormat &fmt = vfmt;
 	if ((vertType & GE_VTYPE_POS_MASK) == 0)
 		return;
-	const bool hasUV = fmt.tc != 0, hasNormal = fmt.nrm != 0, hasColor = fmt.col != 0;
+	const bool hasColor = fmt.col != 0;
 	EnsureTransformState(fmt.through, hasColor, vertType);
 	g_stats.vertices += count;
 
@@ -1127,37 +1411,16 @@ void SubmitPrimitive(const u8 *verts, const u8 *inds, GEPrimitiveType prim, int 
 	int lower = 0, upper = count > 0 ? count - 1 : 0;
 	if (useIndices && count > 0)
 		GetIndexBounds(inds, count, fmt.idx, &lower, &upper);
-
 	// Reusing indexed vertices: transform the range once.
 	const bool useCache = useIndices && count > upper - lower + 1;
-	if (useCache) {
-		if ((int)cache.size() < upper - lower + 1)
-			cache.resize(upper - lower + 1);
-		Carry c = carry;
-		SimpleVertex sv;
-		for (int i = lower; i <= upper; ++i) {
-			DecodeVertex(fmt, verts, i, &sv);
-			cache[i - lower] = ReadVertex(sv, hasUV, hasNormal, hasColor, c);
-		}
-		// What the next draw carries is the last vertex in draw order.
-		if (count != 0) {
-			DecodeVertex(fmt, verts, ReadIndex(inds, fmt.idx, count - 1), &sv);
-			ReadVertex(sv, hasUV, hasNormal, hasColor, carry);
-		}
-	}
-
-	auto read = [&](int vtx) -> ClipVertex {
-		if (useCache)
-			return cache[ReadIndex(inds, fmt.idx, vtx) - lower];
-		SimpleVertex sv;
-		DecodeVertex(fmt, verts, useIndices ? ReadIndex(inds, fmt.idx, vtx) : vtx, &sv);
-		return ReadVertex(sv, hasUV, hasNormal, hasColor, carry);
-	};
-	isImmDraw = false;
-	Assemble(prim, count, read);
+	RecordDraw(verts, inds, prim, count, fmt, lower, upper, useCache);
+	// Vertices in VRAM are read now, on this thread (rendering a GPU keeps may have to come back first).
+	if (InVram(verts) || (inds && InVram(inds)))
+		ResolvePendingDraws();
 }
 
 void SubmitSimpleVertices(const SimpleVertex *verts, const u16 *inds, GEPrimitiveType prim, int count, bool through, bool hasColor, bool hasUV, bool hasNormal) {
+	ResolvePendingDraws();
 	// The curve's vertex format: float position, normal and UVs, 8888 color, 16-bit indices.
 	const u32 vtype = (through ? GE_VTYPE_THROUGH : 0) | GE_VTYPE_POS_FLOAT | GE_VTYPE_IDX_16BIT |
 		(hasColor ? GE_VTYPE_COL_8888 : 0) | (hasUV ? GE_VTYPE_TC_FLOAT : 0) | (hasNormal ? GE_VTYPE_NRM_FLOAT : 0);
@@ -1168,13 +1431,18 @@ void SubmitSimpleVertices(const SimpleVertex *verts, const u16 *inds, GEPrimitiv
 		if (through) {
 			sv.pos[2] = sv.pos[2] >= 65535.0f ? 65535.0f : (sv.pos[2] > 0.0f ? (float)(int)sv.pos[2] : 0.0f);
 		}
-		return ReadVertex(sv, hasUV, hasNormal, hasColor, carry);
+		return ReadVertex(ts, sv, hasUV, hasNormal, hasColor, carry);
 	};
+	const AssemblyCtx ctx = LiveCtx();
+	actx = &ctx;
 	isImmDraw = false;
 	Assemble(prim, count, read);
+	actx = nullptr;
+	recPrevPrim = prevPrim;
 }
 
 void SubmitImmVertex(GEPrimitiveType prim, const RVertex &v, float clipw, bool first) {
+	ResolvePendingDraws();
 	if (first) {
 		dataIndex = 0;
 		prevPrim = prim;
@@ -1203,11 +1471,15 @@ void SubmitImmVertex(GEPrimitiveType prim, const RVertex &v, float clipw, bool f
 			data[dataIndex++] = cv;
 		break;
 	}
+	const AssemblyCtx ctx = LiveCtx();
+	actx = &ctx;
 	isImmDraw = true;
 	cullXY = false;
 	Assemble(GE_PRIM_KEEP_PREVIOUS, 0, [](int) { return ClipVertex{}; });
 	cullXY = true;
 	isImmDraw = false;
+	actx = nullptr;
+	recPrevPrim = prevPrim;
 }
 
 bool TestBoundingBox(const u8 *verts, const u8 *inds, int count, u32 vertType) {

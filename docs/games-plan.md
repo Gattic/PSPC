@@ -253,6 +253,24 @@ What went in:
     arithmetic (`gemath.cpp`: "scalar versions only"), about 2 µs per primitive.
   - **PPSSPP:** it decodes vertices with a JIT and transforms them in shaders. Its exact
     arithmetic is only in its software renderer, which uses SSE.
+- **Done (2026-10-16): draws are transformed in parallel, across draws.**
+  - Per-draw parallelism, as (c) planned it, doesn't pay: Logan's Shadow submits about 5000 draws
+    per frame, and most have 4-7 vertices.
+  - `transform.cpp` now records each draw with a copy of the state its vertices and primitives
+    depend on. When the binner's queue is next needed, all recorded vertices are transformed at
+    once on the worker threads, then assembled draw by draw in order. CLUT loads and transfer
+    sources only wait for the recorded draws when those could draw over them.
+  - Frames are unchanged: all 42 checkpoints byte-identical with both renderers, and pspautotests
+    at 539 + 20 known in the interpreter and as AOT.
+  - GE time per frame, measured headless in the interpreter (the native code was stale):
+
+    | Scene | Renderer | Before | After |
+    |---|---|---:|---:|
+    | Logan's Shadow, first mission (VBlanks 6600-7800) | Direct3D 11 | 19.6-24.3 ms | 8.3-8.8 ms |
+    | Logan's Shadow, first mission | software | 26.9-31.8 ms | 15.3-18.9 ms |
+    | Battlefront II, Dagobah battle (7800-9600) | Direct3D 11 | 14.1-17.1 ms | 4.6-5.3 ms |
+    | Battlefront II, Dagobah battle | software | 19.8-21.9 ms | 9.2-10.9 ms |
+
 - **Work, measured stage by stage with `PSPC_GPU_STATS`:**
   - (a) Bit-exact SIMD versions of `GERowSum4`, `GEDot3`, `GENormalize3` and the lighting loop.
     The exact path stays the definition: compare the two on every vertex in a test build.

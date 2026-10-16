@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 #include "common/common.h"
@@ -142,6 +143,15 @@ void DrawPoint(const RVertex &v0, const Range &range, const RasterState &state);
 
 void ComputeRasterState(RasterState *state, const u8 *clut);
 
+// The worker threads (binner.cpp): runs fn(0..count-1) on them and on the calling thread, in the
+// caller's floating-point mode, and returns when all are done. Not reentrant.
+void ParallelFor(int count, const std::function<void(int)> &fn);
+int ParallelWorkers();
+
+// Draws recorded for later (transform.cpp): transforms and assembles them now, into the queue. The
+// queue's functions below call it first, so the queue is always as if the draws went in one by one.
+void ResolvePendingDraws();
+
 // The primitive queue.
 namespace binner {
 
@@ -167,6 +177,15 @@ void Flush();
 bool HasQueued();
 // Flushes if queued drawing writes [addr, addr+size) or (writing) reads it.
 void FlushIfOverlap(u32 addr, u32 size, bool modifying);
+
+// Recorded draws: the current raster state kept for a draw assembled later (an id, the same for
+// draws in between that share it), and the pushes of their primitives while ResolvePendingDraws
+// assembles them, from the state each was recorded with.
+u32 SnapshotState();
+const RasterState &Snapshot(u32 id);
+void BeginResolve();
+void UseSnapshot(u32 id);
+void EndResolve();
 
 }  // namespace binner
 

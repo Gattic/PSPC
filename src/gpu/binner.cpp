@@ -18,6 +18,7 @@
 #if defined(_MSC_VER)
 #include <intrin.h>
 #endif
+#include <xmmintrin.h>
 
 #include "gpu/backend.h"
 #include "gpu/ge_state.h"
@@ -158,6 +159,31 @@ std::vector<AddrRange> readRanges;
 RasterState current;
 bool currentValid = false;   // current is up to date with gstate
 int currentIndex = -1;       // current's index in states, -1 if not queued yet
+u64 currentGen = 0;          // counts the recomputations of current
+u32 batchEpoch = 0;          // counts the batches (ResetBatch)
+// The texture-cache copy current samples (UseTexCache), if any.
+std::shared_ptr<std::vector<u8>> currentTexCopy;
+
+// Snapshots of current for recorded draws (SnapshotState), and where each went in states.
+struct PendingState {
+	RasterState st;
+	std::shared_ptr<std::vector<u8>> texCopy;
+	u64 gen;
+	int index;   // in states, valid in batch epoch
+	u32 epoch;
+};
+std::vector<PendingState> pendingStates;
+bool resolving = false;      // pushes come from pendingStates[pushSnapshot]
+u32 pushSnapshot = 0;
+// Where the recorded draws can draw: their target and the rows of their scissors.
+struct PendingTarget {
+	bool mixed;              // more than one target
+	u32 fbOffset, zbOffset;
+	int fbStride, zbStride;
+	u8 fbFormat;
+	int minRow, maxRow;
+	bool depth;
+} pendingTarget;
 bool batchUsesDepth = false;
 bool batchSingleThread = false;
 int batchMaxRow = -1;
@@ -204,6 +230,7 @@ void EnsureCurrent() {
 		ComputeRasterState(&current, LatestClut());
 		currentValid = true;
 		currentIndex = -1;
+		currentGen++;
 		UseTexCache(&current);
 	}
 }
@@ -228,18 +255,34 @@ void AddTextureReads(const RasterState &st) {
 	}
 }
 
+// Adds st to the batch's states (a copy of the texture it samples from the cache, texCopy, stays until
+// the batch is drawn).
+int AddState(const RasterState &st, const std::shared_ptr<std::vector<u8>> &texCopy) {
+	states.push_back(st);
+	clutInUse = true;
+	if (texCopy)
+		batchTexCopies.push_back(texCopy);
+	AddTextureReads(st);
+	const PixelState &ps = st.pix;
+	if (ps.depthWrite || ps.depthTestFunc != GE_COMP_ALWAYS || (ps.clearMode && ps.depthClear))
+		batchUsesDepth = true;
+	return (int)states.size() - 1;
+}
+
 u32 PushCurrent() {
 	EnsureCurrent();
-	if (currentIndex < 0) {
-		states.push_back(current);
-		currentIndex = (int)states.size() - 1;
-		clutInUse = true;
-		AddTextureReads(current);
-		const PixelState &ps = current.pix;
-		if (ps.depthWrite || ps.depthTestFunc != GE_COMP_ALWAYS || (ps.clearMode && ps.depthClear))
-			batchUsesDepth = true;
-	}
+	if (currentIndex < 0)
+		currentIndex = AddState(current, currentTexCopy);
 	return (u32)currentIndex;
+}
+
+u32 PushSnapshot(u32 id) {
+	PendingState &p = pendingStates[id];
+	if (p.index < 0 || p.epoch != batchEpoch) {
+		p.index = AddState(p.st, p.texCopy);
+		p.epoch = batchEpoch;
+	}
+	return (u32)p.index;
 }
 
 inline bool Overlaps(const AddrRange &a, const AddrRange &b);
@@ -274,6 +317,7 @@ bool TexturesFromTarget(const RasterState &st) {
 }
 
 void UseTexCache(RasterState *st) {
+	currentTexCopy.reset();
 	// The D3D11 renderer keeps textures its own way.
 	if (g_backend)
 		return;
@@ -299,6 +343,7 @@ void UseTexCache(RasterState *st) {
 		std::equal(key.addr, key.addr + key.levels, texCache.addr) && std::equal(key.bytes, key.bytes + key.levels, texCache.bytes);
 	if (!hit) {
 		// The copy must see everything drawn before it.
+		ResolvePendingDraws();
 		if (!prims.empty()) {
 			binner::Flush();
 			currentValid = true;
@@ -315,6 +360,7 @@ void UseTexCache(RasterState *st) {
 		texCache = key;
 	}
 	batchTexCopies.push_back(texCache.data);
+	currentTexCopy = texCache.data;
 	u32 off = 0;
 	for (int i = 0; i < key.levels; ++i) {
 		TexLevel &lv = ss.levels[i];
@@ -352,6 +398,60 @@ inline bool Overlaps(const AddrRange &a, const AddrRange &b) {
 	return a.start < b.end && b.start < a.end && a.end > a.start && b.end > b.start;
 }
 
+inline bool UsesDepth(const PixelState &ps) {
+	return ps.depthWrite || ps.depthTestFunc != GE_COMP_ALWAYS || (ps.clearMode && ps.depthClear);
+}
+
+inline bool SameTarget(const PixelState &ps, const PendingTarget &t) {
+	return ps.fbOffset == t.fbOffset && ps.zbOffset == t.zbOffset && ps.fbStride == t.fbStride && ps.zbStride == t.zbStride &&
+	       ps.fbFormat == t.fbFormat;
+}
+
+void AddPendingTarget(const RasterState &st) {
+	const PixelState &ps = st.pix;
+	PendingTarget &t = pendingTarget;
+	const int row1 = std::max(st.scissor.y1 / SUBPIX, 0), row2 = st.scissor.y2 / SUBPIX;
+	if (pendingStates.empty()) {
+		t.mixed = false;
+		t.fbOffset = ps.fbOffset;
+		t.zbOffset = ps.zbOffset;
+		t.fbStride = ps.fbStride;
+		t.zbStride = ps.zbStride;
+		t.fbFormat = ps.fbFormat;
+		t.minRow = row1;
+		t.maxRow = row2;
+		t.depth = false;
+	} else if (!SameTarget(ps, t)) {
+		t.mixed = true;
+	}
+	t.minRow = std::min(t.minRow, row1);
+	t.maxRow = std::max(t.maxRow, row2);
+	t.depth = t.depth || UsesDepth(ps);
+}
+
+// Whether assembling the recorded draws could make the queue write [r.start, r.end): a superset of the
+// rows FramebufferWriteRange and DepthWriteRange will have.
+bool PendingMayWrite(const AddrRange &r) {
+	if (pendingStates.empty())
+		return false;
+	const PendingTarget &t = pendingTarget;
+	if (t.mixed || (!states.empty() && !SameTarget(states[0].pix, t)))
+		return true;
+	int minRow = t.minRow, maxRow = t.maxRow;
+	if (batchMaxRow >= 0) {
+		minRow = std::min(minRow, batchMinRow);
+		maxRow = std::max(maxRow, batchMaxRow);
+	}
+	if (maxRow < minRow)
+		return false;
+	const u32 bpp = t.fbFormat == GE_FORMAT_8888 ? 4 : 2;
+	const AddrRange fb{ VRAM_BASE + t.fbOffset + (u32)minRow * t.fbStride * bpp, VRAM_BASE + t.fbOffset + (u32)(maxRow + 1) * t.fbStride * bpp };
+	if (Overlaps(r, fb))
+		return true;
+	const AddrRange zb{ VRAM_BASE + t.zbOffset + (u32)minRow * t.zbStride * 2, VRAM_BASE + t.zbOffset + (u32)(maxRow + 1) * t.zbStride * 2 };
+	return (batchUsesDepth || t.depth) && Overlaps(r, zb);
+}
+
 bool AnyReadOverlap(const AddrRange &w) {
 	for (const AddrRange &r : readRanges) {
 		if (Overlaps(r, w))
@@ -365,8 +465,9 @@ inline Range Intersect(const Range &a, const Range &b) {
 }
 
 void Push(PrimType type, const Range &rawRange, const RVertex *v, int nv) {
-	const u32 idx = PushCurrent();
-	const Range range = Intersect(rawRange, current.scissor);
+	const u32 idx = resolving ? PushSnapshot(pushSnapshot) : PushCurrent();
+	const RasterState &st = states[idx];
+	const Range range = Intersect(rawRange, st.scissor);
 	if (range.Invalid())
 		return;
 	Prim p;
@@ -384,7 +485,7 @@ void Push(PrimType type, const Range &rawRange, const RVertex *v, int nv) {
 	g_stats.prims++;
 	g_stats.pixels += area;
 	// Pixels past the stride land in the next row, which another band may be drawing.
-	const PixelState &ps = current.pix;
+	const PixelState &ps = st.pix;
 	const bool usesDepth = ps.depthWrite || ps.depthTestFunc != GE_COMP_ALWAYS || (ps.clearMode && ps.depthClear);
 	if (range.x2 / SUBPIX >= ps.fbStride || (usesDepth && range.x2 / SUBPIX >= ps.zbStride))
 		batchSingleThread = true;
@@ -442,8 +543,9 @@ void ResetBatch() {
 	batchMaxRow = -1;
 	batchMinRow = 1 << 30;
 	batchPixels = 0;
-	// Keep only the latest CLUT snapshot.
-	if (clutCount > 1) {
+	batchEpoch++;
+	// Keep only the latest CLUT snapshot (not while recorded draws still point at the others).
+	if (clutCount > 1 && !resolving) {
 		std::swap(clutPool[0], clutPool[clutCount - 1]);
 		clutCount = 1;
 		currentValid = false;
@@ -469,6 +571,7 @@ void Shutdown() {
 	pool.Stop();
 	prims.clear();
 	states.clear();
+	pendingStates.clear();
 }
 
 void SetThreads(int count) {
@@ -487,6 +590,7 @@ void DirtyState() {
 }
 
 void TargetChanged() {
+	ResolvePendingDraws();
 	if (!prims.empty())
 		Flush();
 	currentValid = false;
@@ -547,10 +651,12 @@ void AddPoint(const RVertex &v0) {
 }
 
 bool HasQueued() {
+	ResolvePendingDraws();
 	return !prims.empty();
 }
 
 void Flush() {
+	ResolvePendingDraws();
 	if (prims.empty()) {
 		ResetBatch();
 		return;
@@ -591,10 +697,15 @@ void Flush() {
 }
 
 void FlushIfOverlap(u32 addr, u32 size, bool modifying) {
-	if (prims.empty() || size == 0)
+	if (size == 0)
 		return;
 	const u32 start = FoldAddress(addr);
 	const AddrRange r{ start, start + size };
+	// Recorded draws wait unless they could change the answer (a write may also change their vertices).
+	if (modifying || PendingMayWrite(r))
+		ResolvePendingDraws();
+	if (prims.empty())
+		return;
 	if (Overlaps(r, FramebufferWriteRange()) || Overlaps(r, DepthWriteRange())) {
 		Flush();
 		return;
@@ -603,7 +714,65 @@ void FlushIfOverlap(u32 addr, u32 size, bool modifying) {
 		Flush();
 }
 
+u32 SnapshotState() {
+	EnsureCurrent();
+	if (pendingStates.empty() || pendingStates.back().gen != currentGen) {
+		AddPendingTarget(current);
+		// A copy that's queued already stays the one the draw's primitives use.
+		pendingStates.push_back({ current, currentTexCopy, currentGen, currentIndex, batchEpoch });
+		// Later CLUT loads must not overwrite the snapshot the copy points to.
+		clutInUse = true;
+	}
+	return (u32)pendingStates.size() - 1;
+}
+
+const RasterState &Snapshot(u32 id) {
+	return pendingStates[id].st;
+}
+
+void BeginResolve() {
+	resolving = true;
+}
+
+void UseSnapshot(u32 id) {
+	pushSnapshot = id;
+}
+
+void EndResolve() {
+	resolving = false;
+	// current is queued where its last snapshot went, as if the draws had pushed it.
+	if (!pendingStates.empty()) {
+		const PendingState &last = pendingStates.back();
+		if (currentValid && last.gen == currentGen)
+			currentIndex = last.epoch == batchEpoch ? last.index : -1;
+	}
+	pendingStates.clear();
+}
+
 }  // namespace binner
+
+void ParallelFor(int count, const std::function<void(int)> &fn) {
+	if (count <= 0)
+		return;
+	if (count == 1 || pool.Workers() == 0) {
+		for (int i = 0; i < count; ++i)
+			fn(i);
+		return;
+	}
+	// The same floating-point mode on every thread, so results don't depend on where they ran.
+	const unsigned csr = _mm_getcsr();
+	const std::function<void(int)> task = [&](int i) {
+		const unsigned saved = _mm_getcsr();
+		_mm_setcsr(csr);
+		fn(i);
+		_mm_setcsr(saved);
+	};
+	pool.ParallelFor(count, task);
+}
+
+int ParallelWorkers() {
+	return pool.Workers();
+}
 
 void SetRenderBackend(RenderBackend *backend) {
 	binner::Flush();

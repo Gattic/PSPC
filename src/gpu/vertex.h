@@ -29,8 +29,12 @@ struct SimpleVertex {
 	float pos[3];
 };
 
-// Reads index i (already through the index buffer) of a draw: morph and skinning applied (transform mode).
+// Reads index i (already through the index buffer) of a draw: morph and skinning applied (transform mode),
+// with the given morph weights (8) and bone matrices (8 x 12).
 // hasUV/hasNormal/hasColor come from the format.
+void DecodeVertex(const VertexFormat &fmt, const u8 *base, int index, SimpleVertex *out, const float *morphWeights,
+                  const float *boneMatrix);
+// The same with the GE's current morph weights and bones.
 void DecodeVertex(const VertexFormat &fmt, const u8 *base, int index, SimpleVertex *out);
 
 // Index buffer helpers.

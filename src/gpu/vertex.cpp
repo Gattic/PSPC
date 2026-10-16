@@ -114,11 +114,11 @@ static inline u32 ReadColor(const u8 *p, int col) {
 // One morphed component: each frame's value times its weight as a float24, summed in frame order with
 // the GE's adder (gpu/probe exp67, exp107).
 template <typename Read>
-static float GEMorphComponent(const VertexFormat &fmt, const u8 *in, int off, int c, Read read) {
+static float GEMorphComponent(const VertexFormat &fmt, const u8 *in, int off, int c, const float *morphWeights, Read read) {
 	float acc = 0.0f;
 	for (int k = 0; k < fmt.morphcount; ++k) {
 		const float v = TruncateToFloat24(read(in + k * fmt.onesize + off, c));
-		const float w = TruncateToFloat24(gstate_c.morphWeights[k]);
+		const float w = TruncateToFloat24(morphWeights[k]);
 		const float term = v == 0.0f || w == 0.0f ? 0.0f : ProductToFloat24((double)v * w);
 		if (term != 0.0f)
 			acc = acc == 0.0f ? term : TruncateToFloat24(GEAdd(acc, term));
@@ -135,10 +135,15 @@ static inline float GEMul24(float a, float b) {
 }
 
 void DecodeVertex(const VertexFormat &fmt, const u8 *base, int index, SimpleVertex *out) {
+	DecodeVertex(fmt, base, index, out, gstate_c.morphWeights, gstate.boneMatrix);
+}
+
+void DecodeVertex(const VertexFormat &fmt, const u8 *base, int index, SimpleVertex *out, const float *morphWeights,
+                  const float *boneMatrix) {
 	const u8 *in = base + (size_t)index * fmt.size;
 	const bool morph = fmt.morphcount > 1 && !fmt.through;
 	auto component = [&](int off, int c, auto read) {
-		return morph ? GEMorphComponent(fmt, in, off, c, read) : read(in + off, c);
+		return morph ? GEMorphComponent(fmt, in, off, c, morphWeights, read) : read(in + off, c);
 	};
 
 	// Texture coordinates.
@@ -164,7 +169,7 @@ void DecodeVertex(const VertexFormat &fmt, const u8 *base, int index, SimpleVert
 			if (!fmt.through) {
 				// Per channel expanded to 8 bits, morphed, floored.
 				for (int c = 0; c < 4; ++c) {
-					const float ch = GEMorphComponent(fmt, in, fmt.coloff, c, [&](const u8 *p, int i) {
+					const float ch = GEMorphComponent(fmt, in, fmt.coloff, c, morphWeights, [&](const u8 *p, int i) {
 						return (float)((ReadColor(p, fmt.col) >> (8 * i)) & 0xFF);
 					});
 					out->color |= (u32)std::clamp((int)std::floor(ch), 0, 255) << (8 * c);
@@ -174,7 +179,7 @@ void DecodeVertex(const VertexFormat &fmt, const u8 *base, int index, SimpleVert
 				for (int k = 0; k < fmt.morphcount; ++k) {
 					const u32 cv = ReadColor(in + k * fmt.onesize + fmt.coloff, fmt.col);
 					for (int c = 0; c < 4; ++c)
-						acc[c] += (float)((cv >> (8 * c)) & 0xFF) * gstate_c.morphWeights[k];
+						acc[c] += (float)((cv >> (8 * c)) & 0xFF) * morphWeights[k];
 				}
 				for (int c = 0; c < 4; ++c)
 					out->color |= (u32)std::clamp((int)acc[c], 0, 255) << (8 * c);
@@ -230,7 +235,7 @@ void DecodeVertex(const VertexFormat &fmt, const u8 *base, int index, SimpleVert
 			const float w = weights[b];
 			if (w == 0.0f)
 				continue;
-			const float *m = gstate.boneMatrix + b * 12;
+			const float *m = boneMatrix + b * 12;
 			float rows[4][3];
 			for (int j = 0; j < 4; ++j)
 				for (int c = 0; c < 3; ++c)
