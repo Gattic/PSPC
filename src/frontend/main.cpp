@@ -591,7 +591,23 @@ static int Main(int argc, char **argv) {
 }
 
 #ifdef _WIN32
-int wmain(int argc, wchar_t **argv) { return RunUtf8Main(Main, argc, argv); }
+int wmain(int argc, wchar_t **argv) {
+	try {
+		return RunUtf8Main(Main, argc, argv);
+	} catch (const std::exception &error) {
+		fprintf(stderr, "%s\n", error.what());
+		// Started from the launcher or Explorer, the console closes with this process: show the
+		// error where it can be read.
+		DWORD ids[2];
+		if (GetConsoleWindow() && GetConsoleProcessList(ids, 2) == 1) {
+			std::string what = error.what();
+			std::wstring text(what.size(), L'\0');
+			text.resize(MultiByteToWideChar(CP_UTF8, 0, what.data(), (int)what.size(), text.data(), (int)text.size()));
+			MessageBoxW(nullptr, (L"PSPC could not start:\n\n" + text).c_str(), L"PSPC", MB_ICONERROR);
+		}
+		return 1;
+	}
+}
 #else
 int main(int argc, char **argv) {
 	try {

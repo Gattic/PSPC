@@ -397,6 +397,11 @@ TEST(fs_host_readonly_and_host0) {
 	CHECK_EQ(host.Rename("/kd/a.prx", "/other/b.prx"), 0);
 	CHECK(sfs::exists(root / "other" / "b.prx"));
 	CHECK_EQ(host.Rename("/other/b.prx", "/nodir/b.prx"), SCE_ERRNO_ENOENT);
+
+	// A missing read-only root stays missing (an old flash0 path must not come back empty).
+	HostFileSystem missing(tmp.Path() / "flash0-old", ro);
+	CHECK_EQ(missing.Open("/kd/a.prx", PSP_O_RDONLY, 0), SCE_ERRNO_ENOENT);
+	CHECK(!sfs::exists(tmp.Path() / "flash0-old"));
 }
 
 TEST(fs_host_rename_and_remove_open_file) {

@@ -112,7 +112,9 @@ struct HostFileSystem::OpenDir { std::vector<EntryInfo> entries; size_t index = 
 
 HostFileSystem::HostFileSystem(fs::path root, HostFsOptions options) : opt_(options) {
 	std::error_code ec;
-	fs::create_directories(root, ec);
+	// Not a read-only root (flash0): nothing could be written into it, and a run given an old
+	// --flash0 path would leave an empty folder there.
+	if (!opt_.readOnly) fs::create_directories(root, ec);
 	root_ = fs::weakly_canonical(fs::absolute(root));
 }
 HostFileSystem::~HostFileSystem() = default;

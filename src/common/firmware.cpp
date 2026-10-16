@@ -9,6 +9,10 @@ void NoSymlink(const fs::path &path) {
 	if (fs::is_symlink(fs::symlink_status(path)))
 		throw std::runtime_error("Firmware paths must not be symbolic links: " + PathToUtf8(path));
 }
+bool EmptyDir(const fs::path &path) {
+	std::error_code ec;
+	return fs::is_directory(fs::symlink_status(path, ec)) && fs::is_empty(path, ec) && !ec;
+}
 }
 bool ValidName(const std::string &name) {
 	auto alnum = [](char c) { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'); };
@@ -52,6 +56,11 @@ void Migrate(const fs::path &dataRoot, bool migrateFlash0, bool migrateFlash1) {
 	// Check every requested destination before moving any tree. Partial migration can resume.
 	for (const char *flash : roots) {
 		NoSymlink(dataRoot / flash);
+		// An empty folder holds nothing to keep (a run given the old root as --flash0 recreates
+		// one): drop it rather than refuse to start.
+		std::error_code ec;
+		if (EmptyDir(dataRoot / flash)) fs::remove(dataRoot / flash, ec);
+		else if (fs::exists(dataRoot / flash) && EmptyDir(target / flash)) fs::remove(target / flash, ec);
 		if (fs::exists(dataRoot / flash) && fs::exists(target / flash))
 			throw std::runtime_error("Cannot migrate firmware: both " + PathToUtf8(dataRoot / flash) + " and " + PathToUtf8(target / flash) + " exist. Move one aside first.");
 	}

@@ -117,6 +117,23 @@ TEST(firmware_migration_does_not_inspect_overridden_roots) {
 	CHECK(fs::is_regular_file(f.root / "flash0/keep"));
 }
 
+TEST(firmware_migration_drops_empty_folders) {
+	Fixture f;
+	f.Install("default");
+	// A run given the old root as --flash0 left an empty folder next to the migrated profile.
+	fs::create_directories(f.root / "flash0");
+	firmware::Migrate(f.root);
+	CHECK(!fs::exists(f.root / "flash0"));
+	CHECK(firmware::Installed(f.root, "default"));
+	// An empty profile folder doesn't keep the old tree from moving in.
+	fs::remove_all(f.root / "firmware/default/flash1");
+	fs::create_directories(f.root / "firmware/default/flash1");
+	f.Put(f.root / "flash1/registry/system.dreg", "old");
+	firmware::Migrate(f.root);
+	CHECK(!fs::exists(f.root / "flash1"));
+	CHECK(fs::is_regular_file(f.root / "firmware/default/flash1/registry/system.dreg"));
+}
+
 #ifndef _WIN32
 TEST(firmware_symlinks_cannot_redirect_deletion) {
 	Fixture f;

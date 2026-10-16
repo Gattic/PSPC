@@ -14,6 +14,7 @@ built from and their SHA-1s, so the launcher can tell which games have native co
 """
 import argparse
 import concurrent.futures
+import copy
 import hashlib
 import json
 import os
@@ -40,6 +41,72 @@ TOOLCHAIN = None
 _seen_lock = threading.Lock()
 _seen = set()
 _module_sha = {}  # module path -> SHA-1 of its plain ELF (for games.json)
+
+
+class Progress:
+    """What the build is doing, for whoever waits in its console: a line per step and, when one
+    module at a time is built on a console, a live line while compiling with the time left."""
+
+    def __init__(self, live, subject):
+        self.live = live
+        self.subject = subject
+        self.start = time.monotonic()
+        self.lock = threading.Lock()
+        self.shown = 0  # length of the live line on screen (0: none)
+        self.title('')
+
+    def clock(self):
+        s = int(time.monotonic() - self.start)
+        return '%d:%02d' % (s // 60, s % 60)
+
+    def title(self, prefix):
+        if self.live and WINDOWS:
+            import ctypes
+            ctypes.windll.kernel32.SetConsoleTitleW(prefix + 'Building native code: ' + self.subject)
+
+    def say(self, text):
+        with self.lock:
+            if self.shown:
+                sys.stdout.write('\n')
+                self.shown = 0
+            print(text, flush=True)
+
+    def step(self, text):
+        self.say('[%s] %s' % (self.clock(), text))
+
+    def compiled(self, done, total, started, jobs):
+        """`done` of `total` files compiled since `started`. The time left is only estimated once
+        the first round of parallel compiles has finished."""
+        if not self.live:
+            return
+        width = max(20, shutil.get_terminal_size().columns - 1)
+        bar = 20 if width >= 70 else 10
+        filled = bar * done // total
+        line = '      %s%s %3d%%  %d/%d files' % ('█' * filled, '░' * (bar - filled), 100 * done // total, done, total)
+        if done < min(jobs, total):
+            line += ', estimating the time left'
+        elif done < total:
+            left = int((time.monotonic() - started) / done * (total - done)) + 1
+            line += ', about %s left' % ('%d:%02d' % (left // 60, left % 60) if left >= 60 else '%d s' % left)
+        line = line[:width]
+        with self.lock:
+            sys.stdout.write('\r' + line.ljust(self.shown))
+            sys.stdout.flush()
+            self.shown = len(line)
+        self.title('%d%% - ' % (100 * done // total))
+
+
+def compile_all(args, compile_one, sources):
+    """Compiles the generated sources on args.jobs threads. The objects come back in source order
+    (the link order); the first failure is raised."""
+    args.progress.step('%s: compiling %d C++ files' % (args.label, len(sources)))
+    started = time.monotonic()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as ex:
+        futs = [ex.submit(compile_one, cpp) for cpp in sources]
+        for done, f in enumerate(concurrent.futures.as_completed(futs), 1):
+            f.result()
+            args.progress.compiled(done, len(futs), started, args.jobs)
+    return [f.result() for f in futs]
 
 
 def source_sem_version():
@@ -87,7 +154,9 @@ def vs_env():
                           'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', '-property', 'installationPath'],
                          stdout=subprocess.PIPE, text=True).stdout.strip()
     vcvars = pathlib.Path(out) / 'VC' / 'Auxiliary' / 'Build' / 'vcvars64.bat'
-    env_out = subprocess.run('call "%s" >nul && set' % vcvars, shell=True, stdout=subprocess.PIPE, text=True).stdout
+    # vcvars64.bat complains on stderr that vswhere.exe isn't on PATH: harmless, but in the build console.
+    env_out = subprocess.run('call "%s" >nul && set' % vcvars, shell=True, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True).stdout
     # Variable names are case-insensitive: os.environ has PATH, but `set` prints the spelling the
     # process got (Path when started from Explorer), and a second key would lose VS's PATH.
     env = {k.upper(): v for k, v in os.environ.items()}
@@ -227,6 +296,13 @@ def game_info(path):
     return {k.lower(): sfo[k] for k in ('DISC_ID', 'TITLE') if sfo.get(k)}
 
 
+def subject(inputs):
+    """The game's title (one disc image or PBP), else what the inputs are."""
+    if len(inputs) == 1:
+        return game_info(inputs[0]).get('title') or inputs[0].name
+    return '%d modules' % len(inputs)
+
+
 def write_index(cache, origins, ok):
     """Records in <cache>/games.json which modules each input was built from:
     {"version": 1, "games": {"<input path>": {"disc_id", "title", "size", "built",
@@ -285,8 +361,8 @@ def build_bundled(args, env, src, sha):
             raise RuntimeError('compile failed (%s):\n%s' % (cpp.name, r.stdout[-6000:]))
         return obj
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as ex:
-        objs = list(ex.map(compile_one, sorted(src.glob('*.cpp'))))
+    objs = compile_all(args, compile_one, sorted(src.glob('*.cpp')))
+    args.progress.step('%s: linking' % args.label)
     dll = obj_dir / (sha + '.dll')
     # Static C++ support: the resulting DLL needs only Windows' system DLLs, even when copied
     # into another cache. A response file also handles large modules and long installation paths.
@@ -327,8 +403,8 @@ def build_linux(args, env, src, sha):
             raise RuntimeError('compile failed (%s):\n%s' % (cpp.name, r.stdout[-6000:]))
         return obj
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as ex:
-        objs = list(ex.map(compile_one, sorted(src.glob('*.cpp'))))
+    objs = compile_all(args, compile_one, sorted(src.glob('*.cpp')))
+    args.progress.step('%s: linking' % args.label)
     module = obj_dir / (sha + MODULE_SUFFIX)
     cmd = [cc, '-shared', '-Wl,-Bsymbolic', '-Wl,--exclude-libs,ALL', '-Wl,--no-undefined',
            '-o', str(module), *map(str, objs)]
@@ -365,8 +441,8 @@ def build_direct(args, env, src, sha):
             raise RuntimeError('compile failed (%s):\n%s' % (cpp.name, r.stdout[-6000:]))
         return obj
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as ex:
-        objs = list(ex.map(compile_one, sorted(src.glob('*.cpp'))))
+    objs = compile_all(args, compile_one, sorted(src.glob('*.cpp')))
+    args.progress.step('%s: linking' % args.label)
     dll = obj_dir / (sha + '.dll')
     cmd = [linker, '/nologo', '/DLL', '/INCREMENTAL:NO', '/OUT:' + str(dll), '/IMPLIB:' + str(obj_dir / (sha + '.lib'))]
     cmd += [str(o) for o in objs]
@@ -387,6 +463,7 @@ def build_with_cmake(args, env, src, sha):
     r = subprocess.run(cfg, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if r.returncode != 0:
         raise RuntimeError('cmake configure failed:\n' + r.stdout[-4000:])
+    args.progress.step('%s: compiling and linking' % args.label)
     r = subprocess.run(['cmake', '--build', str(bdir), '--parallel', str(args.jobs)], env=env,
                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if r.returncode != 0:
@@ -394,7 +471,9 @@ def build_with_cmake(args, env, src, sha):
     return bdir / (sha + MODULE_SUFFIX)
 
 
-def build_one(args, env, path):
+def build_one(args, env, path, label):
+    args = copy.copy(args)
+    args.label = label  # this module's name in progress lines
     work = pathlib.Path(args.work)
     work.mkdir(parents=True, exist_ok=True)
     elf = plain_elf(path, work, pathlib.Path(args.decrypt))
@@ -425,6 +504,8 @@ def build_one(args, env, path):
         cmd += ['--hints', str(hints)]
     if args.no_comments:
         cmd.append('--no-comments')
+    size = '%.1f MB' % (len(elf) / 1048576) if len(elf) >= 1048576 else '%d KB' % -(-len(elf) // 1024)
+    args.progress.step('%s: translating PSP code to C++ (%s)' % (label, size))
     r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                        encoding='utf-8', errors='replace')
     if r.returncode != 0:
@@ -485,6 +566,14 @@ def main():
     args.cache = args.cache or str(BIN / 'cache' / 'aot')
     args.decrypt = args.decrypt or str(BIN / ('pspc-decrypt' + EXE_SUFFIX))
     args.work = args.work or str(installed / 'cache' / 'aot-work' if installed_sdk else ROOT / 'build' / 'aot-work')
+    inputs = [pathlib.Path(p) for p in args.inputs]
+    # The launcher runs this in a console of its own: say what is going on and for how long.
+    args.progress = Progress(sys.stdout.isatty() and args.modules_in_parallel == 1, subject(inputs))
+    args.progress.say('Building native code for %s' % args.progress.subject)
+    if args.progress.live:
+        args.progress.say('%s\nThe time left shows while compiling. Closing this window stops the build.\n'
+                          % ('Most games take 1 to 5 minutes, depending on their size and this PC.' if len(inputs) == 1
+                             else 'Small modules take seconds, a game\'s main program minutes.'))
     if TOOLCHAIN:
         env = bundled_env()
     else:
@@ -504,21 +593,30 @@ def main():
 def build_batch(args, env):
     args.lib_dir = snapshot_libs(pathlib.Path(args.work), args.sem_version)
     origins, ok = {}, {}
-    paths = expand_inputs(args, [pathlib.Path(p) for p in args.inputs], origins)
+    inputs = [pathlib.Path(p) for p in args.inputs]
+    if any(p.suffix.lower() in DISC_EXTS for p in inputs):
+        args.progress.step('Reading the disc')
+    paths = expand_inputs(args, inputs, origins)
     failures = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.modules_in_parallel) as ex:
-        futs = {ex.submit(build_one, args, env, p): p for p in paths}
+        futs = {}
+        for i, p in enumerate(paths, 1):
+            label = pathlib.PurePosixPath(origins[p][1]).name
+            if len(paths) > 1:
+                label += ' (%d of %d)' % (i, len(paths))
+            futs[ex.submit(build_one, args, env, p, label)] = p
         for f in concurrent.futures.as_completed(futs):
             try:
-                print(f.result())
+                args.progress.say(f.result())
                 ok[futs[f]] = True
             except Exception as e:  # noqa: BLE001 - report and continue with other modules
                 failures += 1
-                print('FAILED %s: %s' % (futs[f], e))
+                args.progress.say('FAILED %s: %s' % (futs[f], e))
     try:
         write_index(args.cache, origins, ok)
     except Exception as e:  # noqa: BLE001 - the index is a convenience for the launcher
-        print('warning: games.json not updated: %s' % e)
+        args.progress.say('warning: games.json not updated: %s' % e)
+    args.progress.step('%d of %d modules failed' % (failures, len(paths)) if failures else 'Done')
     return 1 if failures else 0
 
 
