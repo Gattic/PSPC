@@ -11,8 +11,8 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 	set(GL_SHADERS ${CMAKE_BINARY_DIR}/generated/opengl_shaders.h)
 	add_custom_command(OUTPUT ${GL_SHADERS}
 		COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/gl_shaders.py
-			${CMAKE_CURRENT_SOURCE_DIR}/d3d11_shaders.cpp ${GL_SHADERS}
-		DEPENDS d3d11_shaders.cpp ${CMAKE_SOURCE_DIR}/tools/gl_shaders.py VERBATIM)
+			${CMAKE_CURRENT_SOURCE_DIR}/d3d11_shaders.cpp ${CMAKE_CURRENT_SOURCE_DIR}/d3d11_geometry.cpp ${GL_SHADERS}
+		DEPENDS d3d11_shaders.cpp d3d11_geometry.cpp ${CMAKE_SOURCE_DIR}/tools/gl_shaders.py VERBATIM)
 	add_library(pspc_gpu_gl STATIC opengl_backend.cpp ${GL_SHADERS})
 	target_include_directories(pspc_gpu_gl PRIVATE ${CMAKE_BINARY_DIR}/generated)
 	target_link_libraries(pspc_gpu_gl PUBLIC pspc_gpu PRIVATE OpenGL::GL SDL2::SDL2)

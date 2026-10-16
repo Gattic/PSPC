@@ -779,6 +779,21 @@ PSPC_RENDERER_REQUIRE=1 build/LinuxRuntime/bin/pspc_unittests gpu_opengl
 These synthetic scenes do not establish retail GPU correctness, driver-wide compatibility,
 performance, or screenshot/overlay pixel parity. D3D11 and WARP remain Windows-only.
 
+Since 2026-10-16 the OpenGL renderer also transforms, lights and clips transform-mode triangles
+in compute shaders generated from the D3D11 ones, bit for bit with the CPU
+([GPU transform](gpu-transform.md#opengl)). `PSPC_GPU_TRANSFORM=0` keeps that on the CPU, and
+`PSPC_GPU_TRANSFORM_VERIFY=1 PSPC_GPU_STATS=1` compares every triangle job with the CPU's.
+On Ubuntu 22.04 (WSLg, Mesa 23.2.1 llvmpipe) `gpu_hardware_transform_matches_cpu` passed, verified
+runs of Logan's Shadow and Battlefront II (about 2 million triangle jobs) found no difference, and
+Battlefront II's frames were byte-identical with and without the GPU transform. No hardware Linux
+GPU has been tested yet:
+
+```sh
+export LIBGL_ALWAYS_SOFTWARE=1 PSPC_GL_SERIAL_FRAGMENTS=1 PSPC_RENDERER_REQUIRE=1
+build/LinuxCI/bin/pspc_unittests gpu_hardware_transform_matches_cpu
+PSPC_RENDERER=opengl PSPC_GPU_TRANSFORM_VERIFY=1 PSPC_GPU_STATS=1 build/LinuxCI/bin/pspc --headless ...
+```
+
 ### GTK workflows and native builds
 
 The GTK launcher provides:

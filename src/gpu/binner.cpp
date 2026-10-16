@@ -672,6 +672,10 @@ bool TransformsGeometry() {
 	return g_backend && g_backend->TransformsGeometry();
 }
 
+bool TransformsGeometryFor(const RasterState &st) {
+	return g_backend && g_backend->TransformsGeometryFor(st);
+}
+
 bool VerifiesGeometry() {
 	return g_backend && g_backend->VerifiesGeometry();
 }

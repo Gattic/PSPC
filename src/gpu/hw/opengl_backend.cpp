@@ -1,20 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Ordered integer-image GE rasterization. Guest memory is synchronized eagerly;
-// no signal handler or inaccessible VRAM mappings are needed on Linux.
+// no signal handler or inaccessible VRAM mappings are needed on Linux. Transform-mode
+// triangles can be transformed and assembled by compute shaders (gpu/geometry.h).
 #define GL_GLEXT_PROTOTYPES
 #include "gpu/hw/opengl_backend.h"
 #include "common/log.h"
 #include "gpu/color.h"
+#include "gpu/gemath.h"
 #include "gpu/hw/draw_data.h"
 #include "opengl_shaders.h"
 #include <GL/glcorearb.h>
 #include <SDL.h>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 
 namespace gpu::hw {
 namespace {
@@ -128,6 +134,27 @@ void IVec(GLuint p, const char *n, int x, int y) { glProgramUniform2i(p, glGetUn
 void UVec(GLuint p, const char *n, unsigned x, unsigned y) { glProgramUniform2ui(p, glGetUniformLocation(p, n), x, y); }
 void FVec(GLuint p, const char *n, float x, float y) { glProgramUniform2f(p, glGetUniformLocation(p, n), x, y); }
 void Barrier() { glMemoryBarrier(GL_ALL_BARRIER_BITS); }
+// The vertex transform's GLSL (tools/gl_shaders.py) for one entry point, with gemath.cpp's tables. Doubles
+// are core since GLSL 4.00: the texture-level gradient and the reciprocal w of vertices behind the camera
+// are computed in doubles, as on the CPU.
+std::string GeometrySource(const char *entry) {
+	std::string tables = "const ivec2 kRecip[128] = ivec2[128](";
+	char buf[48];
+	for (int i = 0; i < 128; ++i) {
+		snprintf(buf, sizeof(buf), "%sivec2(%d, %d)", i ? ", " : "", geRecipSegments[i].b, geRecipSegments[i].m);
+		tables += buf;
+	}
+	tables += ");\nconst ivec2 kRsqrt[256] = ivec2[256](";
+	for (int i = 0; i < 256; ++i) {
+		const GERecipSegment &s = geRsqrtSegments[i >> 7][i & 127];
+		snprintf(buf, sizeof(buf), "%sivec2(%d, %d)", i ? ", " : "", s.b, s.m);
+		tables += buf;
+	}
+	tables += ");\n";
+	std::string src = kGLGeometry;
+	src.replace(src.find("TABLES"), 6, tables);
+	return std::string("#version 450 core\n#define DOUBLES 1\n#define ENTRY ") + entry + "\n" + src;
+}
 struct Surface {
 	u32 addr = 0;
 	int stride = 0, fmt = 0, h = 0;
@@ -139,10 +166,22 @@ class OpenGLBackend final : public RenderBackend, private DrawData {
 	SDL_GLContext context_ = nullptr;
 	bool ownedWindow_ = false, ownedVideo_ = false, visible_ = false;
 	bool serialFragments_ = false;
+	GLint maxViewport_[2] = {};
 	std::recursive_mutex mutex_;
 	GLuint dummyDepth_ = 0, vao_ = 0, vb_ = 0, sb_ = 0, fbo_ = 0, programs_[16] = {}, expand_ = 0, reduce_ = 0,
 		   display_ = 0, upscale_ = 0, present_ = 0;
 	std::vector<std::unique_ptr<Surface>> surfaces_;
+	// Vertex transform on the GPU (gpu/geometry.h): CSVertex and CSTriangle, and their storage buffers
+	// (the shaders' bindings); GEO_OUT holds CSTriangle's GPU vertices, drawn as a vertex buffer.
+	enum { GEO_INPUTS, GEO_DRAWS, GEO_TRANSFORMS, GEO_JOBS, GEO_CLIP, GEO_OUT, GEO_BUFFERS };
+	static constexpr size_t CLIP_STRIDE = 64;  // ClipV in std430
+	GLuint geoPrograms_[2] = {}, geoShaders_[2] = {}, geoBuffers_[GEO_BUFFERS] = {};
+	size_t geoBytes_[GEO_BUFFERS] = {};
+	bool geoCompiling_ = false, geoParallel_ = false, geoVerify_ = false, printStats_ = false;
+	std::atomic<bool> geoEnabled_{false};
+	std::chrono::steady_clock::time_point geoStart_;
+	TransformStats geoStats_;
+	u64 syncs_ = 0;
 	struct Current {
 		std::unique_lock<std::recursive_mutex> lock;
 		SDL_Window *previousWindow;
@@ -307,6 +346,319 @@ class OpenGLBackend final : public RenderBackend, private DrawData {
 		glDrawArrays(GL_TRIANGLES, 0, 3);
 		SDL_GL_SwapWindow(window_);
 	}
+	// Whether the primitives can be drawn here with the states, and the target rows they need. Color and
+	// depth overlapping in memory, or coordinates outside a target's stride, need the exact memory order
+	// of the software reference.
+	bool Drawable(const BatchPrim *prims, size_t count, const RasterState *states, size_t n, int *height, bool *usesDepth) const {
+		bool supported = true;
+		*height = 1;
+		*usesDepth = false;
+		const PixelState &ps = states[0].pix;
+		for (size_t i = 0; i < n; ++i) {
+			const auto &p = states[i].pix;
+			*usesDepth |= p.depthWrite || p.depthTestFunc != GE_COMP_ALWAYS || (p.clearMode && p.depthClear);
+		}
+		for (size_t i = 0; i < count; ++i) {
+			*height = std::max(*height, prims[i].range.y2 / SUBPIX + 1);
+			supported &= prims[i].range.x1 >= 0 && prims[i].range.y1 >= 0 && prims[i].range.x2 / SUBPIX < ps.fbStride &&
+						 (!*usesDepth || prims[i].range.x2 / SUBPIX < ps.zbStride);
+		}
+		if (*usesDepth) {
+			u32 cb = (u32)*height * ps.fbStride * (ps.fbFormat == 3 ? 4 : 2), zb = (u32)*height * ps.zbStride * 2;
+			bool overlap = cb >= VRAM_SIZE || zb >= VRAM_SIZE || ((ps.fbOffset - ps.zbOffset) & (VRAM_SIZE - 1)) < zb ||
+						   ((ps.zbOffset - ps.fbOffset) & (VRAM_SIZE - 1)) < cb;
+			supported &= !overlap;
+		}
+		return supported && ps.fbStride > 0 && (!*usesDepth || ps.zbStride > 0) && *height * scale_ <= MAX_TEXTURE_SIDE &&
+			   ps.fbStride * scale_ <= MAX_TEXTURE_SIDE && (!*usesDepth || ps.zbStride * scale_ <= MAX_TEXTURE_SIDE);
+	}
+	// Starts compiling the vertex transform's shaders: on the driver's own threads when it can
+	// (KHR_parallel_shader_compile), and until they're ready the CPU transforms.
+	void InitGeometry(const OpenGLOptions &o) {
+		const char *env = getenv("PSPC_GPU_TRANSFORM");
+		if (!o.gpuTransform || (env && *env == '0'))
+			return;
+		geoVerify_ = o.verifyTransform || getenv("PSPC_GPU_TRANSFORM_VERIFY") != nullptr;
+		const bool wait = o.waitForShaders || getenv("PSPC_GPU_TRANSFORM_WAIT") != nullptr;
+		if (!wait && SDL_GL_ExtensionSupported("GL_KHR_parallel_shader_compile")) {
+			auto threads = (PFNGLMAXSHADERCOMPILERTHREADSKHRPROC)SDL_GL_GetProcAddress("glMaxShaderCompilerThreadsKHR");
+			if (threads) {
+				threads(0xFFFFFFFFu);
+				geoParallel_ = true;
+			}
+		}
+		geoStart_ = std::chrono::steady_clock::now();
+		const char *entries[2] = { "CSVertex", "CSTriangle" };
+		for (int i = 0; i < 2; ++i) {
+			const std::string text = GeometrySource(entries[i]);
+			const char *p = text.c_str();
+			geoShaders_[i] = glCreateShader(GL_COMPUTE_SHADER);
+			glShaderSource(geoShaders_[i], 1, &p, nullptr);
+			glCompileShader(geoShaders_[i]);
+			geoPrograms_[i] = glCreateProgram();
+			glAttachShader(geoPrograms_[i], geoShaders_[i]);
+			glLinkProgram(geoPrograms_[i]);
+		}
+		glCreateBuffers(GEO_BUFFERS, geoBuffers_);
+		geoCompiling_ = true;
+		if (!geoParallel_)
+			PollGeometry();
+	}
+	// Turns the GPU transform on once its shaders are ready (without parallel compiling, they are).
+	void PollGeometry() {
+		if (geoParallel_) {
+			for (GLuint p : geoPrograms_) {
+				GLint done = 0;
+				glGetProgramiv(p, GL_COMPLETION_STATUS_KHR, &done);
+				if (!done)
+					return;
+			}
+		}
+		geoCompiling_ = false;
+		bool ok = true;
+		for (int i = 0; i < 2; ++i) {
+			GLint linked = 0;
+			glGetProgramiv(geoPrograms_[i], GL_LINK_STATUS, &linked);
+			if (!linked && ok) {
+				GLint n = 0;
+				glGetShaderiv(geoShaders_[i], GL_INFO_LOG_LENGTH, &n);
+				std::string error((size_t)std::max(n, 1), '\0');
+				glGetShaderInfoLog(geoShaders_[i], n, nullptr, error.data());
+				if (error.size() <= 1) {
+					glGetProgramiv(geoPrograms_[i], GL_INFO_LOG_LENGTH, &n);
+					error.assign((size_t)std::max(n, 1), '\0');
+					glGetProgramInfoLog(geoPrograms_[i], n, nullptr, error.data());
+				}
+				LOGW("opengl", "vertex transform shaders unavailable; transforming on the CPU: %.2000s", error.c_str());
+			}
+			ok = ok && linked;
+			glDeleteShader(geoShaders_[i]);
+			geoShaders_[i] = 0;
+		}
+		if (!ok)
+			return;
+		const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - geoStart_).count();
+		LOGI("opengl", "vertex transform on the GPU (shaders ready in %d ms)%s", (int)ms, geoVerify_ ? ", verified against the CPU" : "");
+		geoEnabled_.store(true, std::memory_order_release);
+	}
+	// CSVertex over the batch's vertices and CSTriangle over its jobs, into GEO_OUT; then, verifying, the
+	// GPU's vertices against the CPU's.
+	void RunGeometry(const GeometryBatch &g, const RasterState *states) {
+		const size_t nIn = g.inputs.size(), nJobs = g.jobs.size(), outBytes = nJobs * GEO_JOB_VERTS * sizeof(GpuVertex);
+		// A batch split while its draws were assembled shares their inputs with the batch before: only those
+		// from the first its jobs use are transformed again.
+		u32 firstIn = (u32)nIn;
+		for (const GeJob &j : g.jobs)
+			firstIn = std::min({ firstIn, j.v[0], j.v[1], j.v[2] });
+		auto upload = [&](int i, const void *data, size_t bytes) {
+			glNamedBufferData(geoBuffers_[i], bytes ? bytes : 16, bytes ? data : nullptr, GL_STREAM_DRAW);
+		};
+		auto reserve = [&](int i, size_t bytes) {
+			if (geoBytes_[i] >= bytes)
+				return;
+			size_t cap = std::max<size_t>(geoBytes_[i] * 2, 1 << 20);
+			while (cap < bytes)
+				cap *= 2;
+			glNamedBufferData(geoBuffers_[i], cap, nullptr, GL_DYNAMIC_COPY);
+			geoBytes_[i] = cap;
+		};
+		upload(GEO_INPUTS, g.inputs.data(), nIn * sizeof(GeVertexIn));
+		upload(GEO_DRAWS, g.draws.data(), g.draws.size() * sizeof(GeDraw));
+		upload(GEO_TRANSFORMS, g.transforms.data(), g.transforms.size() * sizeof(GeTransform));
+		upload(GEO_JOBS, g.jobs.data(), nJobs * sizeof(GeJob));
+		reserve(GEO_CLIP, nIn * CLIP_STRIDE);
+		reserve(GEO_OUT, outBytes);
+		for (int i = 0; i < GEO_BUFFERS; ++i)
+			glBindBufferBase(GL_SHADER_STORAGE_BUFFER, i, geoBuffers_[i]);
+		if (nIn > firstIn) {
+			glUseProgram(geoPrograms_[0]);
+			UInt(geoPrograms_[0], "gCount", (u32)(nIn - firstIn));
+			UInt(geoPrograms_[0], "gBase", firstIn);
+			glDispatchCompute((GLuint)((nIn - firstIn + 63) / 64), 1, 1);
+			glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+		}
+		glUseProgram(geoPrograms_[1]);
+		UInt(geoPrograms_[1], "gCount", (u32)nJobs);
+		UInt(geoPrograms_[1], "gScale", (u32)scale_);
+		glDispatchCompute((GLuint)((nJobs + 63) / 64), 1, 1);
+		Barrier();
+		geoStats_.jobs += nJobs;
+		geoStats_.vertices += nIn - firstIn;
+		if (geoVerify_) {
+			std::vector<GpuVertex> gpu(nJobs * GEO_JOB_VERTS);
+			glGetNamedBufferSubData(geoBuffers_[GEO_OUT], 0, (GLsizeiptr)outBytes, gpu.data());
+			VerifyGeometry(g, states, gpu.data(), geoStats_, "opengl");
+		}
+	}
+	void PrintTransformStats() {
+		if (geoEnabled_)
+			LOGI("opengl", "GPU transform: %llu vertices, %llu triangle jobs%s", (unsigned long long)geoStats_.vertices,
+				 (unsigned long long)geoStats_.jobs,
+				 geoVerify_ ? (", " + std::to_string(geoStats_.mismatches) + " of " + std::to_string(geoStats_.checked) +
+							   " jobs differ from the CPU").c_str() : "");
+	}
+	// geo: the batch's geometry, when it has PrimType::Geometry primitives. alone: one of them drawn by
+	// itself, after its batch's geometry ran, with the batch's states (which its GPU vertices name).
+	void DrawBatchImpl(const BatchPrim *prims, size_t count, const RasterState *states, size_t n, const GeometryBatch *geo, bool alone) {
+		if (!count || !n)
+			return;
+		Current current(*this);
+		if (geoCompiling_)
+			PollGeometry();
+		// Alone, only its own state counts.
+		const RasterState *own = alone ? &states[prims[0].stateIndex] : states;
+		int height;
+		bool usesDepth;
+		if (!Drawable(prims, count, own, alone ? 1 : n, &height, &usesDepth)) {
+			if (geo && !alone)
+				RunGeometry(*geo, states);
+			// One aliased primitive must not send unrelated later states through software.
+			if (count > 1 || (geo && !alone)) {
+				for (size_t i = 0; i < count; ++i) {
+					BatchPrim p = prims[i];
+					if (p.type == PrimType::Geometry) {
+						DrawBatchImpl(&p, 1, states, n, geo, true);
+						continue;
+					}
+					p.stateIndex = 0;
+					DrawBatchImpl(&p, 1, &states[prims[i].stateIndex], 1, nullptr, false);
+				}
+				return;
+			}
+			for (size_t i = 0; i < count; ++i) {
+				const auto &p = prims[i];
+				const auto &s = states[p.stateIndex];
+				switch (p.type) {
+				case PrimType::Triangle:
+					DrawTriangle(p.v[0], p.v[1], p.v[2], p.range, s);
+					break;
+				case PrimType::Rect:
+					DrawRectangle(p.v[0], p.v[1], p.range, s);
+					break;
+				case PrimType::ClearRect:
+					ClearRectangle(p.v[0], p.v[1], p.range, s);
+					break;
+				case PrimType::Line:
+					DrawLine(p.v[0], p.v[1], p.range, s);
+					break;
+				case PrimType::Point:
+					DrawPoint(p.v[0], p.range, s);
+					break;
+				case PrimType::Geometry:  // TransformsGeometryFor leaves such draws to the CPU
+					break;
+				}
+			}
+			return;
+		}
+		const PixelState &ps = own[0].pix;
+		Surface *color = Get(VRAM_BASE + ps.fbOffset, ps.fbStride, ps.fbFormat, height);
+		Surface *depth = usesDepth ? Get(VRAM_BASE + ps.zbOffset, ps.zbStride, 4, height) : nullptr;
+		BuildVertices(prims, count, states, geo);
+		FillStates(states, n);
+		if (geo && !alone)
+			RunGeometry(*geo, states);
+		glNamedBufferData(vb_, verts_.size() * sizeof(GpuVertex), verts_.data(), GL_STREAM_DRAW);
+		glBindVertexArray(vao_);
+		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, sb_);
+		// The same viewport for every batch (llvmpipe clips primitives to it), with sides that are powers of
+		// two (pixel positions map to clip space and back exactly): a primitive draws the same whatever the
+		// rest of its batch covers, whether the CPU or the GPU transformed it.
+		int extentW = 512, extentH = 512;
+		while (extentW < color->stride)
+			extentW *= 2;
+		while (extentH < height)
+			extentH *= 2;
+		if (extentW * scale_ > maxViewport_[0] || extentH * scale_ > maxViewport_[1]) {
+			extentW = color->stride;
+			extentH = height;
+		}
+		bool gpuVb = false;  // the vertex array reads vb_
+		for (const Segment &seg : segs_) {
+			if (!seg.count)
+				continue;
+			const auto &st = states[seg.state];
+			GLuint texture = 0, feedback = 0;
+			if (st.enableTextures && !st.pix.clearMode) {
+				// Indexed/swizzled feedback also sees all preceding draws in this batch.
+				Download(*color);
+				if (depth)
+					Download(*depth);
+				texture = Decode(st.samp);
+				if (!st.samp.swizzle && st.samp.maxLevel == 0 && st.samp.texfmt <= GE_TFMT_8888) {
+					for (auto &surface : surfaces_) {
+						int bpp = surface->fmt == 3 ? 4 : 2;
+						u32 addr = FoldAddress(st.samp.levels[0].addr);
+						if (surface->fmt != st.samp.texfmt || surface->stride != st.samp.levels[0].bufw ||
+							addr < surface->addr)
+							continue;
+						u32 pixel = (addr - surface->addr) / bpp, x = pixel % surface->stride,
+							y = pixel / surface->stride;
+						if (x + st.samp.levels[0].w > (unsigned)surface->stride ||
+							y + st.samp.levels[0].h > (unsigned)surface->h)
+							continue;
+						Validate(*surface);
+						feedback = Texture(surface->stride * scale_, surface->h * scale_);
+						glCopyImageSubData(surface->texture, GL_TEXTURE_2D, 0, 0, 0, 0, feedback, GL_TEXTURE_2D, 0, 0,
+										   0, 0, surface->stride * scale_, surface->h * scale_, 1);
+						Barrier();
+						for (size_t i = 0; i < n; ++i)
+							if (SameTexture(states[i].samp, st.samp)) {
+								auto &d = gpuStates_[i];
+								d.rtt = 0x100 | surface->fmt | (scale_ << 12);
+								d.texLevels[0] = (d.texLevels[0] & 0xFFFF0000u) | (x * scale_);
+								d.rttY = y * scale_;
+							}
+						break;
+					}
+				}
+			}
+			if (seg.gpu != gpuVb) {
+				glVertexArrayVertexBuffer(vao_, 0, seg.gpu ? geoBuffers_[GEO_OUT] : vb_, 0, sizeof(GpuVertex));
+				gpuVb = seg.gpu;
+			}
+			glNamedBufferData(sb_, gpuStates_.size() * sizeof(DrawStateGpu), gpuStates_.data(), GL_STREAM_DRAW);
+			glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
+			glFramebufferParameteri(GL_FRAMEBUFFER, GL_FRAMEBUFFER_DEFAULT_WIDTH, color->stride * scale_);
+			glFramebufferParameteri(GL_FRAMEBUFFER, GL_FRAMEBUFFER_DEFAULT_HEIGHT, height * scale_);
+			glDrawBuffer(GL_NONE);
+			glReadBuffer(GL_NONE);
+			glViewport(0, 0, extentW * scale_, extentH * scale_);
+			glEnable(GL_SCISSOR_TEST);
+			int x = std::max(0, st.scissor.x1 / SUBPIX), y = std::max(0, st.scissor.y1 / SUBPIX);
+			glScissor(x * scale_, y * scale_, std::max(0, st.scissor.x2 / SUBPIX + 1 - x) * scale_,
+					  std::max(0, st.scissor.y2 / SUBPIX + 1 - y) * scale_);
+			GLuint p = programs_[st.pix.fbFormat * 4 + (st.pix.clearMode ? 2 : st.enableTextures ? 1 : 0)];
+			glUseProgram(p);
+			FVec(p, "extent", (float)extentW, (float)extentH);
+			UInt(p, "scale", scale_);
+			glBindTextureUnit(0, texture);
+			glBindTextureUnit(1, feedback);
+			glBindImageTexture(0, color->texture, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+			glBindImageTexture(1, depth ? depth->texture : dummyDepth_, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
+			const GLenum primitive = seg.lines ? GL_LINES : GL_TRIANGLES;
+			if (serialFragments_) {
+				// Each primitive covers a pixel at most once (multisampling is off).
+				// Complete its image writes before drawing the next overlapping primitive.
+				const u32 vertices = seg.lines ? 2 : 3;
+				for (u32 first = seg.first; first < seg.first + seg.count; first += vertices) {
+					glDrawArrays(primitive, first, vertices);
+					Barrier();
+				}
+			} else {
+				glDrawArrays(primitive, seg.first, seg.count);
+				Barrier();
+			}
+			glDeleteTextures(1, &texture);
+			glDeleteTextures(1, &feedback);
+		}
+		if (gpuVb)
+			glVertexArrayVertexBuffer(vao_, 0, vb_, 0, sizeof(GpuVertex));
+		Download(*color);
+		if (depth)
+			Download(*depth);
+		if (glGetError() != GL_NO_ERROR)
+			throw std::runtime_error("OpenGL GE draw failed");
+	}
 
   public:
 	~OpenGLBackend() override { ReleaseWindow(); }
@@ -344,6 +696,7 @@ class OpenGLBackend final : public RenderBackend, private DrawData {
 		glGetIntegerv(GL_MAX_TEXTURE_SIZE, &side);
 		if (side < MAX_TEXTURE_SIDE)
 			throw std::runtime_error("OpenGL requires 16384-pixel textures");
+		glGetIntegerv(GL_MAX_VIEWPORT_DIMS, maxViewport_);
 		LOGI("opengl", "%s / %s", glGetString(GL_VENDOR), glGetString(GL_RENDERER));
 		SDL_GL_SetSwapInterval(o.vsync ? 1 : 0);
 		for (int fmt = 0; fmt < 4; ++fmt)
@@ -384,156 +737,34 @@ class OpenGLBackend final : public RenderBackend, private DrawData {
 		glDisable(GL_CULL_FACE);
 		glDisable(GL_BLEND);
 		glDisable(GL_DITHER);
+		printStats_ = getenv("PSPC_GPU_STATS") != nullptr;
+		InitGeometry(o);
 		SDL_GL_MakeCurrent(window_, nullptr);
 	}
 	void DrawBatch(const BatchPrim *prims, size_t count, const RasterState *states, size_t n) override {
-		if (!count || !n)
-			return;
-		Current current(*this);
-		int height = 1;
-		bool supported = true, usesDepth = false;
-		const PixelState &ps = states[0].pix;
-		for (size_t i = 0; i < n; ++i) {
-			const auto &p = states[i].pix;
-			usesDepth |= p.depthWrite || p.depthTestFunc != GE_COMP_ALWAYS || (p.clearMode && p.depthClear);
-		}
-		for (size_t i = 0; i < count; ++i) {
-			height = std::max(height, prims[i].range.y2 / SUBPIX + 1);
-			supported &= prims[i].range.x1 >= 0 && prims[i].range.y1 >= 0 && prims[i].range.x2 / SUBPIX < ps.fbStride &&
-						 (!usesDepth || prims[i].range.x2 / SUBPIX < ps.zbStride);
-		}
-		if (usesDepth) {
-			u32 cb = (u32)height * ps.fbStride * (ps.fbFormat == 3 ? 4 : 2), zb = (u32)height * ps.zbStride * 2;
-			bool overlap = cb >= VRAM_SIZE || zb >= VRAM_SIZE || ((ps.fbOffset - ps.zbOffset) & (VRAM_SIZE - 1)) < zb ||
-						   ((ps.zbOffset - ps.fbOffset) & (VRAM_SIZE - 1)) < cb;
-			supported &= !overlap;
-		}
-		// Overlapping color/depth or coordinates outside a target's stride need exact memory order.
-		if (!supported || ps.fbStride <= 0 || (usesDepth && ps.zbStride <= 0) || height * scale_ > MAX_TEXTURE_SIDE ||
-			ps.fbStride * scale_ > MAX_TEXTURE_SIDE || (usesDepth && ps.zbStride * scale_ > MAX_TEXTURE_SIDE)) {
-			// One aliased primitive must not send unrelated later states through software.
-			if (count > 1) {
-				for (size_t i = 0; i < count; ++i) {
-					BatchPrim p = prims[i];
-					p.stateIndex = 0;
-					DrawBatch(&p, 1, &states[prims[i].stateIndex], 1);
-				}
-				return;
-			}
-			for (size_t i = 0; i < count; ++i) {
-				const auto &p = prims[i];
-				const auto &s = states[p.stateIndex];
-				switch (p.type) {
-				case PrimType::Triangle:
-					DrawTriangle(p.v[0], p.v[1], p.v[2], p.range, s);
-					break;
-				case PrimType::Rect:
-					DrawRectangle(p.v[0], p.v[1], p.range, s);
-					break;
-				case PrimType::ClearRect:
-					ClearRectangle(p.v[0], p.v[1], p.range, s);
-					break;
-				case PrimType::Line:
-					DrawLine(p.v[0], p.v[1], p.range, s);
-					break;
-				case PrimType::Point:
-					DrawPoint(p.v[0], p.range, s);
-					break;
-				case PrimType::Geometry:  // this backend doesn't transform geometry
-					break;
-				}
-			}
-			return;
-		}
-		Surface *color = Get(VRAM_BASE + ps.fbOffset, ps.fbStride, ps.fbFormat, height);
-		Surface *depth = usesDepth ? Get(VRAM_BASE + ps.zbOffset, ps.zbStride, 4, height) : nullptr;
-		BuildVertices(prims, count, states);
-		FillStates(states, n);
-		glNamedBufferData(vb_, verts_.size() * sizeof(GpuVertex), verts_.data(), GL_STREAM_DRAW);
-		glBindVertexArray(vao_);
-		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, sb_);
-		for (const Segment &seg : segs_) {
-			if (!seg.count)
-				continue;
-			const auto &st = states[seg.state];
-			GLuint texture = 0, feedback = 0;
-			if (st.enableTextures && !st.pix.clearMode) {
-				// Indexed/swizzled feedback also sees all preceding draws in this batch.
-				Download(*color);
-				if (depth)
-					Download(*depth);
-				texture = Decode(st.samp);
-				if (!st.samp.swizzle && st.samp.maxLevel == 0 && st.samp.texfmt <= GE_TFMT_8888) {
-					for (auto &surface : surfaces_) {
-						int bpp = surface->fmt == 3 ? 4 : 2;
-						u32 addr = FoldAddress(st.samp.levels[0].addr);
-						if (surface->fmt != st.samp.texfmt || surface->stride != st.samp.levels[0].bufw ||
-							addr < surface->addr)
-							continue;
-						u32 pixel = (addr - surface->addr) / bpp, x = pixel % surface->stride,
-							y = pixel / surface->stride;
-						if (x + st.samp.levels[0].w > (unsigned)surface->stride ||
-							y + st.samp.levels[0].h > (unsigned)surface->h)
-							continue;
-						Validate(*surface);
-						feedback = Texture(surface->stride * scale_, surface->h * scale_);
-						glCopyImageSubData(surface->texture, GL_TEXTURE_2D, 0, 0, 0, 0, feedback, GL_TEXTURE_2D, 0, 0,
-										   0, 0, surface->stride * scale_, surface->h * scale_, 1);
-						Barrier();
-						for (size_t i = 0; i < n; ++i)
-							if (SameTexture(states[i].samp, st.samp)) {
-								auto &d = gpuStates_[i];
-								d.rtt = 0x100 | surface->fmt | (scale_ << 12);
-								d.texLevels[0] = (d.texLevels[0] & 0xFFFF0000u) | (x * scale_);
-								d.rttY = y * scale_;
-							}
-						break;
-					}
-				}
-			}
-			glNamedBufferData(sb_, gpuStates_.size() * sizeof(DrawStateGpu), gpuStates_.data(), GL_STREAM_DRAW);
-			glBindFramebuffer(GL_FRAMEBUFFER, fbo_);
-			glFramebufferParameteri(GL_FRAMEBUFFER, GL_FRAMEBUFFER_DEFAULT_WIDTH, color->stride * scale_);
-			glFramebufferParameteri(GL_FRAMEBUFFER, GL_FRAMEBUFFER_DEFAULT_HEIGHT, height * scale_);
-			glDrawBuffer(GL_NONE);
-			glReadBuffer(GL_NONE);
-			glViewport(0, 0, color->stride * scale_, height * scale_);
-			glEnable(GL_SCISSOR_TEST);
-			int x = std::max(0, st.scissor.x1 / SUBPIX), y = std::max(0, st.scissor.y1 / SUBPIX);
-			glScissor(x * scale_, y * scale_, std::max(0, st.scissor.x2 / SUBPIX + 1 - x) * scale_,
-					  std::max(0, st.scissor.y2 / SUBPIX + 1 - y) * scale_);
-			GLuint p = programs_[st.pix.fbFormat * 4 + (st.pix.clearMode ? 2 : st.enableTextures ? 1 : 0)];
-			glUseProgram(p);
-			FVec(p, "extent", (float)color->stride, (float)height);
-			UInt(p, "scale", scale_);
-			glBindTextureUnit(0, texture);
-			glBindTextureUnit(1, feedback);
-			glBindImageTexture(0, color->texture, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
-			glBindImageTexture(1, depth ? depth->texture : dummyDepth_, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32UI);
-			const GLenum primitive = seg.lines ? GL_LINES : GL_TRIANGLES;
-			if (serialFragments_) {
-				// Each primitive covers a pixel at most once (multisampling is off).
-				// Complete its image writes before drawing the next overlapping primitive.
-				const u32 vertices = seg.lines ? 2 : 3;
-				for (u32 first = seg.first; first < seg.first + seg.count; first += vertices) {
-					glDrawArrays(primitive, first, vertices);
-					Barrier();
-				}
-			} else {
-				glDrawArrays(primitive, seg.first, seg.count);
-				Barrier();
-			}
-			glDeleteTextures(1, &texture);
-			glDeleteTextures(1, &feedback);
-		}
-		Download(*color);
-		if (depth)
-			Download(*depth);
-		if (glGetError() != GL_NO_ERROR)
-			throw std::runtime_error("OpenGL GE draw failed");
+		DrawBatchImpl(prims, count, states, n, nullptr, false);
+	}
+	bool TransformsGeometry() const override { return geoEnabled_.load(std::memory_order_acquire); }
+	// A geometry primitive drawn by itself: its range is the scissor.
+	bool TransformsGeometryFor(const RasterState &st) const override {
+		BatchPrim p{};
+		p.type = PrimType::Geometry;
+		p.range = st.scissor;
+		int height;
+		bool usesDepth;
+		return Drawable(&p, 1, &st, 1, &height, &usesDepth);
+	}
+	bool VerifiesGeometry() const override { return geoVerify_; }
+	TransformStats GetTransformStats() const override { return geoStats_; }
+	void DrawGeometryBatch(const BatchPrim *prims, size_t count, const RasterState *states, size_t n,
+						   const GeometryBatch &geo) override {
+		DrawBatchImpl(prims, count, states, n, geo.Empty() ? nullptr : &geo, false);
 	}
 	// DrawBatch writes back before returning, including texture feedback and block transfers.
-	void Sync() override {}
+	void Sync() override {
+		if (printStats_ && ++syncs_ % 300 == 0)
+			PrintTransformStats();
+	}
 	bool GetDisplayImage(u32 addr, int stride, int fmt, int w, int h, std::vector<u32> &out, int *ow, int *oh,
 						 int requested) override {
 		Current current(*this);
@@ -613,15 +844,23 @@ class OpenGLBackend final : public RenderBackend, private DrawData {
 				previousWindow = nullptr;
 			}
 			SDL_GL_MakeCurrent(window_, context_);
+			if (printStats_)
+				PrintTransformStats();
+			geoEnabled_.store(false, std::memory_order_release);
+			geoCompiling_ = false;
 			for (auto &s : surfaces_)
 				glDeleteTextures(1, &s->texture);
 			surfaces_.clear();
 			for (GLuint p : programs_)
 				if (p)
 					glDeleteProgram(p);
-			for (GLuint p : {expand_, reduce_, display_, upscale_, present_})
+			for (GLuint p : {expand_, reduce_, display_, upscale_, present_, geoPrograms_[0], geoPrograms_[1]})
 				if (p)
 					glDeleteProgram(p);
+			for (GLuint s : geoShaders_)
+				if (s)
+					glDeleteShader(s);
+			glDeleteBuffers(GEO_BUFFERS, geoBuffers_);
 			glDeleteTextures(1, &dummyDepth_);
 			glDeleteBuffers(1, &vb_);
 			glDeleteBuffers(1, &sb_);

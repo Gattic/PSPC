@@ -178,6 +178,7 @@ void AddPoint(const RVertex &v0);
 // Geometry the backend transforms (geometry.h): whether it does, the batch's geometry, and a run of its
 // jobs, all from one GeDraw, as a primitive.
 bool TransformsGeometry();
+bool TransformsGeometryFor(const RasterState &st);
 bool VerifiesGeometry();
 GeometryBatch &Geometry();
 void AddGeometry(u32 geoDraw, u32 firstJob, u32 jobCount);

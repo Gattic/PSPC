@@ -620,7 +620,6 @@ TEST(gpu_hardware_resolution_perf) {
 	}
 }
 
-#ifdef _WIN32
 namespace {
 
 // Lit, textured, fogged 3D drawn in transform mode: four light kinds, material colors from the vertex
@@ -772,17 +771,43 @@ void DrawLitScene() {
 	memcpy(GPtr(at), morph.data(), morph.size() * sizeof(VM));
 	dl.F(GE_CMD_MORPHWEIGHT0, 0.7f).F(GE_CMD_MORPHWEIGHT0 + 1, 0.4f);
 	dl.C(GE_CMD_LIGHTINGENABLE, 0).C(GE_CMD_VERTEXTYPE, GE_VTYPE_NRM_8BIT | GE_VTYPE_POS_16BIT | (1 << 18)).Prim(GE_PRIM_TRIANGLES, 45, at);
+	at += (u32)(morph.size() * sizeof(VM) + 64) & ~15u;
+
+	// A batch the OpenGL renderer draws primitive by primitive (a rectangle past the framebuffer's
+	// stride) between lit triangles, and triangles under a scissor past the stride, whose transform it
+	// leaves to the CPU.
+	auto lit = [&](int count) {
+		std::vector<VA> verts(count);
+		for (VA &v : verts)
+			randomA(v);
+		memcpy(GPtr(at), verts.data(), verts.size() * sizeof(VA));
+		dl.C(GE_CMD_VERTEXTYPE, VT_A).Prim(GE_PRIM_TRIANGLES, count, at);
+		at += (u32)(verts.size() * sizeof(VA) + 64) & ~15u;
+	};
+	dl.C(GE_CMD_LIGHTINGENABLE, 1);
+	lit(60);
+	TVert wide[2] = { { 0xFF4080C0, 400, 100, 0, 0 }, { 0xFF4080C0, 600, 140, 0, 0 } };
+	memcpy(GPtr(at), wide, sizeof(wide));
+	dl.C(GE_CMD_SCISSOR2, 1023 | (271 << 10)).C(GE_CMD_REGION2, 1023 | (271 << 10));
+	dl.C(GE_CMD_TEXTUREMAPENABLE, 0).C(GE_CMD_ZTEST, GE_COMP_ALWAYS).C(GE_CMD_VERTEXTYPE, VT_C8888_P16).Prim(GE_PRIM_RECTANGLES, 2, at);
+	at += 64;
+	dl.C(GE_CMD_TEXTUREMAPENABLE, 1).C(GE_CMD_ZTEST, GE_COMP_GEQUAL);
+	lit(60);
+	dl.C(GE_CMD_SCISSOR2, 479 | (271 << 10)).C(GE_CMD_REGION2, 479 | (271 << 10));
+	lit(60);
 	dl.C(GE_CMD_FINISH).C(GE_CMD_END);
 	EnqueueList(dl.start, 0, -1, 0, false);
 	Run();
 	DrawSync(0);
 }
 
-std::vector<u8> RenderLit(bool gpuTransform, hw::D3D11TransformStats *stats) {
+std::vector<u8> RenderLit(bool gpuTransform, TransformStats *stats) {
 	Env env;
 	BackendOptions o;
 	o.scale = 1;
+#ifdef _WIN32
 	o.warp = true;
+#endif
 	o.gpuTransform = gpuTransform;
 	o.waitForShaders = true;
 	o.verifyTransform = gpuTransform;
@@ -793,7 +818,7 @@ std::vector<u8> RenderLit(bool gpuTransform, hw::D3D11TransformStats *stats) {
 	SetRenderBackend(backend.get());
 	DrawLitScene();
 	std::vector<u8> vram(GPtr(VRAM), GPtr(VRAM) + 0x200000);
-	*stats = hw::GetD3D11TransformStats(backend.get());
+	*stats = backend->GetTransformStats();
 	SetRenderBackend(nullptr);
 	return vram;
 }
@@ -802,7 +827,7 @@ std::vector<u8> RenderLit(bool gpuTransform, hw::D3D11TransformStats *stats) {
 
 // The GPU's vertex transform and triangle assembly (gpu/geometry.h) make what the CPU's do, bit for bit.
 TEST(gpu_hardware_transform_matches_cpu) {
-	hw::D3D11TransformStats cpuStats, gpuStats;
+	TransformStats cpuStats, gpuStats;
 	const std::vector<u8> cpu = RenderLit(false, &cpuStats);
 	const std::vector<u8> gpu = RenderLit(true, &gpuStats);
 	if (cpu.empty() || gpu.empty())
@@ -829,7 +854,6 @@ TEST(gpu_hardware_transform_matches_cpu) {
 	}
 	CHECK(drawn > 480 * 272 / 10);
 }
-#endif
 
 TEST(gpu_hardware_memory_coherence) {
 	Env env;

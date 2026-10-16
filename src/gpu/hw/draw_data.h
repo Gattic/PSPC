@@ -111,6 +111,10 @@ protected:
 	void FillStates(const RasterState *states, size_t n);
 	// One triangle's three vertices, appended to verts_.
 	void EmitTriangle(const BatchPrim &, const RasterState &);
+	// PSPC_GPU_TRANSFORM_VERIFY: the GPU's vertices of the geometry jobs (gpu, GEO_JOB_VERTS a job, in
+	// order) against what transform.cpp and EmitTriangle make of the same jobs (GeometryBatch::expect),
+	// bit for bit. Counts the jobs in stats and logs the first mismatches under `tag`.
+	void VerifyGeometry(const GeometryBatch &g, const RasterState *states, const GpuVertex *gpu, TransformStats &stats, const char *tag);
 	int scale_ = 1, texFilter_ = 0, texUpscale_ = 1;
 	std::vector<GpuVertex> verts_;
 	std::vector<Segment> segs_;

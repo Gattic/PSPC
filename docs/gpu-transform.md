@@ -25,10 +25,10 @@ primitives are assembled draw by draw in the original order. The queue ends up e
 had gone in one by one, so batches, flush points and states are unchanged. Workers run in the caller's
 floating-point mode.
 
-## Transform and lighting on the GPU (Direct3D 11)
+## Transform and lighting on the GPU (Direct3D 11 and OpenGL)
 
-With the Direct3D 11 renderer, transform-mode triangles, strips and fans go to the GPU
-(`src/gpu/geometry.h`, `src/gpu/hw/d3d11_geometry.cpp`):
+With the Direct3D 11 renderer (Windows) and the OpenGL renderer (Linux), transform-mode triangles,
+strips and fans go to the GPU (`src/gpu/geometry.h`, `src/gpu/hw/d3d11_geometry.cpp`):
 
 - The CPU still decodes the vertices (in parallel), with morphing and skinning. It hands over the
   decoded vertices, each draw's transform state, and one *job* per call `ProcessTriangle` would see,
@@ -48,22 +48,54 @@ which D3D11 rounds correctly. With the device's extended double instructions, th
 gradient and the reciprocal w of vertices behind the camera are computed in doubles as on the CPU.
 
 Lines, points, rectangles, through-mode (2D) draws, immediate vertices, curves and draws that continue
-the previous one (`KEEP_PREVIOUS`) stay on the CPU. The OpenGL renderer and the software renderer use
-the parallel CPU path.
+the previous one (`KEEP_PREVIOUS`) stay on the CPU. The software renderer uses the parallel CPU path.
 
 The shaders compile in the background the first time (about 8 s on a Core i7-13650HX) and are cached
 under the cache root (`cache/shaders`); until they're ready the CPU transforms. Later starts load the
 cache.
 
+### OpenGL
+
+The OpenGL renderer runs the same shaders. `tools/gl_shaders.py` turns `CSVertex` and `CSTriangle`
+into GLSL at build time, as it does the pixel shaders, so the GE's arithmetic has one source. What
+differs:
+
+- The structured buffers are std430 storage blocks with the C++ layouts. std430 aligns a `vec3` to 16
+  bytes, so `GeVertexIn`'s normal and position and `GeShadeLight`'s padding are float arrays there;
+  the shaders' own `ClipV` has a 64-byte stride. CSTriangle writes its vertices into a storage buffer
+  that the draws then read as their vertex buffer.
+- Every float operation that `precise` covers in HLSL is `precise` in GLSL too, and so are the doubles:
+  D3D11 compiles with IEEE strictness, but GLSL compilers may fuse a double multiply-add otherwise.
+  Shifts never reach 32 bits (GLSL leaves that undefined; HLSL masks it), the `GL_` light flags are
+  renamed (GLSL reserves the prefix), and so are the variables `sign` and `flat`.
+- Doubles are core in GLSL 4.00, so the texture-level gradient and the reciprocal w of vertices behind
+  the camera always use them.
+- The driver compiles the shaders on threads of its own (`KHR_parallel_shader_compile`), and the CPU
+  transforms until they're ready. Mesa compiles both in about 1.5 s on llvmpipe and keeps them in its
+  shader cache, so later starts take about 0.1 s. Without that extension the compile happens at startup.
+  (llvmpipe runs them on the CPU, so there they only test exactness: Battlefront II to VBlank 9000 took
+  1598 s with them and 834 s without, in the serial-fragment mode llvmpipe needs.)
+- A draw whose state the renderer would hand to the software reference (color and depth overlapping in
+  memory, a scissor past the target's stride) stays on the CPU: `RenderBackend::TransformsGeometryFor`.
+  When a batch has to go primitive by primitive, the geometry runs once and each of its runs is drawn
+  by itself.
+- A run of GPU-made triangles covers the whole scissor, while CPU-made triangles cover their own
+  bounds, so the batches they're drawn in differ. The renderer's viewport used to follow the rows a
+  batch covered, and llvmpipe clips triangles to the viewport: the same triangle came out a little
+  different in a taller batch (a depth step, a color step at the odd pixel). The viewport is now the
+  same for every batch (at least 512 x 512, sides powers of two, so pixel positions map to clip space
+  and back exactly).
+
 ## Settings
 
 | Environment variable | Effect |
 |---|---|
-| `PSPC_GPU_TRANSFORM=0` | Transform on the CPU with Direct3D 11 too. |
+| `PSPC_GPU_TRANSFORM=0` | Transform on the CPU with Direct3D 11 or OpenGL too. |
 | `PSPC_GPU_TRANSFORM_WAIT=1` | Wait for the shaders at startup instead of transforming on the CPU until they're compiled. |
 | `PSPC_GPU_TRANSFORM_VERIFY=1` | Also transform on the CPU, read the GPU's vertices back, and compare every job bit for bit (slow). Mismatches are logged; `PSPC_GPU_STATS=1` prints the counts. |
 
-`D3D11Options::gpuTransform`, `waitForShaders` and `verifyTransform` do the same for the backend.
+`D3D11Options` and `OpenGLOptions` have `gpuTransform`, `waitForShaders` and `verifyTransform` for the
+same; `RenderBackend::GetTransformStats` returns the counts.
 
 ## Verification
 
@@ -72,11 +104,19 @@ cache.
 - All 42 game checkpoints with Direct3D 11 and the GPU transform are byte-identical to the frames
   recorded with the CPU transform, and all 42 with the software renderer to the frames before the
   parallel transform.
-- `gpu_hardware_transform_matches_cpu` (unit test, WARP): a lit, textured, fogged scene with every
-  light kind, material colors from the vertex, both specular modes, a texture matrix and an
-  environment map, skinning, morphing, flat shading, every cull mode, indexed strips and fans, and
-  triangles through the near plane with depth clipping on and off. The VRAM is byte-identical with and
-  without the GPU transform, and no job differs.
+- `gpu_hardware_transform_matches_cpu` (unit test, WARP on Windows, the OpenGL renderer on Linux): a
+  lit, textured, fogged scene with every light kind, material colors from the vertex, both specular
+  modes, a texture matrix and an environment map, skinning, morphing, flat shading, every cull mode,
+  indexed strips and fans, triangles through the near plane with depth clipping on and off, and a batch
+  OpenGL draws primitive by primitive with draws it leaves to the CPU. The VRAM is byte-identical with
+  and without the GPU transform, and no job differs.
+- OpenGL on Mesa 23.2.1 llvmpipe (Ubuntu 22.04 under WSL, `PSPC_GL_SERIAL_FRAGMENTS=1`):
+  `gpu_hardware_transform_matches_cpu` passes, and `PSPC_GPU_TRANSFORM_VERIFY=1` found no difference
+  in Logan's Shadow to VBlank 3600 (the main menu, 1,273,218 triangle jobs) or Battlefront II to
+  VBlank 9000 (the Boz Pity battle, 774,584 jobs). Battlefront II's 30 frames to VBlank 9000 are
+  byte-identical with and without the GPU transform. No hardware GPU has run it on Linux yet. GLSL only promises double division as
+  accurate as float division, so a driver that doesn't round it correctly could make the texture level
+  differ; `PSPC_GPU_TRANSFORM_VERIFY=1` shows it.
 
 ## Measurements
 

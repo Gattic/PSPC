@@ -35,6 +35,11 @@ struct BatchPrim {
 inline u32 GeoFirstJob(const BatchPrim &p) { return (u32)p.v[0].x; }
 inline u32 GeoJobCount(const BatchPrim &p) { return (u32)p.v[0].y; }
 
+// A backend's vertex transform counts so far (geometry.h).
+struct TransformStats {
+	u64 vertices = 0, jobs = 0, checked = 0, mismatches = 0;
+};
+
 class RenderBackend {
 public:
 	virtual ~RenderBackend() = default;
@@ -48,8 +53,16 @@ public:
 	// Whether the backend transforms vertices and assembles triangles itself (geometry.h): then batches
 	// may have PrimType::Geometry primitives, and come with their GeometryBatch here.
 	virtual bool TransformsGeometry() const { return false; }
+	// Whether it transforms a draw with this state: its PrimType::Geometry primitive (whose range is the
+	// state's scissor) must be one the backend can draw by itself.
+	virtual bool TransformsGeometryFor(const RasterState &state) const {
+		(void)state;
+		return true;
+	}
 	// Whether the backend checks its geometry against the CPU's: then GeometryBatch::expect is filled.
 	virtual bool VerifiesGeometry() const { return false; }
+	// The vertex transform's counts so far (zeros for a backend that doesn't transform).
+	virtual TransformStats GetTransformStats() const { return {}; }
 	virtual void DrawGeometryBatch(const BatchPrim *prims, size_t primCount, const RasterState *states, size_t stateCount,
 	                               const GeometryBatch &geo) {
 		(void)geo;

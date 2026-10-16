@@ -226,7 +226,7 @@ public:
 	void DrawBatch(const BatchPrim *prims, size_t primCount, const RasterState *states, size_t stateCount) override;
 	bool TransformsGeometry() const override { return geoEnabled_.load(std::memory_order_acquire); }
 	bool VerifiesGeometry() const override { return geoVerify_; }
-	D3D11TransformStats TransformStats() const { return { geoVerts, geoJobs, geoChecked, geoMismatches }; }
+	TransformStats GetTransformStats() const override { return geoStats_; }
 	D3D11WriteBackStats WriteBackStats() {
 		std::lock_guard<std::recursive_mutex> lock(mu_);
 		return { stats_.downloads, stats_.earlyUsed, stats_.gpuTextures, stats_.texMismatches };
@@ -361,7 +361,7 @@ private:
 	GeoBuffer geoOut_;   // CSTriangle's GPU vertices, raw UAV and vertex buffer
 	ComPtr<ID3D11Buffer> geoCB_, geoStaging_;
 	size_t geoStagingBytes_ = 0;
-	u64 geoJobs = 0, geoVerts = 0, geoChecked = 0, geoMismatches = 0;
+	TransformStats geoStats_;
 
 	// Scratch: 1x upload source, 1x reduce target, readback staging, display conversion.
 	ComPtr<ID3D11Texture2D> uploadTex_, reduceTex_, stagingTex_, displayTex_, displayStaging_;
@@ -1350,8 +1350,10 @@ void D3D11Backend::PrintStats() {
 			LOGI("d3d11", "  downloads for %s", by.c_str());
 	}
 	if (geoEnabled_)
-		LOGI("d3d11", "  GPU transform: %llu vertices, %llu triangle jobs%s", (unsigned long long)geoVerts, (unsigned long long)geoJobs,
-		     geoVerify_ ? (", " + std::to_string(geoMismatches) + " of " + std::to_string(geoChecked) + " jobs differ from the CPU").c_str() : "");
+		LOGI("d3d11", "  GPU transform: %llu vertices, %llu triangle jobs%s", (unsigned long long)geoStats_.vertices,
+		     (unsigned long long)geoStats_.jobs,
+		     geoVerify_ ? (", " + std::to_string(geoStats_.mismatches) + " of " + std::to_string(geoStats_.checked) + " jobs differ from the CPU").c_str()
+		                : "");
 	LOGI("d3d11", "  texture hash %.3fs (pure %.3fs, %.1f MB), decode %.3fs (%.1f Mtexels)", texCache_->hashSeconds, texCache_->pureHashSeconds, texCache_->hashBytes / 1e6,
 		texCache_->decodeSeconds, texCache_->decodeTexels / 1e6);
 	if (profileGpu_) {
@@ -2130,8 +2132,8 @@ bool D3D11Backend::RunGeometry(const GeometryBatch &g) {
 	ctx_->Dispatch((UINT)((nJobs + 63) / 64), 1, 1);
 	ctx_->CSSetUnorderedAccessViews(0, 2, nullUav, nullptr);
 	ctx_->CSSetShaderResources(0, 5, nullSrv);
-	geoJobs += nJobs;
-	geoVerts += nIn - firstIn;
+	geoStats_.jobs += nJobs;
+	geoStats_.vertices += nIn - firstIn;
 	return true;
 }
 
@@ -2156,70 +2158,8 @@ void D3D11Backend::VerifyGeometry(const GeometryBatch &g, const RasterState *sta
 	D3D11_MAPPED_SUBRESOURCE m{};
 	if (FAILED(ctx_->Map(geoStaging_.Get(), 0, D3D11_MAP_READ, 0, &m)))
 		return;
-	const GpuVertex *gpu = (const GpuVertex *)m.pData;
-	// EmitTriangle appends to verts_, which holds the batch's own vertices: work past them.
-	const size_t keep = verts_.size();
-	static const char *const names[11] = { "x", "y", "z", "fog", "c0", "c1", "s", "t", "q", "state", "lod" };
-	u64 fieldMismatches[11] = {};
-	u64 bad = 0;
-	for (size_t j = 0; j < g.jobs.size() && j < g.expectFirst.size(); ++j) {
-		const GeJob &job = g.jobs[j];
-		const GeDraw &d = g.draws[job.draw];
-		const u32 e0 = g.expectFirst[j], e1 = j + 1 < g.expectFirst.size() ? g.expectFirst[j + 1] : (u32)g.expect.size();
-		// The CPU's triangles, made into GPU vertices, against the GPU's in order (a triangle the GPU
-		// leaves out is degenerate: every vertex at 0, 0).
-		std::vector<GpuVertex> want, got;
-		for (u32 e = e0; e + 3 <= e1; e += 3) {
-			BatchPrim p{};
-			p.type = PrimType::Triangle;
-			p.stateIndex = d.state;
-			for (int k = 0; k < 3; ++k)
-				p.v[k] = g.expect[e + k];
-			EmitTriangle(p, states[d.state]);
-			want.insert(want.end(), verts_.end() - 3, verts_.end());
-			verts_.resize(keep);
-		}
-		for (u32 t = 0; t < GEO_JOB_VERTS / 3; ++t) {
-			const GpuVertex *v = &gpu[job.out + t * 3];
-			bool degenerate = true;
-			for (int k = 0; k < 3; ++k)
-				degenerate = degenerate && FloatBits(v[k].x) == 0 && FloatBits(v[k].y) == 0;
-			if (!degenerate)
-				got.insert(got.end(), v, v + 3);
-		}
-		bool jobBad = false;
-		if (want.size() != got.size()) {
-			if (geoMismatches < 20)
-				LOGW("d3d11", "GPU transform: job %zu: GPU made %zu triangles, CPU %zu", j, got.size() / 3, want.size() / 3);
-			jobBad = true;
-		}
-		for (size_t k = 0; k < want.size() && k < got.size(); ++k) {
-			const u32 *a = (const u32 *)&got[k], *b = (const u32 *)&want[k];
-			for (int f = 0; f < 11; ++f) {
-				if (a[f] != b[f]) {
-					fieldMismatches[f]++;
-					if (!jobBad && geoMismatches < 20)
-						LOGW("d3d11", "GPU transform: job %zu vertex %zu %s: GPU %08x, CPU %08x", j, k, names[f], a[f], b[f]);
-					jobBad = true;
-				}
-			}
-		}
-		if (jobBad) {
-			bad++;
-			geoMismatches++;
-		}
-		geoChecked++;
-	}
+	DrawData::VerifyGeometry(g, states, (const GpuVertex *)m.pData, geoStats_, "d3d11");
 	ctx_->Unmap(geoStaging_.Get(), 0);
-	if (bad) {
-		std::string fields;
-		for (int f = 0; f < 11; ++f) {
-			if (fieldMismatches[f])
-				fields += std::string(fields.empty() ? "" : ", ") + names[f] + " " + std::to_string(fieldMismatches[f]);
-		}
-		LOGW("d3d11", "GPU transform: %llu of %zu jobs differ (%s); %llu of %llu so far", (unsigned long long)bad, g.jobs.size(), fields.c_str(),
-		     (unsigned long long)geoMismatches, (unsigned long long)geoChecked);
-	}
 }
 
 // The surface a displayed framebuffer is, when the GPU drew it; nullptr otherwise.
@@ -2508,10 +2448,6 @@ std::unique_ptr<RenderBackend> CreateD3D11Backend(const D3D11Options &opts, std:
 	return b;
 }
 
-D3D11TransformStats GetD3D11TransformStats(RenderBackend *backend) {
-	auto *b = dynamic_cast<D3D11Backend *>(backend);
-	return b ? b->TransformStats() : D3D11TransformStats{};
-}
 
 D3D11WriteBackStats GetD3D11WriteBackStats(RenderBackend *backend) {
 	auto *b = dynamic_cast<D3D11Backend *>(backend);

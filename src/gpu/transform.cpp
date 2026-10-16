@@ -1494,6 +1494,9 @@ void PrepareGeometry() {
 		if (!backend || d.ctx.through || d.slots == 0 ||
 		    (d.prim != GE_PRIM_TRIANGLES && d.prim != GE_PRIM_TRIANGLE_STRIP && d.prim != GE_PRIM_TRIANGLE_FAN))
 			continue;
+		const RasterState &st = binner::Snapshot(d.stateId);
+		if (!binner::TransformsGeometryFor(st))
+			continue;
 		d.gpu = true;
 		d.geoBase = (u32)geo.inputs.size();
 		geo.inputs.resize(geo.inputs.size() + d.slots);
@@ -1502,7 +1505,6 @@ void PrepareGeometry() {
 			geo.transforms.emplace_back();
 			PackTransform(tsSnaps[d.tsId], geo.transforms.back());
 		}
-		const RasterState &st = binner::Snapshot(d.stateId);
 		GeDraw gd{};
 		gd.transform = tsGeo[d.tsId];
 		u32 f = 0;

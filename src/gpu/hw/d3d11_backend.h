@@ -35,12 +35,6 @@ struct D3D11Options {
 	bool verifyTransform = false;
 };
 
-// The GPU transform's counts so far (a D3D11 backend's; zeros for others).
-struct D3D11TransformStats {
-	u64 vertices = 0, jobs = 0, checked = 0, mismatches = 0;
-};
-D3D11TransformStats GetD3D11TransformStats(RenderBackend *backend);
-
 // Rendering written back to guest memory so far (a D3D11 backend's; zeros for others): every write-back,
 // those that took the copy made at the end of a GE run, textures over rendering decoded on the GPU
 // instead, and how many of those differed from the CPU's decoding (PSPC_D3D11_TEXTURE_VERIFY).
