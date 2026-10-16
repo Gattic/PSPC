@@ -884,4 +884,214 @@ TEST(gpu_hardware_memory_coherence) {
 	backend->ReleaseWindow();
 	backend->ReleaseWindow();
 }
+#ifdef _WIN32
+namespace {
+
+typedef PVOID(WINAPI *VirtualAlloc2Fn)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER *, ULONG);
+typedef PVOID(WINAPI *MapViewOfFile3Fn)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER *, ULONG);
+constexpr u32 VRAM_BYTES = 0x200000, WINDOW = 0x0A000000;
+
+// Guest memory mapped as the runtime maps it (runtime/core/memory.cpp): VRAM is a view of a section, so
+// the backend keeps the guest's VRAM pages inaccessible where rendering isn't written back yet and
+// writes through a private view of the same memory.
+struct GuardedEnv {
+	u8 *mem = nullptr, *privateVram = nullptr, *saved = nullptr;
+	HANDLE section = nullptr;
+	bool ok = false;
+	GuardedEnv() {
+		HMODULE kb = GetModuleHandleW(L"kernelbase.dll");
+		auto alloc2 = kb ? (VirtualAlloc2Fn)GetProcAddress(kb, "VirtualAlloc2") : nullptr;
+		auto map3 = kb ? (MapViewOfFile3Fn)GetProcAddress(kb, "MapViewOfFile3") : nullptr;
+		if (!alloc2 || !map3)
+			return;
+		section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, VRAM_BYTES, nullptr);
+		mem = (u8 *)alloc2(GetCurrentProcess(), nullptr, WINDOW, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+		if (!section || !mem)
+			return;
+		// The scratchpad, VRAM and RAM get placeholders of their own, then memory.
+		const struct { u32 off, size; } parts[] = { { 0x10000, 0x10000 }, { VRAM, VRAM_BYTES }, { RAM, RAM_SIZE } };
+		for (const auto &part : parts)
+			VirtualFree(mem + part.off, part.size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+		const ULONG commit = MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER;
+		if (!alloc2(GetCurrentProcess(), mem + 0x10000, 0x10000, commit, PAGE_READWRITE, nullptr, 0) ||
+			!alloc2(GetCurrentProcess(), mem + RAM, RAM_SIZE, commit, PAGE_READWRITE, nullptr, 0) ||
+			!map3(section, GetCurrentProcess(), mem + VRAM, 0, VRAM_BYTES, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0))
+			return;
+		privateVram = (u8 *)MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, VRAM_BYTES);
+		if (!privateVram)
+			return;
+		saved = g_membase;
+		g_membase = mem;
+		SetRamSize(RAM_SIZE);
+		SetSdkVersion(0x06060010);
+		Init();
+		SetRenderThreads(1);
+		ok = true;
+	}
+	~GuardedEnv() {
+		if (ok) {
+			SetRenderBackend(nullptr);
+			Shutdown();
+			g_membase = saved;
+		}
+		if (privateVram)
+			UnmapViewOfFile(privateVram);
+		if (mem) {
+			UnmapViewOfFile(mem + VRAM);
+			// Every piece of the window, memory and placeholders.
+			for (u8 *p = mem; p < mem + WINDOW;) {
+				MEMORY_BASIC_INFORMATION mbi{};
+				if (!VirtualQuery(p, &mbi, sizeof(mbi)))
+					break;
+				u8 *next = (u8 *)mbi.BaseAddress + mbi.RegionSize;
+				if (mbi.State != MEM_FREE)
+					VirtualFree(mbi.AllocationBase, 0, MEM_RELEASE);
+				p = next;
+			}
+		}
+		if (section)
+			CloseHandle(section);
+	}
+};
+
+void Target(DL &dl, u32 fb, int stride, int fmt) {
+	dl.C(GE_CMD_FRAMEBUFPTR, fb).C(GE_CMD_FRAMEBUFWIDTH, stride).C(GE_CMD_FRAMEBUFPIXFORMAT, fmt);
+}
+
+void Texture(DL &dl, u32 addr, int fmt, int bufw, int wLog, int hLog) {
+	dl.C(GE_CMD_TEXFORMAT, fmt).C(GE_CMD_TEXMODE, 0).C(GE_CMD_TEXADDR0, addr & 0xFFFFF0);
+	dl.C(GE_CMD_TEXBUFWIDTH0, bufw | ((addr >> 8) & 0x0F0000)).C(GE_CMD_TEXSIZE0, wLog | (hLog << 8));
+}
+
+// A 1:1 textured sprite from (u0, v0); its two vertices at *verts.
+void Sprite(DL &dl, u32 *verts, int x0, int y0, int x1, int y1, int u0, int v0) {
+	const TTVert s[2] = { { (u16)u0, (u16)v0, 0xFFFFFFFF, (s16)x0, (s16)y0, 0, 0 },
+	                      { (u16)(u0 + x1 - x0), (u16)(v0 + y1 - y0), 0xFFFFFFFF, (s16)x1, (s16)y1, 0, 0 } };
+	memcpy(GPtr(*verts), s, sizeof(s));
+	dl.Prim(GE_PRIM_RECTANGLES, 2, *verts);
+	*verts += sizeof(s);
+}
+
+}  // namespace
+
+// Rendering read back by the GE in other layouts and by the CPU, with the VRAM guard (as the runtime
+// runs): Logan's Shadow's 128-wide 5551 targets one above the other in VRAM, drawn in turn with sprites
+// ending on the other's first row, one sampled as 8-bit CLUT indices, a 512-row texture over both and
+// the memory after them, a CPU read, more lists (one drawing and block-transferring the target after a
+// GE run left a copy of it) and CPU reads, and then all of VRAM read by the CPU. The same bytes as the
+// software renderer, with the textures decoded on the GPU and a write-back taking the copy made at the
+// end of a GE run.
+TEST(gpu_hardware_guarded_render_to_texture) {
+	for (int scale : { 1, 3 }) {
+		GuardedEnv env;
+		if (!env.ok) {
+			printf("  guarded VRAM unavailable\n");
+			return;
+		}
+		BackendOptions options;
+		options.scale = scale;
+		options.warp = true;
+		options.privateVram = env.privateVram;
+		std::string error;
+		auto backend = MakeBackend(options, &error);
+		if (!backend) {
+			printf("  hardware guarded test unavailable: %s\n", error.c_str());
+			return;
+		}
+		constexpr u32 T1 = 0x100000, T2 = T1 + 128 * 128 * 2;
+		auto draw = [&](RenderBackend *renderer) {
+			SetRenderBackend(nullptr);
+			Shutdown();
+			Init();
+			memset(GPtr(VRAM), 0, VRAM_BYTES);
+			SetRenderBackend(renderer);
+			g_seed = 77;
+			for (u32 i = 0; i < 128 * 256; ++i)
+				GWrite16(TEX + i * 2, (u16)Rnd());
+			for (u32 i = 0; i < 256; ++i)
+				GWrite32(CLUTA + i * 4, 0xFF000000 | (i * 0x010305));
+			// What the 512-row texture reads past both targets.
+			for (u32 i = 192 * 128; i < 512 * 128; ++i)
+				GWrite16(VRAM + T1 + i * 2, (u16)(i * 37));
+			DL dl;
+			u32 verts = VERTS;
+			dl.C(GE_CMD_SCISSOR1, 0).C(GE_CMD_SCISSOR2, 511 | (511 << 10)).C(GE_CMD_REGION2, 511 | (511 << 10));
+			dl.C(GE_CMD_ZWRITEDISABLE, 1).C(GE_CMD_TEXTUREMAPENABLE, 1).C(GE_CMD_TEXFILTER, 0).C(GE_CMD_TEXWRAP, 0x101);
+			dl.C(GE_CMD_TEXFUNC, GE_TEXFUNC_REPLACE | 0x100).C(GE_CMD_VERTEXTYPE, VT_T16_C8888_P16);
+			Texture(dl, TEX, GE_TFMT_5551, 128, 7, 8);
+			Target(dl, T1, 128, GE_FORMAT_5551);
+			Sprite(dl, &verts, 0, 0, 128, 128, 0, 0);
+			Target(dl, T2, 128, GE_FORMAT_5551);
+			Sprite(dl, &verts, 0, 0, 128, 64, 0, 128);
+			Target(dl, T1, 128, GE_FORMAT_5551);
+			Sprite(dl, &verts, 32, 32, 96, 128, 0, 64);
+			Target(dl, T2, 128, GE_FORMAT_5551);
+			Sprite(dl, &verts, 0, 0, 64, 64, 64, 192);
+			Target(dl, 0, 256, GE_FORMAT_8888);
+			Texture(dl, VRAM + T1, GE_TFMT_CLUT8, 256, 8, 7);
+			dl.Addr(GE_CMD_CLUTADDR, CLUTA).C(GE_CMD_CLUTADDRUPPER, (CLUTA >> 8) & 0x0F0000);
+			dl.C(GE_CMD_CLUTFORMAT, GE_CMODE_32BIT_ABGR8888 | (0xFF << 8)).C(GE_CMD_LOADCLUT, 32);
+			Sprite(dl, &verts, 0, 0, 256, 128, 0, 0);
+			// Rows 64-127 of T1, T2's first 64 and 128 rows of memory.
+			Texture(dl, VRAM + T1, GE_TFMT_5551, 128, 7, 9);
+			Sprite(dl, &verts, 0, 128, 128, 384, 0, 64);
+			dl.C(GE_CMD_FINISH).C(GE_CMD_END);
+			EnqueueList(dl.start, 0, -1, 0, false);
+			Run();
+			DrawSync(0);
+			const u16 read = GRead16(VRAM + T1 + (40 * 128 + 40) * 2);
+			DL again;
+			again.start = again.pc = LIST + 0x10000;
+			Target(again, T1, 128, GE_FORMAT_5551);
+			Texture(again, TEX, GE_TFMT_5551, 128, 7, 8);
+			Sprite(again, &verts, 0, 0, 64, 64, 64, 0);
+			again.C(GE_CMD_FINISH).C(GE_CMD_END);
+			EnqueueList(again.start, 0, -1, 0, false);
+			Run();
+			DrawSync(0);
+			// Drawn again and block-transferred in the same list: that write-back can't take the copy
+			// made when the last run ended.
+			DL third;
+			third.start = third.pc = LIST + 0x20000;
+			Sprite(third, &verts, 16, 8, 48, 40, 0, 200);
+			third.C(GE_CMD_TRANSFERSRC, T1 & 0xFFFFF0).C(GE_CMD_TRANSFERSRCW, 128 | ((VRAM >> 8) & 0xFF0000));
+			third.C(GE_CMD_TRANSFERDST, 0x180000).C(GE_CMD_TRANSFERDSTW, 128 | ((VRAM >> 8) & 0xFF0000));
+			third.C(GE_CMD_TRANSFERSRCPOS, 0).C(GE_CMD_TRANSFERDSTPOS, 0);
+			third.C(GE_CMD_TRANSFERSIZE, 127 | (63 << 10)).C(GE_CMD_TRANSFERSTART, 0);
+			third.C(GE_CMD_FINISH).C(GE_CMD_END);
+			EnqueueList(third.start, 0, -1, 0, false);
+			Run();
+			DrawSync(0);
+			// Drawn once more: the CPU's next read takes the copy made when this run ended.
+			DL fourth;
+			fourth.start = fourth.pc = LIST + 0x30000;
+			Sprite(fourth, &verts, 64, 64, 128, 96, 0, 100);
+			fourth.C(GE_CMD_FINISH).C(GE_CMD_END);
+			EnqueueList(fourth.start, 0, -1, 0, false);
+			Run();
+			DrawSync(0);
+			const u16 last = GRead16(VRAM + T1 + (70 * 128 + 70) * 2);
+			std::vector<u8> vram(VRAM_BYTES);
+			memcpy(vram.data(), GPtr(VRAM), vram.size());
+			for (u16 v : { read, last }) {
+				vram.push_back((u8)v);
+				vram.push_back((u8)(v >> 8));
+			}
+			SetRenderBackend(nullptr);
+			return vram;
+		};
+		const std::vector<u8> reference = draw(nullptr), actual = draw(backend.get());
+		size_t diffs = 0;
+		for (size_t i = 0; i < reference.size() && i < actual.size(); ++i)
+			diffs += reference[i] != actual[i];
+		if (diffs)
+			printf("  scale %d: %zu bytes of VRAM differ\n", scale, diffs);
+		CHECK(reference.size() == actual.size() && diffs == 0);
+		CHECK(GRead32(VRAM + (64 * 256 + 64) * 4) != 0);
+		const hw::D3D11WriteBackStats stats = hw::GetD3D11WriteBackStats(backend.get());
+		CHECK(stats.gpuTextures >= 2);
+		CHECK(stats.earlyCopiesUsed >= 1);
+	}
+}
+#endif
 #endif

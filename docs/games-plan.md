@@ -145,15 +145,41 @@ What went in:
 - **1.2.2 (M, part of 2.1):** the 3D editor costs 10-15 ms of GE time per VBlank with the
   software renderer (5300 primitives). A window would drop under 60 fps when the machine is
   busy.
-- **1.2.3 (S-M, Direct3D 11):** in 33 s of the 3D editor the renderer logged:
-  - 2540 framebuffer downloads;
-  - 2504 guest faults;
-  - 4 s of waiting.
+- **1.2.3 (S-M, Direct3D 11) — done 2026-10-16:** in 33 s of the 3D editor the renderer had
+  logged 2540 framebuffer downloads, 2504 guest faults and 4 s of waiting. `PSPC_GPU_STATS=1`
+  now counts the downloads by cause.
+  - **What reads VRAM back:**
+    - Combat Ops: only the game's CPU code, reading the depth buffer (0x88000, from pc 08c766e0)
+      once a frame, as PPSSPP's `[SoftwareRasterDepth]` suggested. The read comes about 10 ms after
+      the GE's last run ended, with nothing drawn since: the CPU waited for the readback copy's
+      round trip, not for drawing.
+    - Logan's Shadow (1.3), the same engine: that depth read (pc 08c13718), plus readbacks the GE
+      itself caused. Two 128-wide 5551 targets lie one above the other (0xd4000, 0xdc000), and each
+      was written back whenever the other was drawn: a sprite's bounding box ending on row 128
+      counted the next target's first row. The 16-bit framebuffers are read as 512 x 512 textures
+      (taller than their 272 rows), and 0xd4000 as 8-bit CLUT indices; the texture cache wrote that
+      rendering back to decode it.
+  - **What changed** (`src/gpu/hw/d3d11_backend.cpp`):
+    - a batch's rows are the ones its GPU vertices reach;
+    - textures over rendering not yet written back, in another layout than the surface, are decoded
+      on the GPU from an image of VRAM with the rendering packed in, as the CPU would decode them
+      after a write-back (`PSPC_D3D11_TEXTURE_VERIFY=1` checks every one against the CPU);
+    - surfaces the guest touched lately are copied out at the end of each GE run that drew to them,
+      and the next write-back takes that copy if nothing was drawn since.
+  - **Numbers:** headless with the smoke test's input, render scale 1, the old and new builds run side
+    by side from the same folder (two such runs under different load):
 
-  Find what the guest reads back from VRAM (the download path in
-  `src/gpu/hw/d3d11_backend.cpp`). PPSSPP's `compat.ini` lists this game under
-  `[SoftwareRasterDepth]`, which points at light-flare depth tests, and under
-  `[DisableMemcpySlicing]`.
+    | Run | Downloads | Waiting for them | Time in the renderer |
+    |---|---|---|---|
+    | Combat Ops to VBlank 10900 (the editor from 9000) | 2204 → 2204 | 1.0-1.4 s → 0.11-0.17 s | 2.4-2.7 s → 2.5-2.9 s |
+    | Logan's Shadow to VBlank 7800 (the mission from 6000) | 24905 → 2241 | 9.2-13.5 s → 0.11-0.17 s | 16.5-21.7 s → 4.7-5.7 s |
+
+    Logan's Shadow's GE time at VBlank 7800 went from 8.7-10.0 to 4.7-6.0 ms per frame. The downloads
+    left are the CPU's reads, one a frame.
+  - **Verified:** every D3D11 and software checkpoint as before (Elite Squadron's D3D11 run differs
+    between two runs of the old build too; the new build's 48 frames equal the second run's), no
+    texture different from the CPU's decoding (Logan's Shadow 5260, Elite Squadron 14430), and
+    `gpu_hardware_guarded_render_to_texture` (WARP, with the VRAM guard).
 
 ### 1.3 Syphon Filter: Logan's Shadow (UCUS98606)
 - **Status:**
@@ -333,8 +359,8 @@ Set aside on 2026-10-12, to come back to. Each one says what to do and what it d
     the script and checkpoints past it. If not, it's a bug: do 1.1.2.
   - Scripted attempts (about 40) can't settle it.
 - [ ] **3.2 Pick the renderer for Combat Ops' 3D editor** (1.2.2).
-  - **What to do:** first do 1.2.3 (why Direct3D 11 reads VRAM back so often there). Then
-    measure both renderers in the editor under load.
+  - **What to do:** measure both renderers in the editor under load (1.2.3, done: the CPU's one
+    depth read a frame no longer waits for the GPU).
   - **What it decides:** keep the software default, or recommend Direct3D 11 for this game.
 - [ ] **3.3 Decide on online checkpoints** (2.4).
   - **What to do:** weigh a scripted two-instance check (the Combat Ops lobby and a match, an

@@ -19,17 +19,22 @@
 //    the GPU draws rows of a surface, rows whose VRAM differs from the shadow (the CPU, a block transfer
 //    or another surface wrote them) are uploaded again; the others keep their (upscaled) GPU contents.
 //  * Rows the GPU drew are "dirty" until written back (reduced to 1x first at a render scale above 1; a
-//    pixel the CPU changed meanwhile keeps the CPU's value). They are written back when the GE reads
-//    that memory itself (block transfer source, CLUT, a texture that isn't a surface), before a block
-//    transfer writes it, before another surface overlapping it is validated, and
+//    pixel the CPU changed meanwhile keeps the CPU's value). A batch's rows are those its GPU vertices
+//    reach. They are written back when the GE reads that memory itself (block transfer source, CLUT, a
+//    texture the GPU can't decode), before a block transfer writes it, before another surface
+//    overlapping it is validated, and
 //    - with the VRAM guard (the default; it needs mem::PrivateVramView): the guest's VRAM pages under
 //      dirty rows are made inaccessible, and the first guest access to one (CPU code, HLE, sceDisplay,
 //      frame dumps) faults into a handler that writes the rendering back. The backend does its own
 //      accesses through a private view of the same memory. Nothing is read back otherwise, so the CPU
-//      never waits for the GPU at list ends;
+//      never waits for the GPU at list ends. Surfaces the guest touched lately are copied out at the
+//      end of each GE run that drew to them (EarlyCopies), so the next write-back finds its copy done;
 //    - without it (PSPC_D3D11_SYNC=eager): at every list end and sceGeDrawSync/ListSync.
 //  * Textures are hashed (d3d11_texcache.cpp) after their memory was made current; a texture that is
 //    (part of) a surface in the same pixel format is sampled from the surface itself (render to texture).
+//    Other textures over dirty rows (another format or row length, taller than the surface) are decoded
+//    on the GPU from an image of VRAM with the rendering packed in (GpuTexture), the texels a write-back
+//    and the CPU's decoding would give (PSPC_D3D11_TEXTURE_VERIFY=1 compares every one).
 //
 // Presentation. With a host window, sceDisplay's framebuffer goes from its surface straight into the
 // window's swap chain, scaled to fit by a pixel shader (averaged down when the render scale is larger
@@ -45,6 +50,7 @@
 #include <atomic>
 #include <chrono>
 #include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -56,6 +62,7 @@
 #include "common/log.h"
 #include "gpu/gemath.h"
 #include "gpu/hw/d3d11_internal.h"
+#include "gpu/sampler.h"
 
 namespace gpu::hw {
 
@@ -83,6 +90,20 @@ struct CopyCB {
 	u32 outScale;
 	u32 pad;
 };
+
+// CSPack and CSDecodeTex (d3d11_shaders.cpp kTexDecode).
+struct TexCB {
+	u32 start;
+	u32 rowBytes;
+	u32 extent[2];
+	u32 bpp;
+	u32 clipStart, clipEnd;
+	u32 srcY;
+	u32 texFmt;
+	u32 clutFmt, clutShift, clutMask, clutOffset, clutSimple;
+	u32 pad[2];
+};
+static_assert(sizeof(TexCB) == 64, "TexCB layout");
 
 struct PresentCB {
 	float dstOrigin[2];
@@ -142,6 +163,14 @@ struct Surface {
 	bool drawn = false;
 	int slot = -1;               // bit in the VRAM page masks
 	int protP0 = 0, protP1 = 0;  // VRAM pages kept inaccessible for its dirty rows, [protP0, protP1)
+	u64 drawSeq = 0;             // draws to it so far
+	// The guest has been touching its rendering (faults) until this many syncs: each GE run's end copies
+	// what it rendered to `early` (1x rows earlyY0..earlyY1, as of draw earlySeq), for the next write-back.
+	u64 hotUntil = 0;
+	ComPtr<ID3D11Texture2D> early;
+	int earlyY0 = 0, earlyY1 = -1;
+	u64 earlySeq = 0;
+	bool earlyValid = false;
 
 	u32 RowBytes() const { return (u32)stride * (u32)bpp; }
 	u32 Start(int y) const { return addr + (u32)y * RowBytes(); }
@@ -155,9 +184,16 @@ inline bool Overlaps(u64 a0, u64 a1, u64 b0, u64 b1) {
 // The backend's own view of VRAM: the private one when the guest's pages may be inaccessible.
 u8 *g_vram = nullptr;
 
+// What makes rendering go back to guest memory (PSPC_GPU_STATS).
+enum DownloadCause { DL_GUEST_READ, DL_GUEST_WRITE, DL_GE, DL_TEXTURE, DL_DISPLAY, DL_OVERLAP, DL_EVICT, DL_OTHER, DL_CAUSES };
+const char *const kDownloadCause[DL_CAUSES] = { "guest reads", "guest writes", "GE transfers and CLUTs", "textures", "display",
+                                                "other surfaces", "evictions", "syncs" };
+
 constexpr u32 PAGE_SIZE = 4096;
 constexpr int NUM_PAGES = (int)(VRAM_SIZE / PAGE_SIZE);
 constexpr int MAX_SURFACES = 64;
+// How long (in syncs: list ends, sceGeDrawSync) a surface counts as touched by the guest after a fault.
+constexpr u64 HOT_SYNCS = 120;
 
 // Guest VRAM bytes at an offset, wrapping at its end.
 void ReadVram(u32 off, u8 *out, u32 n) {
@@ -191,6 +227,10 @@ public:
 	bool TransformsGeometry() const override { return geoEnabled_.load(std::memory_order_acquire); }
 	bool VerifiesGeometry() const override { return geoVerify_; }
 	D3D11TransformStats TransformStats() const { return { geoVerts, geoJobs, geoChecked, geoMismatches }; }
+	D3D11WriteBackStats WriteBackStats() {
+		std::lock_guard<std::recursive_mutex> lock(mu_);
+		return { stats_.downloads, stats_.earlyUsed, stats_.gpuTextures, stats_.texMismatches };
+	}
 	void DrawGeometryBatch(const BatchPrim *prims, size_t primCount, const RasterState *states, size_t stateCount,
 	                       const GeometryBatch &geo) override;
 	void SyncRange(u32 addr, u32 size) override;
@@ -199,7 +239,7 @@ public:
 	// Lets the GPU start on what's queued while the CPU goes on.
 	void EndRun() override {
 		std::lock_guard<std::recursive_mutex> lock(mu_);
-		if (pendingDraws_) {
+		if (EarlyCopies() || pendingDraws_) {
 			ctx_->Flush();
 			pendingDraws_ = false;
 		}
@@ -211,7 +251,7 @@ public:
 	bool PresentImage(const u32 *rgba, int width, int height, int stride) override;
 	void ReleaseWindow() override;
 	// A guest access to a VRAM page kept inaccessible: writes back what's rendered there.
-	bool OnGuestFault(u32 off);
+	bool OnGuestFault(u32 off, bool write);
 	bool Guarded() const { return guard_; }
 	u8 *GuestVram(int mirror) const { return guestVram_[mirror]; }
 
@@ -233,6 +273,9 @@ private:
 	void ValidateRows(Surface *s, int y0, int y1);
 	void UploadRows(Surface *s, int y0, int y1);
 	void Download(Surface *s);
+	// Rows y0..y1 of a surface at 1x into a staging texture, from row dstY.
+	bool CopyRowsOut(Surface *s, int y0, int y1, ID3D11Texture2D *dst, UINT dstY);
+	bool EarlyCopies();
 	void MarkDirty(Surface *s, int y0, int y1);
 	void Protect(Surface *s);
 	void Unprotect(Surface *s);
@@ -242,12 +285,30 @@ private:
 	void UnbindOM();
 	void DrainDebugMessages();
 	void RunCompute(ID3D11ComputeShader *cs, ID3D11ShaderResourceView *srv, ID3D11UnorderedAccessView *uav, const CopyCB &cb, UINT gx, UINT gy);
-	static void SyncRangeThunk(void *user, u32 addr, u32 size) { static_cast<D3D11Backend *>(user)->SyncRange(addr, size); }
+	static void SyncRangeThunk(void *user, u32 addr, u32 size) {
+		D3D11Backend *b = static_cast<D3D11Backend *>(user);
+		CauseScope cs(b, DL_TEXTURE);
+		b->SyncRange(addr, size);
+	}
+	// The cause downloads are counted under while it's in scope.
+	struct CauseScope {
+		D3D11Backend *b;
+		int prev;
+		CauseScope(D3D11Backend *backend, int cause) : b(backend), prev(backend->dlCause_) { b->dlCause_ = cause; }
+		~CauseScope() { b->dlCause_ = prev; }
+	};
 
 	void BindDraw(Surface *color, Surface *depth);
+	void DrawnRows(const BatchPrim *prims, size_t n, int *y0, int *y1) const;
 	Surface *FindTextureSurface(const SamplerState &ss, int *x0, int *y0);
 	void ResolveRenderToTexture(const RasterState *states, size_t n);
 	ID3D11ShaderResourceView *FeedbackCopy(Surface *s);
+	// Textures over rendering not yet written back, decoded on the GPU (nullptr: the texture cache's).
+	ID3D11ShaderResourceView *GpuTexture(const SamplerState &ss);
+	bool EnsureGpuTextureResources();
+	void TexCompute(ID3D11ComputeShader *cs, const TexCB &cb, ID3D11ShaderResourceView *srv0, ID3D11UnorderedAccessView *uav0,
+	                ID3D11UnorderedAccessView *uav1, UINT gx, UINT gy);
+	void VerifyGpuTexture(const SamplerState &ss, int w, int h);
 	void PrintStats();
 	// Optional GPU timestamps (PSPC_GPU_PROFILE): collect completed queries without stalling draws.
 	void BeginGpuSample(int category);
@@ -312,6 +373,16 @@ private:
 	std::vector<std::unique_ptr<Surface>> surfaces_;
 	std::unique_ptr<TextureCache> texCache_;
 	std::vector<Surface *> rttSurf_;  // per batch state: the surface its texture is (render to texture)
+	// GpuTexture: an image of guest VRAM with the rendering packed in, the CLUT, the decoded level.
+	ComPtr<ID3D11ComputeShader> csPack_, csDecodeTex_;
+	ComPtr<ID3D11Buffer> vramImg_, clutBuf_, texCB_;
+	ComPtr<ID3D11ShaderResourceView> vramImgSrv_, clutSrv_, gpuTexSrv_, packSrv_;
+	ComPtr<ID3D11UnorderedAccessView> vramImgUav_, gpuTexUav_, packUav_;
+	ComPtr<ID3D11Texture2D> gpuTex_, gpuTexStaging_, packTex_;
+	int packW_ = 0, packH_ = 0;
+	bool gpuTexFailed_ = false;
+	bool texVerify_ = false;
+	std::vector<u32> verifyBuf_;
 	ComPtr<ID3D11Texture2D> feedbackTex_;
 	ComPtr<ID3D11ShaderResourceView> feedbackSrv_;
 	int feedbackW_ = 0, feedbackH_ = 0;
@@ -358,7 +429,11 @@ private:
 		double seconds = 0;
 		double tDownloadWait = 0, tDownloadCopy = 0, tValidate = 0, tTexture = 0, tBuild = 0, tSubmit = 0, tDisplay = 0;
 		u64 rttDraws = 0;
+		u64 gpuTextures = 0, texVerified = 0, texMismatches = 0;
+		u64 earlyCopies = 0, earlyUsed = 0;
+		struct { u64 count = 0, rows = 0; double wait = 0; } byCause[DL_CAUSES];
 	} stats_;
+	int dlCause_ = DL_OTHER;
 	bool printStats_ = false;
 	bool profileGpu_ = false;
 	struct GpuSample {
@@ -391,7 +466,7 @@ LONG CALLBACK VramFaultHandler(EXCEPTION_POINTERS *ep) {
 	for (int m = 0; m < 4; ++m) {
 		const uintptr_t base = (uintptr_t)g_guarded->GuestVram(m);
 		if (base && addr >= base && addr < base + VRAM_SIZE)
-			return g_guarded->OnGuestFault((u32)(addr - base)) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+			return g_guarded->OnGuestFault((u32)(addr - base), ep->ExceptionRecord->ExceptionInformation[0] == 1) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
 	}
 	return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -545,8 +620,9 @@ void D3D11Backend::Unprotect(Surface *s) {
 	s->protP0 = s->protP1 = 0;
 }
 
-bool D3D11Backend::OnGuestFault(u32 off) {
+bool D3D11Backend::OnGuestFault(u32 off, bool write) {
 	std::lock_guard<std::recursive_mutex> lock(mu_);
+	CauseScope cs(this, write ? DL_GUEST_WRITE : DL_GUEST_READ);
 	const int pg = (int)(off / PAGE_SIZE);
 	if (pg < 0 || pg >= NUM_PAGES)
 		return false;
@@ -562,8 +638,10 @@ bool D3D11Backend::OnGuestFault(u32 off) {
 	}
 	faults_++;
 	for (auto &sp : surfaces_) {
-		if (sp->slot >= 0 && (mask & (1ull << sp->slot)))
+		if (sp->slot >= 0 && (mask & (1ull << sp->slot))) {
 			Download(sp.get());
+			sp->hotUntil = syncs_ + HOT_SYNCS;
+		}
 	}
 	return true;
 }
@@ -610,6 +688,7 @@ bool D3D11Backend::Init(const D3D11Options &o, std::string *err) {
 	texUpscale_ = std::clamp(o.textureUpscale, 1, 4);
 	window_ = (HWND)o.window;
 	printStats_ = getenv("PSPC_GPU_STATS") != nullptr;
+	texVerify_ = getenv("PSPC_D3D11_TEXTURE_VERIFY") != nullptr;
 	profileGpu_ = getenv("PSPC_GPU_PROFILE") != nullptr;
 	g_vram = o.privateVram ? o.privateVram : VramPtr();
 	const char *syncMode = getenv("PSPC_D3D11_SYNC");
@@ -678,6 +757,7 @@ bool D3D11Backend::Init(const D3D11Options &o, std::string *err) {
 	struct { ShaderKind kind; const char *entry; ComPtr<ID3D11ComputeShader> *cs; } computes[] = {
 		{ ShaderKind::Compute, "CSExpand", &csExpand_ }, { ShaderKind::Compute, "CSReduce", &csReduce_ },
 		{ ShaderKind::Compute, "CSDisplay", &csDisplay_ }, { ShaderKind::Upscale, "CSUpscale", &csUpscale_ },
+		{ ShaderKind::TexDecode, "CSPack", &csPack_ }, { ShaderKind::TexDecode, "CSDecodeTex", &csDecodeTex_ },
 	};
 	for (auto &c : computes) {
 		ComPtr<ID3DBlob> code = Compile(c.kind, c.entry, "cs_5_0", nullptr, err);
@@ -845,6 +925,8 @@ bool D3D11Backend::ResizeSurface(Surface *s, int height) {
 	s->uav = uav;
 	s->srv = srv;
 	s->height = height;
+	s->early.Reset();
+	s->earlyValid = false;
 	s->shadow.resize((size_t)height * s->RowBytes());
 	s->rowValid.resize((size_t)height, 0);
 	omDirty_ = true;
@@ -891,7 +973,10 @@ void D3D11Backend::EvictSurface() {
 			victim = i;
 	}
 	Surface *s = surfaces_[victim].get();
-	Download(s);
+	{
+		CauseScope cs(this, DL_EVICT);
+		Download(s);
+	}
 	Unprotect(s);
 	if (s->slot >= 0)
 		usedSlots_ &= ~(1ull << s->slot);
@@ -988,34 +1073,31 @@ void D3D11Backend::Download(Surface *s) {
 	if (y0 > y1)
 		return;
 	const int rows = y1 - y0 + 1, w = s->width;
-	ID3D11Texture2D *src = s->tex.Get();
-	UINT srcY = (UINT)y0;
-	UnbindOM();
-	if (scale_ > 1) {
-		if (!EnsureScratch(reduceTex_, std::addressof(reduceUav_), nullptr, w, rows, &reduceW_, &reduceH_, false))
+	// The copy made at the end of the last GE run, when nothing was drawn to the surface since.
+	const bool early = s->earlyValid && s->earlySeq == s->drawSeq && s->earlyY0 <= y0 && y1 <= s->earlyY1;
+	s->earlyValid = false;
+	ID3D11Texture2D *staging = early ? s->early.Get() : nullptr;
+	const int stagingY = early ? y0 : 0;  // the staging row of y0
+	if (early) {
+		stats_.earlyUsed++;
+	} else {
+		if (!EnsureScratch(stagingTex_, nullptr, nullptr, w, rows, &stagingW_, &stagingH_, true) || !CopyRowsOut(s, y0, y1, stagingTex_.Get(), 0))
 			return;
-		CopyCB cb{};
-		cb.origin[1] = (u32)y0;
-		cb.size[0] = (u32)w;
-		cb.size[1] = (u32)rows;
-		cb.scale = (u32)scale_;
-		cb.format = (u32)s->fmt;
-		RunCompute(csReduce_.Get(), s->srv.Get(), reduceUav_.Get(), cb, (UINT)(w + 7) / 8, (UINT)(rows + 7) / 8);
-		src = reduceTex_.Get();
-		srcY = 0;
+		staging = stagingTex_.Get();
 	}
-	if (!EnsureScratch(stagingTex_, nullptr, nullptr, w, rows, &stagingW_, &stagingH_, true))
-		return;
-	const D3D11_BOX box{ 0, srcY, 0, (UINT)w, srcY + (UINT)rows, 1 };
-	ctx_->CopySubresourceRegion(stagingTex_.Get(), 0, 0, 0, 0, src, 0, &box);
 	D3D11_MAPPED_SUBRESOURCE m{};
+	const double waitBefore = stats_.tDownloadWait;
 	{
 		ScopedTimer tw(&stats_.tDownloadWait);
-		if (FAILED(ctx_->Map(stagingTex_.Get(), 0, D3D11_MAP_READ, 0, &m))) {
+		if (FAILED(ctx_->Map(staging, 0, D3D11_MAP_READ, 0, &m))) {
 			LOGW("d3d11", "readback failed");
 			return;
 		}
 	}
+	auto &cause = stats_.byCause[dlCause_];
+	cause.count++;
+	cause.rows += (u64)rows;
+	cause.wait += stats_.tDownloadWait - waitBefore;
 	ScopedTimer tc(&stats_.tDownloadCopy);
 	const u32 rb = s->RowBytes(), bpp = (u32)s->bpp;
 	const u32 gpuBytes = std::min(rb, (u32)w * bpp);
@@ -1023,7 +1105,7 @@ void D3D11Backend::Download(Surface *s) {
 	rowTmp2_.resize(rb);
 	for (int r = 0; r < rows; ++r) {
 		const int y = y0 + r;
-		const u32 *g = (const u32 *)((const u8 *)m.pData + (size_t)r * m.RowPitch);
+		const u32 *g = (const u32 *)((const u8 *)m.pData + (size_t)(stagingY + r) * m.RowPitch);
 		u8 *gpu = rowTmp_.data();
 		u8 *vram = rowTmp2_.data();
 		u8 *shadow = &s->shadow[(size_t)y * rb];
@@ -1053,12 +1135,67 @@ void D3D11Backend::Download(Surface *s) {
 		memcpy(shadow, vram, rb);
 		s->rowValid[y] = 0;
 	}
-	ctx_->Unmap(stagingTex_.Get(), 0);
+	ctx_->Unmap(staging, 0);
 	Unprotect(s);
 	stats_.downloads++;
 	stats_.downloadRows += (u64)rows;
 	vramGen_++;
 	texCache_->Invalidate(VRAM_BASE + s->Start(y0), VRAM_BASE + s->Start(y1 + 1));
+}
+
+bool D3D11Backend::CopyRowsOut(Surface *s, int y0, int y1, ID3D11Texture2D *dst, UINT dstY) {
+	const int rows = y1 - y0 + 1, w = s->width;
+	ID3D11Texture2D *src = s->tex.Get();
+	UINT srcY = (UINT)y0;
+	UnbindOM();
+	if (scale_ > 1) {
+		if (!EnsureScratch(reduceTex_, std::addressof(reduceUav_), nullptr, w, rows, &reduceW_, &reduceH_, false))
+			return false;
+		CopyCB cb{};
+		cb.origin[1] = (u32)y0;
+		cb.size[0] = (u32)w;
+		cb.size[1] = (u32)rows;
+		cb.scale = (u32)scale_;
+		cb.format = (u32)s->fmt;
+		RunCompute(csReduce_.Get(), s->srv.Get(), reduceUav_.Get(), cb, (UINT)(w + 7) / 8, (UINT)(rows + 7) / 8);
+		src = reduceTex_.Get();
+		srcY = 0;
+	}
+	const D3D11_BOX box{ 0, srcY, 0, (UINT)w, srcY + (UINT)rows, 1 };
+	ctx_->CopySubresourceRegion(dst, 0, 0, dstY, 0, src, 0, &box);
+	return true;
+}
+
+// The CPU waits for a write-back mostly for the copy's round trip through the GPU, not for drawing: by
+// the time the guest touches rendering (Logan's Shadow and Combat Ops read the depth buffer every frame),
+// the GPU has long finished. So surfaces the guest has been touching get their rendering copied out at
+// the end of every GE run that drew to them, and the write-back takes that copy when nothing was drawn
+// to the surface since. Returns whether it issued copies.
+bool D3D11Backend::EarlyCopies() {
+	if (!guard_)
+		return false;
+	bool issued = false;
+	for (auto &sp : surfaces_) {
+		Surface *s = sp.get();
+		if (!s->Dirty() || s->hotUntil < syncs_ || (s->earlyValid && s->earlySeq == s->drawSeq))
+			continue;
+		const int y0 = std::max(s->dirtyY0, 0), y1 = std::min(s->dirtyY1, s->height - 1);
+		if (y0 > y1)
+			continue;
+		if (!s->early && !MakeTexture(s->width, s->height, true, std::addressof(s->early), nullptr, nullptr)) {
+			s->hotUntil = 0;
+			continue;
+		}
+		if (!CopyRowsOut(s, y0, y1, s->early.Get(), (UINT)y0))
+			continue;
+		s->earlyY0 = y0;
+		s->earlyY1 = y1;
+		s->earlySeq = s->drawSeq;
+		s->earlyValid = true;
+		stats_.earlyCopies++;
+		issued = true;
+	}
+	return issued;
 }
 
 void D3D11Backend::ValidateRows(Surface *s, int y0, int y1) {
@@ -1072,8 +1209,10 @@ void D3D11Backend::ValidateRows(Surface *s, int y0, int y1) {
 	// What other surfaces rendered into this memory reaches VRAM first.
 	const u32 start = s->Start(y0), end = s->Start(y1 + 1);
 	for (auto &o : surfaces_) {
-		if (o.get() != s && o->Dirty() && Overlaps(start, end, o->Start(o->dirtyY0), o->Start(o->dirtyY1 + 1)))
+		if (o.get() != s && o->Dirty() && Overlaps(start, end, o->Start(o->dirtyY0), o->Start(o->dirtyY1 + 1))) {
+			CauseScope cs(this, DL_OVERLAP);
 			Download(o.get());
+		}
 	}
 	const u32 rb = s->RowBytes();
 	rowTmp_.resize(rb);
@@ -1133,6 +1272,7 @@ void D3D11Backend::MarkDirty(Surface *s, int y0, int y1) {
 	s->dirtyY0 = std::min(s->dirtyY0, y0);
 	s->dirtyY1 = std::max(s->dirtyY1, y1);
 	s->drawn = true;
+	s->drawSeq++;
 }
 
 void D3D11Backend::SyncRange(u32 addr, u32 size) {
@@ -1141,6 +1281,8 @@ void D3D11Backend::SyncRange(u32 addr, u32 size) {
 	if (a < VRAM_BASE || a >= VRAM_BASE + VRAM_SIZE || size == 0)
 		return;
 	const u64 off = a - VRAM_BASE, end = off + size;
+	// (The GE's own reads and writes unless a caller says otherwise.)
+	CauseScope cs(this, dlCause_ == DL_OTHER ? DL_GE : dlCause_);
 	for (auto &s : surfaces_) {
 		if (!s->Dirty())
 			continue;
@@ -1189,7 +1331,24 @@ void D3D11Backend::PrintStats() {
 		(unsigned long long)texCache_->hashes, surfaces_.size(), stats_.seconds);
 	LOGI("d3d11", "  download wait %.3fs, download copy %.3fs, validate %.3fs, textures %.3fs, build %.3fs, submit %.3fs (incl. textures/downloads), display %.3fs",
 		stats_.tDownloadWait, stats_.tDownloadCopy, stats_.tValidate, stats_.tTexture, stats_.tBuild, stats_.tSubmit, stats_.tDisplay);
-	LOGI("d3d11", "  %llu draws textured from surfaces, %llu guest faults", (unsigned long long)stats_.rttDraws, (unsigned long long)faults_);
+	LOGI("d3d11", "  %llu draws textured from surfaces, %llu guest faults, %llu early copies (%llu written back), %llu textures decoded on the GPU%s",
+		(unsigned long long)stats_.rttDraws, (unsigned long long)faults_, (unsigned long long)stats_.earlyCopies,
+		(unsigned long long)stats_.earlyUsed, (unsigned long long)stats_.gpuTextures,
+		texVerify_ ? (", " + std::to_string(stats_.texMismatches) + " of " + std::to_string(stats_.texVerified) + " differ from the CPU").c_str() : "");
+	{
+		std::string by;
+		for (int c = 0; c < DL_CAUSES; ++c) {
+			const auto &cause = stats_.byCause[c];
+			if (!cause.count)
+				continue;
+			char buf[128];
+			snprintf(buf, sizeof(buf), "%s%s %llu (%llu rows, %.3fs waiting)", by.empty() ? "" : ", ", kDownloadCause[c],
+				(unsigned long long)cause.count, (unsigned long long)cause.rows, cause.wait);
+			by += buf;
+		}
+		if (!by.empty())
+			LOGI("d3d11", "  downloads for %s", by.c_str());
+	}
 	if (geoEnabled_)
 		LOGI("d3d11", "  GPU transform: %llu vertices, %llu triangle jobs%s", (unsigned long long)geoVerts, (unsigned long long)geoJobs,
 		     geoVerify_ ? (", " + std::to_string(geoMismatches) + " of " + std::to_string(geoChecked) + " jobs differ from the CPU").c_str() : "");
@@ -1277,6 +1436,250 @@ ID3D11ShaderResourceView *D3D11Backend::FeedbackCopy(Surface *s) {
 	return feedbackSrv_.Get();
 }
 
+// --- Textures over rendering not yet written back ---
+//
+// A texture that reads memory the GPU rendered and hasn't written back, but isn't a surface in the same
+// format and row length (render to texture): a 16-bit framebuffer read as 8-bit CLUT indices, a
+// 512 x 512 texture over a 272-row framebuffer and what follows it. The texture cache would write the
+// rendering back (waiting for the GPU) and decode guest memory. Here guest VRAM goes into a GPU image of
+// it, each surface's rendering there is packed in as a write-back would write it (reduced to 1x as
+// Download does), and the level is decoded from the image as sampler.h decodes memory: the same texels,
+// and the rendering stays on the GPU.
+
+bool D3D11Backend::EnsureGpuTextureResources() {
+	if (vramImg_)
+		return true;
+	if (gpuTexFailed_)
+		return false;
+	gpuTexFailed_ = true;
+	D3D11_BUFFER_DESC bd{};
+	bd.ByteWidth = VRAM_SIZE;
+	bd.Usage = D3D11_USAGE_DEFAULT;
+	bd.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+	bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+	D3D11_BUFFER_DESC cd = bd;
+	cd.ByteWidth = 2048;  // the CLUT snapshot: 1 KB of palette, repeated
+	cd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+	D3D11_BUFFER_DESC cbd{};
+	cbd.ByteWidth = sizeof(TexCB);
+	cbd.Usage = D3D11_USAGE_DEFAULT;
+	cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	ComPtr<ID3D11Buffer> img, clut, cb;
+	if (FAILED(dev_->CreateBuffer(&bd, nullptr, &img)) || FAILED(dev_->CreateBuffer(&cd, nullptr, &clut)) || FAILED(dev_->CreateBuffer(&cbd, nullptr, &cb)))
+		return false;
+	D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+	sd.Format = DXGI_FORMAT_R32_TYPELESS;
+	sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
+	sd.BufferEx.NumElements = VRAM_SIZE / 4;
+	sd.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
+	D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+	ud.Format = DXGI_FORMAT_R32_TYPELESS;
+	ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+	ud.Buffer.NumElements = VRAM_SIZE / 4;
+	ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+	D3D11_SHADER_RESOURCE_VIEW_DESC csd = sd;
+	csd.BufferEx.NumElements = 2048 / 4;
+	D3D11_TEXTURE2D_DESC td{};
+	td.Width = 512;
+	td.Height = 512;
+	td.MipLevels = 1;
+	td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+	ComPtr<ID3D11Texture2D> tex;
+	ComPtr<ID3D11ShaderResourceView> imgSrv, clutSrv, texSrv;
+	ComPtr<ID3D11UnorderedAccessView> imgUav, texUav;
+	if (FAILED(dev_->CreateShaderResourceView(img.Get(), &sd, &imgSrv)) || FAILED(dev_->CreateUnorderedAccessView(img.Get(), &ud, &imgUav)) ||
+		FAILED(dev_->CreateShaderResourceView(clut.Get(), &csd, &clutSrv)) || FAILED(dev_->CreateTexture2D(&td, nullptr, &tex)) ||
+		FAILED(dev_->CreateShaderResourceView(tex.Get(), nullptr, &texSrv)) || FAILED(dev_->CreateUnorderedAccessView(tex.Get(), nullptr, &texUav))) {
+		LOGW("d3d11", "GPU texture decoding unavailable: rendering read as textures is written back first");
+		return false;
+	}
+	vramImg_ = img;
+	clutBuf_ = clut;
+	texCB_ = cb;
+	vramImgSrv_ = imgSrv;
+	vramImgUav_ = imgUav;
+	clutSrv_ = clutSrv;
+	gpuTex_ = tex;
+	gpuTexSrv_ = texSrv;
+	gpuTexUav_ = texUav;
+	gpuTexFailed_ = false;
+	return true;
+}
+
+void D3D11Backend::TexCompute(ID3D11ComputeShader *cs, const TexCB &cb, ID3D11ShaderResourceView *srv0, ID3D11UnorderedAccessView *uav0,
+                              ID3D11UnorderedAccessView *uav1, UINT gx, UINT gy) {
+	UnbindOM();
+	ctx_->UpdateSubresource(texCB_.Get(), 0, nullptr, &cb, 0, 0);
+	ctx_->CSSetShader(cs, nullptr, 0);
+	ctx_->CSSetConstantBuffers(0, 1, texCB_.GetAddressOf());
+	ID3D11ShaderResourceView *srvs[3] = { srv0, uav0 ? nullptr : vramImgSrv_.Get(), uav0 ? nullptr : clutSrv_.Get() };
+	ID3D11UnorderedAccessView *uavs[2] = { uav0, uav1 };
+	ctx_->CSSetShaderResources(0, 3, srvs);
+	ctx_->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
+	ctx_->Dispatch(gx, gy, 1);
+	ID3D11ShaderResourceView *nullSrvs[3] = {};
+	ID3D11UnorderedAccessView *nullUavs[2] = {};
+	ctx_->CSSetShaderResources(0, 3, nullSrvs);
+	ctx_->CSSetUnorderedAccessViews(0, 2, nullUavs, nullptr);
+	DrainDebugMessages();
+}
+
+ID3D11ShaderResourceView *D3D11Backend::GpuTexture(const SamplerState &ss) {
+	// (With PSPC_D3D11_SYNC=eager the CPU may have changed rendered rows: Download merges them.)
+	if (!guard_ || !csDecodeTex_ || texUpscale_ > 1 || ss.swizzle || ss.maxLevel > 0 || ss.texfmt > GE_TFMT_CLUT32)
+		return nullptr;
+	const TexLevel &lv = ss.levels[0];
+	const u32 a = FoldAddress(lv.addr);
+	if (!lv.ptr || a < VRAM_BASE || a >= VRAM_BASE + VRAM_SIZE)
+		return nullptr;
+	const u32 off = a - VRAM_BASE;
+	const u32 bits = kTexelBits[ss.texfmt];
+	const int w = std::min<int>(lv.w, 512), h = std::min<int>(lv.h, 512);
+	if (w <= 0 || h <= 0)
+		return nullptr;
+	// sampler.h FetchTexelT: the texel's byte offset, and 4 bytes from it within validBytes (else 0).
+	const u32 rowBytes = ((u32)lv.bufw * bits) >> 3;
+	const u64 last = (u64)(h - 1) * rowBytes + (((u64)(w - 1) * bits) >> 3);
+	const u64 readEnd = (u64)off + last + 4;
+	if (readEnd > VRAM_SIZE || last + 4 > lv.validBytes)
+		return nullptr;
+	// The memory the texture cache would make current (LevelBytes): unless rendering is held back there,
+	// the texture cache has it.
+	const u64 hashEnd = (u64)off + std::min<u64>((u64)h * lv.bufw * bits / 8, lv.validBytes);
+	bool held = false;
+	for (auto &sp : surfaces_) {
+		const Surface *s = sp.get();
+		if (!s->Dirty())
+			continue;
+		held |= s->protP1 > s->protP0 ? Overlaps(off, hashEnd, (u64)s->protP0 * PAGE_SIZE, (u64)s->protP1 * PAGE_SIZE)
+		                              : Overlaps(off, hashEnd, s->Start(s->dirtyY0), s->Start(s->dirtyY1 + 1));
+	}
+	if (!held)
+		return nullptr;
+
+	// The surfaces whose rendering the texels can read (dirty rows don't overlap between surfaces).
+	struct Part {
+		Surface *s;
+		int y0, y1;
+	};
+	Part parts[MAX_SURFACES];
+	int nparts = 0;
+	for (auto &sp : surfaces_) {
+		Surface *s = sp.get();
+		if (!s->Dirty())
+			continue;
+		const u32 rb = s->RowBytes();
+		const int d0 = std::max(s->dirtyY0, 0), d1 = std::min(s->dirtyY1, s->height - 1);
+		if (d0 > d1 || !Overlaps(off, readEnd, s->Start(d0), s->Start(d1 + 1)))
+			continue;
+		if (s->addr % 4 != 0 || rb % 4 != 0 || ((u32)s->width * (u32)s->bpp) % 4 != 0 || s->Start(d1 + 1) > VRAM_SIZE)
+			return nullptr;
+		const int y0 = std::max(d0, off > s->addr ? (int)((off - s->addr) / rb) : 0);
+		const int y1 = std::min(d1, (int)((readEnd - 1 - s->addr) / rb));
+		if (y0 > y1)
+			continue;
+		parts[nparts++] = { s, y0, y1 };
+	}
+	if (!EnsureGpuTextureResources())
+		return nullptr;
+
+	// Guest memory, then the rendering over it.
+	const u32 lo = off & ~3u, hi = (u32)std::min<u64>(VRAM_SIZE, (readEnd + 3) & ~3ull);
+	const D3D11_BOX box{ lo, 0, 0, hi, 1, 1 };
+	ctx_->UpdateSubresource(vramImg_.Get(), 0, &box, g_vram + lo, 0, 0);
+	for (int i = 0; i < nparts; ++i) {
+		Surface *s = parts[i].s;
+		const int rows = parts[i].y1 - parts[i].y0 + 1;
+		ID3D11ShaderResourceView *src = s->srv.Get();
+		u32 srcY = (u32)parts[i].y0;
+		if (scale_ > 1) {
+			if (!EnsureScratch(packTex_, std::addressof(packUav_), std::addressof(packSrv_), s->width, rows, &packW_, &packH_, false))
+				return nullptr;
+			CopyCB cb{};
+			cb.origin[1] = (u32)parts[i].y0;
+			cb.size[0] = (u32)s->width;
+			cb.size[1] = (u32)rows;
+			cb.scale = (u32)scale_;
+			cb.format = (u32)s->fmt;
+			RunCompute(csReduce_.Get(), s->srv.Get(), packUav_.Get(), cb, (UINT)(s->width + 7) / 8, (UINT)(rows + 7) / 8);
+			src = packSrv_.Get();
+			srcY = 0;
+		}
+		TexCB cb{};
+		cb.start = s->Start(parts[i].y0);
+		cb.rowBytes = s->RowBytes();
+		cb.extent[0] = (u32)s->width * (u32)s->bpp / 4;
+		cb.extent[1] = (u32)rows;
+		cb.bpp = (u32)s->bpp;
+		cb.clipStart = off;
+		cb.clipEnd = (u32)readEnd;
+		cb.srcY = srcY;
+		TexCompute(csPack_.Get(), cb, src, vramImgUav_.Get(), nullptr, (cb.extent[0] + 63) / 64, (UINT)rows);
+	}
+	if (ss.texfmt >= GE_TFMT_CLUT4)
+		ctx_->UpdateSubresource(clutBuf_.Get(), 0, nullptr, ss.clut, 0, 0);
+	TexCB cb{};
+	cb.start = off;
+	cb.rowBytes = rowBytes;
+	cb.extent[0] = (u32)w;
+	cb.extent[1] = (u32)h;
+	cb.texFmt = ss.texfmt;
+	cb.clutFmt = ss.clutfmt;
+	cb.clutShift = ss.clutShift;
+	cb.clutMask = ss.clutMask;
+	cb.clutOffset = ss.clutOffset;
+	cb.clutSimple = ss.clutSimple ? 1 : 0;
+	TexCompute(csDecodeTex_.Get(), cb, nullptr, nullptr, gpuTexUav_.Get(), (UINT)(w + 7) / 8, (UINT)(h + 7) / 8);
+	stats_.gpuTextures++;
+	if (texVerify_)
+		VerifyGpuTexture(ss, w, h);
+	return gpuTexSrv_.Get();
+}
+
+// PSPC_D3D11_TEXTURE_VERIFY: the texture as the texture cache would decode it (after writing the
+// rendering back), against the GPU's.
+void D3D11Backend::VerifyGpuTexture(const SamplerState &ss, int w, int h) {
+	if (!gpuTexStaging_) {
+		D3D11_TEXTURE2D_DESC td{};
+		gpuTex_->GetDesc(&td);
+		td.Usage = D3D11_USAGE_STAGING;
+		td.BindFlags = 0;
+		td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		if (FAILED(dev_->CreateTexture2D(&td, nullptr, &gpuTexStaging_)))
+			return;
+	}
+	const D3D11_BOX box{ 0, 0, 0, (UINT)w, (UINT)h, 1 };
+	ctx_->CopySubresourceRegion(gpuTexStaging_.Get(), 0, 0, 0, 0, gpuTex_.Get(), 0, &box);
+	D3D11_MAPPED_SUBRESOURCE m{};
+	if (FAILED(ctx_->Map(gpuTexStaging_.Get(), 0, D3D11_MAP_READ, 0, &m)))
+		return;
+	verifyBuf_.resize((size_t)w * h);
+	for (int y = 0; y < h; ++y)
+		memcpy(&verifyBuf_[(size_t)y * w], (const u8 *)m.pData + (size_t)y * m.RowPitch, (size_t)w * 4);
+	ctx_->Unmap(gpuTexStaging_.Get(), 0);
+	const TexLevel &lv = ss.levels[0];
+	{
+		CauseScope cs(this, DL_TEXTURE);
+		SyncRange(lv.addr, (u32)std::min<u64>((u64)std::min<int>(lv.h, 512) * lv.bufw * kTexelBits[ss.texfmt] / 8, lv.validBytes));
+	}
+	std::vector<u32> want((size_t)w * h);
+	DecodeTextureLevel(ss, 0, w, h, want.data(), (size_t)w);
+	stats_.texVerified++;
+	for (size_t i = 0; i < want.size(); ++i) {
+		if (want[i] != verifyBuf_[i]) {
+			if (stats_.texMismatches < 20)
+				LOGW("d3d11", "GPU texture %08x (format %d, %d x %d, bufw %d): texel %zu, %zu is %08x on the GPU, %08x on the CPU", lv.addr, ss.texfmt, w, h,
+				     lv.bufw, i % (size_t)w, i / (size_t)w, verifyBuf_[i], want[i]);
+			stats_.texMismatches++;
+			break;
+		}
+	}
+}
+
 void D3D11Backend::BindDraw(Surface *color, Surface *depth) {
 	const UINT stride = sizeof(GpuVertex), offset = 0;
 	ctx_->IASetInputLayout(layout_.Get());
@@ -1293,6 +1696,40 @@ void D3D11Backend::BindDraw(Surface *color, Surface *depth) {
 	ID3D11UnorderedAccessView *uavs[2] = { color->uav.Get(), depth ? depth->uav.Get() : dummyUav_.Get() };
 	ctx_->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr, 0, 2, uavs, nullptr);
 	omDirty_ = false;
+}
+
+// The pixel rows the batch's GPU vertices can reach: a row is drawn only where the primitive spans one of
+// its pixel centers (at any render scale; lines may reach half a pixel further). Jobs the GPU transforms
+// count their scissor's rows (their ranges).
+void D3D11Backend::DrawnRows(const BatchPrim *prims, size_t n, int *y0, int *y1) const {
+	for (const Segment &seg : segs_) {
+		if (seg.gpu || seg.count == 0)
+			continue;
+		float lo = verts_[seg.first].y, hi = lo;
+		for (u32 i = seg.first + 1; i < seg.first + seg.count; ++i) {
+			lo = std::min(lo, verts_[i].y);
+			hi = std::max(hi, verts_[i].y);
+		}
+		if (!(lo >= -(float)MAX_SURFACE_H && hi <= 2.0f * MAX_SURFACE_H)) {
+			// Not a usable bound (NaN or far outside): the primitives' ranges stand.
+			*y0 = INT_MAX;
+			*y1 = -1;
+			return;
+		}
+		if (seg.lines) {
+			*y0 = std::min(*y0, (int)std::floor(lo) - 1);
+			*y1 = std::max(*y1, (int)std::floor(hi) + 1);
+		} else {
+			*y0 = std::min(*y0, (int)std::floor(lo));
+			*y1 = std::max(*y1, (int)std::ceil(hi) - 1);
+		}
+	}
+	for (size_t i = 0; i < n; ++i) {
+		if (prims[i].type == PrimType::Geometry) {
+			*y0 = std::min(*y0, prims[i].range.y1 / SUBPIX);
+			*y1 = std::max(*y1, prims[i].range.y2 / SUBPIX);
+		}
+	}
 }
 
 void D3D11Backend::DrawBatch(const BatchPrim *prims, size_t n, const RasterState *states, size_t ns) {
@@ -1327,6 +1764,19 @@ void D3D11Backend::DrawBatchImpl(const BatchPrim *prims, size_t n, const RasterS
 	maxRow = std::min(maxRow, MAX_SURFACE_H - 1);
 	if (minRow > maxRow)
 		return;
+	{
+		ScopedTimer tb(&stats_.tBuild);
+		BuildVertices(prims, n, states, geo);
+		FillStates(states, ns);
+	}
+	// The primitives' ranges are their bounding boxes in subpixels, so one ending on a row boundary
+	// counts the row below too; the vertices made for the GPU give the rows it can draw.
+	int drawY0 = INT_MAX, drawY1 = -1;
+	DrawnRows(prims, n, &drawY0, &drawY1);
+	if (drawY0 <= drawY1) {
+		minRow = std::max(minRow, std::max(drawY0, 0));
+		maxRow = std::min(maxRow, drawY1);
+	}
 	Surface *color = GetSurface(p0.fbOffset, p0.fbStride, p0.fbFormat, maxRow + 1);
 	if (!color)
 		return;
@@ -1334,12 +1784,6 @@ void D3D11Backend::DrawBatchImpl(const BatchPrim *prims, size_t n, const RasterS
 	ValidateRows(color, minRow, maxRow);
 	if (depth)
 		ValidateRows(depth, minRow, maxRow);
-
-	{
-		ScopedTimer tb(&stats_.tBuild);
-		BuildVertices(prims, n, states, geo);
-		FillStates(states, ns);
-	}
 	if (segs_.empty())
 		return;
 	if (geo && !geo->Empty()) {
@@ -1430,7 +1874,9 @@ void D3D11Backend::DrawBatchImpl(const BatchPrim *prims, size_t n, const RasterS
 				stats_.rttDraws++;
 			} else {
 				ScopedTimer tt(&stats_.tTexture);
-				srv = texCache_->Lookup(st.samp, runSeq_, &SyncRangeThunk, this);
+				srv = GpuTexture(st.samp);
+				if (!srv)
+					srv = texCache_->Lookup(st.samp, runSeq_, &SyncRangeThunk, this);
 				if (!srv)
 					continue;
 			}
@@ -1814,6 +2260,7 @@ bool D3D11Backend::ReadDisplay(Surface *s, int width, int height, int format, in
 bool D3D11Backend::GetDisplayImage(u32 addr, int stride, int format, int width, int height, std::vector<u32> &out, int *outW, int *outH,
                                    int outScale) {
 	std::lock_guard<std::recursive_mutex> lock(mu_);
+	CauseScope cs(this, DL_DISPLAY);
 	Surface *s = scale_ > 1 ? DisplaySurface(addr, stride, format, width) : nullptr;
 	if (!s) {
 		SyncRange(addr, (u32)(height * stride * (format == GE_FORMAT_8888 ? 4 : 2)));
@@ -2064,6 +2511,11 @@ std::unique_ptr<RenderBackend> CreateD3D11Backend(const D3D11Options &opts, std:
 D3D11TransformStats GetD3D11TransformStats(RenderBackend *backend) {
 	auto *b = dynamic_cast<D3D11Backend *>(backend);
 	return b ? b->TransformStats() : D3D11TransformStats{};
+}
+
+D3D11WriteBackStats GetD3D11WriteBackStats(RenderBackend *backend) {
+	auto *b = dynamic_cast<D3D11Backend *>(backend);
+	return b ? b->WriteBackStats() : D3D11WriteBackStats{};
 }
 
 }  // namespace gpu::hw

@@ -41,6 +41,14 @@ struct D3D11TransformStats {
 };
 D3D11TransformStats GetD3D11TransformStats(RenderBackend *backend);
 
+// Rendering written back to guest memory so far (a D3D11 backend's; zeros for others): every write-back,
+// those that took the copy made at the end of a GE run, textures over rendering decoded on the GPU
+// instead, and how many of those differed from the CPU's decoding (PSPC_D3D11_TEXTURE_VERIFY).
+struct D3D11WriteBackStats {
+	u64 downloads = 0, earlyCopiesUsed = 0, gpuTextures = 0, textureMismatches = 0;
+};
+D3D11WriteBackStats GetD3D11WriteBackStats(RenderBackend *backend);
+
 // Creates the backend; nullptr (with the reason in *error) when this machine can't run it (no D3D11
 // device with rasterizer-ordered views).
 std::unique_ptr<RenderBackend> CreateD3D11Backend(const D3D11Options &opts, std::string *error);

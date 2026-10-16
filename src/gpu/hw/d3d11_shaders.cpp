@@ -107,6 +107,28 @@ PSIn VSMain(VSIn i) {
 }
 )HLSL";
 
+// 16-bit texel and CLUT colors as RGBA8888 (color.h), for 16-bit inputs.
+static const char kColorConv[] = R"HLSL(
+uint RGBA4444ToRGBA8888(uint src) {
+	uint c = (src & 0x000F) | ((src & 0x00F0) << 4) | ((src & 0x0F00) << 8) | ((src & 0xF000) << 12);
+	return c | (c << 4);
+}
+uint RGBA5551ToRGBA8888(uint src) {
+	uint dark = ((src & 0x1F) << 3) | ((src & 0x3E0) << 6) | ((src & 0x7C00) << 9);
+	uint full = dark | ((dark >> 5) & 0x070707);
+	if (src >> 15)
+		full |= 0xFF000000;
+	return full;
+}
+uint RGB565ToRGBA8888(uint src) {
+	uint dark_rb = ((src & 0x1F) << 3) | ((src & 0xF800) << 8);
+	uint full_rb = dark_rb | ((dark_rb >> 5) & 0x070007);
+	uint dark_g = (src & 0x7E0) << 5;
+	uint full_g = dark_g | ((dark_g >> 6) & 0x300);
+	return full_rb | full_g | 0xFF000000;
+}
+)HLSL";
+
 static const char kPixel1[] = R"HLSL(
 #ifndef FMT
 #define FMT 3
@@ -126,24 +148,6 @@ Texture2D<uint> rttTex : register(t2);
 RasterizerOrderedTexture2D<uint> fbuf : register(u0);
 RasterizerOrderedTexture2D<uint> zbuf : register(u1);
 
-uint RGBA4444ToRGBA8888(uint src) {
-	uint c = (src & 0x000F) | ((src & 0x00F0) << 4) | ((src & 0x0F00) << 8) | ((src & 0xF000) << 12);
-	return c | (c << 4);
-}
-uint RGBA5551ToRGBA8888(uint src) {
-	uint dark = ((src & 0x1F) << 3) | ((src & 0x3E0) << 6) | ((src & 0x7C00) << 9);
-	uint full = dark | ((dark >> 5) & 0x070707);
-	if (src >> 15)
-		full |= 0xFF000000;
-	return full;
-}
-uint RGB565ToRGBA8888(uint src) {
-	uint dark_rb = ((src & 0x1F) << 3) | ((src & 0xF800) << 8);
-	uint full_rb = dark_rb | ((dark_rb >> 5) & 0x070007);
-	uint dark_g = (src & 0x7E0) << 5;
-	uint full_g = dark_g | ((dark_g >> 6) & 0x300);
-	return full_rb | full_g | 0xFF000000;
-}
 uint ExpandColor(uint raw) {
 #if FMT == 0
 	return RGB565ToRGBA8888(raw) & 0x00FFFFFF;
@@ -699,6 +703,111 @@ void CSDisplay(uint3 id : SV_DispatchThreadID) {
 }
 )HLSL";
 
+// Textures that read rendering not yet written back (d3d11_backend.cpp GpuTexture): CSPack writes a
+// surface's rows (1x raw pixels) into an image of guest VRAM, as a write-back would put them in memory;
+// CSDecodeTex decodes a texture level from that image as sampler.h's FetchTexelT does (linear layout).
+static const char kTexDecode[] = R"HLSL(
+cbuffer TexCB : register(b0) {
+	uint start;       // VRAM offset: CSPack the first row's, CSDecodeTex the texture's
+	uint rowBytes;    // bytes from one row to the next
+	uint2 extent;     // CSPack: words per row, rows; CSDecodeTex: texels
+	uint bpp;         // CSPack: 2 or 4
+	uint clipStart;   // CSPack: only the bytes in [clipStart, clipEnd) are written
+	uint clipEnd;
+	uint srcY;        // CSPack: the first row in packSrc
+	uint texFmt;      // CSDecodeTex: GE_TFMT_* (up to CLUT32)
+	uint clutFmt;
+	uint clutShift;
+	uint clutMask;
+	uint clutOffset;
+	uint clutSimple;
+	uint2 texPad;
+};
+Texture2D<uint> packSrc : register(t0);
+ByteAddressBuffer vramIn : register(t1);
+ByteAddressBuffer clutIn : register(t2);
+RWByteAddressBuffer vramOut : register(u0);
+RWTexture2D<uint4> texOut : register(u1);
+
+[numthreads(64, 1, 1)]
+void CSPack(uint3 id : SV_DispatchThreadID) {
+	if (id.x >= extent.x || id.y >= extent.y)
+		return;
+	uint a = start + id.y * rowBytes + id.x * 4;
+	if (a >= clipEnd || a + 4 <= clipStart)
+		return;
+	uint v;
+	if (bpp == 4)
+		v = packSrc[uint2(id.x, srcY + id.y)];
+	else
+		v = (packSrc[uint2(id.x * 2, srcY + id.y)] & 0xFFFF) | (packSrc[uint2(id.x * 2 + 1, srcY + id.y)] << 16);
+	if (a < clipStart || a + 4 > clipEnd) {
+		uint keep = 0;
+		[unroll] for (uint k = 0; k < 4; ++k) {
+			if (a + k < clipStart || a + k >= clipEnd)
+				keep |= 0xFFu << (k * 8);
+		}
+		v = (v & ~keep) | (vramOut.Load(a) & keep);
+	}
+	vramOut.Store(a, v);
+}
+
+uint VramByte(uint a) {
+	return (vramIn.Load(a & ~3u) >> ((a & 3u) * 8)) & 0xFF;
+}
+uint Vram16(uint a) {
+	return VramByte(a) | (VramByte(a + 1) << 8);
+}
+uint Vram32(uint a) {
+	return Vram16(a) | (Vram16(a + 2) << 16);
+}
+uint Clut16(uint a) {
+	return (clutIn.Load(a & ~3u) >> ((a & 2u) * 8)) & 0xFFFF;
+}
+// sampler.h LookupClut at level 0.
+uint LookupClut(uint index) {
+	if (clutSimple == 0) {
+		uint offsetMask = clutFmt == 3 ? 0xFF : 0x1FF;
+		index = ((index >> clutShift) & clutMask) | (clutOffset & offsetMask);
+	} else {
+		index &= 0xFF;
+	}
+	if (clutFmt == 0)
+		return RGB565ToRGBA8888(Clut16(2 * (index & 0x3FF)));
+	if (clutFmt == 1)
+		return RGBA5551ToRGBA8888(Clut16(2 * (index & 0x3FF)));
+	if (clutFmt == 2)
+		return RGBA4444ToRGBA8888(Clut16(2 * (index & 0x3FF)));
+	return clutIn.Load(4 * (index & 0x1FF));
+}
+
+[numthreads(8, 8, 1)]
+void CSDecodeTex(uint3 id : SV_DispatchThreadID) {
+	if (id.x >= extent.x || id.y >= extent.y)
+		return;
+	uint u = id.x, row = start + id.y * rowBytes;
+	uint c;
+	if (texFmt == 0)
+		c = RGB565ToRGBA8888(Vram16(row + u * 2));
+	else if (texFmt == 1)
+		c = RGBA5551ToRGBA8888(Vram16(row + u * 2));
+	else if (texFmt == 2)
+		c = RGBA4444ToRGBA8888(Vram16(row + u * 2));
+	else if (texFmt == 3)
+		c = Vram32(row + u * 4);
+	else if (texFmt == 4) {
+		uint b = VramByte(row + (u >> 1));
+		c = LookupClut((u & 1) != 0 ? (b >> 4) : (b & 0xF));
+	} else if (texFmt == 5)
+		c = LookupClut(VramByte(row + u));
+	else if (texFmt == 6)
+		c = LookupClut(Vram16(row + u * 2));
+	else
+		c = LookupClut(Vram32(row + u * 4));
+	texOut[id.xy] = uint4(c & 0xFF, (c >> 8) & 0xFF, (c >> 16) & 0xFF, c >> 24);
+}
+)HLSL";
+
 // Texture upscaling: xBR level 2, Hyllian's algorithm (after his MIT-licensed xBR-lv2 shader). Every
 // output texel comes from the 5x5 texels around its source texel: where an edge runs through a corner of
 // the source texel, the corner takes the neighbor's color up to the edge, at 45, 30 or 60 degrees, so
@@ -866,7 +975,8 @@ float4 PSPresent(float4 pos : SV_Position) : SV_Target {
 std::string ShaderSource(ShaderKind kind) {
 	switch (kind) {
 	case ShaderKind::Vertex: return std::string(kCommon) + kVertex;
-	case ShaderKind::Pixel: return std::string(kCommon) + kPixel1 + kPixel2;
+	case ShaderKind::Pixel: return std::string(kCommon) + kColorConv + kPixel1 + kPixel2;
+	case ShaderKind::TexDecode: return std::string(kColorConv) + kTexDecode;
 	case ShaderKind::Upscale: return kUpscale;
 	case ShaderKind::Present: return std::string(kDisplay) + kPresent;
 	case ShaderKind::Geometry: return GeometryShaderSource();
