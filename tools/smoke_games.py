@@ -21,9 +21,12 @@ tree. Discovery/migration runs once before the parallel guests; other user setti
 ignored. References record the resolved flash0 so a check with another one says so.
 
 The report lists each game's exit status (crash / timeout / exit), the last frame dumped, how many
-distinct frames there were (a frozen screen shows up as 1-2), the checkpoints, and the first lines
-of any crash backtrace. Frame dumps stay in --out/<game>/. Exit status 1 when a game crashed, hung
-or froze, or missed or changed at a checkpoint.
+distinct frames there were (a frozen screen shows up as 1-2), the checkpoints, the first lines
+of any crash backtrace, and what the run logged as errors (a host operation that failed, such as a
+save the memory stick couldn't take, sends a game down another path). Frame dumps and the run's log
+(log.txt) stay in --out/<game>/. Exit status 1 when a game crashed, hung or froze, or missed or
+changed at a checkpoint, or (--record) its references weren't recorded: a run that logged errors
+isn't.
 """
 import argparse
 import concurrent.futures
@@ -171,6 +174,8 @@ def run_one(args, game, presses, points, flash0):
         code, err = None, 'host timeout'
     finally:
         shutil.rmtree(ms, ignore_errors=True)
+    # The run's log (--log warn) stays with its frames, to look into a run afterwards.
+    (out / 'log.txt').write_text(err, encoding='utf-8')
     frames = sorted(out.glob('frame_*.bmp'))
     distinct = len({hashlib.sha1(f.read_bytes()).hexdigest() for f in frames})
     if code == 124:
@@ -184,8 +189,11 @@ def run_one(args, game, presses, points, flash0):
     if points and status == 'ran' and not (out / frame_name(points[-1][0])).exists():
         status = 'TOO SLOW'  # the wall-clock limit came before the last checkpoint
     crash = [l for l in err.splitlines() if l.startswith('[FATAL]') or l.lstrip().startswith('#')][:8]
+    # What the run logged as errors: a host operation that failed (a save the memory stick couldn't
+    # take) sends the game down another path, and its frames are no good as references.
+    errors = list(dict.fromkeys(l for l in err.splitlines() if l.startswith('[E]')))
     return {'game': game, 'status': status, 'last': frames[-1].stem if frames else '-', 'frames': len(frames),
-            'distinct': distinct, 'crash': crash, 'out': out, 'points': points}
+            'distinct': distinct, 'crash': crash, 'errors': errors, 'out': out, 'points': points}
 
 
 def check(result, refs, flash0):
@@ -216,6 +224,8 @@ def record(result, refs, args, flash0):
     missing = [vb for vb, _, _ in result['points'] if not (result['out'] / frame_name(vb)).exists()]
     if missing:
         return 'not recorded: no frame at %s' % ', '.join(map(str, missing))
+    if result['errors']:
+        return 'not recorded: the run logged errors (%s)' % (result['out'] / 'log.txt')
     if refs.exists():
         shutil.rmtree(refs)
     refs.mkdir(parents=True)
@@ -280,7 +290,8 @@ def main():
         lines = []
         if r['points']:
             if args.record:
-                lines = [(None, '', record(r, refs, args, flash0), False)]
+                verdict = record(r, refs, args, flash0)
+                lines = [(None, '', verdict, verdict.startswith('not recorded'))]
             else:
                 lines = check(r, refs, flash0)
         passed = sum(1 for vb, _, v, f in lines if vb is not None and not f and not v.startswith('no reference'))
@@ -295,6 +306,10 @@ def main():
             failed = failed or f
         for l in r['crash']:
             print('    ' + l[:150])
+        for l in r['errors'][:5]:
+            print('    logged: ' + l[:150])
+        if len(r['errors']) > 5:
+            print('    logged: ... %d more in %s' % (len(r['errors']) - 5, r['out'] / 'log.txt'))
         bad += failed
     print('\n%d game(s), %d with problems; frames in %s' % (len(results), bad, args.out))
     return 1 if bad else 0

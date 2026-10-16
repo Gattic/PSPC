@@ -78,6 +78,22 @@ What went in:
   - **A fresh memory stick per run.** pspc's own ms0 held a real Elite Squadron profile, which
     changes the path, and some paths save.
   - **`--no-plugins` no longer overlays the plugins folder onto ms0:.**
+  - **A host operation that fails changes the path too** (2026-10-16). One recording of Elite
+    Squadron's D3D11 references differed from every later run at 6600, 9600 and 14400, and by
+    14400 in the battle itself (31/56 reinforcements against 30/50, another capture message).
+    - **Cause:** that run's profile save failed on the host.
+      `ms0:/PSP/SAVEDATA/ULUS103900000/DATA.BIN` wasn't written, the savedata utility returned
+      SAVE_MS_NOSPACE, and the game's path after that is another one. Making that write fail
+      reproduces all six frames byte for byte; with the software renderer it changes the same
+      three checkpoints. Why the host write failed that once is unknown: the run's log wasn't kept.
+    - **Not the renderer:** about 60 D3D11 runs gave the same frames. They covered two builds
+      (98d2857, 6827dce), runs alone and six at a time under CPU load, a cold shader cache, the CPU
+      transform, `PSPC_D3D11_SYNC=eager`, and every GPU resource filled with garbage at creation.
+      With the software renderer and with D3D11, the guest's RAM is the same at every 300
+      VBlanks to 14400: Elite Squadron never reads its rendering back into game state.
+    - **Now:** `smoke_games.py` keeps each run's log (`log.txt` beside its frames) and lists the
+      errors it logged under the game. `--record` refuses a run that logged errors (normal runs of
+      the eight games log none).
 - **Richer input:**
   - analog stick directions in `--press`: AUP, ADOWN, ALEFT, ARIGHT;
   - `osk=<text>` in `tools/smoke_inputs.txt`, for the system keyboard (MHFU and Elite
@@ -176,10 +192,10 @@ What went in:
 
     Logan's Shadow's GE time at VBlank 7800 went from 8.7-10.0 to 4.7-6.0 ms per frame. The downloads
     left are the CPU's reads, one a frame.
-  - **Verified:** every D3D11 and software checkpoint as before (Elite Squadron's D3D11 run differs
-    between two runs of the old build too; the new build's 48 frames equal the second run's), no
-    texture different from the CPU's decoding (Logan's Shadow 5260, Elite Squadron 14430), and
-    `gpu_hardware_guarded_render_to_texture` (WARP, with the VRAM guard).
+  - **Verified:** every D3D11 and software checkpoint as before (Elite Squadron's D3D11 references
+    came from a run whose profile save failed on the host, see Phase 0; the new build's 48 frames
+    equal a normal run's), no texture different from the CPU's decoding (Logan's Shadow 5260, Elite
+    Squadron 14430), and `gpu_hardware_guarded_render_to_texture` (WARP, with the VRAM guard).
 
 ### 1.3 Syphon Filter: Logan's Shadow (UCUS98606)
 - **Status:**
