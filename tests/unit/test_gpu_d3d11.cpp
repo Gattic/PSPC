@@ -331,9 +331,11 @@ TEST(gpu_hardware_matches_software) {
 
 namespace {
 
-// A 32 x 32 texture split along its diagonal (white above, black below) drawn 1:1, with nearest filtering,
-// over mid gray at render scale 4. Returns the display image at outScale (0: the render scale).
-std::vector<u32> RenderDiagonal(int textureFilter, int textureUpscale, int outScale, int *w, int *h) {
+// A 32 x 32 texture split along its diagonal (white above, black below; alpha texAlpha) drawn 1:1, with
+// nearest filtering, over mid gray at render scale 4, with the texture's alpha used or not (texture
+// function RGBA / RGB). Returns the display image at outScale (0: the render scale).
+std::vector<u32> RenderDiagonal(int textureFilter, int textureUpscale, int outScale, int *w, int *h,
+                                u32 texAlpha = 0xFF000000u, bool textureAlpha = true) {
 	Env env;
 	BackendOptions o;
 	o.scale = 4;
@@ -349,7 +351,7 @@ std::vector<u32> RenderDiagonal(int textureFilter, int textureUpscale, int outSc
 	SetRenderBackend(backend.get());
 	for (int v = 0; v < 32; ++v)
 		for (int u = 0; u < 32; ++u)
-			GWrite32(TEX + (u32)(v * 32 + u) * 4, u + v < 32 ? 0xFFFFFFFFu : 0xFF000000u);
+			GWrite32(TEX + (u32)(v * 32 + u) * 4, texAlpha | (u + v < 32 ? 0xFFFFFFu : 0u));
 	DL dl;
 	dl.C(GE_CMD_FRAMEBUFPTR, 0).C(GE_CMD_FRAMEBUFWIDTH, 512).C(GE_CMD_FRAMEBUFPIXFORMAT, GE_FORMAT_8888);
 	dl.C(GE_CMD_SCISSOR1, 0).C(GE_CMD_SCISSOR2, 479 | (271 << 10)).C(GE_CMD_REGION1, 0).C(GE_CMD_REGION2, 479 | (271 << 10));
@@ -358,7 +360,8 @@ std::vector<u32> RenderDiagonal(int textureFilter, int textureUpscale, int outSc
 	dl.C(GE_CMD_CLEARMODE, 1 | (7 << 8)).C(GE_CMD_VERTEXTYPE, VT_C8888_P16).Prim(GE_PRIM_RECTANGLES, 2, VERTS + 0x70000).C(GE_CMD_CLEARMODE, 0);
 	dl.C(GE_CMD_TEXTUREMAPENABLE, 1).C(GE_CMD_TEXFORMAT, GE_TFMT_8888).C(GE_CMD_TEXMODE, 0);
 	dl.C(GE_CMD_TEXADDR0, TEX & 0xFFFFF0).C(GE_CMD_TEXBUFWIDTH0, 32 | ((TEX >> 8) & 0x0F0000));
-	dl.C(GE_CMD_TEXSIZE0, 5 | (5 << 8)).C(GE_CMD_TEXFUNC, GE_TEXFUNC_REPLACE | 0x100).C(GE_CMD_TEXFILTER, 0).C(GE_CMD_TEXWRAP, 1 | (1 << 8));
+	dl.C(GE_CMD_TEXSIZE0, 5 | (5 << 8)).C(GE_CMD_TEXFUNC, GE_TEXFUNC_REPLACE | (textureAlpha ? 0x100 : 0));
+	dl.C(GE_CMD_TEXFILTER, 0).C(GE_CMD_TEXWRAP, 1 | (1 << 8));
 	TTVert sp[2] = { { 0, 0, 0xFFFFFFFF, 100, 100, 0, 0 }, { 32, 32, 0xFFFFFFFF, 132, 132, 0, 0 } };
 	memcpy(GPtr(VERTS + 0x60000), sp, sizeof(sp));
 	dl.C(GE_CMD_VERTEXTYPE, VT_T16_C8888_P16).Prim(GE_PRIM_RECTANGLES, 2, VERTS + 0x60000);
@@ -413,6 +416,18 @@ TEST(gpu_hardware_texture_upscaling_and_filtering) {
 	if (step > 2)
 		printf("  xBR diagonal: steps of %d pixels\n", step);
 	CHECK(!xbr.empty() && step <= 2);
+	// A texture drawn without its alpha (texture function RGB) that keeps 0 there: upscaled, its colors
+	// stay (blended premultiplied by that alpha, all of it was black) and its diagonal is smooth too.
+	std::vector<u32> noAlpha = RenderDiagonal(0, 4, 0, &w, &h, 0, false);
+	CHECK(!noAlpha.empty());
+	if (!noAlpha.empty()) {
+		CHECK((noAlpha[(size_t)(102 * 4) * w + 102 * 4] & 0xFFFFFF) == 0xFFFFFF);
+		CHECK((noAlpha[(size_t)(130 * 4) * w + 130 * 4] & 0xFFFFFF) == 0x000000);
+		DiagonalShape(noAlpha, w, &step, &blended);
+		if (step > 2)
+			printf("  xBR diagonal without alpha: steps of %d pixels\n", step);
+		CHECK(step <= 2);
+	}
 	// Linear filtering forced: the edge is blended.
 	std::vector<u32> linear = RenderDiagonal(2, 1, 0, &w, &h);
 	DiagonalShape(linear, w, &step, &blended);

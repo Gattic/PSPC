@@ -812,7 +812,10 @@ void CSDecodeTex(uint3 id : SV_DispatchThreadID) {
 // output texel comes from the 5x5 texels around its source texel: where an edge runs through a corner of
 // the source texel, the corner takes the neighbor's color up to the edge, at 45, 30 or 60 degrees, so
 // diagonals and curves come out smooth instead of stepped. Edges are found on luma, with alpha counted
-// (outlines against transparent texels are edges too); colors blend premultiplied by alpha.
+// (outlines against transparent texels are edges too); colors blend premultiplied by alpha, so
+// transparent texels lend no color to the edges of visible ones - except where the result is fully
+// transparent: there the colors blend as they are, since a game may draw a texture without its alpha
+// (texture function RGB) and keep 0 in it (Elite Squadron's Republic cruiser hull was drawn black).
 static const char kUpscale[] = R"HLSL(
 cbuffer UpscaleCB : register(b0) {
 	int2 lvOrigin;   // the level in the 1x atlas
@@ -828,7 +831,9 @@ float4 UpTexel(int2 p, int dx, int dy) {
 	int x = p.x + dx, y = p.y + dy;
 	x = (wrapMode & 1) ? ((x % lvSize.x) + lvSize.x) % lvSize.x : clamp(x, 0, lvSize.x - 1);
 	y = (wrapMode & 2) ? ((y % lvSize.y) + lvSize.y) % lvSize.y : clamp(y, 0, lvSize.y - 1);
-	float4 c = (float4)upSrc.Load(int3(lvOrigin + int2(x, y), 0)) / 255.0;
+	return (float4)upSrc.Load(int3(lvOrigin + int2(x, y), 0)) / 255.0;
+}
+float4 Premul(float4 c) {
 	return float4(c.rgb * c.a, c.a);
 }
 float Luma(float4 c) {
@@ -907,14 +912,20 @@ void CSUpscale(uint3 id : SV_DispatchThreadID) {
 	bool4 px = Df(e, f) <= Df(e, h);
 	float4 m = max(max(fx30, fx60), max(fx45, fx45i));
 
-	float4 res1 = lerp(E, px.x ? F : H, m.x);
-	res1 = lerp(res1, px.z ? D : B, m.z);
-	float4 res2 = lerp(E, px.y ? B : F, m.y);
-	res2 = lerp(res2, px.w ? H : D, m.w);
-	// Of the two, the one further from E.
+	// Blended premultiplied and as they are; of each pair, the one further from E.
 	const float4 one = float4(1.0, 1.0, 1.0, 1.0);
-	float4 r = dot(abs(E - res2), one) >= dot(abs(E - res1), one) ? res2 : res1;
-	float3 rgb = r.a > 0.0 ? r.rgb / r.a : float3(0.0, 0.0, 0.0);
+	float4 pE = Premul(E);
+	float4 res1 = lerp(pE, Premul(px.x ? F : H), m.x);
+	res1 = lerp(res1, Premul(px.z ? D : B), m.z);
+	float4 res2 = lerp(pE, Premul(px.y ? B : F), m.y);
+	res2 = lerp(res2, Premul(px.w ? H : D), m.w);
+	float4 r = dot(abs(pE - res2), one) >= dot(abs(pE - res1), one) ? res2 : res1;
+	float4 st1 = lerp(E, px.x ? F : H, m.x);
+	st1 = lerp(st1, px.z ? D : B, m.z);
+	float4 st2 = lerp(E, px.y ? B : F, m.y);
+	st2 = lerp(st2, px.w ? H : D, m.w);
+	float4 st = dot(abs(E - st2), one) >= dot(abs(E - st1), one) ? st2 : st1;
+	float3 rgb = r.a > 0.0 ? r.rgb / r.a : st.rgb;
 	upDst[(uint2)lvOrigin * factor + id.xy] = (uint4)round(saturate(float4(rgb, r.a)) * 255.0);
 }
 )HLSL";
