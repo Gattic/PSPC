@@ -161,6 +161,21 @@ struct Surface {
 	GLuint texture = 0;
 	std::vector<u32> shadow;
 };
+// Use the sampler's readable range conservatively: it covers every format and swizzle.
+// A wrapped target may touch either end of VRAM, so keep its existing synchronization.
+bool MayReadSurface(const SamplerState &ss, const Surface &surface) {
+	const u64 end = (u64)surface.addr + (u64)surface.stride * surface.h * (surface.fmt == 3 ? 4 : 2);
+	for (int level = 0; level <= ss.maxLevel; ++level) {
+		const auto &lv = ss.levels[level];
+		if (!lv.ptr)
+			continue;
+		const u32 addr = FoldAddress(lv.addr);
+		if (addr >= VRAM_BASE && addr < VRAM_BASE + VRAM_SIZE &&
+			(end > VRAM_BASE + VRAM_SIZE || (addr < end && (u64)addr + lv.validBytes > surface.addr)))
+			return true;
+	}
+	return false;
+}
 class OpenGLBackend final : public RenderBackend, private DrawData {
 	SDL_Window *window_ = nullptr;
 	SDL_GLContext context_ = nullptr;
@@ -579,9 +594,11 @@ class OpenGLBackend final : public RenderBackend, private DrawData {
 			const auto &st = states[seg.state];
 			GLuint texture = 0, feedback = 0;
 			if (st.enableTextures && !st.pix.clearMode) {
-				// Indexed/swizzled feedback also sees all preceding draws in this batch.
-				Download(*color);
-				if (depth)
+				// Only targets a texture can read need intermediate synchronization.
+				// Indexed/swizzled feedback and all mip levels still see preceding draws.
+				if (MayReadSurface(st.samp, *color))
+					Download(*color);
+				if (depth && MayReadSurface(st.samp, *depth))
 					Download(*depth);
 				texture = Decode(st.samp);
 				if (!st.samp.swizzle && st.samp.maxLevel == 0 && st.samp.texfmt <= GE_TFMT_8888) {

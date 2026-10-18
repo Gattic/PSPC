@@ -134,3 +134,56 @@ queries are polled without flushing; the queue is bounded, invalid timestamps
 are rejected, failed queries are discarded, and skipped/disjoint/failed/pending
 samples are reported. Unset
 `PSPC_GPU_PROFILE` before measuring before/after performance.
+
+## Linux OpenGL target readbacks (2026-10-18)
+
+A separate investigation on Fedora 44 / Intel UHD CML GT2 / Mesa 26.2.4 found
+avoidable CPU/GPU synchronization in `OpenGLBackend::DrawBatchImpl`. A bounded
+120-second Dark Mirror profile recorded 37,073 `glGetTextureImage` calls requesting
+20.66 GB, with 83.77 seconds inside that API. Matched runs with geometry verification
+present versus absent both missed VBlank 1800; disabling verification did not solve
+this bottleneck.
+
+The backend downloaded color and depth before **every textured segment**, even
+when its textures could not read either target. Skipping RAM-only dependencies
+first let Dark Mirror reach its endpoint, but was insufficient for the other two
+games. A Logan's Shadow trace then showed swizzled CLUT textures at `0x040cc000`
+and above while the render targets ended at `0x040cc000`.
+
+Intermediate downloads now require a possible overlap with an active mip's
+readable memory range. Address mirrors are folded, wrapped targets remain
+conservative, and eager batch-end guest-memory writeback is unchanged. Using the
+sampler's existing readable bound avoids duplicating format/swizzle address math;
+it may still synchronize more than the actual texels require. No resolution,
+filtering, geometry-verification, interpreter or deadline settings were relaxed.
+
+Three Linux regressions cover RAM and unrelated VRAM textures (nine readbacks
+before the relevant fix, one after, with exact guest pixels), plus in-batch indexed
+feedback through a mirrored address, higher mip and wrapped target. The latter
+retains both required readbacks and checks exact RGB/stencil output. The configured
+build and **40/40 CTests** pass, including 160 registered unit cases with zero
+failures and synthetic interpreter/AOT render-writeback at 1x/2x/4x/8x/16x.
+The hardware-required NVIDIA GTX 1050 Max-Q GPU group also passes **54/54**.
+Missing reference corpora still cause the existing explicit skips.
+
+Fresh isolated retail runs used the original scripted inputs, 120-second limit,
+2x rendering/texture upscaling, strict guest memory and geometry verification:
+
+| Game | Required VBlank | Result | Elapsed / last capture |
+|---|---:|---|---|
+| Dark Mirror | 1800 | PASS | 52.20 s / 1800 |
+| Combat Ops | 3900 | PASS | 117.02 s / 3900 |
+| Logan's Shadow | 3600 | FAIL: deadline | 120.31 s / 3000 |
+
+There were zero geometry differences or reported guest-memory errors. Common
+before/after captures were byte-identical. These are finite title/menu progression
+observations, not sustained gameplay or a repeatability/performance guarantee.
+**The overall retail gate remains incomplete:** Logan's Shadow still has expensive
+late GE work whose remaining cause has not been isolated. No speculative further
+fix or unchanged retry was applied. The investigation retained approximately
+156.3 MiB of its 192 MiB cap; further retail work needs an archival/budget decision,
+not a longer runtime deadline or an automatic continuation.
+
+Evidence and all failed/intermediate attempts are retained under
+`build/linux-pull-check-048f7f9/retail-investigation/`, notably `REPORT.md`,
+`final-results.json`, revision manifests, `final-ctest.log` and `final-nvidia-gpu.log`.

@@ -27,6 +27,18 @@
 
 using namespace gpu;
 
+#if PSPC_TEST_GPU_GL && defined(__linux__)
+#include <GL/glcorearb.h>
+#include <atomic>
+static std::atomic<unsigned> glTextureReadbacks{0};
+extern "C" void __real_glGetTextureImage(GLuint, GLint, GLenum, GLenum, GLsizei, void *);
+extern "C" void __wrap_glGetTextureImage(GLuint texture, GLint level, GLenum format, GLenum type,
+										GLsizei size, void *pixels) {
+	++glTextureReadbacks;
+	__real_glGetTextureImage(texture, level, format, type, size, pixels);
+}
+#endif
+
 namespace {
 #ifdef _WIN32
 using BackendOptions = hw::D3D11Options;
@@ -495,6 +507,124 @@ TEST(gpu_hardware_framebuffer_feedback_and_transfer) {
 		CHECK(reference == actual);
 	}
 }
+
+#if PSPC_TEST_GPU_GL && defined(__linux__)
+static void CheckUnrelatedTextureReadbacks(u32 textureBase) {
+	Env env;
+	BackendOptions options;
+	options.scale = 2;
+	options.gpuTransform = false;
+	std::string error;
+	auto backend = MakeBackend(options, &error);
+	if (!backend) { printf("  OpenGL unavailable: %s\n", error.c_str()); return; }
+	SetRenderBackend(backend.get());
+	DL dl;
+	dl.C(GE_CMD_FRAMEBUFPTR, 0).C(GE_CMD_FRAMEBUFWIDTH, 64).C(GE_CMD_FRAMEBUFPIXFORMAT, GE_FORMAT_8888);
+	dl.C(GE_CMD_ZWRITEDISABLE, 1);
+	dl.C(GE_CMD_SCISSOR1, 0).C(GE_CMD_SCISSOR2, 31 | (31 << 10)).C(GE_CMD_REGION2, 31 | (31 << 10));
+	TVert clear[2] = {{0xFF102030, 0, 0, 0, 0}, {0xFF102030, 32, 32, 0, 0}};
+	memcpy(GPtr(VERTS), clear, sizeof(clear));
+	dl.C(GE_CMD_CLEARMODE, 1 | (3 << 8)).C(GE_CMD_VERTEXTYPE, VT_C8888_P16);
+	dl.Prim(GE_PRIM_RECTANGLES, 2, VERTS).C(GE_CMD_CLEARMODE, 0);
+	dl.C(GE_CMD_TEXTUREMAPENABLE, 1).C(GE_CMD_TEXFORMAT, GE_TFMT_8888).C(GE_CMD_TEXMODE, 0);
+	dl.C(GE_CMD_TEXSIZE0, 0).C(GE_CMD_TEXFILTER, 0).C(GE_CMD_TEXWRAP, 0x101);
+	dl.C(GE_CMD_TEXFUNC, GE_TEXFUNC_REPLACE | 0x100).C(GE_CMD_VERTEXTYPE, VT_T16_C8888_P16);
+	for (int i = 0; i < 8; ++i) {
+		const u32 texture = textureBase + i * 16, vertices = VERTS + 0x1000 + i * 64;
+		GWrite32(texture, 0xFF000000u | (i + 1) * 0x010101u);
+		TTVert sprite[2] = {{0, 0, 0xFFFFFFFF, (s16)(i * 4), 0, 0, 0},
+			{1, 1, 0xFFFFFFFF, (s16)(i * 4 + 4), 4, 0, 0}};
+		memcpy(GPtr(vertices), sprite, sizeof(sprite));
+		dl.C(GE_CMD_TEXADDR0, texture & 0xFFFFF0).C(GE_CMD_TEXBUFWIDTH0, 1 | ((texture >> 8) & 0x0F0000));
+		dl.Prim(GE_PRIM_RECTANGLES, 2, vertices);
+	}
+	dl.C(GE_CMD_FINISH).C(GE_CMD_END);
+	const unsigned before = glTextureReadbacks.load();
+	EnqueueList(dl.start, 0, -1, 0, false); Run(); DrawSync(0);
+	const unsigned reads = glTextureReadbacks.load() - before;
+	printf("  Textures at %08x: %u image readbacks\n", textureBase, reads);
+	// Eager batch-end writeback remains required; unrelated textures need no intermediate readback.
+	CHECK(reads > 0 && reads <= 2);
+	for (int i = 0; i < 8; ++i)
+		CHECK(GRead32(VRAM + (64 + i * 4 + 1) * 4) == (0xFF000000u | (i + 1) * 0x010101u));
+	CHECK(GRead32(VRAM + (8 * 64 + 1) * 4) == 0xFF102030);
+	SetRenderBackend(nullptr);
+}
+TEST(gpu_opengl_ram_textures_do_not_read_back_each_segment) {
+	CheckUnrelatedTextureReadbacks(TEX);
+}
+TEST(gpu_opengl_unrelated_vram_textures_do_not_read_back_each_segment) {
+	CheckUnrelatedTextureReadbacks(VRAM + 0x180000);
+}
+
+TEST(gpu_opengl_feedback_alias_mip_and_wrap) {
+	for (int mode = 0; mode < 3; ++mode) {
+		Env env;
+		BackendOptions options;
+		options.scale = 2;
+		options.gpuTransform = false;
+		std::string error;
+		auto backend = MakeBackend(options, &error);
+		if (!backend) { printf("  OpenGL unavailable: %s\n", error.c_str()); return; }
+		const u32 offset = mode == 2 ? 0x1FF000 : 0;
+		u32 clut[512]{};
+		clut[0] = 0xFF102030;
+		clut[1] = 0xFF336699;
+		RasterState states[2]{};
+		auto &st = states[1];
+		st.pix.fbOffset = offset;
+		st.pix.fbStride = 64;
+		st.pix.fbFormat = GE_FORMAT_8888;
+		st.pix.depthTestFunc = GE_COMP_ALWAYS;
+		st.pix.alphaTestFunc = GE_COMP_ALWAYS;
+		st.scissor = {0, 0, 32 * SUBPIX - 1, 32 * SUBPIX - 1};
+		st.throughMode = true;
+		states[0] = st;
+		states[0].pix.clearMode = true;
+		states[0].pix.colorClear = states[0].pix.stencilClear = true;
+		st.enableTextures = true;
+		auto &ss = st.samp;
+		ss.texfmt = GE_TFMT_CLUT8;
+		ss.clutfmt = GE_CMODE_32BIT_ABGR8888;
+		ss.clut = reinterpret_cast<const u8 *>(clut);
+		ss.clutSimple = ss.useSharedClut = ss.useTextureAlpha = true;
+		ss.texFunc = GE_TEXFUNC_REPLACE;
+		ss.clampS = ss.clampT = true;
+		// Indexed feedback forces the CPU decoder to observe the preceding GPU clear.
+		const u32 texture = mode == 0 ? VRAM + 0x200000 : VRAM;
+		TexLevel feedback{GPtr(VRAM), texture, 4, 16, 1, 1, true};
+		ss.levels[0] = feedback;
+		if (mode == 1) {
+			ss.levels[0] = {GPtr(TEX), TEX, 4, 16, 1, 1, true};
+			ss.levels[1] = feedback;
+			ss.maxLevel = 1;
+			ss.texLevelMode = GE_TEXLEVEL_MODE_CONST;
+			ss.texLevelOffset = 16;
+		}
+		BatchPrim prims[2]{};
+		prims[0].type = PrimType::ClearRect;
+		prims[0].range = st.scissor;
+		prims[0].v[1].x = prims[0].v[1].y = 32 * SUBPIX;
+		prims[0].v[1].color0 = 0x01010101;
+		prims[1].type = PrimType::Rect;
+		prims[1].stateIndex = 1;
+		prims[1].range = st.scissor;
+		prims[1].v[0].x = prims[1].v[0].y = 4 * SUBPIX;
+		prims[1].v[1].x = prims[1].v[1].y = 8 * SUBPIX;
+		prims[1].v[0].color0 = prims[1].v[1].color0 = 0xFFFFFFFF;
+		const unsigned before = glTextureReadbacks.load();
+		backend->DrawBatch(prims, 2, states, 2);
+		CHECK(glTextureReadbacks.load() - before == 2);
+		const u32 pixel = VRAM + ((offset + (5 * 64 + 5) * 4) & 0x1FFFFF);
+		const u32 actual = GRead32(pixel);
+		// Texture RGB replaces the clear, while the framebuffer's stencil byte is retained.
+		const u32 expected = 0x01336699;
+		if (actual != expected)
+			printf("  feedback mode %d: pixel %08x, expected %08x\n", mode, actual, expected);
+		CHECK(actual == expected);
+	}
+}
+#endif
 
 // Repeating a texture by whole periods must produce identical tiles even across negative UVs.
 // Exercise both taps at the bilinear seam and non-power-of-two xBR/RTT periods.

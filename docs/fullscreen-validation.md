@@ -224,7 +224,10 @@ approximately **108.2 MiB of 128 MiB** combined evidence; staging and reservatio
 also stayed within the unchanged caps. The continuation crossed a user-approved
 pause: input hashes and recorded environment matched, but desktop scheduling was
 not frozen. This finite comparison is not a failure-rate estimate or a guarantee
-for every compositor; the separate retail progression gap remains open.
+for every compositor; the separate retail progression gap remains open. The
+[subsequent OpenGL readback fix](resolution-performance.md#linux-opengl-target-readbacks-2026-10-18)
+reaches Dark Mirror and Combat Ops' bounded endpoints, but Logan's Shadow still
+misses its unchanged deadline.
 
 Evidence: `build/wayland-stack-comparison-20261018/` (`PLAN.md`, `manifest.json`,
 `historical.json`, original partial records, `RESUME.md`, `resume-manifest.json`,
