@@ -1,0 +1,70 @@
+--- a/src/video/wayland/SDL_waylandwindow.c
++++ b/src/video/wayland/SDL_waylandwindow.c
+@@ -1270,11 +1270,15 @@
+                             0, 0);
+     }
+
++    const bool have_configure_size = libdecor_configuration_get_content_size(configuration, frame, &width, &height);
++    const int configure_width = have_configure_size ? width : 0;
++    const int configure_height = have_configure_size ? height : 0;
++
+     /* For fullscreen or fixed-size windows we know our size.
+      * Always assume the configure is wrong.
+      */
+     if (fullscreen) {
+-        if (!libdecor_configuration_get_content_size(configuration, frame, &width, &height)) {
++        if (!have_configure_size) {
+             width = wind->requested.logical_width;
+             height = wind->requested.logical_height;
+         } else {
+@@ -1313,7 +1317,7 @@
+              *      https://gitlab.freedesktop.org/libdecor/libdecor/-/issues/34
+              */
+             if ((floating && (!wind->floating && !(window->flags & SDL_WINDOW_BORDERLESS))) ||
+-                !libdecor_configuration_get_content_size(configuration, frame, &width, &height)) {
++                !have_configure_size) {
+                 /* This happens when we're being restored from a non-floating state,
+                  * or the compositor indicates that the size is up to the client, so
+                  * used the cached window size here.
+@@ -1351,6 +1355,7 @@
+                  * by the decoration dimensions, which should also be ignored.
+                  */
+                 if ((width != wind->last_configure.width || height != wind->last_configure.height) &&
++                    (width != wind->shell_surface.libdecor.last_configure_width || height != wind->shell_surface.libdecor.last_configure_height) &&
+                     !(wind->shell_surface_status == WAYLAND_SHELL_SURFACE_STATUS_WAITING_FOR_FRAME && wind->suspended != suspended)) {
+                     wind->requested.logical_width = width;
+                     wind->requested.logical_height = height;
+@@ -1426,6 +1431,12 @@
+     const bool started_resize = !wind->resizing && resizing;
+     wind->last_configure.width = width;
+     wind->last_configure.height = height;
++    /* Preserve raw compositor history separately from substituted restore geometry
++     * and the pre-scale logical size recorded by Wayland_HandlePreferredScaleChanged.
++     * Either stale size can be echoed by a later activation-only configure.
++     */
++    wind->shell_surface.libdecor.last_configure_width = configure_width;
++    wind->shell_surface.libdecor.last_configure_height = configure_height;
+     wind->floating = floating;
+     wind->suspended = suspended;
+     wind->active = active;
+@@ -2734,6 +2745,9 @@
+     // Default to all capabilities
+     data->wm_caps = WAYLAND_WM_CAPS_ALL;
+
++    // Until the first configure, the geometry is the application's floating size.
++    // A preferred-scale event can arrive first and must preserve those pixel dimensions.
++    data->floating = true;
+     data->scale_factor = 1.0;
+
+     if (SDL_WINDOW_IS_POPUP(window)) {
+--- a/src/video/wayland/SDL_waylandwindow.h
++++ b/src/video/wayland/SDL_waylandwindow.h
+@@ -46,6 +46,8 @@
+         struct
+         {
+             struct libdecor_frame *frame;
++            int last_configure_width;
++            int last_configure_height;
+         } libdecor;
+ #endif
+         struct

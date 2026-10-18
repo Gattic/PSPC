@@ -132,7 +132,10 @@ def main():
                 assert (prefix / 'source' / source.relative_to(ROOT)).read_bytes() == source.read_bytes(), source
         for source in [ROOT / 'CMakeLists.txt', ROOT / 'cmake/LinuxPackage.cmake',
                        ROOT / '.github/workflows/linux-package.yml', ROOT / 'tools/ci_linux.sh',
-                       ROOT / 'tools/pspc_desktop.py', ROOT / 'data/pspc.png',
+                       ROOT / 'tools/pspc_desktop.py', ROOT / 'tools/run_local_sdl.py',
+                       *list((ROOT / 'cmake/local-sdl').glob('*')),
+                       ROOT / 'tests/host/extract_wayland_geometry.py', ROOT / 'tests/host/test_wayland_scale.c',
+                       ROOT / 'data/pspc.png',
                        ROOT / 'tools/pspc-decrypt/CMakeLists.txt', *list((ROOT / 'tools/pspc-decrypt/libkirk').glob('*'))]:
             if source.is_file():
                 assert (prefix / 'source' / source.relative_to(ROOT)).read_bytes() == source.read_bytes(), source

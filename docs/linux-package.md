@@ -10,6 +10,9 @@ This is not an AppImage or a cross-distribution binary guarantee. The package us
 build's architecture and ABI; build it on the distro/ABI baseline you intend to support.
 It has **no installed RPATH/RUNPATH** and no bundled shared libraries. Host library updates,
 GPU drivers, fonts, GTK modules and TLS certificates remain the distro's responsibility.
+The [opt-in local SDL fullscreen workflow](local-sdl.md) is separate: its recipe, patch and
+helper are included in the source snapshot, but its downloaded libraries are not bundled
+and building them does not change normal package launches.
 
 ## Build, package and install
 

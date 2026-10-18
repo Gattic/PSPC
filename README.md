@@ -11,7 +11,9 @@ and [docs/RECOMPILER.md](docs/RECOMPILER.md) for how it works.
 ## Installing
 
 For Linux source builds, the OpenGL renderer and GTK launcher, see
-[Linux build instructions and validation limits](docs/linux-port.md). Runtime builds also provide a
+[Linux build instructions and validation limits](docs/linux-port.md). An optional
+[local SDL fullscreen fix](docs/local-sdl.md) provides a pinned build and per-launch selection
+without replacing system libraries. Runtime builds also provide a
 [relocatable Linux runtime archive/install](docs/linux-package.md) using host libraries, Python and
 a compiler, with optional [per-user menu registration](docs/linux-package.md#application-menu-registration)
 and a [fixture-free Linux CI gate](docs/linux-package.md#fixture-free-ci). The MSI and

@@ -23,7 +23,7 @@ install(FILES src/audio/third_party/at3_standalone/LICENSE DESTINATION licenses/
 install(DIRECTORY src tools tests cmake DESTINATION source COMPONENT Sources FILES_MATCHING
 	PATTERN "*.cpp" PATTERN "*.c" PATTERN "*.h" PATTERN "*.inc" PATTERN "*.S"
 	PATTERN "*.py" PATTERN "*.sh" PATTERN "CMakeLists.txt" PATTERN "*.cmake" PATTERN "*.in"
-	PATTERN "*.rc" PATTERN "*.rc2" PATTERN "*.ico"
+	PATTERN "*.rc" PATTERN "*.rc2" PATTERN "*.ico" PATTERN "*.patch"
 	PATTERN "LICENSE" PATTERN "COPYING" PATTERN "NOTICE" PATTERN "README*"
 	PATTERN "__pycache__" EXCLUDE PATTERN ".pytest_cache" EXCLUDE)
 install(FILES CMakeLists.txt build.sh LICENSE THIRD_PARTY.md README.md PLAN.md DESTINATION source COMPONENT Sources)

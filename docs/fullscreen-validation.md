@@ -50,8 +50,190 @@ geometry. A standalone, single-threaded SDL program with an asserted 960x544
 windowed baseline reproduces 1920x1043 restoration with no PSPC code and no
 post-fullscreen resize. SDL 3.4.18's `decoration_frame_configure` records the
 substituted restore dimensions in `last_configure`; later repeated compositor
-geometry can then pass its unchanged-size filter. This identifies a dependency repair boundary; the host-only repair remains
-partial rather than adding retries or loosening native assertions.
+geometry can then pass its unchanged-size filter. This identified the dependency
+repair boundary; the local dependency experiment below addresses it without
+adding host retries or loosening native assertions.
+
+### Locally patched SDL 3.4.18 (2026-10-18)
+
+Built the exact upstream release twice with identical configuration: an
+unmodified control and a narrow `decoration_frame_configure` patch. The patch
+queries libdecor's supplied dimensions once and records those in `last_configure`,
+separately from the floating dimensions substituted during restoration. A later
+activation-only configure no longer looks like a new resize. Actual user resizes
+remain effective; there is no forced resize, timer, driver override or retry.
+
+| Gate | Result |
+|---|---|
+| Same-build unmodified SDL control | 17/20 native Wayland cases pass |
+| Locally patched SDL | **20/20 native Wayland cases pass (160 transitions)** |
+| Host CTests with patched SDL | **8/8 pass** |
+| SDL-only probe | Both control and patched pass this sample; inconclusive alone |
+
+The control fails SDL/startup-fullscreen/16x and both OpenGL/16x user-resize
+cases, restoring 1920x1043 or 3840x2086 instead of the expected windowed size.
+Every native case confirms the selected SDL3 library from its loader trace.
+The native fixture, its assertions and timing are unchanged in this experiment.
+
+The patch, both libraries, source archive, build recipe, hashes and all logs are
+retained under `build/fullscreen-restore-fix-048f7f9/sdl-patched/`.
+`manifest.json` pins the inputs and tested binaries; `BUILD.md` describes the
+build and `native-patched/results.json` records the 20-case result. For example,
+with a fresh output directory:
+
+```sh
+E=build/fullscreen-restore-fix-048f7f9/sdl-patched
+python3 -I "$E/run_cases.py" "$E/patched/libSDL3.so.0" "$E/native-new-run"
+```
+
+**This validates a process-local dependency patch, not a system or packaging
+upgrade.** The driver selects it with `LD_LIBRARY_PATH`; the installed SDL2,
+SDL3 and libdecor hashes are unchanged. Default launches still use the unpatched
+system dependency. This diagnostic build lacks optional audio development
+backends; only dummy audio was exercised. XWayland's earlier 20/20 result used
+the system library and was not rerun with this dependency. Retail progression,
+Windows and broad SDL conformance remain outside this experiment.
+
+Evidence and the SDL-only reproducer are retained locally in
+`build/fullscreen-restore-fix-048f7f9/`; the original failures remain in
+`build/linux-pull-check-048f7f9/`. These synthetic checks never open existing
+memory sticks. They do not revalidate Windows, exclusive fullscreen, or retail
+gameplay/save progression.
+
+### Project build/launch integration (2026-10-18)
+
+The initial [opt-in local SDL workflow](local-sdl.md) built the same hash-checked
+patch from pinned upstream archives, plus sdl2-compat 2.32.74. It does not depend
+on the earlier experiment's binaries or install anything into the system.
+The separate build requires Wayland/libdecor, X11, OpenGL and a desktop audio
+backend; this host's build includes PulseAudio (device quality remains untested).
+
+Build and incremental rebuild pass. The launch helper's eight tests, patch
+apply/idempotence/drift checks, eight host regressions plus the launcher CLI,
+and default package/source-snapshot checks pass. Actual `pspc --version` loader
+traces confirm system SDL before wrapping, both local libraries while wrapped,
+and the original system libraries again afterward. Installed library hashes
+remain unchanged.
+
+**At this integration checkpoint, native geometry acceptance was partial:**
+helper-mediated native tests passed **19/20 Wayland and 20/20 XWayland** cases. All 40 cases load the intended
+local SDL2 and SDL3. Wayland's SDL/startup-fullscreen/16x case restores 1920x1043
+at transitions 3/5/7 instead of 960x544, despite the exact patched source and
+correct loader selection. The earlier 20/20 result above is a historical sample,
+not a guarantee that this patch completely resolves native Wayland sizing.
+
+A bounded protocol-traced comparison (three samples per stack) also finds a
+480x272 restore in both the previous retained patched SDL3 + system shim and
+the newly built pair. That different signature shows an additional limitation
+on the previous stack too; it does **not** establish the cause of the untraced
+1920x1043 failure. No assertions, timings or production patch were changed to
+hide these results. These retained failures motivated the follow-up below,
+separate from the passing reproducible-build and library-selection/disable checks.
+
+Evidence: `build/local-sdl-integration/` (`selection.json`, `patch-check.json`,
+`host-ctest.log`, `wayland/results.json`, `x11/results.json`, and `comparison-*`).
+The default system-SDL launch/package policy and existing saves are unchanged.
+
+### Scale/configure follow-up (2026-10-18)
+
+The remaining failures exposed two SDL state-ownership problems:
+
+- A newly allocated Wayland window started with `floating=false`. A preferred-scale
+  event before the first configure therefore treated the application's pixel size
+  as fixed logical geometry; a 2x-to-1x event could halve 960x544 to 480x272.
+- The raw compositor history added by the first patch shared `last_configure`
+  with substituted restore geometry and the pre-scale logical-size filter.
+  A scale event overwrote that history, allowing a repeated desktop-sized
+  configure to corrupt the restored size.
+
+The maintained patch initializes floating state before scale callbacks and keeps
+raw libdecor dimensions in separate backend fields. It preserves SDL's existing
+pre-scale filter: simply removing that filter passed a narrower regression but
+still failed the matrix (19/20 Wayland, a 1920x1088 restore). That failed attempt
+is retained, not discarded or counted as acceptance.
+
+The new `wayland_scale_restore` child CTest compiles actual pinned SDL geometry
+code and private types. With the **same final regression fixture**, the previous
+maintained patch fails four checks, the incomplete attempt fails the pre-scale
+configure check, and the final patch has zero failures. Controls cover a genuine
+800x600 user resize and fixed logical fullscreen geometry. No test timing,
+settling bound, native assertion, frame scale or host resize policy was changed.
+
+The project target rebuilds and runs this regression before its loader check.
+The final native rerun passes **20/20 Wayland and 20/20 XWayland cases** (320
+transitions), including all four user-resize cases on each driver. Every process
+loads both intended local libraries. Three fixed-stack protocol-traced repeats
+of SDL/startup-fullscreen/16x also pass, as do nine wrapped host/launcher CTests.
+Patch replay from pristine source is byte-identical, repeat application is
+idempotent, and source/header drift is rejected.
+
+Evidence: `build/wayland-scale-fix/` (`regression-results.json`,
+`regression-comparison.log`, `final-build.log`, `final-incremental-build.log`,
+`patch-check/results.json`, `final-wayland/results.json`, `final-x11/results.json`).
+The opt-in source/header hashes are in `cmake/local-sdl/PatchSDL.cmake`.
+
+These results record passing deterministic regressions and a passing native
+matrix sample. The subsequent bounded comparison below is now complete and
+supports the corrected stack for the tested case, not an unrestricted claim that
+intermittent failures are absent. System-library launches and packaging remain unchanged.
+No installed libraries or existing saves were modified; the separate retail
+OpenGL progression acceptance gap remains open.
+
+### Bounded old-stack reconciliation (2026-10-18)
+
+The conflicting counts belong to identifiable stacks and observation samples,
+not a single interchangeable "SDL 3.4.18" result:
+
+| Stack | SDL3 / SDL2 SHA-256 prefixes | Historical Wayland matrix | New focused passes |
+|---|---|---|---|
+| A: retained first patch + system shim | `13716d1cd9ff` / `7b904d7c5cec` | 20/20 | **0/3** |
+| B: pre-fix integrated pair | `781b4acc76f4` / `fe9f66ee1657` | 19/20 | **0/3** |
+| C: final scale/configure patch + built shim | `2c023ddb6719` / `fe9f66ee1657` | 20/20 | **3/3** |
+
+A and B had the same earlier source patch but different binaries/build features
+and shims. C contains the later repair; its 20/20 must not be attributed to the
+old patch. The intermediate repair's other 19/20 (`7fd62322a5a9`, failing
+SDL/windowed/8x at 1920x1088) is a fourth revision, not another result for C.
+
+This follow-up preregistered three untraced samples per arm in fixed interleaved
+order, using the **unchanged fixture binary, launch helper and comparison driver**.
+The controlled differences were the selected stack and isolated HOME/XDG paths.
+All nine samples confirmed both expected loaded libraries (72 transitions total).
+Every A/B sample restored 480x272 at transitions 1/3/5/7 instead of 960x544;
+all three C samples passed all eight transitions.
+Thus a restore failure is reproducible on the retained old stack without
+protocol tracing, and is not confined to the rebuilt dependency pair. The
+historical 20/20 was a passing sample, not an exhaustive acceptance guarantee.
+The old traced 0/3 results on each of A/B remain a separate observation regime.
+Neither that half-size signature nor these new half-size failures alone establish
+the cause of B's earlier untraced **1920x1043** failure.
+
+**Status: bounded comparison complete; current stack passes 3/3.** All **9/9
+planned samples** ran, with no retries or replacements. The initial budget stop
+at 4/9 is retained in the original partial records. After explicit user approval,
+only the task-generated per-sample caches were losslessly archived. Every archive
+was reopened and fully decompressed; file SHA-256/size, member inventory, modes,
+ownership, nanosecond modification times and extended attributes matched before
+any redundant originals were removed. Only verified files and empty cache
+directories were deleted; logs, results and other evidence were preserved.
+
+Samples 5–9 then ran in their original order, with each new cache archived after
+settlement. Nine archives preserve 279 files / 19,155,807 content bytes in 325,361
+compressed bytes. Retained output is approximately **2.7 MiB of 16 MiB**, with
+approximately **108.2 MiB of 128 MiB** combined evidence; staging and reservations
+also stayed within the unchanged caps. The continuation crossed a user-approved
+pause: input hashes and recorded environment matched, but desktop scheduling was
+not frozen. This finite comparison is not a failure-rate estimate or a guarantee
+for every compositor; the separate retail progression gap remains open.
+
+Evidence: `build/wayland-stack-comparison-20261018/` (`PLAN.md`, `manifest.json`,
+`historical.json`, original partial records, `RESUME.md`, `resume-manifest.json`,
+`resumed-results.json`, `completed-results.json`, `completed-summary.json`,
+`resume-budget.jsonl`, and per-sample archives/verification manifests under
+`archives/`). `completed-results.json` has exactly one observation for each index
+1–9; the earlier raw summary's unlaunched sample-5 budget marker is not a run.
+All input/system-library and preserved non-cache evidence hashes remained
+unchanged. No production code changes, commits or existing-save access occurred.
 
 ## Fixed failure path
 

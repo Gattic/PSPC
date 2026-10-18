@@ -62,6 +62,19 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 	install(FILES docs/linux-port.md docs/RECOMPILER.md DESTINATION docs COMPONENT AOT)
 	if(PSPC_BUILD_RUNTIME)
 		include(cmake/LinuxPackage.cmake)
+		# Explicit opt-in; not part of ALL, install or CPack. No system libraries change.
+		find_package(Python3 REQUIRED COMPONENTS Interpreter)
+		add_custom_target(pspc-local-sdl
+			COMMAND ${CMAKE_COMMAND} -S "${CMAKE_SOURCE_DIR}/cmake/local-sdl"
+				-B "${CMAKE_BINARY_DIR}/local-sdl" -G "${CMAKE_GENERATOR}"
+				-DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+			COMMAND ${CMAKE_COMMAND} --build "${CMAKE_BINARY_DIR}/local-sdl"
+				--parallel 2 --target SDL3-shared SDL2 pspc_sdl_wayland_scale_tests
+			COMMAND ${CMAKE_CTEST_COMMAND} --test-dir "${CMAKE_BINARY_DIR}/local-sdl"
+				--output-on-failure
+			COMMAND ${Python3_EXECUTABLE} -I "${CMAKE_SOURCE_DIR}/tools/run_local_sdl.py"
+				--build-dir "${CMAKE_BINARY_DIR}" --check
+			USES_TERMINAL VERBATIM)
 	endif()
 endif()
 
