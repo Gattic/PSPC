@@ -23,6 +23,8 @@ std::atomic<bool> testDone{false};
 std::atomic<bool> firstFrame{false};
 std::atomic<int> presentFailures{0};
 bool initialFullscreen = false;
+bool resizeWindow = false, resized = false;
+int windowedW = 960, windowedH = 544;
 int transitions = 0;
 int failures = 0;
 auto changedAt = std::chrono::steady_clock::now();
@@ -43,15 +45,23 @@ static int SDLCALL TestPollEvent(SDL_Event *event) {
 	SDL_GetWindowSize(testWindow, &width, &height);
 	// X11/Wayland window managers acknowledge fullscreen/restore asynchronously.
 	// Keep pumping native events while waiting for the requested geometry to settle.
-	if ((actual != expected || (!actual && (width != 960 || height != 544))) &&
+	if ((actual != expected || (!actual && (width != windowedW || height != windowedH))) &&
 	    std::chrono::steady_clock::now() - changedAt < std::chrono::seconds(2)) return 0;
-	if (actual != expected || (!actual && (width != 960 || height != 544))) {
+	if (actual != expected || (!actual && (width != windowedW || height != windowedH))) {
 		printf("FAIL: transition %d, fullscreen=%d (expected %d), size=%dx%d\n",
 		       transitions, actual, expected, width, height);
 		++failures;
 	}
 	printf("transition %d: fullscreen=%d, size=%dx%d\n", transitions, actual, width, height);
 	if (transitions == 8) { testDone = true; return 0; }
+	if (resizeWindow && !resized && !actual && transitions) {
+		windowedW = 800;
+		windowedH = 600;
+		SDL_SetWindowSize(testWindow, windowedW, windowedH);
+		resized = true;
+		changedAt = std::chrono::steady_clock::now();
+		return 0;
+	}
 	*event = {};
 	event->type = SDL_KEYDOWN;
 	event->key.windowID = SDL_GetWindowID(testWindow);
@@ -64,6 +74,7 @@ static int SDLCALL TestPollEvent(SDL_Event *event) {
 int main(int argc, char **argv) {
 	SDL_SetMainReady();
 	initialFullscreen = argc > 1 && std::string(argv[1]) == "fullscreen";
+	resizeWindow = argc > 4 && std::string(argv[4]) == "resize";
 	const int scale = argc > 2 ? atoi(argv[2]) : 1;
 	if (scale != 1 && scale != 4 && scale != 8 && scale != 16) return 2;
 	host::Config config;
@@ -118,7 +129,7 @@ int main(int argc, char **argv) {
 		return testDone ? 0 : 1;
 	}, [] { testDone = true; ++failures; });
 	mem::Shutdown();
-	if (transitions != 8 || result != 0 || presentFailures != 0) ++failures;
+	if (transitions != 8 || result != 0 || presentFailures != 0 || (resizeWindow && !resized)) ++failures;
 	printf("%d fullscreen transitions, scale %d, %d failures\n", transitions, scale, failures);
 	return failures ? 1 : 0;
 }

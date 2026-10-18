@@ -116,15 +116,13 @@ void UpdateInput() {
 	g_digitalLy = axis[1];
 }
 
-void SetFullscreen(SDL_Window *win, bool on, int &windowedW, int &windowedH) {
-	if (on) SDL_GetWindowSize(win, &windowedW, &windowedH);
+void SetFullscreen(SDL_Window *win, bool on) {
 	if (SDL_SetWindowFullscreen(win, on ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0) != 0) {
 		LOGW("HOST", "Fullscreen switch failed: %s", SDL_GetError());
 		return;
 	}
-	// SDL's OpenGL presenter can recreate the native window while fullscreen,
-	// losing SDL's saved windowed size. Keep our own geometry across that recreation.
-	if (!on) SDL_SetWindowSize(win, windowedW, windowedH);
+	// SDL restores its windowed geometry. A second size request races the native
+	// fullscreen transition's decoration/scale changes on X11 and Wayland.
 	SDL_ShowCursor(on ? SDL_DISABLE : SDL_ENABLE);
 }
 
@@ -192,8 +190,6 @@ int Run(const Config &cfg, const std::function<int()> &emulation, const std::fun
 		                       480 * cfg.windowScale, 272 * cfg.windowScale, winFlags & ~SDL_WINDOW_OPENGL);
 	}
 #endif
-	int windowedW = 480 * cfg.windowScale, windowedH = 272 * cfg.windowScale;
-	if (win && cfg.fullscreen) SetFullscreen(win, true, windowedW, windowedH);
 	// FitScale is read by the emulation thread; keep all SDL window queries on this thread.
 	auto updateFitScale = [&]() {
 		int w = 0, h = 0;
@@ -201,7 +197,6 @@ int Run(const Config &cfg, const std::function<int()> &emulation, const std::fun
 		const int pictureW = std::min(w, (int)((long long)h * 480 / 272));
 		g_fitScale = win ? std::max(1, (pictureW + 479) / 480) : 0;
 	};
-	updateFitScale();
 #ifdef _WIN32
 	SDL_SysWMinfo wm;
 	SDL_VERSION(&wm.version);
@@ -216,7 +211,11 @@ int Run(const Config &cfg, const std::function<int()> &emulation, const std::fun
 		ren = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | (cfg.vsync ? SDL_RENDERER_PRESENTVSYNC : 0));
 		SDL_RenderSetLogicalSize(ren, 480, 272);
 	};
+	// Creating SDL's OpenGL presenter can recreate the native window. Do that while
+	// windowed so SDL retains the correct restore size, including on older SDL2.
 	if (!cfg.gpuPresent || !g_hwnd) makeRenderer();
+	if (win && cfg.fullscreen) SetFullscreen(win, true);
+	updateFitScale();
 
 	SDL_AudioSpec want{}, have{};
 	want.freq = 44100;
@@ -265,8 +264,8 @@ int Run(const Config &cfg, const std::function<int()> &emulation, const std::fun
 				bool down = ev.type == SDL_KEYDOWN;
 				if (k == SDLK_F11 || k == SDLK_F12 || (k == SDLK_q && down && (ev.key.keysym.mod & KMOD_CTRL))) {
 					if (down && !ev.key.repeat) {
-					if (k == SDLK_F11)
-						SetFullscreen(win, !(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN_DESKTOP), windowedW, windowedH);
+						if (k == SDLK_F11)
+							SetFullscreen(win, !(SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN_DESKTOP));
 						else if (k == SDLK_F12 && g_hasPresenter) g_screenshotRequested = true;
 						else if (k == SDLK_F12) screenshot = true;
 						else quit();

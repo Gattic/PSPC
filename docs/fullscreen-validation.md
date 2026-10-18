@@ -1,5 +1,58 @@
 # Fullscreen crash investigation
 
+## Linux restore sizing (2026-10-18)
+
+On Fedora 44 / GNOME with sdl2-compat 2.32.74 and SDL 3.4.18, the native
+fullscreen fixture exposed two restore failures: XWayland could lose the
+74-pixel title-bar height on each cycle, and native Wayland's SDL presenter
+could restore 1920x1088 instead of 960x544 at 16x frame scale. These were sizing
+failures, not device-reset crashes.
+
+The host kept its own windowed size and called `SDL_SetWindowSize` immediately
+after leaving fullscreen. That second request interferes with the native
+restore's decoration/scale changes. An SDL-only XWayland probe reproduced the
+height loss; removing only the extra resize preserved the original size.
+
+SDL now owns the restore geometry rather than a second host cache. When SDL
+presentation is selected at startup, the host creates the presenter **before**
+requesting fullscreen, so renderer recreation does not lose the saved windowed
+geometry. There is no delayed resize, retry, forced video driver, or change to
+render resolution.
+
+Four `host_fullscreen_restore_*` CTests exercise the real host loop and dummy SDL
+presentation with injected native restore hazards: renderer recreation while
+fullscreen, and a resize racing decoration or scale restoration. Both startup
+modes also resize to 800x600 between fullscreen trips. All four fail before the
+host change and pass afterward; they require no display server or guest saves.
+
+```sh
+ctest --test-dir build/LinuxRuntime --output-on-failure -R '^host_fullscreen_restore_'
+# Opt-in native windows; repeat with SDL_VIDEODRIVER=wayland and presenter opengl.
+SDL_VIDEODRIVER=x11 SDL_AUDIODRIVER=dummy \
+  build/LinuxRuntime/bin/pspc_host_fullscreen_tests fullscreen 16 sdl
+# Also preserve an explicit user resize after the first fullscreen round trip.
+SDL_VIDEODRIVER=wayland SDL_AUDIODRIVER=dummy \
+  build/LinuxRuntime/bin/pspc_host_fullscreen_tests windowed 16 opengl resize
+```
+
+### Initial host-only results (system SDL)
+
+The build and 20 affected host/runtime CTests pass. The native acceptance matrix
+runs both presenters, both startup modes, scales 1/4/8/16, plus user-resize cases
+at 16x: **XWayland 20/20 pass; native Wayland 15/20 pass** (320 transitions total).
+Wayland's five failing cases are all at 16x, including direct OpenGL. This is a
+**partial repair**, not a green fullscreen acceptance gate. The dummy fault
+models protect the host ownership/order invariants, not all compositor behavior.
+
+A native protocol trace shows the correct 960x544 restore and a completed frame,
+followed by a later configure event overwriting the size with desktop-sized
+geometry. A standalone, single-threaded SDL program with an asserted 960x544
+windowed baseline reproduces 1920x1043 restoration with no PSPC code and no
+post-fullscreen resize. SDL 3.4.18's `decoration_frame_configure` records the
+substituted restore dimensions in `last_configure`; later repeated compositor
+geometry can then pass its unchanged-size filter. This identifies a dependency repair boundary; the host-only repair remains
+partial rather than adding retries or loosening native assertions.
+
 ## Fixed failure path
 
 `src/runtime/host/sdl_host.cpp` used to ignore `SDL_RENDER_DEVICE_RESET` and keep
