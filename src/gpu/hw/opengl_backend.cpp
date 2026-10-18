@@ -12,6 +12,7 @@
 #include <GL/glcorearb.h>
 #include <SDL.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -21,6 +22,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace gpu::hw {
 namespace {
@@ -186,6 +188,19 @@ class OpenGLBackend final : public RenderBackend, private DrawData {
 	GLuint dummyDepth_ = 0, vao_ = 0, vb_ = 0, sb_ = 0, fbo_ = 0, programs_[16] = {}, expand_ = 0, reduce_ = 0,
 		   display_ = 0, upscale_ = 0, present_ = 0;
 	std::vector<std::unique_ptr<Surface>> surfaces_;
+	struct DecodedTexture {
+		GLuint texture;
+		int w, h, factor, wrap, maxLevel;
+		u64 hash;
+		std::array<u32, 8> levels;
+		std::vector<u32> pixels;
+		size_t Bytes() const { return pixels.size() * sizeof(u32) * (1 + factor * factor); }
+	};
+	// Cache decoded contents, never guest addresses: CPU/CLUT writes and feedback still get decoded.
+	// Bound both entry count and the decoded + upscaled payload retained in this context.
+	static constexpr size_t MAX_DECODED_TEXTURES = 32, MAX_DECODED_BYTES = 64 * 1024 * 1024;
+	std::vector<DecodedTexture> decodedTextures_;
+	size_t decodedBytes_ = 0;
 	// Vertex transform on the GPU (gpu/geometry.h): CSVertex and CSTriangle, and their storage buffers
 	// (the shaders' bindings); GEO_OUT holds CSTriangle's GPU vertices, drawn as a vertex buffer.
 	enum { GEO_INPUTS, GEO_DRAWS, GEO_TRANSFORMS, GEO_JOBS, GEO_CLIP, GEO_OUT, GEO_BUFFERS };
@@ -306,7 +321,8 @@ class OpenGLBackend final : public RenderBackend, private DrawData {
 				s.shadow[i] = data[i];
 			}
 	}
-	GLuint Decode(const SamplerState &ss) {
+	// The bool indicates context-owned storage; oversized images remain owned by the draw.
+	std::pair<GLuint, bool> Decode(const SamplerState &ss) {
 		u32 levels[8];
 		int w, h;
 		TextureAtlasLayout(ss, levels, &w, &h);
@@ -314,26 +330,51 @@ class OpenGLBackend final : public RenderBackend, private DrawData {
 		for (int i = 0; i <= ss.maxLevel; ++i)
 			DecodeTextureLevel(ss, i, std::min<int>(ss.levels[i].w, 512), std::min<int>(ss.levels[i].h, 512),
 							   data.data() + (levels[i] & 65535), w);
+		const int factor = TextureUpscale(texUpscale_, w, h);
+		const int wrap = (ss.clampS ? 0 : 1) | (ss.clampT ? 0 : 2);
+		const u64 hash = HashBytes(reinterpret_cast<const u8 *>(data.data()), data.size() * sizeof(u32), 0);
+		for (auto it = decodedTextures_.begin(); it != decodedTextures_.end(); ++it) {
+			if (it->w == w && it->h == h && it->factor == factor && it->wrap == wrap &&
+				it->maxLevel == ss.maxLevel && std::equal(it->levels.begin(), it->levels.end(), levels) &&
+				it->hash == hash && it->pixels == data) {
+				GLuint texture = it->texture;
+				std::rotate(it, it + 1, decodedTextures_.end());
+				return {texture, true};
+			}
+		}
 		GLuint t = Texture(w, h, GL_RGBA8UI);
 		glTextureSubImage2D(t, 0, 0, 0, w, h, GL_RGBA_INTEGER, GL_UNSIGNED_BYTE, data.data());
-		int factor = TextureUpscale(texUpscale_, w, h);
-		if (factor == 1)
-			return t;
-		GLuint dest = Texture(w * factor, h * factor, GL_RGBA8UI);
-		glUseProgram(upscale_);
-		glBindTextureUnit(0, t);
-		glBindImageTexture(0, dest, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8UI);
-		UInt(upscale_, "factor", factor);
-		UInt(upscale_, "wrapMode", (ss.clampS ? 0 : 1) | (ss.clampT ? 0 : 2));
-		for (int i = 0; i <= ss.maxLevel; ++i) {
-			int lw = std::min<int>(ss.levels[i].w, 512), lh = std::min<int>(ss.levels[i].h, 512);
-			IVec(upscale_, "lvOrigin", levels[i] & 65535, 0);
-			IVec(upscale_, "lvSize", lw, lh);
-			glDispatchCompute((lw * factor + 7) / 8, (lh * factor + 7) / 8, 1);
+		if (factor != 1) {
+			GLuint dest = Texture(w * factor, h * factor, GL_RGBA8UI);
+			glUseProgram(upscale_);
+			glBindTextureUnit(0, t);
+			glBindImageTexture(0, dest, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8UI);
+			UInt(upscale_, "factor", factor);
+			UInt(upscale_, "wrapMode", wrap);
+			for (int i = 0; i <= ss.maxLevel; ++i) {
+				int lw = std::min<int>(ss.levels[i].w, 512), lh = std::min<int>(ss.levels[i].h, 512);
+				IVec(upscale_, "lvOrigin", levels[i] & 65535, 0);
+				IVec(upscale_, "lvSize", lw, lh);
+				glDispatchCompute((lw * factor + 7) / 8, (lh * factor + 7) / 8, 1);
+			}
+			Barrier();
+			glDeleteTextures(1, &t);
+			t = dest;
 		}
-		Barrier();
-		glDeleteTextures(1, &t);
-		return dest;
+		DecodedTexture image{t, w, h, factor, wrap, ss.maxLevel, hash, {}, std::move(data)};
+		std::copy_n(levels, 8, image.levels.begin());
+		const size_t bytes = image.Bytes();
+		if (bytes > MAX_DECODED_BYTES)
+			return {t, false};
+		while (!decodedTextures_.empty() &&
+			   (decodedTextures_.size() >= MAX_DECODED_TEXTURES || decodedBytes_ + bytes > MAX_DECODED_BYTES)) {
+			decodedBytes_ -= decodedTextures_.front().Bytes();
+			glDeleteTextures(1, &decodedTextures_.front().texture);
+			decodedTextures_.erase(decodedTextures_.begin());
+		}
+		decodedBytes_ += bytes;
+		decodedTextures_.push_back(std::move(image));
+		return {t, true};
 	}
 	void DrawPicture(GLuint texture, int width, int height, int format, GLuint overlay = 0, int ow = 0, int oh = 0) {
 		int ww, wh;
@@ -593,6 +634,7 @@ class OpenGLBackend final : public RenderBackend, private DrawData {
 				continue;
 			const auto &st = states[seg.state];
 			GLuint texture = 0, feedback = 0;
+			bool cachedTexture = false;
 			if (st.enableTextures && !st.pix.clearMode) {
 				// Only targets a texture can read need intermediate synchronization.
 				// Indexed/swizzled feedback and all mip levels still see preceding draws.
@@ -600,7 +642,9 @@ class OpenGLBackend final : public RenderBackend, private DrawData {
 					Download(*color);
 				if (depth && MayReadSurface(st.samp, *depth))
 					Download(*depth);
-				texture = Decode(st.samp);
+				const auto decoded = Decode(st.samp);
+				texture = decoded.first;
+				cachedTexture = decoded.second;
 				if (!st.samp.swizzle && st.samp.maxLevel == 0 && st.samp.texfmt <= GE_TFMT_8888) {
 					for (auto &surface : surfaces_) {
 						int bpp = surface->fmt == 3 ? 4 : 2;
@@ -665,7 +709,8 @@ class OpenGLBackend final : public RenderBackend, private DrawData {
 				glDrawArrays(primitive, seg.first, seg.count);
 				Barrier();
 			}
-			glDeleteTextures(1, &texture);
+			if (!cachedTexture)
+				glDeleteTextures(1, &texture);
 			glDeleteTextures(1, &feedback);
 		}
 		if (gpuVb)
@@ -868,6 +913,10 @@ class OpenGLBackend final : public RenderBackend, private DrawData {
 			for (auto &s : surfaces_)
 				glDeleteTextures(1, &s->texture);
 			surfaces_.clear();
+			for (auto &t : decodedTextures_)
+				glDeleteTextures(1, &t.texture);
+			decodedTextures_.clear();
+			decodedBytes_ = 0;
 			for (GLuint p : programs_)
 				if (p)
 					glDeleteProgram(p);

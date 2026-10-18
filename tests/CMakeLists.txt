@@ -33,7 +33,9 @@ if(TARGET pspc_gpu_gl)
 	target_link_libraries(pspc_unittests PRIVATE pspc_gpu_gl SDL2::SDL2)
 	target_compile_definitions(pspc_unittests PRIVATE PSPC_TEST_GPU_GL=1)
 	if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-		target_link_options(pspc_unittests PRIVATE "-Wl,--wrap=glGetTextureImage")
+		target_link_options(pspc_unittests PRIVATE
+			"-Wl,--wrap=glGetTextureImage" "-Wl,--wrap=glTextureSubImage2D"
+			"-Wl,--wrap=glTextureStorage2D" "-Wl,--wrap=glDeleteTextures")
 	endif()
 endif()
 if(TARGET pspc-launcher AND CMAKE_SYSTEM_NAME STREQUAL "Linux")

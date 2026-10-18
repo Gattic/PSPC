@@ -178,12 +178,75 @@ Fresh isolated retail runs used the original scripted inputs, 120-second limit,
 There were zero geometry differences or reported guest-memory errors. Common
 before/after captures were byte-identical. These are finite title/menu progression
 observations, not sustained gameplay or a repeatability/performance guarantee.
-**The overall retail gate remains incomplete:** Logan's Shadow still has expensive
-late GE work whose remaining cause has not been isolated. No speculative further
-fix or unchanged retry was applied. The investigation retained approximately
-156.3 MiB of its 192 MiB cap; further retail work needs an archival/budget decision,
-not a longer runtime deadline or an automatic continuation.
+At this stage the overall retail gate remained incomplete: Logan's Shadow still
+had expensive late GE work. Approximately 156.3 MiB of the then 192 MiB investigation
+cap was retained. Subsequent authorized archival, profiling and repair are described
+below; the original failed runs were preserved rather than retried with longer deadlines.
 
 Evidence and all failed/intermediate attempts are retained under
 `build/linux-pull-check-048f7f9/retail-investigation/`, notably `REPORT.md`,
 `final-results.json`, revision manifests, `final-ctest.log` and `final-nvidia-gpu.log`.
+
+## Linux OpenGL decoded-texture reuse (2026-10-18)
+
+A retained genuine-AOT/interpreter comparison isolated the remaining upload/readback
+cost. In matched Logan's Shadow VBlanks 1800–2400, switching to AOT reduced wall time
+from 64.113 to 57.552 ms/VBlank, but texture upload remained about 27 ms/VBlank.
+The interpreter control missed 3600 at 120 seconds; AOT reached it once at 119.559 seconds.
+This did not establish comfortable headroom or fix the forced-interpreter gate.
+
+An observation-only probe found exact RGBA-image repeats in 81.3% of the late uploads.
+Per-pixel surface-validation uploads did not increase during that interval.
+The backend now retains up to 32 decoded textures per context, bounded by 64 MiB of
+CPU decoded plus final GPU-image payload. Each draw still decodes current guest
+memory, including CLUT and mip data. A hit requires exact decoded pixels (not merely
+a hash), atlas dimensions, mip layout, upscale factor and wrap settings. Entries
+are least-recently-used; oversized images remain transient, and context teardown
+releases the retained GL resources. Driver overhead and transient miss allocations
+are not included in the payload bound. Eager target downloads, feedback handling,
+geometry verification and filtering are unchanged.
+
+The new interpreter run used the retained frame-boundary observer and identical
+normalized command/environment, with fresh isolated saves and the original 120-second
+limit. Matched VBlanks 1800–2400:
+
+| Metric | Before | Texture reuse |
+|---|---:|---:|
+| Wall ms/VBlank | 64.113 | 37.363 |
+| Texture-upload calls | 89,736 | 16,792 |
+| Upload API ms/VBlank | 27.146 | 2.652 |
+| Readback calls | 1,201 | 1,201 |
+| Readback API ms/VBlank | 12.909 | 13.849 |
+
+This interval's wall time fell 41.7%. Readback, geometry-buffer transfer, draw and
+other non-texture work counts/units match in all four common 600-VBlank intervals.
+API wall time includes queued driver/GPU waits; these are not shader timestamps.
+Readback remains substantial and was deliberately not deferred.
+
+All three original forced-interpreter endpoints now pass: Dark Mirror 1800 in 49.936 s,
+Combat Ops 3900 in 90.905 s, and Logan's Shadow 3600 in 99.205 s. All 36 native/high-resolution
+captures match retained references byte-for-byte, with zero reported guest-memory
+errors or geometry differences. This is a single bounded progression pass per game,
+not sustained-gameplay or repeatability evidence.
+
+The three initial deterministic render regressions failed upload-count assertions before
+the repair and pass afterward. They cover CPU/CLUT/higher-mip edits, swizzling,
+address-independent reuse, wrap/layout separation, count/byte eviction, oversized
+images and context ownership, alongside the existing feedback/writeback tests.
+At the original implementation checkpoint, the full configured build and strict
+Intel/X11 CTest suite passed 40/40, with 163 unit cases and the existing
+reference-dependent skips. Evidence, the original executable
+and all earlier failed attempts are retained under
+`build/linux-pull-check-048f7f9/retail-investigation/texture-reuse/`; see `REPORT.md`,
+`comparison.json`, `strict-ctest.log`, per-game `parity.json` and `final-audit.json`.
+
+A subsequent cache review added whole-image spatial and alpha-only edit checks,
+observed actual GL allocation/deletion lifetimes, and exercised feedback after
+warming the cache. Its unit run recorded 164 cases with zero failures (the existing
+reference-data skips remain), and the required OpenGL group passed 8/8 on both
+Intel and NVIDIA. These are distinct from the original full-suite totals above.
+The review also independently reconciled the retained timings, 36 capture matches
+and preservation hashes. No production renderer change or new retail run was
+needed; see `review/REPORT.md` and `review/final-review.json` under the same
+evidence directory. The 64 MiB bound remains retained payload, not a process or
+physical-VRAM ceiling.

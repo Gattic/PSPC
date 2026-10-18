@@ -176,8 +176,8 @@ These results record passing deterministic regressions and a passing native
 matrix sample. The subsequent bounded comparison below is now complete and
 supports the corrected stack for the tested case, not an unrestricted claim that
 intermittent failures are absent. System-library launches and packaging remain unchanged.
-No installed libraries or existing saves were modified; the separate retail
-OpenGL progression acceptance gap remains open.
+No installed libraries or existing saves were modified. At this checkpoint, the
+separate retail OpenGL progression acceptance gap remained open.
 
 ### Bounded old-stack reconciliation (2026-10-18)
 
@@ -224,10 +224,13 @@ approximately **108.2 MiB of 128 MiB** combined evidence; staging and reservatio
 also stayed within the unchanged caps. The continuation crossed a user-approved
 pause: input hashes and recorded environment matched, but desktop scheduling was
 not frozen. This finite comparison is not a failure-rate estimate or a guarantee
-for every compositor; the separate retail progression gap remains open. The
-[subsequent OpenGL readback fix](resolution-performance.md#linux-opengl-target-readbacks-2026-10-18)
-reaches Dark Mirror and Combat Ops' bounded endpoints, but Logan's Shadow still
-misses its unchanged deadline.
+for every compositor. The separate retail progression gap remained open at this
+checkpoint. The [subsequent OpenGL readback fix](resolution-performance.md#linux-opengl-target-readbacks-2026-10-18)
+reached Dark Mirror and Combat Ops' bounded endpoints, but Logan's Shadow still
+missed its unchanged deadline at that stage. The later
+[decoded-texture reuse repair](resolution-performance.md#linux-opengl-decoded-texture-reuse-2026-10-18)
+reached all three original bounded endpoints, including Logan's Shadow in 99.205 seconds.
+Those later observations do not replace the historical failures recorded here.
 
 Evidence: `build/wayland-stack-comparison-20261018/` (`PLAN.md`, `manifest.json`,
 `historical.json`, original partial records, `RESUME.md`, `resume-manifest.json`,

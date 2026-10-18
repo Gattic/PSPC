@@ -30,7 +30,33 @@ using namespace gpu;
 #if PSPC_TEST_GPU_GL && defined(__linux__)
 #include <GL/glcorearb.h>
 #include <atomic>
-static std::atomic<unsigned> glTextureReadbacks{0};
+#include <map>
+static std::atomic<unsigned> glTextureReadbacks{0}, glDecodedUploads{0};
+// Enabled only in the single-context resource test; include both upload and upscaled images.
+static std::map<GLuint, size_t> *glDecodedImages = nullptr;
+extern "C" void __real_glTextureStorage2D(GLuint, GLsizei, GLenum, GLsizei, GLsizei);
+extern "C" void __wrap_glTextureStorage2D(GLuint texture, GLsizei levels, GLenum format, GLsizei w, GLsizei h) {
+	__real_glTextureStorage2D(texture, levels, format, w, h);
+	if (glDecodedImages && format == GL_RGBA8UI) {
+		CHECK(levels == 1);
+		CHECK(glDecodedImages->count(texture) == 0);
+		(*glDecodedImages)[texture] = (size_t)w * h * 4;
+	}
+}
+extern "C" void __real_glDeleteTextures(GLsizei, const GLuint *);
+extern "C" void __wrap_glDeleteTextures(GLsizei count, const GLuint *textures) {
+	__real_glDeleteTextures(count, textures);
+	if (glDecodedImages)
+		for (GLsizei i = 0; i < count; ++i)
+			glDecodedImages->erase(textures[i]);
+}
+extern "C" void __real_glTextureSubImage2D(GLuint, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void *);
+extern "C" void __wrap_glTextureSubImage2D(GLuint texture, GLint level, GLint x, GLint y, GLsizei w, GLsizei h,
+                                          GLenum format, GLenum type, const void *pixels) {
+	if (format == GL_RGBA_INTEGER)
+		++glDecodedUploads;
+	__real_glTextureSubImage2D(texture, level, x, y, w, h, format, type, pixels);
+}
 extern "C" void __real_glGetTextureImage(GLuint, GLint, GLenum, GLenum, GLsizei, void *);
 extern "C" void __wrap_glGetTextureImage(GLuint texture, GLint level, GLenum format, GLenum type,
 										GLsizei size, void *pixels) {
@@ -509,6 +535,219 @@ TEST(gpu_hardware_framebuffer_feedback_and_transfer) {
 }
 
 #if PSPC_TEST_GPU_GL && defined(__linux__)
+struct DecodedImageTracking {
+	std::map<GLuint, size_t> live;
+	DecodedImageTracking() { CHECK(glDecodedImages == nullptr); glDecodedImages = &live; }
+	~DecodedImageTracking() { CHECK(live.empty()); glDecodedImages = nullptr; }
+	void CheckBound(int factor) const {
+		size_t payload = 0;
+		for (const auto &image : live)
+			payload += image.second + image.second / (factor * factor);
+		CHECK(live.size() <= 32);
+		CHECK(payload <= 64 * 1024 * 1024);
+	}
+};
+
+// Direct backend draws keep the same guest pointers while their contents change.
+struct DecodedTextureDraw {
+	RasterState st{};
+	BatchPrim prim{};
+	DecodedTextureDraw(int side = 4) {
+		st.pix.fbStride = 64;
+		st.pix.fbFormat = GE_FORMAT_8888;
+		st.pix.depthTestFunc = st.pix.alphaTestFunc = GE_COMP_ALWAYS;
+		st.scissor = {0, 0, 4 * SUBPIX - 1, 4 * SUBPIX - 1};
+		st.throughMode = st.enableTextures = true;
+		auto &ss = st.samp;
+		ss.texfmt = GE_TFMT_8888;
+		ss.useTextureAlpha = ss.clampS = ss.clampT = true;
+		ss.texFunc = GE_TEXFUNC_REPLACE;
+		ss.levels[0] = {GPtr(TEX), TEX, (u32)(side * side * 4 + 4), (u16)side, (u16)side, (u16)side, true};
+		prim.type = PrimType::Rect;
+		prim.range = st.scissor;
+		prim.v[1].x = prim.v[1].y = 4 * SUBPIX;
+		prim.v[1].s = prim.v[1].t = (float)side;
+		prim.v[0].color0 = prim.v[1].color0 = 0xFFFFFFFF;
+	}
+	void Draw(RenderBackend &backend, u32 expected) {
+		backend.DrawBatch(&prim, 1, &st, 1);
+		CHECK((GRead32(VRAM) & 0xFFFFFF) == (expected & 0xFFFFFF));
+	}
+};
+
+TEST(gpu_opengl_decoded_texture_reuse_and_edits) {
+	Env env;
+	BackendOptions o;
+	o.scale = 2; o.textureUpscale = 2; o.gpuTransform = false;
+	std::string error;
+	auto backend = MakeBackend(o, &error);
+	if (!backend) return;
+	DecodedTextureDraw draw;
+	std::fill_n(reinterpret_cast<u32 *>(GPtr(TEX)), 16, 0xFF112233);
+	unsigned before = glDecodedUploads;
+	for (int i = 0; i < 3; ++i) draw.Draw(*backend, 0xFF112233);
+	CHECK(glDecodedUploads - before == 1);
+	// Equal contents at a different address may share; modified contents may not.
+	memcpy(GPtr(TEX + 128), GPtr(TEX), 64);
+	draw.st.samp.levels[0].addr = TEX + 128;
+	draw.st.samp.levels[0].ptr = GPtr(TEX + 128);
+	draw.Draw(*backend, 0xFF112233);
+	CHECK(glDecodedUploads - before == 1);
+	std::fill_n(reinterpret_cast<u32 *>(GPtr(TEX + 128)), 16, 0xFF778899);
+	draw.Draw(*backend, 0xFF778899);
+	CHECK(glDecodedUploads - before == 2);
+	// Same pixels, different upscale wrapping and atlas shape must not share an image.
+	draw.st.samp.clampS = false;
+	draw.Draw(*backend, 0xFF778899);
+	CHECK(glDecodedUploads - before == 3);
+	auto &lv = draw.st.samp.levels[0];
+	lv.w = lv.bufw = 2; lv.h = 8;
+	draw.Draw(*backend, 0xFF778899);
+	CHECK(glDecodedUploads - before == 4);
+}
+
+TEST(gpu_opengl_decoded_texture_spatial_and_alpha_edits) {
+	Env env;
+	BackendOptions o;
+	o.scale = 2; o.textureUpscale = 2; o.gpuTransform = false;
+	std::string error;
+	auto backend = MakeBackend(o, &error);
+	if (!backend) return;
+	DecodedTextureDraw draw;
+	draw.st.pix.alphaTestFunc = GE_COMP_GREATER;
+	draw.st.pix.alphaTestRef = 128;
+	auto *pixels = reinterpret_cast<u32 *>(GPtr(TEX));
+	for (int i = 0; i < 16; ++i) pixels[i] = 0xFF000000u | (i + 1) * 0x030507u;
+	auto capture = [&] {
+		auto clear = draw.st;
+		clear.pix.clearMode = clear.pix.colorClear = clear.pix.stencilClear = true;
+		auto prim = draw.prim;
+		prim.type = PrimType::ClearRect;
+		prim.v[0].color0 = prim.v[1].color0 = 0;
+		backend->DrawBatch(&prim, 1, &clear, 1);
+		backend->DrawBatch(&draw.prim, 1, &draw.st, 1);
+		std::vector<u32> image;
+		int w = 0, h = 0;
+		CHECK(backend->GetDisplayImage(VRAM, 64, GE_FORMAT_8888, 4, 4, image, &w, &h, 0));
+		CHECK(w == 8 && h == 8 && image.size() == 64);
+		// Compare the whole high-resolution image and eager guest-memory writeback on every hit.
+		for (int y = 0; y < 4; ++y)
+			for (int x = 0; x < 4; ++x) image.push_back(GRead32(VRAM + (y * 64 + x) * 4));
+		return image;
+	};
+	unsigned before = glDecodedUploads;
+	const auto original = capture();
+	CHECK(capture() == original);
+	CHECK(glDecodedUploads - before == 1);
+	pixels[15] ^= 0x00FF0000;  // Change a texel other than the one the solid-color tests inspect.
+	const auto edited = capture();
+	CHECK(edited != original);
+	CHECK(capture() == edited);
+	CHECK(glDecodedUploads - before == 2);
+	for (int i = 0; i < 16; ++i) pixels[i] &= 0x00FFFFFF;  // Alpha-only edit must affect rendering.
+	const auto transparent = capture();
+	// Display conversion forces opaque alpha; guest VRAM retains the cleared stencil byte.
+	std::vector<u32> black(80, 0);
+	std::fill_n(black.begin(), 64, 0xFF000000u);
+	CHECK(transparent == black);
+	CHECK(capture() == transparent);
+	CHECK(glDecodedUploads - before == 3);
+	for (int i = 0; i < 16; ++i) pixels[i] |= 0xFF000000;
+	CHECK(capture() == edited);
+	CHECK(glDecodedUploads - before == 3);
+}
+
+TEST(gpu_opengl_decoded_texture_clut_and_mips) {
+	Env env;
+	BackendOptions o;
+	o.textureUpscale = 2; o.gpuTransform = false;
+	std::string error;
+	auto backend = MakeBackend(o, &error);
+	if (!backend) return;
+	DecodedTextureDraw draw(2);
+	u32 clut[512]{};
+	clut[0] = 0xFF112233; clut[1] = 0xFF445566;
+	auto &ss = draw.st.samp;
+	ss.texfmt = GE_TFMT_CLUT8; ss.swizzle = true;
+	ss.clutfmt = GE_CMODE_32BIT_ABGR8888;
+	ss.clut = reinterpret_cast<const u8 *>(clut);
+	ss.clutSimple = ss.useSharedClut = true;
+	ss.maxLevel = 1; ss.texLevelMode = GE_TEXLEVEL_MODE_CONST; ss.texLevelOffset = 16;
+	ss.levels[0] = {GPtr(TEX), TEX, 128, 16, 2, 2, true};
+	ss.levels[1] = {GPtr(TEX + 256), TEX + 256, 128, 16, 2, 2, true};
+	unsigned before = glDecodedUploads;
+	draw.Draw(*backend, clut[0]); draw.Draw(*backend, clut[0]);
+	CHECK(glDecodedUploads - before == 1);
+	clut[0] = 0xFF778899;
+	draw.Draw(*backend, clut[0]);
+	CHECK(glDecodedUploads - before == 2);
+	memset(GPtr(TEX + 256), 1, 128);
+	draw.Draw(*backend, clut[1]);
+	CHECK(glDecodedUploads - before == 3);
+	memset(GPtr(TEX), 1, 128);
+	ss.maxLevel = 2;
+	ss.levels[2] = ss.levels[1];
+	ss.levels[0].w = 4;
+	draw.Draw(*backend, clut[1]);
+	CHECK(glDecodedUploads - before == 4);
+	// Equal atlas pixels/dimensions, different mip boundaries (4+2+2 vs2+4+2).
+	ss.levels[0].w = 2; ss.levels[1].w = 4;
+	draw.Draw(*backend, clut[1]);
+	CHECK(glDecodedUploads - before == 5);
+}
+
+TEST(gpu_opengl_decoded_texture_bounded_and_context_owned) {
+	Env env;
+	DecodedImageTracking images;
+	BackendOptions o;
+	o.textureUpscale = 4; o.gpuTransform = false;
+	std::string error;
+	for (int side : {1, 512}) {
+		CHECK(images.live.empty());
+		auto backend = MakeBackend(o, &error);
+		if (!backend) return;
+		DecodedTextureDraw draw(side);
+		// Evict by entry count, then by decoded + upscaled byte size.
+		int count = side == 1 ? 33 : 4;
+		for (int i = 0; i < count; ++i) {
+			u32 color = 0xFF000001u + i;
+			std::fill_n(reinterpret_cast<u32 *>(GPtr(TEX)), side * side, color);
+			draw.Draw(*backend, color);
+			images.CheckBound(o.textureUpscale);
+		}
+		std::fill_n(reinterpret_cast<u32 *>(GPtr(TEX)), side * side, 0xFF000001);
+		unsigned before = glDecodedUploads;
+		draw.Draw(*backend, 0xFF000001); draw.Draw(*backend, 0xFF000001);
+		CHECK(glDecodedUploads - before == 1);
+		images.CheckBound(o.textureUpscale);
+		backend->ReleaseWindow();
+		CHECK(images.live.empty());  // Destruction of the context alone must not hide missing GL deletes.
+		backend.reset();
+		backend = MakeBackend(o, &error);
+		if (!backend) return;
+		draw.Draw(*backend, 0xFF000001);
+		CHECK(glDecodedUploads - before == 2);
+	}
+	CHECK(images.live.empty());
+	// Four 512-square mips at 4x exceed 64MiB including their decoded pixels.
+	// An oversized image must remain transient instead of defeating the byte bound.
+	auto backend = MakeBackend(o, &error);
+	if (!backend) return;
+	DecodedTextureDraw large(512);
+	large.st.samp.maxLevel = 3;
+	for (int level = 0; level < 4; ++level) {
+		u32 addr = TEX + level * 512 * 512 * 4;
+		std::fill_n(reinterpret_cast<u32 *>(GPtr(addr)), 512 * 512, 0xFF445566);
+		large.st.samp.levels[level] = {GPtr(addr), addr, 512 * 512 * 4 + 4, 512, 512, 512, true};
+	}
+	unsigned before = glDecodedUploads;
+	large.Draw(*backend, 0xFF445566);
+	CHECK(images.live.empty());
+	large.Draw(*backend, 0xFF445566);
+	CHECK(images.live.empty());
+	CHECK(glDecodedUploads - before == 2);
+}
+
 static void CheckUnrelatedTextureReadbacks(u32 textureBase) {
 	Env env;
 	BackendOptions options;
@@ -570,6 +809,7 @@ TEST(gpu_opengl_feedback_alias_mip_and_wrap) {
 		u32 clut[512]{};
 		clut[0] = 0xFF102030;
 		clut[1] = 0xFF336699;
+		clut[2] = 0xFF7755AA;
 		RasterState states[2]{};
 		auto &st = states[1];
 		st.pix.fbOffset = offset;
@@ -622,6 +862,16 @@ TEST(gpu_opengl_feedback_alias_mip_and_wrap) {
 		if (actual != expected)
 			printf("  feedback mode %d: pixel %08x, expected %08x\n", mode, actual, expected);
 		CHECK(actual == expected);
+		const unsigned uploads = glDecodedUploads;
+		prims[0].v[1].color0 = 0x02020202;
+		for (int repeat = 0; repeat < 2; ++repeat) {
+			const unsigned reads = glTextureReadbacks;
+			backend->DrawBatch(prims, 2, states, 2);
+			CHECK(glTextureReadbacks - reads == 2);
+			CHECK(GRead32(pixel) == 0x027755AA);
+			// First observe the GPU-modified source, then reuse it without skipping feedback downloads.
+			CHECK(glDecodedUploads - uploads == 1);
+		}
 	}
 }
 #endif
