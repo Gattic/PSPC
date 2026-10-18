@@ -170,6 +170,10 @@ class OpenGLBackend final : public RenderBackend, private DrawData {
 	std::recursive_mutex mutex_;
 	GLuint dummyDepth_ = 0, vao_ = 0, vb_ = 0, sb_ = 0, fbo_ = 0, programs_[16] = {}, expand_ = 0, reduce_ = 0,
 		   display_ = 0, upscale_ = 0, present_ = 0;
+	// The dialogs' and HOME menu's overlay (PresentDisplay): that revision, ow x oh (0 x 0: none).
+	GLuint overlay_ = 0;
+	u64 overlayRevision_ = 0;
+	int overlayW_ = 0, overlayH_ = 0;
 	std::vector<std::unique_ptr<Surface>> surfaces_;
 	// Vertex transform on the GPU (gpu/geometry.h): CSVertex and CSTriangle, and their storage buffers
 	// (the shaders' bindings); GEO_OUT holds CSTriangle's GPU vertices, drawn as a vertex buffer.
@@ -795,7 +799,7 @@ class OpenGLBackend final : public RenderBackend, private DrawData {
 		return true;
 	}
 	bool PresentDisplay(u32 addr, int stride, int fmt, int w, int h,
-						const std::function<void(u32 *, int, int)> &overlay, bool capture) override {
+						const std::function<void(u32 *, int, int)> &overlay, u64 overlayRevision, bool capture) override {
 		if (!visible_ || !context_)
 			return false;
 		Current current(*this);
@@ -824,14 +828,25 @@ class OpenGLBackend final : public RenderBackend, private DrawData {
 			int factor = std::clamp(std::min((ww + 479) / 480, (wh + 271) / 272), 1, 16);
 			ow = 480 * factor;
 			oh = 272 * factor;
-			std::vector<u32> pixels((size_t)ow * oh);
-			overlay(pixels.data(), ow, oh);
-			over = Texture(ow, oh);
-			glTextureSubImage2D(over, 0, 0, 0, ow, oh, GL_RED_INTEGER, GL_UNSIGNED_INT, pixels.data());
+			// Drawn on the CPU (tens of milliseconds at a large window's size) only when it changes.
+			if (overlayRevision != overlayRevision_ || ow != overlayW_ || oh != overlayH_) {
+				if (ow != overlayW_ || oh != overlayH_) {
+					glDeleteTextures(1, &overlay_);
+					overlay_ = 0;
+					overlayW_ = overlayH_ = 0;
+					overlay_ = Texture(ow, oh);
+				}
+				std::vector<u32> pixels((size_t)ow * oh);
+				overlay(pixels.data(), ow, oh);
+				glTextureSubImage2D(overlay_, 0, 0, 0, ow, oh, GL_RED_INTEGER, GL_UNSIGNED_INT, pixels.data());
+				overlayRevision_ = overlayRevision;
+				overlayW_ = ow;
+				overlayH_ = oh;
+			}
+			over = overlay_;
 		}
 		DrawPicture(picture, w * scale_, h * scale_, fmt, over, ow, oh);
 		glDeleteTextures(1, &picture);
-		glDeleteTextures(1, &over);
 		return true;
 	}
 	void ReleaseWindow() override {
@@ -862,6 +877,9 @@ class OpenGLBackend final : public RenderBackend, private DrawData {
 					glDeleteShader(s);
 			glDeleteBuffers(GEO_BUFFERS, geoBuffers_);
 			glDeleteTextures(1, &dummyDepth_);
+			glDeleteTextures(1, &overlay_);
+			overlay_ = 0;
+			overlayW_ = overlayH_ = 0;
 			glDeleteBuffers(1, &vb_);
 			glDeleteBuffers(1, &sb_);
 			glDeleteVertexArrays(1, &vao_);

@@ -91,11 +91,13 @@ public:
 	// framebuffer at addr. Presents the backend's own image of it, scaled to fit the window, and returns
 	// true. overlay(rgba, w, h), if given, draws over it at about the window's size (RGBA8888, w x h a
 	// multiple of 480x272): onto a transparent image that is laid over the picture (the dialogs and the HOME
-	// menu), or, with `capture`, onto the picture itself read back (screenshots). False without a window or
-	// an image of that framebuffer: the caller presents a CPU image instead.
+	// menu), or, with `capture`, onto the picture itself read back (screenshots). overlayRevision changes
+	// whenever the overlay would draw something else: while it doesn't, at the same size, the backend may
+	// lay the last one over the picture again instead of calling overlay. False without a window or an image
+	// of that framebuffer: the caller presents a CPU image instead.
 	virtual bool PresentDisplay(u32 addr, int stride, int format, int width, int height,
-	                            const std::function<void(u32 *rgba, int w, int h)> &overlay, bool capture) {
-		(void)addr; (void)stride; (void)format; (void)width; (void)height; (void)overlay; (void)capture;
+	                            const std::function<void(u32 *rgba, int w, int h)> &overlay, u64 overlayRevision, bool capture) {
+		(void)addr; (void)stride; (void)format; (void)width; (void)height; (void)overlay; (void)overlayRevision; (void)capture;
 		return false;
 	}
 	// Presents a CPU image (RGBA8888, `stride` pixels a row) to the host window, scaled to fit; false when
@@ -119,9 +121,9 @@ inline bool GetBackendDisplayImage(u32 addr, int stride, int format, int width, 
 	return b && b->GetDisplayImage(addr, stride, format, width, height, out, outW, outH, outScale);
 }
 inline bool PresentBackendDisplay(u32 addr, int stride, int format, int width, int height,
-                                  const std::function<void(u32 *rgba, int w, int h)> &overlay, bool capture) {
+                                  const std::function<void(u32 *rgba, int w, int h)> &overlay, u64 overlayRevision, bool capture) {
 	RenderBackend *b = GetRenderBackend();
-	return b && b->PresentDisplay(addr, stride, format, width, height, overlay, capture);
+	return b && b->PresentDisplay(addr, stride, format, width, height, overlay, overlayRevision, capture);
 }
 
 }  // namespace gpu

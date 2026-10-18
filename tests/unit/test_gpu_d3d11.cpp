@@ -1132,5 +1132,58 @@ TEST(gpu_hardware_guarded_render_to_texture) {
 		CHECK(stats.earlyCopiesUsed >= 1);
 	}
 }
+
+// The dialogs' overlay, presented over the picture in a window: composited on the CPU (at the window's
+// size: tens of milliseconds when it is large) only when its revision or that size changes, not at every
+// present.
+TEST(gpu_hardware_overlay_drawn_when_it_changes) {
+	HWND window = CreateWindowExW(0, L"STATIC", L"PSPC overlay test", WS_POPUP, 0, 0, 960, 544, nullptr, nullptr, nullptr,
+	                              nullptr);
+	CHECK(window != nullptr);
+	if (!window)
+		return;
+	{
+		Env env;
+		BackendOptions o;
+		o.scale = 2;
+		o.warp = true;
+		o.window = window;
+		std::string err;
+		auto backend = MakeBackend(o, &err);
+		if (!backend) {
+			printf("  (D3D11 WARP unavailable: %s)\n", err.c_str());
+		} else {
+			SetRenderBackend(backend.get());
+			DrawScene(GE_FORMAT_8888);
+			int calls = 0, drawnW = 0;
+			auto overlay = [&](u32 *px, int w, int h) {
+				calls++;
+				drawnW = w;
+				px[(size_t)w * h - 1] = 0xFFFFFFFF;
+			};
+			auto present = [&](const std::function<void(u32 *, int, int)> &o, u64 revision) {
+				return backend->PresentDisplay(VRAM, 512, GE_FORMAT_8888, 480, 272, o, revision, false);
+			};
+			for (int i = 0; i < 3; i++)
+				CHECK(present(overlay, 5));
+			CHECK(calls == 1 && drawnW == 960);
+			CHECK(present(overlay, 6));
+			CHECK(calls == 2);
+			// No overlay for a while, then the same one again: the one drawn is still right.
+			CHECK(present(nullptr, 6));
+			CHECK(present(overlay, 6));
+			CHECK(calls == 2);
+			// The window made larger (maximized): drawn again, at its new size.
+			SetWindowPos(window, nullptr, 0, 0, 1920, 1088, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+			CHECK(present(overlay, 6));
+			CHECK(calls == 3 && drawnW == 1920);
+			CHECK(present(overlay, 6));
+			CHECK(calls == 3);
+			backend->ReleaseWindow();
+			SetRenderBackend(nullptr);
+		}
+	}
+	DestroyWindow(window);
+}
 #endif
 #endif

@@ -247,7 +247,7 @@ public:
 	bool GetDisplayImage(u32 addr, int stride, int format, int width, int height, std::vector<u32> &out, int *outW, int *outH,
 	                     int outScale) override;
 	bool PresentDisplay(u32 addr, int stride, int format, int width, int height, const std::function<void(u32 *, int, int)> &overlay,
-	                    bool capture) override;
+	                    u64 overlayRevision, bool capture) override;
 	bool PresentImage(const u32 *rgba, int width, int height, int stride) override;
 	void ReleaseWindow() override;
 	// A guest access to a VRAM page kept inaccessible: writes back what's rendered there.
@@ -402,6 +402,9 @@ private:
 	ComPtr<ID3D11ShaderResourceView> imageSrv_, overlaySrv_;
 	int imageW_ = 0, imageH_ = 0, overlayW_ = 0, overlayH_ = 0;
 	std::vector<u32> overlayBuf_;
+	// What overlayTex_ holds: the overlay of that revision, drawn at that size (0 x 0: none).
+	u64 overlayRevision_ = 0;
+	int overlayDrawnW_ = 0, overlayDrawnH_ = 0;
 	int presents_ = 0;
 
 	ComPtr<ID3D11InfoQueue> infoQueue_;
@@ -2361,7 +2364,7 @@ void D3D11Backend::DrawPresent(ID3D11ShaderResourceView *src, int srcW, int srcH
 }
 
 bool D3D11Backend::PresentDisplay(u32 addr, int stride, int format, int width, int height,
-                                  const std::function<void(u32 *, int, int)> &overlay, bool capture) {
+                                  const std::function<void(u32 *, int, int)> &overlay, u64 overlayRevision, bool capture) {
 	std::lock_guard<std::recursive_mutex> lock(mu_);
 	if (!window_ || presentFailed_)
 		return false;
@@ -2386,10 +2389,17 @@ bool D3D11Backend::PresentDisplay(u32 addr, int stride, int format, int width, i
 			overlay(overlayBuf_.data(), iw, ih);
 			return PresentImageLocked(overlayBuf_.data(), iw, ih, iw);
 		}
-		overlayBuf_.assign((size_t)ow * oh, 0);
-		overlay(overlayBuf_.data(), ow, oh);
-		if (!UploadImage(overlayBuf_.data(), ow, oh, ow, overlayTex_, overlaySrv_, &overlayW_, &overlayH_))
-			return false;
+		// Drawn on the CPU (tens of milliseconds at a large window's size) only when it changes.
+		if (overlayRevision != overlayRevision_ || ow != overlayDrawnW_ || oh != overlayDrawnH_) {
+			overlayDrawnW_ = overlayDrawnH_ = 0;
+			overlayBuf_.assign((size_t)ow * oh, 0);
+			overlay(overlayBuf_.data(), ow, oh);
+			if (!UploadImage(overlayBuf_.data(), ow, oh, ow, overlayTex_, overlaySrv_, &overlayW_, &overlayH_))
+				return false;
+			overlayRevision_ = overlayRevision;
+			overlayDrawnW_ = ow;
+			overlayDrawnH_ = oh;
+		}
 		DrawPresent(s->srv.Get(), width * scale_, height * scale_, format, scale_ > 1, overlaySrv_.Get(), ow, oh);
 		return true;
 	}

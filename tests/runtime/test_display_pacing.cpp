@@ -20,7 +20,7 @@ public:
 	unsigned presents = 0, firstVcount = 0;
 	const char *Name() const override { return "pacing-test"; }
 	void DrawBatch(const gpu::BatchPrim *, size_t, const gpu::RasterState *, size_t) override {}
-	bool PresentDisplay(u32, int, int, int, int, const std::function<void(u32 *, int, int)> &, bool) override {
+	bool PresentDisplay(u32, int, int, int, int, const std::function<void(u32 *, int, int)> &, u64, bool) override {
 		if (!presents) firstVcount = display::Vcount();
 		++presents;
 		if (!fast) hostsys::SleepMs(20);

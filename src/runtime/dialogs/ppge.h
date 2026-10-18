@@ -105,6 +105,10 @@ void MeasureString(float *w, float *h, std::string_view text, float scale, int w
 void Composite(u32 *rgba, int width, int height, bool gameScreen = true);
 // Whether a layer would be drawn now.
 bool Visible(Layer layer);
+// Changes whenever what Composite(..., gameScreen) draws changes. The dialogs draw a new frame at every
+// Update, mostly the same as the last one: a GPU renderer keeps the overlay it composited (which at the
+// window's size takes many milliseconds) while this stays the same.
+u64 Revision(bool gameScreen = true);
 
 // UTF-16 (OSK text) to UTF-8.
 std::string Utf16ToUtf8(const std::u16string &s);
