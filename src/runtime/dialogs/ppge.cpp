@@ -271,6 +271,11 @@ struct Cmd {
 	Icon icon = Icon::Cross;
 	short clip[4] = {0, 0, 480, 272};
 	std::shared_ptr<const Texture> tex;
+
+	bool operator==(const Cmd &o) const {
+		return kind == o.kind && x1 == o.x1 && y1 == o.y1 && x2 == o.x2 && y2 == o.y2 && color == o.color && code == o.code &&
+		       icon == o.icon && memcmp(clip, o.clip, sizeof(clip)) == 0 && tex == o.tex;
+	}
 };
 
 struct Frame {
@@ -284,6 +289,8 @@ Frame g_building;
 Layer g_buildLayer = Layer::Dialog;
 bool g_inFrame = false;
 short g_scissor[4] = {0, 0, 480, 272};
+// Counts the changes of the layers' contents (Revision).
+u64 g_contents = 0;
 
 void Add(Cmd c) {
 	if (!g_inFrame) return;
@@ -722,13 +729,23 @@ void End() {
 	g_inFrame = false;
 	g_building.vcount = display::Vcount();
 	g_building.live = true;
-	g_layers[(int)g_buildLayer] = std::move(g_building);
+	Frame &shown = g_layers[(int)g_buildLayer];
+	if (!shown.live || shown.cmds != g_building.cmds) g_contents++;
+	shown = std::move(g_building);
 	g_building = Frame{};
 }
 
-void Clear(Layer layer) { g_layers[(int)layer] = Frame{}; }
+void Clear(Layer layer) {
+	g_layers[(int)layer] = Frame{};
+	g_contents++;
+}
 
 bool Visible(Layer layer) { return LayerVisible((int)layer); }
+
+u64 Revision(bool gameScreen) {
+	// Which layers are drawn changes it too (a dialog frame expires; a system screen hides the dialog).
+	return g_contents << 2 | (gameScreen && LayerVisible(0) ? 1 : 0) | (LayerVisible(1) ? 2 : 0);
+}
 
 void DrawRect(float x1, float y1, float x2, float y2, u32 color) {
 	if (!g_inFrame) return;

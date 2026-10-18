@@ -118,7 +118,7 @@ void Present() {
 			ppge::Composite(px, w, h, gameScreen);
 			if (screenshot) host::SaveScreenshotIfRequested(px, w, h);
 		};
-	if (gpu::PresentBackendDisplay(fb.addr, fb.stride, fb.format, 480, 272, draw, screenshot)) return;
+	if (gpu::PresentBackendDisplay(fb.addr, fb.stride, fb.format, 480, 272, draw, ppge::Revision(gameScreen), screenshot)) return;
 	// Otherwise its image of the framebuffer, read back at about the window's size (or guest memory made
 	// current).
 	int w = 0, h = 0;
