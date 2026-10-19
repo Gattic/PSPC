@@ -39,7 +39,7 @@ struct Settings {
 	bool aot = true;                // use AOT-compiled module DLLs (false = interpreter only)
 	std::string fw = "6.60";        // firmware version reported to games
 	std::string firmware = "default"; // installed profile under the user-data firmware directory
-	std::string renderer;           // "software", "opengl", "d3d11", "d3d11-warp"; "" = $PSPC_RENDERER or software
+	std::string renderer;           // "software", "opengl", "d3d11", "d3d11-warp", "none"; "" = $PSPC_RENDERER or software
 	int renderScale = 0;            // GPU internal resolution 1-16 (8 = 4K, 16 = 8K); 0 = default (1)
 	std::string textureFilter = "auto";  // GPU: "auto" (as the game sets it), "nearest", "linear"
 	int textureUpscale = 1;         // GPU: 1 = off, 2-4 = textures upscaled with xBR

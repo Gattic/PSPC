@@ -109,6 +109,8 @@ bool asyncTaken = false;
 // A list finished during this Run: the backend writes its rendering back to guest memory at the end.
 bool backendSyncPending = false;
 u32 edramTranslation = 0x400;
+// SetDrawing: off, primitives are neither transformed nor drawn (everything else runs as before).
+bool drawing = true;
 
 // The CLUT as LOADCLUT leaves it (a partial load keeps the rest).
 u8 clutData[1024];
@@ -450,7 +452,8 @@ void Execute_Prim(u32 op) {
 	cyclesExecuted += PerVertexCycles() * count;
 	if (hooks.getTicks)
 		cyclesExecuted += ClearFillCycles(prim, verts, inds, count, vertType);
-	SubmitPrimitive(verts, inds, prim, count, vertType);
+	if (drawing)
+		SubmitPrimitive(verts, inds, prim, count, vertType);
 	// The vertex (or index) address advances; VADDR/IADDR stay.
 	AdvanceVerts(vertType, count, count * drawFmt.size);
 }
@@ -462,10 +465,12 @@ void Execute_Curve(u32 op, bool spline) {
 	const u8 *verts, *inds;
 	if (count == 0 || !DrawPointers(vertType, count, count, &verts, &inds))
 		return;
-	if (spline)
-		SubmitSpline(verts, inds, op, vertType);
-	else
-		SubmitBezier(verts, inds, op, vertType);
+	if (drawing) {
+		if (spline)
+			SubmitSpline(verts, inds, op, vertType);
+		else
+			SubmitBezier(verts, inds, op, vertType);
+	}
 	AdvanceVerts(vertType, count, count * drawFmt.size);
 }
 
@@ -656,8 +661,9 @@ void Execute_MtxData(u32 op, u32 &numReg, u32 &dataReg, float *mtx, int size, u3
 void FlushImm() {
 	if (immCount == 0 || immPrim == GE_PRIM_INVALID)
 		return;
-	// Immediate points at 0,0 with no color are leftovers of clearing the state.
-	if (immCount == 1 && immPrim == GE_PRIM_POINTS && immVerts[0].x == 0 && immVerts[0].y == 0 && immVerts[0].z == 0 && immVerts[0].color0 == 0) {
+	// Nothing is drawn (SetDrawing), or immediate points at 0,0 with no color: leftovers of clearing the state.
+	if (!drawing || (immCount == 1 && immPrim == GE_PRIM_POINTS && immVerts[0].x == 0 && immVerts[0].y == 0 &&
+	                 immVerts[0].z == 0 && immVerts[0].color0 == 0)) {
 		immCount = 0;
 		return;
 	}
@@ -1332,6 +1338,11 @@ void SetRamSize(u32 bytes) {
 void SetRenderThreads(int count) {
 	binner::Flush();
 	binner::SetThreads(count);
+}
+
+void SetDrawing(bool on) {
+	binner::Flush();
+	drawing = on;
 }
 
 void SetInterruptsEnabled(bool enabled) {

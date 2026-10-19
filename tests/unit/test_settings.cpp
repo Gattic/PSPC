@@ -83,6 +83,9 @@ TEST(settings_set_validates) {
 	CHECK(settings::Set(s, "texture_upscale", "4") && s.textureUpscale == 4);
 	CHECK(!settings::Set(s, "texture_upscale", "5") && s.textureUpscale == 4);
 	CHECK(settings::Get(s, "texture_upscale") == "4" && settings::Get(s, "texture_filter") == "linear");
+	CHECK(settings::Set(s, "renderer", "None") && s.renderer == "none");
+	CHECK(settings::Set(s, "renderer", "d3d11") && s.renderer == "d3d11");
+	CHECK(!settings::Set(s, "renderer", "vulkan") && s.renderer == "d3d11");
 	// The servers the launcher runs.
 	CHECK(!s.hostNetwork && s.hostNetworkPort == 8423 && s.hostNetworkLan && s.hostSfcoAllowLocal);
 	CHECK(settings::Set(s, "host_network", "1") && s.hostNetwork);

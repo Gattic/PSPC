@@ -315,7 +315,7 @@ void SetUpRenderer(const Options &o) {
 	}
 	scale = std::clamp(scale, 1, 16);
 	gpu::SetRenderBackend(nullptr);
-	if (name == "software")
+	if (name == "software" || name == "none")
 		return;
 #if PSPC_HAVE_GPU_GL
 	if (name == "opengl") {
@@ -395,6 +395,10 @@ int RunOnce(const Options &o, BootTarget bt) {
 	if (!o.dataDir.empty()) hle::LoadNidDatabase(fs::u8path(o.dataDir) / "nids.csv");
 	hle::RegisterAllModules();
 #if PSPC_HAVE_GPU
+	// "none": display lists run, nothing is drawn (a dedicated game server that nobody watches).
+	gpu::SetDrawing(RendererName(o) != "none");
+	if (RendererName(o) == "none")
+		LOGI("RUNTIME", "Renderer none: display lists run, nothing is drawn");
 	SetUpRenderer(o);
 #endif
 	sched::Init(o.fastTime);

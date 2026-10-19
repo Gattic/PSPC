@@ -147,7 +147,7 @@ Useful options (`pspc --help` lists them all):
 | `--memstick <dir>`, `--flash0 <dir>`, `--host0 <dir>` | device roots |
 | `--plugins <dir>`, `--no-plugins` | M33 plugins folder laid over ms0: (default: `plugins`), or none |
 | `--umd <image>` | insert a disc while running a .prx/.elf/.pbp |
-| `--renderer software\|opengl\|d3d11`, `--render-scale <1-16>` | Software (default), OpenGL (Linux) or D3D11 (Windows); GPU renderers support 1-16 times 480x272 (8 = 4K, 16 = 8K) |
+| `--renderer software\|opengl\|d3d11\|none`, `--render-scale <1-16>` | Software (default), OpenGL (Linux) or D3D11 (Windows); GPU renderers support 1-16 times 480x272 (8 = 4K, 16 = 8K). `none` draws nothing (display lists still run): for dedicated game servers, which nobody watches |
 | `--texture-upscale <1-4>`, `--texture-filter auto\|nearest\|linear` | GPU textures: scaled up with xBR; filtering as the game sets it, or forced |
 | `--osk-text <text>` | headless: what the on-screen keyboard returns (e.g. a character name) |
 | `--config <file\|none>`, `--set key=value` | settings file to use (default `pspc.ini`), or override one entry |

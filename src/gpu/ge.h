@@ -101,6 +101,11 @@ void SetSdkVersion(u32 version);
 void SetRamSize(u32 bytes);
 // Rasterizer worker threads: 0 = automatic, 1 = draw on the calling thread only.
 void SetRenderThreads(int count);
+// Whether the GE draws (default on). Off (the "none" renderer: dedicated game servers, which nobody
+// watches): display lists still run as before - their timing, the vertex and index addresses draws
+// advance, bounding boxes, block transfers, CLUT loads, signals and syncs - but primitives are neither
+// transformed nor drawn, so guest VRAM holds only what the CPU and block transfers put there.
+void SetDrawing(bool on);
 
 // For sceDisplay: convert a framebuffer in guest memory to RGBA8888 (R,G,B,A bytes in memory).
 // pixelFormat: 0=565, 1=5551, 2=4444, 3=8888. stride in pixels. Alpha is forced to 255.

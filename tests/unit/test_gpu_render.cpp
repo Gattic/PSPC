@@ -631,6 +631,57 @@ TEST(gpu_block_transfer) {
 	CHECK_EQ(Pixel32(10, 24), 0u);
 }
 
+// The "none" renderer (SetDrawing(false)): lists run - block transfers copy, draws move the vertex and
+// index addresses on as they would - but nothing is drawn.
+TEST(gpu_no_drawing) {
+	GeEnv env;
+	for (int i = 0; i < 16; ++i)
+		GWrite32(RAM + 0x10000 + i * 4, 0xCD000000u | (u32)i);
+	// Two sprites back to back, and 16-bit indices 0,1 then 2,3 into them.
+	TVert v[4] = { { 0xFF0000FF, 10, 10, 0, 0 }, { 0xFF0000FF, 20, 20, 0, 0 },
+	               { 0xFF00FF00, 30, 30, 0, 0 }, { 0xFF00FF00, 40, 40, 0, 0 } };
+	PutVerts(VERTS, v, 4);
+	const u16 idx[4] = { 0, 1, 2, 3 };
+	memcpy(GPtr(VERTS + 0x1000), idx, sizeof(idx));
+	const u32 prim2 = ((u32)GE_PRIM_RECTANGLES << 16) | 2;
+	// Drawing off: no clear, no sprite, but the block transfer copies and the vertex address moves on.
+	SetDrawing(false);
+	DL a;
+	a.Target();
+	ClearScreen(a, 0xFF112233);
+	a.C(GE_CMD_VERTEXTYPE, VT_C8888_P16).Prim(GE_PRIM_RECTANGLES, 2, VERTS);
+	a.C(GE_CMD_TRANSFERSRC, (RAM + 0x10000) & 0xFFFFF0).C(GE_CMD_TRANSFERSRCW, 16 | (((RAM + 0x10000) >> 8) & 0xFF0000));
+	a.C(GE_CMD_TRANSFERDST, 0).C(GE_CMD_TRANSFERDSTW, 512 | ((VRAM >> 8) & 0xFF0000));
+	a.C(GE_CMD_TRANSFERSRCPOS, 0).C(GE_CMD_TRANSFERDSTPOS, 100 | (100 << 10));
+	a.C(GE_CMD_TRANSFERSIZE, (4 - 1) | ((1 - 1) << 10)).C(GE_CMD_TRANSFERSTART, 1).Finish();
+	RunList(a);
+	CHECK_EQ(Pixel32(5, 5), 0u);
+	CHECK_EQ(Pixel32(15, 15), 0u);
+	CHECK_EQ(Pixel32(100, 100), 0xCD000000u);
+	CHECK_EQ(Pixel32(103, 100), 0xCD000003u);
+	// Drawing on: a PRIM without a new VADDR draws the second sprite.
+	SetDrawing(true);
+	DL b(LIST + 0x1000);
+	b.Target().C(GE_CMD_VERTEXTYPE, VT_C8888_P16).C(GE_CMD_PRIM, prim2).Finish();
+	RunList(b);
+	CHECK_EQ(Pixel32(15, 15), 0u);
+	CHECK_EQ(Pixel32(35, 35) & 0xFFFFFFu, 0x00FF00u);  // the second sprite (no clear: alpha, the stencil, stays 0)
+	// The same with indices: the index address moves on past the skipped draw.
+	GWrite32(VRAM + (35 * 512 + 35) * 4, 0);
+	SetDrawing(false);
+	DL c(LIST + 0x2000);
+	c.Target().C(GE_CMD_VERTEXTYPE, VT_C8888_P16 | GE_VTYPE_IDX_16BIT).Addr(GE_CMD_IADDR, VERTS + 0x1000);
+	c.Prim(GE_PRIM_RECTANGLES, 2, VERTS).Finish();
+	RunList(c);
+	CHECK_EQ(Pixel32(15, 15), 0u);
+	SetDrawing(true);
+	DL d(LIST + 0x3000);
+	d.Target().C(GE_CMD_VERTEXTYPE, VT_C8888_P16 | GE_VTYPE_IDX_16BIT).C(GE_CMD_PRIM, prim2).Finish();
+	RunList(d);
+	CHECK_EQ(Pixel32(15, 15), 0u);
+	CHECK_EQ(Pixel32(35, 35) & 0xFFFFFFu, 0x00FF00u);  // the second sprite (no clear: alpha, the stencil, stays 0)
+}
+
 TEST(gpu_bezier_patch) {
 	GeEnv env;
 	DL dl;
