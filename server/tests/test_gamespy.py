@@ -20,10 +20,12 @@ import threading
 import time
 import unittest
 import urllib.request
+from contextlib import contextmanager
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
-from pspc_gamespy import crypt, gstats, kv, qr  # noqa: E402
+from pspc_gamespy import crypt, games, gstats, kv, leaderboards, qr  # noqa: E402
+from pspc_gamespy.web import WebServer  # noqa: E402
 from pspc_gamespy.server import Config, GameSpyServer  # noqa: E402
 from pspc_gamespy.sqlfilter import Filter  # noqa: E402
 from pspc_gamespy.store import Store  # noqa: E402
@@ -132,6 +134,51 @@ class HeartbeatTests(unittest.TestCase):
     def test_no_players(self):
         keys, players, teams = qr.parse_heartbeat(heartbeat(b'\0\0\0\1', {'hostname': 'Empty'})[5:])
         self.assertEqual((keys['hostname'], players, len(teams)), ('Empty', [], 2))
+
+
+@contextmanager
+def more_games(entries):
+    """The games in entries loaded from a games file, and gone again afterwards."""
+    tmp = tempfile.mkdtemp()
+    path = os.path.join(tmp, 'gamespy-games.json')
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(entries, f)
+    before_games, before_aliases = dict(games.GAMES), dict(games.ALIASES)
+    try:
+        yield path
+    finally:
+        games.GAMES.clear()
+        games.GAMES.update(before_games)
+        games.ALIASES.clear()
+        games.ALIASES.update(before_aliases)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+class MoreGamesTests(unittest.TestCase):
+    def test_a_game_like_elite_squadron(self):
+        with more_games([{'gamename': 'ModGame', 'name': 'A Mod', 'like': GAMENAME, 'disc_ids': ['ULUS99999']}]) as path:
+            added = games.load(path)
+            self.assertEqual([g.gamename for g in added], ['modgame'])
+            g = games.find('modgame')
+            self.assertEqual((g.secret_key, g.product_id, g.namespace_id, g.disc_ids, g.leaderboard),
+                             (SECRET, 11878, 1, ('ULUS99999',), 'bfes'))
+            self.assertIs(games.find('modgameam'), g)       # Elite Squadron's aliases, by suffix
+            self.assertIs(games.find(GAMENAME).gamename, GAMENAME)
+            web = WebServer(None)
+            leaderboards.install(web, None)
+            self.assertIn('/games/modgame/web/bfes_score.asp', web.pages)
+            self.assertIn('/games/swbfespsp/web/bfes_score.asp', web.pages)
+        self.assertIsNone(games.find('modgame'))
+
+    def test_a_game_of_its_own_and_bad_entries(self):
+        with more_games({'games': [{'gamename': 'other', 'secret_key': 'abcdef', 'product_id': 1}]}) as path:
+            g = games.load(path)[0]
+            self.assertEqual((g.secret_key, g.leaderboard, g.empty_persist), ('abcdef', None, b''))
+        for bad in ([{'gamename': GAMENAME, 'like': GAMENAME}], [{'gamename': 'x', 'like': 'nosuchgame'}],
+                    [{'gamename': 'x'}], [{'name': 'no game name'}]):
+            with more_games(bad) as path:
+                with self.assertRaises(ValueError):
+                    games.load(path)
 
 
 class Tcp:
@@ -388,6 +435,32 @@ class ServerTests(unittest.TestCase):
         host.sendto(heartbeat(instance, keys, statechanged=2), ('127.0.0.1', self.config.qr_port))
         gone = self.read_pushed(sb, cipher)
         self.assertEqual(gone, b'\x04' + socket.inet_aton('127.0.0.1') + struct.pack('>H', port))
+
+    def test_more_games_apart(self):
+        """A game from a games file has its own server list: hosts of each game are listed to that game only."""
+        global GAMENAME
+        with more_games([{'gamename': 'modgame', 'like': GAMENAME}]) as path:
+            games.load(path)
+            fields = ['hostname']
+            for game, name, inst in (('modgame', 'Mod host', b'abcd'), ('swbfespsp', 'Plain host', b'qrst')):
+                GAMENAME = game
+                try:
+                    self.register_host(self.udp(), inst, {'gamename': game, 'hostname': name, 'gamemode': 'openplaying'})
+                finally:
+                    GAMENAME = 'swbfespsp'
+            listed = {}
+            for game in ('modgame', 'swbfespsp'):
+                GAMENAME = game
+                try:
+                    sb = self.tcp(self.config.sb_port)
+                    sb.send(self.list_request(fields, "gamemode='openplaying'"))
+                    listed[game] = {v['hostname'] for _, _, _, v in self.read_list(sb, fields)[1]}
+                finally:
+                    GAMENAME = 'swbfespsp'
+            self.assertIn('Mod host', listed['modgame'])
+            self.assertNotIn('Plain host', listed['modgame'])
+            self.assertIn('Plain host', listed['swbfespsp'])
+            self.assertNotIn('Mod host', listed['swbfespsp'])
 
     def test_unknown_game_refused(self):
         sb = self.tcp(self.config.sb_port)

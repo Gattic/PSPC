@@ -16,6 +16,8 @@ header when they aren't ranked."""
 
 import logging
 
+from . import games
+
 log = logging.getLogger('gamespy')
 
 TIME, KILLS, DEATHS, KD, WINS, LOSSES, WL, OVERALL, RANK, POINTS = 0, 1, 2, 3, 9, 10, 11, 12, 13, 14
@@ -24,9 +26,12 @@ MAX_ROWS = 50
 
 
 def install(web, store):
-    page = Leaderboard(store, 'swbfespsp')
-    for path in ('/games/swbfespsp/web/bfes_score.asp', '/swbfespsp/bfes_score.asp'):
-        web.add(path, page.handle)
+    """Every known game whose leaderboards are in this format (Elite Squadron's and games like it) gets its pages."""
+    for g in games.GAMES.values():
+        if g.leaderboard == 'bfes':
+            page = Leaderboard(store, g.gamename)
+            for path in ('/games/%s/web/bfes_score.asp' % g.gamename, '/%s/bfes_score.asp' % g.gamename):
+                web.add(path, page.handle)
 
 
 def career_columns(totals):

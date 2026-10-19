@@ -75,8 +75,26 @@ python -m pspc_gamespy --db gamespy.sqlite serve --public-host 203.0.113.7
 | `--motd <text>` | the message of the day (the game fetches it but doesn't show it) |
 | `--status-file <file>` | keep a JSON summary of who is online and the hosted games there (the launcher reads it) |
 | `--log debug` (before `serve`) | log every message (large) |
+| `--games <file>` (before `serve`) | more games, from a games file (default: `gamespy-games.json` beside the database, if there is one; see below) |
 
 Players redirect `*.gamespy.com` to the server's address, as above.
+
+### More games
+
+A game that isn't built in is added with a games file: `gamespy-games.json` beside the database
+(for the launcher's server, in its `servers` folder) or one named with `--games`. A mod or another
+release of a known game names that game with `like` and gets its secret key, product ID, namespace,
+stored record and leaderboard pages unless the entry gives its own; any other game needs
+`secret_key` and `product_id` (and gets no leaderboard pages).
+
+```json
+[{"gamename": "mymodpsp", "name": "My Elite Squadron mod", "like": "swbfespsp", "disc_ids": ["ULUS99999"]}]
+```
+
+Each game has its own hosted games (a game's server list holds only its hosts), careers and
+leaderboards; accounts are shared, as GameSpy's were. The executable has to call itself by that
+game name (it is in its GameSpy code, beside the secret key), and its players need a redirect for
+its disc ID: add the ID to the game's entry in `infrastructure.json`, or an entry of its own.
 
 ### Ports
 
@@ -144,7 +162,7 @@ records, reported games and career totals. Back it up.
 | `careers.py` | career totals from hosts' reports |
 | `crypt.py` | GameSpy's base64 and password encoding, login proofs, the stats XOR, the server list cipher |
 | `kv.py`, `sqlfilter.py` | `\key\value\` messages; the server browser's filters |
-| `games.py` | the games: name, secret key, disc IDs |
+| `games.py` | the games: name, secret key, disc IDs; games files |
 | `store.py` | the database |
 
 The game's GameSpy name is `swbfespsp` and its secret key `wLfbMH` (the game builds it byte by byte
@@ -186,12 +204,13 @@ python -m unittest discover -s server/tests       # from the repository root
 GameSpy SDK's C implementation), filters and heartbeats, and runs the whole server on spare ports:
 an account created and logged in, a game hosted and found, pushed updates and full details, a
 message forwarded to the host, NAT negotiation between two players, the stats server's sign-in and
-records, a round counted into careers and the leaderboard pages.
+records, a round counted into careers and the leaderboard pages; games from a games file (their
+own server list, their leaderboard pages, bad entries refused).
 
 ## Limits
 
-- Only Elite Squadron. Other GameSpy games need their name and secret key in `games.py`, and
-  whatever else they use (their leaderboards, their stats records).
+- Elite Squadron is the only game built in. Others come from a games file (above); one that
+  plays unlike Elite Squadron needs whatever else it uses (its leaderboards, its stats records).
 - NAT negotiation is covered by the tests, not by a match: on one PC and on one network the game
   connects to the host's private address directly.
 - The leaderboards come from hosts' heartbeats; a host that leaves before reporting a round still

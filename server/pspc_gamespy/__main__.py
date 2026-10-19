@@ -6,15 +6,19 @@ import asyncio
 import getpass
 import json
 import logging
+import os
 import sys
 import time
 
 from . import __version__
 from . import crypt
-from .games import GAMES
+from .games import GAMES, load as load_games
 from .gstats import decode_kv
 from .server import DEFAULT_MOTD, Config, GameSpyServer
 from .store import Store
+
+
+GAMES_FILE = 'gamespy-games.json'
 
 
 def serve(args):
@@ -90,6 +94,8 @@ def main(argv=None):
     ap.add_argument('--log', default='info', choices=('debug', 'info', 'warning'), help='log level')
     ap.add_argument('--log-file', help='also write the log here')
     ap.add_argument('--json', action='store_true', help='accounts, games and stats: one JSON array (for the launcher)')
+    ap.add_argument('--games', action='append', metavar='FILE',
+                    help='serve: more games, from a JSON file (default: %s beside the database, if there is one)' % GAMES_FILE)
     sub = ap.add_subparsers(dest='command', required=True)
     s = sub.add_parser('serve', help='run the servers')
     s.add_argument('--public-host', default='127.0.0.1',
@@ -114,6 +120,15 @@ def main(argv=None):
     logging.basicConfig(level=getattr(logging, args.log.upper()), handlers=handlers,
                         format='%(asctime)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
     if args.command == 'serve':
+        files = args.games or [os.path.join(os.path.dirname(os.path.abspath(args.db)), GAMES_FILE)]
+        for f in files:
+            if args.games or os.path.exists(f):
+                try:
+                    added = load_games(f)
+                except (OSError, ValueError) as e:  # the built-in games are still served
+                    logging.getLogger('gamespy').error("can't read the games in %s: %s", f, e)
+                    continue
+                logging.getLogger('gamespy').info('games from %s: %s', f, ', '.join(g.name for g in added) or 'none')
         return serve(args)
     store = Store(args.db)
     try:
