@@ -76,6 +76,7 @@ python -m pspc_gamespy --db gamespy.sqlite serve --public-host 203.0.113.7
 | `--status-file <file>` | keep a JSON summary of who is online and the hosted games there (the launcher reads it) |
 | `--log debug` (before `serve`) | log every message (large) |
 | `--games <file>` (before `serve`) | more games, from a games file (default: `gamespy-games.json` beside the database, if there is one; see below) |
+| `--sessions <file>` | programs to run alongside, such as dedicated game servers (default: `gamespy-sessions.json` beside the database, if there is one; see below) |
 
 Players redirect `*.gamespy.com` to the server's address, as above.
 
@@ -95,6 +96,25 @@ Each game has its own hosted games (a game's server list holds only its hosts), 
 leaderboards; accounts are shared, as GameSpy's were. The executable has to call itself by that
 game name (it is in its GameSpy code, beside the secret key), and its players need a redirect for
 its disc ID: add the ID to the game's entry in `infrastructure.json`, or an entry of its own.
+
+### Sessions
+
+Programs the server runs while it runs - dedicated game servers that host games on it, say - come
+from a sessions file: `gamespy-sessions.json` beside the database (for the launcher's server, in
+its `servers` folder) or one named with `--sessions`.
+
+```json
+{"accounts": [{"nick": "Ded-Conquest", "email": "ded@example.com", "password": "...", "namespace": 1}],
+ "sessions": [{"name": "Conquest", "command": ["python", "host.py", "conquest"], "cwd": "...", "restart_after": 30}]}
+```
+
+The accounts are GameSpy accounts for the sessions to log in with: made in the database when they
+are missing (unique nick = nick), their password set to the file's. Each session's command starts
+once the server is listening, starts again `restart_after` seconds (default 30) after it ends, and
+ends with the server together with its child processes, even when the server is killed (as the
+launcher stops it): on Windows they run in a job object that ends them when the server's handle to
+it closes, on Linux with a parent-death signal. A session's output goes to `sessions/<name>.log`
+beside the database; the status file lists the sessions (running, starts).
 
 ### Ports
 
@@ -163,6 +183,7 @@ records, reported games and career totals. Back it up.
 | `crypt.py` | GameSpy's base64 and password encoding, login proofs, the stats XOR, the server list cipher |
 | `kv.py`, `sqlfilter.py` | `\key\value\` messages; the server browser's filters |
 | `games.py` | the games: name, secret key, disc IDs; games files |
+| `sessions.py` | programs run alongside the server (dedicated game servers) |
 | `store.py` | the database |
 
 The game's GameSpy name is `swbfespsp` and its secret key `wLfbMH` (the game builds it byte by byte
@@ -205,7 +226,9 @@ GameSpy SDK's C implementation), filters and heartbeats, and runs the whole serv
 an account created and logged in, a game hosted and found, pushed updates and full details, a
 message forwarded to the host, NAT negotiation between two players, the stats server's sign-in and
 records, a round counted into careers and the leaderboard pages; games from a games file (their
-own server list, their leaderboard pages, bad entries refused).
+own server list, their leaderboard pages, bad entries refused); sessions (their accounts made and
+their passwords kept up to date, a session started again when it ends, sessions stopped with the
+server, and on Windows ended when the server process is killed).
 
 ## Limits
 

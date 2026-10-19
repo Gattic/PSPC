@@ -14,6 +14,7 @@ import os
 import shutil
 import socket
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -24,7 +25,7 @@ from contextlib import contextmanager
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
-from pspc_gamespy import crypt, games, gstats, kv, leaderboards, qr  # noqa: E402
+from pspc_gamespy import crypt, games, gstats, kv, leaderboards, qr, sessions  # noqa: E402
 from pspc_gamespy.web import WebServer  # noqa: E402
 from pspc_gamespy.server import Config, GameSpyServer  # noqa: E402
 from pspc_gamespy.sqlfilter import Filter  # noqa: E402
@@ -179,6 +180,103 @@ class MoreGamesTests(unittest.TestCase):
             with more_games(bad) as path:
                 with self.assertRaises(ValueError):
                     games.load(path)
+
+
+class SessionsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def write(self, doc):
+        path = os.path.join(self.tmp, sessions.SESSIONS_FILE)
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(doc, f)
+        return path
+
+    def test_file_and_accounts(self):
+        path = self.write({'accounts': [{'nick': 'Ded-One', 'email': 'ded1@example.com', 'password': 'pw1'}],
+                           'sessions': [{'name': 'One', 'command': ['x']}]})
+        accounts, entries = sessions.load(path)
+        store = Store(os.path.join(self.tmp, 'gamespy.sqlite'))
+        self.addCleanup(store.close)
+        self.assertEqual(sessions.make_accounts(store, accounts), 1)
+        p = store.profile_by_uniquenick('Ded-One', 1)
+        self.assertEqual(p['password_md5'], crypt.md5hex('pw1'))
+        accounts[0]['password'] = 'pw2'                     # made once; the password follows the file
+        self.assertEqual(sessions.make_accounts(store, accounts), 0)
+        self.assertEqual(store.profile_by_uniquenick('Ded-One', 1)['password_md5'], crypt.md5hex('pw2'))
+        for bad in ({'sessions': [{'name': 'x'}]}, {'sessions': [{'name': 'a', 'command': ['x']}, {'name': 'a', 'command': ['y']}]},
+                    {'accounts': [{'nick': 'n', 'email': 'no-at', 'password': 'p'}]}):
+            with self.assertRaises(ValueError):
+                sessions.load(self.write(bad))
+
+    def test_restarted_and_stopped(self):
+        marker = os.path.join(self.tmp, 'runs.txt')
+        quick = [sys.executable, '-c', 'open(%r, "a").write("x")' % marker]
+        slow = [sys.executable, '-c', 'import time; time.sleep(60)']
+        ss = sessions.Sessions([{'name': 'quick', 'command': quick, 'restart_after': 0.2},
+                                {'name': 'slow', 'command': slow}], os.path.join(self.tmp, 'logs'))
+
+        async def run():
+            task = asyncio.ensure_future(ss.run())
+            deadline = time.time() + 15
+            while time.time() < deadline and not (_runs(marker) >= 2 and 'slow' in ss.procs):
+                await asyncio.sleep(0.1)
+            slow_proc = ss.procs.get('slow')
+            ss.stop()
+            task.cancel()
+            return slow_proc
+        slow_proc = asyncio.run(run())
+        self.assertGreaterEqual(_runs(marker), 2)                     # ran again after it ended
+        self.assertIsNotNone(slow_proc)
+        slow_proc.wait(10)                                           # stopped with the server
+        self.assertEqual([st['starts'] >= 1 for st in ss.status()], [True, True])
+        self.assertTrue(os.path.exists(ss.log_path('quick')))
+
+    @unittest.skipUnless(sys.platform == 'win32', 'the job object is Windows-only')
+    def test_sessions_end_when_the_server_is_killed(self):
+        """A server killed outright (as the launcher stops it) takes its sessions with it."""
+        pidfile = os.path.join(self.tmp, 'pid.txt')
+        script = ('import sys, time; sys.path.insert(0, %r)\n'
+                  'from pspc_gamespy import sessions\n'
+                  'ss = sessions.Sessions([{"name": "s", "command": [sys.executable, "-c", "import time; time.sleep(60)"]}], %r)\n'
+                  'p = ss.start(ss.sessions[0])\n'
+                  'open(%r, "w").write(str(p.pid))\n'
+                  'time.sleep(60)\n') % (os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'), self.tmp, pidfile)
+        server = subprocess.Popen([sys.executable, '-c', script])
+        deadline = time.time() + 15
+        while time.time() < deadline and not os.path.exists(pidfile):
+            time.sleep(0.1)
+        time.sleep(0.3)
+        with open(pidfile) as f:
+            child = int(f.read())
+        self.assertTrue(_alive(child))
+        server.kill()
+        server.wait(10)
+        deadline = time.time() + 10
+        while time.time() < deadline and _alive(child):
+            time.sleep(0.1)
+        self.assertFalse(_alive(child))
+
+
+def _runs(marker):
+    if not os.path.exists(marker):
+        return 0
+    with open(marker) as f:
+        return len(f.read())
+
+
+def _alive(pid):
+    import ctypes
+    k32 = ctypes.WinDLL('kernel32')
+    k32.OpenProcess.restype = ctypes.c_void_p
+    h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    code = ctypes.c_ulong()
+    k32.GetExitCodeProcess(ctypes.c_void_p(h), ctypes.byref(code))
+    k32.CloseHandle(ctypes.c_void_p(h))
+    return code.value == 259  # STILL_ACTIVE
 
 
 class Tcp:

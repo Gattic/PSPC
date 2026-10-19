@@ -12,6 +12,7 @@ import time
 
 from . import __version__
 from . import crypt
+from . import sessions as sessions_mod
 from .games import GAMES, load as load_games
 from .gstats import decode_kv
 from .server import DEFAULT_MOTD, Config, GameSpyServer
@@ -23,10 +24,23 @@ GAMES_FILE = 'gamespy-games.json'
 
 def serve(args):
     store = Store(args.db)
-    config = Config(public_host=args.public_host, bind=args.bind, http_port=args.http_port, motd=args.motd,
-                    status_file=args.status_file)
-    server = GameSpyServer(config, store)
     log = logging.getLogger('gamespy')
+    sessions = None
+    path = args.sessions or os.path.join(os.path.dirname(os.path.abspath(args.db)), sessions_mod.SESSIONS_FILE)
+    if args.sessions or os.path.exists(path):
+        try:
+            accounts, entries = sessions_mod.load(path)
+        except (OSError, ValueError) as e:  # the server still runs, without them
+            log.error("can't read the sessions in %s: %s", path, e)
+        else:
+            made = sessions_mod.make_accounts(store, accounts)
+            log.info('sessions from %s: %s%s', path, ', '.join(s['name'] for s in entries) or 'none',
+                     ' (%d accounts made)' % made if made else '')
+            if entries:
+                sessions = sessions_mod.Sessions(entries, os.path.join(os.path.dirname(os.path.abspath(args.db)), 'sessions'))
+    config = Config(public_host=args.public_host, bind=args.bind, http_port=args.http_port, motd=args.motd,
+                    status_file=args.status_file, sessions=sessions)
+    server = GameSpyServer(config, store)
     log.info('PSPC GameSpy server %s for %s; players on other PCs reach it at %s', __version__,
              ', '.join(g.name for g in GAMES.values()), args.public_host)
     try:
@@ -37,6 +51,8 @@ def serve(args):
         log.error("can't start: %s", e.strerror or e)
         return 1
     finally:
+        if sessions:
+            sessions.stop()
         store.close()
     return 0
 
@@ -104,6 +120,9 @@ def main(argv=None):
     s.add_argument('--http-port', type=int, default=80, help='the web pages\' port (default: %(default)s; games ask port 80)')
     s.add_argument('--motd', default=DEFAULT_MOTD, help='the message of the day')
     s.add_argument('--status-file', help='keep a JSON summary of online players and hosted games here')
+    s.add_argument('--sessions', metavar='FILE',
+                   help='programs to run alongside, such as dedicated game servers (default: %s beside the '
+                        'database, if there is one)' % sessions_mod.SESSIONS_FILE)
     sub.add_parser('accounts', help='list accounts (GameSpy profiles)')
     for name in ('ban', 'unban'):
         p = sub.add_parser(name, help='%s the account owning a profile' % name)

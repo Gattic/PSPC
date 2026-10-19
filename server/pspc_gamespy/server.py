@@ -25,7 +25,8 @@ DEFAULT_MOTD = 'Welcome to a PSPC GameSpy server.'
 
 class Config:
     def __init__(self, public_host='127.0.0.1', bind='0.0.0.0', gpcm_port=29900, gpsp_port=29901, qr_port=27900,
-                 natneg_port=27901, sb_port=28910, gstats_port=29920, http_port=80, motd=DEFAULT_MOTD, status_file=None):
+                 natneg_port=27901, sb_port=28910, gstats_port=29920, http_port=80, motd=DEFAULT_MOTD, status_file=None,
+                 sessions=None):
         self.public_host = public_host      # the address players on other PCs reach this server at
         self.bind = bind
         self.gpcm_port = gpcm_port
@@ -37,6 +38,7 @@ class Config:
         self.http_port = http_port
         self.motd = motd
         self.status_file = status_file      # where to keep a JSON summary (online players, hosted games)
+        self.sessions = sessions            # sessions.Sessions: programs run alongside (dedicated servers), or None
 
 
 class GameSpyServer:
@@ -98,7 +100,8 @@ class GameSpyServer:
         return {'time': int(time.time()),
                 'online': [{'profileid': s.profileid, 'nick': s.profile['nick'], 'address': s.peer[0]}
                            for s in self.presence.online()],
-                'games': [h.summary() for h in self.registry.listed()]}
+                'games': [h.summary() for h in self.registry.listed()],
+                'sessions': self.config.sessions.status() if self.config.sessions else []}
 
     def write_status(self):
         path = self.config.status_file
@@ -112,9 +115,14 @@ class GameSpyServer:
 
     async def serve_forever(self):
         await self.start()
-        await asyncio.gather(self.ticker(), *(s.serve_forever() for s in self._servers))
+        tasks = [self.ticker()] + [s.serve_forever() for s in self._servers]
+        if self.config.sessions:
+            tasks.append(self.config.sessions.run())
+        await asyncio.gather(*tasks)
 
     def close(self):
+        if self.config.sessions:
+            self.config.sessions.stop()
         for s in self._servers:
             s.close()
         for t in self._transports:
