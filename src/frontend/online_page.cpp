@@ -173,10 +173,10 @@ Texts TextsOf(const Card &c) {
 	}
 	case Kind::GameSpy: {
 		std::string to = GameSpyRedirect();
-		t.you = to.empty()                   ? L"Elite Squadron has no GameSpy server to go online to: choose one."
-		        : IsLocalHost(to)            ? L"Elite Squadron goes online to this PC's server."
-		        : to == servers::kOpenSpyTarget ? L"Elite Squadron goes online to OpenSpy (openspy.net), the public GameSpy revival."
-		                                     : L"Elite Squadron goes online to " + Widen(to) + L".";
+		t.you = to.empty()                   ? L"Elite Squadron has no GameSpy server to go online to: choose one. Super Squadron plays on swss.pspc.online."
+		        : IsLocalHost(to)            ? L"Elite Squadron and Super Squadron go online to this PC's server."
+		        : to == servers::kOpenSpyTarget ? L"Elite Squadron and Super Squadron go online to OpenSpy (openspy.net), the public GameSpy revival."
+		                                     : L"Elite Squadron and Super Squadron go online to " + Widen(to) + L".";
 		if (st == State::Running) {
 			json::Value status = json::Value::Parse(servers::Status(Kind::GameSpy));
 			size_t online = status["online"].Array().size(), games = status["games"].Array().size();
@@ -513,8 +513,9 @@ void ChangeTarget(Card &c) {
 		Target t = to.empty() ? Target::None : IsLocalHost(to) ? Target::ThisPc : to == servers::kOpenSpyTarget ? Target::Public : Target::Other;
 		std::wstring address = t == Target::Other ? Widen(to) : L"";
 		if (!serverdlg::ChooseServer(g_page, L"GameSpy online",
-		                             L"Where should Star Wars Battlefront: Elite Squadron go when you choose online play? Its players "
-		                             L"log in with GameSpy accounts on that server.",
+		                             L"Where should Star Wars Battlefront: Elite Squadron and Star Wars Super Squadron go when you choose online play? "
+		                             L"Their players log in with GameSpy accounts on that server. Without one chosen here, Super Squadron plays on "
+		                             L"swss.pspc.online.",
 		                             true, &t, &address, L"OpenSpy (openspy.net), the public GameSpy revival"))
 			return;
 		std::wstring error;
@@ -617,7 +618,7 @@ void MakeCards() {
 	g_cards = {
 		{Kind::Network, ui::kIconPeople, L"PSPC Network", L"Sign-in, online IDs and friends for online games: PSPC's stand-in for the PlayStation Network."},
 		{Kind::Sfco, ui::kIconGamepad, L"Syphon Filter: Combat Ops", L"The game's own online service: lobby, matches, shared missions, cells and leaderboards."},
-		{Kind::GameSpy, ui::kIconGlobe, L"GameSpy: Star Wars Battlefront: Elite Squadron",
+		{Kind::GameSpy, ui::kIconGlobe, L"GameSpy: Elite Squadron and Super Squadron",
 		 L"GameSpy's services for the game: accounts, friends, games to join and leaderboards."},
 		{Kind::Adhoc, ui::kIconWifi, L"Ad hoc", L"Local multiplayer (ad hoc mode) over a network, as PPSSPP's ad hoc servers do it."},
 	};

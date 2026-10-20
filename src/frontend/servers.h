@@ -34,11 +34,13 @@ constexpr const char *kSfcoDomain = "combatops.psp.online.scea.com";
 constexpr int kAdhocPort = 27312;
 
 // The games Kind::GameSpy serves. Their redirect sends every GameSpy name (*.gamespy.com) to a
-// server; OpenSpy's public servers have the same names under openspy.net.
+// server; OpenSpy's public servers have the same names under openspy.net. Super Squadron plays on
+// the public server swss.pspc.online (data/infrastructure.json) until a redirect here replaces that.
 struct GameSpyGame {
 	const char *discId, *name;
 };
-constexpr GameSpyGame kGameSpyGames[] = {{"ULUS10390", "Star Wars Battlefront: Elite Squadron"}};
+constexpr GameSpyGame kGameSpyGames[] = {{"ULUS10390", "Star Wars Battlefront: Elite Squadron"},
+                                         {"ULUS99390", "Star Wars Super Squadron"}};
 constexpr const char *kGameSpyDomain = "*.gamespy.com";
 constexpr const char *kOpenSpyTarget = "*.openspy.net";
 
