@@ -1,0 +1,24 @@
+# The SWSS (GameSpy) server, as a user service. Installed by install.sh.
+[Unit]
+Description=SWSS game server (PSPC GameSpy)
+After=network.target
+
+[Service]
+Environment=PYTHONPATH=@PREFIX@/app
+WorkingDirectory=@PREFIX@/data
+# mode.env (install.sh writes it) says how players reach the server: with forwarded ports, the services listen on
+# every address, the public host is the domain, and only this machine's dedicated servers may list games; behind
+# a Cloudflare Tunnel, they listen on 127.0.0.1 and the tunnel carries the players' TCP and UDP.
+EnvironmentFile=@PREFIX@/data/mode.env
+# The web pages are on 8080: the router maps port 80 to it, which is where the game asks.
+ExecStart=@PYTHON@ -u -B -X utf8 -m pspc_gamespy --db @PREFIX@/data/gamespy.sqlite serve $SWSS_MODE --http-port 8080 --status-file @PREFIX@/data/status.json --motd "Welcome to the Star Wars Super Squadron server."
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+LimitNOFILE=16384
+# Dedicated servers (gamespy-sessions.json beside the database) are its children: a restart ends them too.
+KillMode=control-group
+UMask=0077
+
+[Install]
+WantedBy=default.target

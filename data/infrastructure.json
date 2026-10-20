@@ -1,5 +1,5 @@
 {
-  "comment": "Online-service redirects for PSPC (src/runtime/hle/modules/net_infra.cpp, docs/pspc-network.md). Same format as PPSSPP's infra-dns.json: per game, the disc IDs it covers, 'domains' (host name -> address of a revival server) and/or 'dns' (a revival DNS server that answers for all of the game's names). An infrastructure.json next to pspc.exe takes precedence over this file. 'hosts' lists the servers each game was seen to use, for revival server authors; it isn't used for redirecting.",
+  "comment": "Online-service redirects for PSPC (src/runtime/hle/modules/net_infra.cpp, docs/pspc-network.md). Same format as PPSSPP's infra-dns.json: per game, the disc IDs it covers, 'domains' (host name -> address of a revival server) and/or 'dns' (a revival DNS server that answers for all of the game's names). 'tunnel' (optional) names a public server that is reached over HTTPS only (a Cloudflare Tunnel carries nothing else): PSPC starts a relay for the game (server/pspc_gamespy/relay.py) that listens at 127.77.0.1, where 'domains' then send the game. An infrastructure.json next to pspc.exe takes precedence over this file: its entry for a game replaces this one, so a server on this PC (the launcher's Online page) overrides the public one. 'hosts' lists the servers each game was seen to use, for revival server authors; it isn't used for redirecting.",
   "games": [
     {
       "name": "Syphon Filter: Combat Ops",
@@ -34,7 +34,10 @@
     {
       "name": "Star Wars Super Squadron",
       "ids": ["ULUS99390"],
-      "domains": {"*.gamespy.com": "swss.pspc.online"}
+      "domains": {"*.gamespy.com": "swss.pspc.online"},
+      "hosts": [
+        "The same GameSpy names and ports as Elite Squadron (below), all at the public server swss.pspc.online (docs/gamespy-server.md, 'Public server'). Behind a Cloudflare Tunnel instead of forwarded ports, the entry has \"tunnel\": \"https://swss.pspc.online\" and \"domains\": {\"*.gamespy.com\": \"127.77.0.1\"}"
+      ]
     },
     {
       "name": "Star Wars Battlefront: Elite Squadron",

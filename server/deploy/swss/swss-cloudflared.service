@@ -1,0 +1,16 @@
+# The Cloudflare Tunnel in front of the server (swss.pspc.online -> http://127.0.0.1:8080). Installed by install.sh.
+[Unit]
+Description=Cloudflare Tunnel for the SWSS server
+After=network-online.target swss-server.service
+Wants=network-online.target
+
+[Service]
+# TUNNEL_TOKEN=... (Zero Trust > Networks > Tunnels > the tunnel > Configure), in a file only this user can read.
+EnvironmentFile=@PREFIX@/cloudflared/token.env
+ExecStart=@PREFIX@/bin/cloudflared tunnel --no-autoupdate --metrics 127.0.0.1:20241 run
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

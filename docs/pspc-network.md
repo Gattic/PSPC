@@ -90,7 +90,16 @@ The format is PPSSPP's, so community revival tables work unchanged:
 }
 ```
 
-`ids` (or PPSSPP's `known_working_ids`, `other_ids`, `not_working_ids`) are disc IDs. `domains`
+`ids` (or PPSSPP's `known_working_ids`, `other_ids`, `not_working_ids`) are disc IDs. `tunnel` (PSPC's own, optional) names a public server that is reached over HTTPS only, because a
+Cloudflare Tunnel is in front of it: `"tunnel": "https://swss.pspc.online"`. When the game connects to the
+network PSPC then starts a relay (`server/pspc_gamespy/relay.py`, `src/net/relay_process.cpp`) that listens
+at 127.77.0.1, where the entry's `domains` send the game, and passes its TCP and UDP
+to the server over WebSockets ([gamespy-server.md](gamespy-server.md#without-open-ports-the-cloudflare-tunnel)).
+Star Wars Super Squadron (ULUS99390) has an entry in `data/infrastructure.json` that sends `*.gamespy.com`
+to the public server's domain, `swss.pspc.online` ([forwarded ports](gamespy-server.md#with-forwarded-ports),
+which PSPC looks up when the game connects); an `infrastructure.json` next to pspc.exe with an entry for
+the game (the launcher writes one when it starts a server on your PC) replaces it, so a local server
+overrides the public one. `domains`
 maps a host name to an IPv4 address or another host name. A name starting with `*.` covers every
 name under it (`"*.gamespy.com": "127.0.0.1"`; an exact name wins over it, a longer wildcard over a
 shorter one), and a target starting with `*.` keeps what the wildcard matched
