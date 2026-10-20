@@ -3,9 +3,17 @@
 "gamever='1.0' and numplayers < maxplayers and hostname like '%fun%'".
 
 Identifiers are server keys (a missing key is ''), comparisons are numeric when both sides are
-numbers and case-insensitive text otherwise. A filter that doesn't parse lets everything through."""
+numbers and case-insensitive text otherwise. A filter that doesn't parse lets everything through.
+
+Filters come from anyone who can reach the server, so they are bounded: MAX_FILTER characters, MAX_DEPTH
+levels of parentheses and `not`, and LIKE patterns are matched in time proportional to the product of
+the lengths (no regular expressions, which a pattern such as %a%a%a%a%b makes exponential)."""
 
 import re
+
+MAX_FILTER = 1024
+MAX_DEPTH = 24
+MAX_VALUE = 512         # LIKE looks at no more than this much of a key's value
 
 _TOKEN = re.compile(r"""\s*(?:
     (?P<num>-?\d+(?:\.\d+)?) |
@@ -52,8 +60,25 @@ def _number(v):
 
 
 def _like(value, pattern):
-    rx = ''.join('.*' if c == '%' else '.' if c == '_' else re.escape(c) for c in pattern)
-    return re.fullmatch(rx, value, re.I | re.S) is not None
+    """SQL LIKE, case-insensitive: % is any text, _ any one character. Greedy matching with one
+    backtrack point (the last %), so it never takes more than len(value) * len(pattern) steps."""
+    value, pattern = value[:MAX_VALUE].lower(), pattern[:MAX_VALUE].lower()
+    v = p = 0
+    star = mark = -1
+    while v < len(value):
+        if p < len(pattern) and pattern[p] == '%':
+            star, mark = p, v
+            p += 1
+        elif p < len(pattern) and pattern[p] in ('_', value[v]):
+            p += 1
+            v += 1
+        elif star >= 0:
+            p = star + 1
+            mark += 1
+            v = mark
+        else:
+            return False
+    return pattern[p:].strip('%') == ''
 
 
 def _compare(a, op, b):
@@ -72,8 +97,11 @@ class Filter:
         self.text = text or ''
         self.ok = True
         self.tree = None
+        self.depth = 0
         if self.text.strip():
             try:
+                if len(self.text) > MAX_FILTER:
+                    raise FilterError('filter longer than %d characters' % MAX_FILTER)
                 self.toks = _tokens(self.text)
                 self.i = 0
                 self.tree = self._or()
@@ -112,8 +140,17 @@ class Filter:
     def _not(self):
         if self._peek() == ('kw', 'not'):
             self.i += 1
-            return ('not', self._not())
+            return ('not', self._nested(self._not))
         return self._cmp()
+
+    def _nested(self, parse):
+        self.depth += 1
+        if self.depth > MAX_DEPTH:
+            raise FilterError('filter nested more than %d levels' % MAX_DEPTH)
+        try:
+            return parse()
+        finally:
+            self.depth -= 1
 
     def _operand(self):
         kind, value = self._take()
@@ -124,7 +161,7 @@ class Filter:
     def _cmp(self):
         if self._peek() == ('op', '('):
             self.i += 1
-            node = self._or()
+            node = self._nested(self._or)
             if self._take() != ('op', ')'):
                 raise FilterError('missing )')
             return node

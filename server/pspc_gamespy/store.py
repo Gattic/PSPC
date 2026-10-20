@@ -3,6 +3,7 @@
 and their profiles (nick, unique nick), buddy lists and requests, blocks, offline messages, the
 games' persistent player data (the stats server's getpd/setpd), and the stats of finished games."""
 
+import os
 import sqlite3
 import threading
 import time
@@ -86,6 +87,16 @@ CREATE TABLE IF NOT EXISTS player_stats (
 FIRST_USERID = 10000000
 FIRST_PROFILEID = 100000000
 
+# What one player may keep here (anyone can make accounts).
+MAX_PROFILES = 16               # per account
+MAX_PENDING_REQUESTS = 100      # buddy requests a profile has made, and ones waiting for it
+MAX_QUEUED_MESSAGES = 200       # offline messages waiting for a profile (the oldest go)
+MAX_RECORDS = 32                # persistent records per profile
+# What is kept of the past.
+KEEP_GAMES = 90 * 86400         # reported games
+KEEP_MESSAGES = 60 * 86400
+KEEP_REQUESTS = 180 * 86400
+
 
 class StoreError(Exception):
     def __init__(self, code, message):
@@ -96,6 +107,18 @@ class StoreError(Exception):
 
 class Store:
     def __init__(self, path):
+        # The database holds e-mail addresses and password hashes: readable by its owner only (SQLite
+        # gives the -wal and -shm files the same permissions).
+        if path in (':memory:', ''):    # SQLite's private databases have no file to protect (and must not get one named like that)
+            pass
+        elif not os.path.exists(path):
+            os.close(os.open(path, os.O_CREAT | os.O_WRONLY, 0o600))
+        else:
+            try:
+                os.chmod(path, 0o600)
+            except OSError:         # not ours to change: whoever owns it decides
+                pass
+        self.stats_version = 0          # changes when what the leaderboards show may have
         self._db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._db.row_factory = sqlite3.Row
         self._lock = threading.RLock()
@@ -168,6 +191,8 @@ class Store:
                                     (user['userid'], nick))
                 if existing:
                     raise StoreError(513, 'A profile with that nick already exists.')
+                if len(self.profiles_of(user['userid'])) >= MAX_PROFILES:
+                    raise StoreError(513, 'There are too many profiles on this account.')
                 userid = user['userid']
             else:
                 userid = self.x('INSERT INTO users (email, password_md5, created) VALUES (?, ?, ?)', (email, password_md5, now))
@@ -178,10 +203,13 @@ class Store:
     def new_profile(self, userid, nick):
         if self.one('SELECT 1 FROM profiles WHERE userid = ? AND nick = ? AND deleted = 0', (userid, nick)):
             raise StoreError(1025, 'A profile with that nick already exists.')
+        if len(self.profiles_of(userid)) >= MAX_PROFILES:
+            raise StoreError(1025, 'There are too many profiles on this account.')
         return self.x('INSERT INTO profiles (userid, nick, created) VALUES (?, ?, ?)', (userid, nick, int(time.time())))
 
     def delete_profile(self, profileid):
         self.x('UPDATE profiles SET deleted = 1 WHERE profileid = ?', (profileid,))
+        self.stats_version += 1
 
     def register_uniquenick(self, profileid, uniquenick):
         if self.uniquenick_taken(uniquenick):
@@ -205,6 +233,7 @@ class Store:
         rows = self.q('SELECT DISTINCT userid FROM profiles WHERE (nick = ? OR uniquenick = ?) AND deleted = 0', (name, name))
         for r in rows:
             self.x('UPDATE users SET banned = ? WHERE userid = ?', (1 if banned else 0, r['userid']))
+        self.stats_version += 1
         return len(rows)
 
     def list_profiles(self):
@@ -233,8 +262,13 @@ class Store:
         return [r['profileid'] for r in self.q('SELECT profileid FROM buddies WHERE buddyid = ?', (profileid,))]
 
     def add_buddy_request(self, fromid, toid, reason):
-        self.x('INSERT OR REPLACE INTO buddy_requests (fromid, toid, reason, created) VALUES (?, ?, ?, ?)',
-               (fromid, toid, reason, int(time.time())))
+        with self._lock:
+            if not self.has_request(fromid, toid) and (
+                    self.one('SELECT COUNT(*) FROM buddy_requests WHERE fromid = ?', (fromid,))[0] >= MAX_PENDING_REQUESTS or
+                    self.one('SELECT COUNT(*) FROM buddy_requests WHERE toid = ?', (toid,))[0] >= MAX_PENDING_REQUESTS):
+                raise StoreError(1540, 'There are too many pending requests.')
+            self.x('INSERT OR REPLACE INTO buddy_requests (fromid, toid, reason, created) VALUES (?, ?, ?, ?)',
+                   (fromid, toid, reason, int(time.time())))
 
     def pending_requests(self, toid):
         return self.q('SELECT * FROM buddy_requests WHERE toid = ? ORDER BY created', (toid,))
@@ -264,8 +298,12 @@ class Store:
     # ---- offline messages
 
     def queue_message(self, fromid, toid, mtype, text):
-        self.x('INSERT INTO messages (fromid, toid, type, text, created) VALUES (?, ?, ?, ?, ?)',
-               (fromid, toid, mtype, text, int(time.time())))
+        with self._lock:
+            self.x('INSERT INTO messages (fromid, toid, type, text, created) VALUES (?, ?, ?, ?, ?)',
+                   (fromid, toid, mtype, text, int(time.time())))
+            self.x('DELETE FROM messages WHERE toid = ? AND message_id NOT IN '
+                   '(SELECT message_id FROM messages WHERE toid = ? ORDER BY message_id DESC LIMIT ?)',
+                   (toid, toid, MAX_QUEUED_MESSAGES))
 
     def take_messages(self, toid):
         with self._lock:
@@ -281,10 +319,14 @@ class Store:
         return (bytes(row['data']), row['modified']) if row else (b'', 0)
 
     def set_persist(self, profileid, ptype, dindex, data):
-        now = int(time.time())
-        self.x('INSERT OR REPLACE INTO persist (profileid, ptype, dindex, data, modified) VALUES (?, ?, ?, ?, ?)',
-               (profileid, ptype, dindex, data, now))
-        return now
+        with self._lock:
+            if not self.one('SELECT 1 FROM persist WHERE profileid = ? AND ptype = ? AND dindex = ?', (profileid, ptype, dindex)) and \
+                    self.one('SELECT COUNT(*) FROM persist WHERE profileid = ?', (profileid,))[0] >= MAX_RECORDS:
+                raise StoreError(0, 'too many records')
+            now = int(time.time())
+            self.x('INSERT OR REPLACE INTO persist (profileid, ptype, dindex, data, modified) VALUES (?, ?, ?, ?, ?)',
+                   (profileid, ptype, dindex, data, now))
+            return now
 
     # ---- finished games and player stats
 
@@ -297,6 +339,7 @@ class Store:
 
     def add_stats(self, profileid, gamename, values):
         """Adds to a player's totals (key -> number)."""
+        self.stats_version += 1
         with self._lock:
             for key, value in values.items():
                 self.x('INSERT INTO player_stats (profileid, gamename, key, value) VALUES (?, ?, ?, ?) '
@@ -306,3 +349,14 @@ class Store:
     def stats(self, profileid, gamename):
         return {r['key']: r['value'] for r in self.q('SELECT key, value FROM player_stats WHERE profileid = ? AND gamename = ?',
                                                      (profileid, gamename))}
+
+    # ---- housekeeping
+
+    def prune(self):
+        """Forgets reported games, offline messages and buddy requests nobody answered after a long
+        time. Returns how many rows went."""
+        now = int(time.time())
+        with self._lock:
+            return (self._db.execute('DELETE FROM games WHERE started < ?', (now - KEEP_GAMES,)).rowcount +
+                    self._db.execute('DELETE FROM messages WHERE created < ?', (now - KEEP_MESSAGES,)).rowcount +
+                    self._db.execute('DELETE FROM buddy_requests WHERE created < ?', (now - KEEP_REQUESTS,)).rowcount)

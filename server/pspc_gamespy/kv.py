@@ -1,6 +1,13 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """GameSpy's text messages: \\command\\\\key\\value\\...\\final\\ (Presence, search, stats)."""
 
+MAX_MESSAGE = 1 << 16       # the longest message (or unfinished one) a connection may send
+MAX_INT = 1 << 62           # numbers beyond this are not numbers any game sends; SQLite stores 64 bits
+
+
+class TooLong(ValueError):
+    """A client sent more than MAX_MESSAGE without ending the message."""
+
 
 class Message(dict):
     """One message: the command (its first key) and the key/value pairs (lower-case keys; the first
@@ -15,9 +22,10 @@ class Message(dict):
 
     def int(self, key, default=0):
         try:
-            return int(self.get(key, default))
+            value = int(self.get(key, default))
         except (TypeError, ValueError):
             return default
+        return value if -MAX_INT <= value <= MAX_INT else default
 
 
 def parse(text):
@@ -35,8 +43,10 @@ def parse(text):
 
 
 def build(*pairs, final=True):
-    """build(('lc', 1), ('challenge', 'X')) -> '\\lc\\1\\challenge\\X\\final\\'."""
-    out = ''.join('\\%s\\%s' % (k, '' if v is None else v) for k, v in pairs)
+    """build(('lc', 1), ('challenge', 'X')) -> '\\lc\\1\\challenge\\X\\final\\'. A value can't contain
+    the separator: text a player sent (a nick, a message) that did would let them write messages of
+    their own into another player's stream, so the backslashes are dropped."""
+    out = ''.join('\\%s\\%s' % (k, '' if v is None else str(v).replace('\\', '')) for k, v in pairs)
     return out + ('\\final\\' if final else '')
 
 
@@ -47,10 +57,13 @@ class Splitter:
         self.buf = ''
 
     def feed(self, text):
+        """The complete messages in what has arrived so far; TooLong for a client that never finishes one."""
         self.buf += text
         while True:
             i = self.buf.find('\\final\\')
             if i < 0:
+                if len(self.buf) > MAX_MESSAGE:
+                    raise TooLong('a message longer than %d bytes' % MAX_MESSAGE)
                 return
             msg, self.buf = self.buf[:i], self.buf[i + 7:]
             if msg.strip():

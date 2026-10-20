@@ -15,6 +15,7 @@ retries forever), so an empty board has a placeholder row; the player's own quer
 header when they aren't ranked."""
 
 import logging
+import time
 
 from . import games
 
@@ -22,7 +23,9 @@ log = logging.getLogger('gamespy')
 
 TIME, KILLS, DEATHS, KD, WINS, LOSSES, WL, OVERALL, RANK, POINTS = 0, 1, 2, 3, 9, 10, 11, 12, 13, 14
 RATIOS = (KD, WL)
+SORTABLE = (TIME, KILLS, DEATHS, KD, WINS, LOSSES, WL, OVERALL, RANK, POINTS)
 MAX_ROWS = 50
+MAX_AGE = 60                    # seconds the rankings are kept when nothing here changed them (an admin may ban from outside)
 
 
 def install(web, store):
@@ -63,20 +66,29 @@ class Leaderboard:
     def __init__(self, store, gamename):
         self.store = store
         self.gamename = gamename
+        self.cache = {}                 # sort column -> the ranking
+        self.cached = (None, 0.0)       # the store's stats version and the time the cache was made
 
     def ranked(self, sortcol):
-        """[(profile id, name, columns)] best first: players who finished at least one game."""
-        totals = {}
-        for r in self.store.q('SELECT s.profileid, s.key, s.value FROM player_stats s WHERE s.gamename = ?', (self.gamename,)):
+        """[(profile id, name, columns)] best first: players who finished at least one game. Anyone can
+        ask for a page, so the ranking is kept until the stats change (or MAX_AGE passes)."""
+        now = time.monotonic()
+        if self.cached[0] != self.store.stats_version or now - self.cached[1] > MAX_AGE:
+            self.cache = {}
+            self.cached = (self.store.stats_version, now)
+        sortcol = sortcol if sortcol in SORTABLE else OVERALL
+        if sortcol not in self.cache:
+            self.cache[sortcol] = self._rank(sortcol)
+        return self.cache[sortcol]
+
+    def _rank(self, sortcol):
+        totals, names = {}, {}
+        for r in self.store.q('SELECT s.profileid, s.key, s.value, p.nick, p.uniquenick FROM player_stats s '
+                              'JOIN profiles p ON p.profileid = s.profileid JOIN users u ON u.userid = p.userid '
+                              'WHERE s.gamename = ? AND p.deleted = 0 AND u.banned = 0', (self.gamename,)):
             totals.setdefault(r['profileid'], {})[r['key']] = r['value']
-        rows = []
-        for pid, t in totals.items():
-            if not t.get('games'):
-                continue
-            p = self.store.profile(pid)
-            if p is None or p['banned']:
-                continue
-            rows.append((pid, p['uniquenick'] or p['nick'], career_columns(t)))
+            names[r['profileid']] = r['uniquenick'] or r['nick']
+        rows = [(pid, names[pid], career_columns(t)) for pid, t in totals.items() if t.get('games')]
         rows.sort(key=lambda r: (-r[2].get(sortcol, 0), r[0]))
         return rows
 

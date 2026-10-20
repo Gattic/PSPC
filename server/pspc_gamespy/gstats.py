@@ -18,12 +18,15 @@ after each \\final\\, which is sent in the clear):
 
 import asyncio
 import logging
-import random
+import secrets
 import string
+import time
 
+from . import access
 from . import crypt
 from . import games
 from . import kv
+from .store import StoreError
 
 log = logging.getLogger('gamespy')
 
@@ -31,6 +34,12 @@ PD_PRIVATE_RO, PD_PRIVATE_RW, PD_PUBLIC_RO, PD_PUBLIC_RW = 0, 1, 2, 3
 KEEPALIVE_INTERVAL = 60
 XOR_KEY = b'GameSpy3D'
 FINAL = b'\\final\\'
+AUTH_TIMEOUT = 60               # seconds a new connection has to send \auth\
+IDLE_TIMEOUT = 7200             # seconds of silence before a signed-in connection is closed
+MAX_BUFFER = 1 << 17            # the most a connection may send without ending a message
+MAX_RECORD = 1 << 16            # a stored record (setpd's data)
+MAX_GAMES = 16                  # games (newgame) one connection may report
+MAX_GAMEDATA = 8192
 
 
 def chresp_num(challenge):
@@ -97,8 +106,9 @@ class Session:
         self.reader = reader
         self.writer = writer
         self.peer = writer.get_extra_info('peername') or ('?', 0)
-        self.challenge = ''.join(random.choice(string.ascii_uppercase) for _ in range(10))
-        self.sesskey = random.randint(1, 0x7FFFFFFF)
+        self.limits = server.limits
+        self.challenge = ''.join(secrets.choice(string.ascii_uppercase) for _ in range(10))
+        self.sesskey = secrets.randbelow(0x7FFFFFFF) + 1
         self.rx = Xor()
         self.tx = Xor()
         self.game = None
@@ -118,6 +128,8 @@ class Session:
             self.writer.write(self.tx.apply(payload + FINAL))
         except Exception:
             self.closed = True
+        if access.drop_if_backlogged(self.writer):
+            self.closed = True
 
     def send_error(self, code, message, fatal=False):
         self.send(kv.build(('error', ''), ('err', code), ('errmsg', message), *([('fatal', 1)] if fatal else []),
@@ -128,15 +140,22 @@ class Session:
     async def run(self):
         self.send(kv.build(('lc', 1), ('challenge', self.challenge), ('id', 1), final=False))
         buf = b''
+        last_heard = time.monotonic()
         try:
             while not self.closed:
                 try:
                     data = await asyncio.wait_for(self.reader.read(16384), KEEPALIVE_INTERVAL)
                 except asyncio.TimeoutError:
+                    silent = time.monotonic() - last_heard
+                    limit = access.patience(self.peer[0], IDLE_TIMEOUT if self.game else AUTH_TIMEOUT)
+                    if limit is not None and silent > limit:
+                        log.info('gstats %s: silent for %d seconds; closed', self.peer[0], silent)
+                        break
                     self.send('\\ka\\')
                     continue
                 if not data:
                     break
+                last_heard = time.monotonic()
                 buf += self.rx.apply(data)
                 while True:
                     i = buf.find(FINAL)
@@ -144,12 +163,18 @@ class Session:
                         break
                     raw, buf = buf[:i], buf[i + 7:]
                     if raw.strip():
+                        if not self.limits.allow(self.limits.stats_messages, self.peer[0]):
+                            log.info('gstats %s: too many messages; closed', self.peer[0])
+                            return
                         self.dispatch(raw)
-                if len(buf) > 1 << 20:
+                if len(buf) > MAX_BUFFER:
+                    log.info('gstats %s: a message longer than %d bytes; closed', self.peer[0], MAX_BUFFER)
                     break
                 await self.writer.drain()
         except (ConnectionError, OSError):
             pass
+        except Exception:
+            log.warning('gstats %s: a message was not handled; closed', self.peer[0], exc_info=log.isEnabledFor(logging.DEBUG))
         finally:
             self.closed = True
             try:
@@ -160,9 +185,9 @@ class Session:
     def dispatch(self, raw):
         m, data = parse_message(raw)
         log.debug('gstats %s -> %s%s', self.peer[0], m.pairs, ' + %d bytes' % len(data) if data is not None else '')
-        handler = getattr(self, 'on_' + m.command, None)
+        handler = getattr(self, 'on_' + m.command, None) if m.command.isidentifier() else None
         if handler is None:
-            log.info('gstats %s: unhandled %s %s', self.peer[0], m.command, m.pairs)
+            log.info('gstats %s: unhandled %s', self.peer[0], access.safe(m.command))
             return
         handler(m, data)
 
@@ -171,13 +196,13 @@ class Session:
     def on_auth(self, m, data):
         self.game = games.find(m.get('gamename'))
         if self.game is None:
-            log.info("gstats %s: auth for %r, a game this server doesn't know", self.peer[0], m.get('gamename'))
+            log.info("gstats %s: auth for %s, a game this server doesn't know", self.peer[0], access.safe(m.get('gamename')))
             self.send_error(0x100, 'Unknown game.', fatal=True)
             return
         expected = auth_response(self.challenge, self.game.secret_key)
         if m.get('response', '') != expected:
             log.warning('gstats %s: auth response %s for %s, expected %s (letting it in)', self.peer[0],
-                        m.get('response'), self.game.gamename, expected)
+                        access.safe(m.get('response'), 40), self.game.gamename, expected)
         self.send(kv.build(('lc', 2), ('sesskey', self.sesskey), ('proof', 0), ('id', m.get('id', 1)), final=False))
 
     def on_authp(self, m, data):
@@ -185,22 +210,34 @@ class Session:
         profile = None
         if m.int('pid'):
             profile = self.store.profile(m.int('pid'))
+            # The response is MD5(the plain password + a challenge made from the session key). This
+            # server keeps only the password's MD5, so it can't check it. Games sign players in here
+            # after GP has checked their password, so the player has to be logged in to GP - from
+            # this address - or anyone could be anyone here.
+            if profile is not None and not self.logged_in_from_here(profile['profileid']):
+                log.info('gstats %s: sign-in as profile %d refused: not logged in to Presence from this address',
+                         self.peer[0], profile['profileid'])
+                profile = None
         elif m.get('authtoken'):
             pid = self.server.presence.tickets.get(m['authtoken']) if self.server.presence else None
             profile = self.store.profile(pid) if pid else None
         if profile is None or profile['banned']:
             log.info('gstats %s: player sign-in refused (%s)', self.peer[0],
-                     'banned' if profile else 'no such profile %s' % (m.get('pid') or m.get('authtoken')))
+                     'banned' if profile else 'no such profile %s' % access.safe(m.get('pid') or m.get('authtoken'), 30))
             self.send(kv.build(('pauthr', -1), ('errmsg', 'Invalid profile.'), ('lid', lid), final=False))
             return
-        # The response is MD5(the plain password + a challenge made from the session key). This server
-        # keeps only the password's MD5, so it can't check it; GP has checked the password at login,
-        # and games sign players in here only after that.
         self.profileid = profile['profileid']
         self.profiles.add(self.profileid)
-        log.info('gstats %s: %s signed in to %s stats', self.peer[0], profile['nick'],
+        log.info('gstats %s: %s signed in to %s stats', self.peer[0], access.safe(profile['nick']),
                  self.game.gamename if self.game else '?')
         self.send(kv.build(('pauthr', self.profileid), ('lid', lid), final=False))
+
+    def logged_in_from_here(self, profileid):
+        presence = self.server.presence
+        if presence is None:
+            return True                     # no Presence server here (tests of this one alone)
+        session = presence.sessions.get(profileid)
+        return session is not None and session.peer[0] == self.peer[0]
 
     def on_getpid(self, m, data):
         self.send(kv.build(('getpidr', -1), ('errmsg', 'CD keys are not used.'), ('lid', m.get('lid', 0)), final=False))
@@ -238,27 +275,42 @@ class Session:
             values = decode_kv(self.store.get_persist(pid, ptype, dindex)[0])
             values.update(decode_kv(data.rstrip(b'\0')))
             data = encode_kv(values)
-        modified = self.store.set_persist(pid, ptype, dindex, data)
+        try:
+            if len(data) > MAX_RECORD:
+                raise StoreError(0, 'record too long')
+            modified = self.store.set_persist(pid, ptype, dindex, data)
+        except StoreError as e:
+            log.info('gstats %s: profile %d: record not saved: %s', self.peer[0], pid, e.message)
+            self.send(kv.build(('setpdr', 0), ('lid', lid), ('pid', pid), ('mod', 0), final=False))
+            return
         log.info('gstats %s: profile %d saved %d bytes (type %d, index %d)', self.peer[0], pid, len(data), ptype, dindex)
         self.send(kv.build(('setpdr', 1), ('lid', lid), ('pid', pid), ('mod', modified), final=False))
 
     # ---- games
 
+    def game_id(self, key):
+        """The stored game for a game's session key, made if need be (None past MAX_GAMES a connection)."""
+        game_id = self.games.get(key)
+        if game_id is None and len(self.games) < MAX_GAMES:
+            game_id = self.games[key] = self.store.new_game(self.game.gamename if self.game else '', self.profileid)
+        return game_id
+
     def on_newgame(self, m, data):
         key = m.int('sesskey')
-        self.games[key] = self.store.new_game(self.game.gamename if self.game else '', self.profileid)
-        log.info('gstats %s: game %d started (session %d)', self.peer[0], self.games[key], key)
+        game_id = self.game_id(key)
+        if game_id is not None:
+            log.info('gstats %s: game %d started (session %d)', self.peer[0], game_id, key)
 
     def on_updgame(self, m, data):
         key = m.int('sesskey')
-        game_id = self.games.get(key)
+        game_id = self.game_id(key)
         if game_id is None:
-            game_id = self.games[key] = self.store.new_game(self.game.gamename if self.game else '', self.profileid)
-        text = m.get('gamedata', '').replace('\x01', '\\')
+            return
+        text = m.get('gamedata', '')[:MAX_GAMEDATA].replace('\x01', '\\')
         done = m.int('done') != 0
         self.store.update_game(game_id, text, done)
         if done:
-            log.info('gstats %s: game %d finished: %s', self.peer[0], game_id, text[:300])
+            log.info('gstats %s: game %d finished: %s', self.peer[0], game_id, access.safe(text, 300))
             if self.server.on_round_end and self.game:
                 self.server.on_round_end(self.game.gamename, self.peer[0], self.profileid, decode_kv(text.encode('latin-1')))
 
@@ -277,8 +329,9 @@ def encode_kv(values):
 
 
 class StatsServer:
-    def __init__(self, store, presence=None, on_round_end=None):
+    def __init__(self, store, presence=None, on_round_end=None, limits=None):
         self.store = store
+        self.limits = limits or access.Limits.none()
         self.presence = presence
         self.on_round_end = on_round_end    # (gamename, host IP, host profile id, game data) at each reported round's end
 

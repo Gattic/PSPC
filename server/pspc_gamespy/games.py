@@ -28,10 +28,14 @@ GAMES = {g.gamename: g for g in (
     # Its stored record is the GP message inbox: version 0, a count, then the messages (little-endian).
     Game('swbfespsp', 'Star Wars Battlefront: Elite Squadron', 'wLfbMH', 11878, ('ULUS10390',), namespace_id=1,
          empty_persist=bytes(8), leaderboard='bfes'),
+    # A mod of Elite Squadron, with its own game name (so its games and rankings are its own) and the
+    # same keys, records and pages.
+    Game('swsspsp', 'Star Wars Super Squadron', 'wLfbMH', 11878, ('ULUS99390',), namespace_id=1,
+         empty_persist=bytes(8), leaderboard='bfes'),
 )}
 
 # Other names of the same games (demo, automatch) share their keys.
-ALIASES = {'swbfespspam': 'swbfespsp', 'swbfespspd': 'swbfespsp'}
+ALIASES = {'swbfespspam': 'swbfespsp', 'swbfespspd': 'swbfespsp', 'swsspspam': 'swsspsp', 'swsspspd': 'swsspsp'}
 
 
 def find(gamename):

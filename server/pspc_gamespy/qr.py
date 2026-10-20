@@ -23,10 +23,13 @@ import ipaddress
 import itertools
 import logging
 import random
+import secrets
+import socket
 import string
 import struct
 import time
 
+from . import access
 from . import games
 
 log = logging.getLogger('gamespy')
@@ -39,6 +42,12 @@ STATE_CHANGED, STATE_EXITING, STATE_INITIAL = 1, 2, 3
 HOST_TIMEOUT = 180          # seconds without a heartbeat or keepalive before a host is dropped
 RESEND_INTERVAL = 2.0
 RESEND_COUNT = 5
+# What a hosted game may say about itself. A 64-player game's heartbeat is a few kilobytes.
+MAX_KEYS = 96               # server keys, and each player and team column
+MAX_ROWS = 128              # players, teams
+MAX_TEXT = 256              # a key's name or value
+MAX_MESSAGE = 256           # what a player may have the server send a host
+MAX_PENDING_MESSAGES = 1024 # messages to hosts waiting to be acknowledged, in all
 
 
 def is_loopback(ip):
@@ -48,16 +57,43 @@ def is_loopback(ip):
         return False
 
 
+def resolve_ipv4(host):
+    """The IPv4 address of a name (or the address itself); OSError if there is none."""
+    try:
+        ipaddress.IPv4Address(host)
+        return host
+    except ValueError:
+        pass
+    return socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0]
+
+
 class Reach:
     """Which address a player is given for another machine. Hosts and players on the server's own
-    machine are seen at 127.0.0.1; players elsewhere reach them at the server's public address."""
+    machine are seen at 127.0.0.1; players elsewhere - on the internet, or tunnelled (tunnel.py) -
+    reach them at the server's public address. That is a name or an address: the lists and NAT
+    negotiation carry addresses, so a name is looked up (and again every few minutes: refresh(), for
+    a name whose address changes). It must be a name that leads to this server: not one that Cloudflare
+    proxies, which answers with Cloudflare's addresses."""
 
     def __init__(self, public_host='127.0.0.1'):
         self.public_host = public_host
+        self.public_ip = resolve_ipv4(public_host)      # OSError if the name has no address
+
+    def refresh(self):
+        """Looks the public host up again; an answer that fails leaves the last good address."""
+        try:
+            ip = resolve_ipv4(self.public_host)
+        except OSError as e:
+            log.warning("can't look up %s (%s); players keep being given %s", self.public_host, e, self.public_ip)
+            return
+        if ip != self.public_ip:
+            log.info('%s is now %s (was %s)', self.public_host, ip, self.public_ip)
+            self.public_ip = ip
 
     def ip_for(self, ip, viewer_ip):
-        if is_loopback(ip) and viewer_ip and not is_loopback(viewer_ip) and not is_loopback(self.public_host):
-            return self.public_host
+        viewer_is_elsewhere = viewer_ip and (not is_loopback(viewer_ip) or access.is_tunnel(viewer_ip))
+        if access.is_local(ip) and viewer_is_elsewhere and self.public_ip != ip:
+            return self.public_ip
         return ip
 
 
@@ -110,39 +146,58 @@ class Host:
         return {'id': self.id, 'game': self.gamename, 'address': '%s:%d' % self.addr, 'name': self.name(),
                 'map': self.keys.get('mapname', ''), 'mode': self.keys.get('gamemode', ''),
                 'players': self.keys.get('numplayers', str(len(self.players))), 'max': self.keys.get('maxplayers', ''),
-                'player_names': [p.get('player_', '') for p in self.players], 'since': int(self.created)}
+                'player_names': [p.get('player_', '') for p in self.players], 'since': int(self.created),
+                'udp_ports': self.udp_ports()}
+
+    def udp_ports(self):
+        """The UDP ports players have to reach on this game's machine, so the ones a router has to forward for a game
+        hosted here: the port its heartbeats come from (the port the server list gives players) and the `localport` it
+        says it has. They are the same for a game that uses one socket for both. The authority is the game's own
+        process: `ss -lunp` lists every UDP port it has open."""
+        ports = {self.port}
+        try:
+            ports.add(int(self.keys.get('localport') or 0))
+        except ValueError:
+            pass
+        return sorted(p for p in ports if 0 < p < 65536)
 
 
 def parse_heartbeat(payload):
-    """(keys, players, teams) from a heartbeat's payload."""
+    """(keys, players, teams) from a heartbeat's payload. What there is too much of is dropped:
+    the work is proportional to the payload's size, whatever counts it claims."""
     keys = {}
     pos = 0
-    while pos < len(payload):
+    while pos < len(payload) and len(keys) < MAX_KEYS:
         name, pos = read_nts(payload, pos)
         if not name:
             break
         value, pos = read_nts(payload, pos)
-        keys.setdefault(name, value)
+        keys.setdefault(name[:MAX_TEXT], value[:MAX_TEXT])
     players, teams = [], []
     while pos + 2 <= len(payload):
         count = struct.unpack_from('>H', payload, pos)[0]
         pos += 2
         names = []
-        while pos < len(payload):
+        while pos < len(payload) and len(names) < MAX_KEYS:
             name, pos = read_nts(payload, pos)
             if not name:
                 break
-            names.append(name)
+            names.append(name[:MAX_TEXT])
         if not names:
             if count == 0:
                 continue
             break
         rows = []
-        for _ in range(count):
+        for _ in range(min(count, MAX_ROWS)):
+            if pos >= len(payload):
+                break
             row = {}
             for name in names:
                 row[name], pos = read_nts(payload, pos)
+                row[name] = row[name][:MAX_TEXT]
             rows.append(row)
+        if count > MAX_ROWS:
+            break
         if all(n.endswith('_t') for n in names):
             teams = rows
         else:
@@ -150,10 +205,27 @@ def parse_heartbeat(payload):
     return keys, players, teams
 
 
+GAME_WINDOW = 512           # how much of a heartbeat is looked at to find its game name (a game's keys start with it)
+
+
+def heartbeat_game(payload):
+    """The game name in a heartbeat's keys ('' if it is not there), read from the first GAME_WINDOW bytes without parsing
+    the rest. For a heartbeat the server will not list, where parse_heartbeat's work (the cost of the whole packet, which
+    anyone can send from any address) would be spent only to decide whether to say so in the log. A name and its value
+    must both end with their NUL, as a real heartbeat's do; the first gamename wins, as in parse_heartbeat."""
+    fields = payload[:GAME_WINDOW].split(b'\0')
+    for i in range(0, len(fields) - 2, 2):              # the last field is what follows the final NUL: not complete
+        if not fields[i]:
+            break                                       # an empty name ends the keys
+        if fields[i] == b'gamename':
+            return fields[i + 1].decode('latin-1')[:MAX_TEXT]
+    return ''
+
+
 def make_challenge(addr):
     a, b, c, d = (int(x) for x in addr[0].split('.'))
-    return (''.join(random.choice(string.ascii_letters + string.digits) for _ in range(6)) +
-            '%x%x' % (random.randrange(8), random.randrange(16)) +
+    return (''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(6)) +
+            '%x%x' % (secrets.randbelow(8), secrets.randbelow(16)) +
             '%08X%04X' % ((a << 24) | (b << 16) | (c << 8) | d, addr[1]))
 
 
@@ -161,9 +233,19 @@ class Registry:
     """The hosted games, and who wants to hear about changes (server browser connections with push
     updates): watchers have host_added(host), host_updated(host) and host_removed(host)."""
 
-    def __init__(self):
+    def __init__(self, limits=None):
+        self.limits = limits or access.Limits.none()
         self.hosts = {}                 # (ip, port) -> Host
         self.watchers = set()
+
+    def has_room(self, addr):
+        """Whether a new host at this address may be added: only so many games are listed in all, and
+        so many from one address (the server's own machine hosts as many as it runs)."""
+        if not self.limits.enabled or access.is_local(addr[0]):
+            return True                 # the server's own machine runs the games it was set up to run
+        if len(self.hosts) >= self.limits.max_hosts:
+            return False
+        return sum(1 for a in self.hosts if a[0] == addr[0]) < self.limits.hosts_per_ip
 
     def listed(self, gamename=None):
         want = games.find(gamename).gamename if gamename and games.find(gamename) else gamename
@@ -203,7 +285,8 @@ class Registry:
         if self.hosts.get(host.addr) is host:
             del self.hosts[host.addr]
             if host.validated:
-                log.info('qr: %s (%s:%d) is no longer listed%s', host.name(), host.ip, host.port, why and ' (%s)' % why)
+                log.info('qr: %s (%s:%d) is no longer listed%s', access.safe(host.name()), host.ip, host.port,
+                         why and ' (%s)' % why)
                 self._notify('host_removed', host)
 
     def expire(self):
@@ -214,9 +297,14 @@ class Registry:
 
 
 class MasterServer(asyncio.DatagramProtocol):
-    def __init__(self, registry):
+    def __init__(self, registry, can_host=None):
         self.registry = registry
+        self.limits = registry.limits
+        self.can_host = can_host or (lambda ip: True)     # who may list a game: see GameSpyServer
         self.transport = None
+        self.ignored_total = 0          # heartbeats dropped because their sender may not list games
+        self._ignored_by_address = access.RateLimiter(1, 1 / 60.0, max_keys=1000)       # who has been named in the log, lately
+        self._ignored_lines = access.RateLimiter(10, 0.1)                                 # and how much of it there is, in all
         self._msg_keys = itertools.count(random.randrange(1, 1 << 30))
         self._pending = {}              # message key -> (host addr, packet, tries left)
 
@@ -228,10 +316,12 @@ class MasterServer(asyncio.DatagramProtocol):
             self.transport.sendto(packet, addr)
 
     def datagram_received(self, data, addr):
+        if not self.limits.allow(self.limits.qr_packets, addr[0]):
+            return
         try:
             self._handle(data, addr)
         except Exception:
-            log.exception('qr: bad packet from %s:%d: %s', addr[0], addr[1], data[:64].hex())
+            log.debug('qr: bad packet from %s:%d: %s', addr[0], addr[1], data[:64].hex(), exc_info=True)
 
     def _handle(self, data, addr):
         if len(data) < 5:
@@ -242,7 +332,7 @@ class MasterServer(asyncio.DatagramProtocol):
             host.last_seen = time.monotonic()
         if ptype == AVAILABLE:
             gamename, _ = read_nts(payload, 0)
-            log.info('qr: %s:%d asks whether %s is available%s', addr[0], addr[1], gamename,
+            log.info('qr: %s:%d asks whether %s is available%s', addr[0], addr[1], access.safe(gamename),
                      '' if games.find(gamename) else ' (a game this server doesn\'t know)')
             self.send(QR_MAGIC + bytes([AVAILABLE]) + b'\0\0\0\0', addr)
         elif ptype == HEARTBEAT:
@@ -261,7 +351,24 @@ class MasterServer(asyncio.DatagramProtocol):
         else:
             log.debug('qr: packet type %d from %s:%d: %s', ptype, addr[0], addr[1], payload[:64].hex())
 
+    def _ignored(self, addr, payload):
+        """A heartbeat from an address that may not list games (what a player who tries to host sends). Anyone can send these
+        from any address, so it costs next to nothing (no parsing) and its line in the log is rare: for a game this server
+        serves only (the internet sends the rest as noise), once a minute for each address and at most ten at once and then
+        one every ten seconds in all, with the number so far, whatever the number of addresses."""
+        self.ignored_total += 1
+        if not games.find(heartbeat_game(payload)) or not self._ignored_by_address.available(addr[0]):
+            return
+        if not self._ignored_lines.allow('all'):
+            return
+        self._ignored_by_address.spend(addr[0])
+        log.info('qr: heartbeat from %s:%d ignored: only this machine may list games on this server (%d such heartbeats so far)',
+                 addr[0], addr[1], self.ignored_total)
+
     def _heartbeat(self, addr, instance, payload):
+        if not self.can_host(addr[0]):
+            self._ignored(addr, payload)
+            return
         keys, players, teams = parse_heartbeat(payload)
         try:
             state = int(keys.get('statechanged') or STATE_CHANGED)
@@ -276,6 +383,9 @@ class MasterServer(asyncio.DatagramProtocol):
         if host is None or state == STATE_INITIAL or host.instance != instance:
             if host is not None:
                 self.registry.remove(host, 'registered again')
+            if not self.registry.has_room(addr):
+                log.info('qr: %s:%d: too many hosted games; not listed', addr[0], addr[1])
+                return
             host = Host(addr, instance)
             self.registry.hosts[addr] = host
         host.gamename = gamename or host.gamename
@@ -283,7 +393,8 @@ class MasterServer(asyncio.DatagramProtocol):
         host.players = players
         host.teams = teams
         if not games.find(host.gamename):
-            log.warning('qr: heartbeat from %s:%d for %r, a game this server has no key for', addr[0], addr[1], host.gamename)
+            log.warning('qr: heartbeat from %s:%d for %s, a game this server has no key for', addr[0], addr[1],
+                        access.safe(host.gamename))
             self.send(QR_MAGIC + bytes([ADDERROR]) + instance + b'\x01' + b'Unknown game name.\0', addr)
             del self.registry.hosts[addr]
             return
@@ -304,15 +415,19 @@ class MasterServer(asyncio.DatagramProtocol):
         answer, _ = read_nts(payload, 0)
         self.send(QR_MAGIC + bytes([CLIENT_REGISTERED]) + instance, addr)
         if not host.validated:
-            log.info('qr: %s hosts %s on %s:%d (map %s, %s/%s players)', host.gamename, host.name(), addr[0], addr[1],
-                     host.keys.get('mapname', '?'), host.keys.get('numplayers', len(host.players)),
-                     host.keys.get('maxplayers', '?'))
+            log.info('qr: %s hosts %s on %s:%d, UDP ports players use: %s (map %s, %s/%s players)', host.gamename,
+                     access.safe(host.name()), addr[0], addr[1], ', '.join(map(str, host.udp_ports())),
+                     access.safe(host.keys.get('mapname', '?')),
+                     access.safe(host.keys.get('numplayers', len(host.players))), access.safe(host.keys.get('maxplayers', '?')))
             log.debug('qr: challenge %s answered %s', host.challenge, answer)
             self.registry.listed_now(host)
 
     # ---- messages to hosts
 
     def send_client_message(self, host, data):
+        if len(self._pending) >= MAX_PENDING_MESSAGES:
+            log.info('qr: too many unacknowledged messages to hosts; one to %s:%d dropped', host.ip, host.port)
+            return
         key = next(self._msg_keys) & 0xFFFFFFFF
         packet = QR_MAGIC + bytes([CLIENT_MESSAGE]) + host.instance + struct.pack('>I', key) + data
         self._pending[key] = (host.addr, packet, RESEND_COUNT)

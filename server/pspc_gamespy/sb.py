@@ -25,8 +25,10 @@ import os
 import socket
 import struct
 
+from . import access
 from . import crypt
 from . import games
+from .qr import MAX_MESSAGE
 from .sqlfilter import Filter
 
 log = logging.getLogger('gamespy')
@@ -43,6 +45,9 @@ NONSTANDARD_PORT_FLAG, NONSTANDARD_PRIVATE_PORT_FLAG, HAS_KEYS_FLAG, HAS_FULL_RU
 DEFAULT_QUERY_PORT = 6500
 KEEPALIVE_INTERVAL = 60
 MAX_REQUEST = 4096
+MAX_FIELDS = 64                 # keys a list request may ask for (a game asks for about ten)
+FIRST_REQUEST_TIMEOUT = 60      # seconds a new connection has to ask for a list
+IDLE_TIMEOUT = 1200             # seconds of silence (not even a keepalive's reply) before a connection is closed
 
 
 def ip_bytes(ip):
@@ -67,7 +72,7 @@ class ListRequest:
         pos += 8
         self.filter, pos = self._nts(body, pos)
         fields, pos = self._nts(body, pos)
-        self.fields = [f for f in fields.split('\\') if f]
+        self.fields = [f for f in fields.split('\\') if f][:MAX_FIELDS]
         self.options = struct.unpack_from('>I', body, pos)[0] if pos + 4 <= len(body) else 0
         pos += 4
         self.source_ip = None
@@ -93,6 +98,7 @@ class Session:
         self.reader = reader
         self.writer = writer
         self.peer = writer.get_extra_info('peername') or ('0.0.0.0', 0)
+        self.limits = browser.limits
         self.cipher = None
         self.game = None
         self.request = None
@@ -117,6 +123,8 @@ class Session:
         try:
             self.writer.write(header + self.cipher.encrypt(data))
         except Exception:
+            self.closed = True
+        if access.drop_if_backlogged(self.writer):
             self.closed = True
 
     def send_error(self, text):
@@ -201,10 +209,10 @@ class Session:
                 out += self.encode_server(h, req.fields)
             out += b'\0\xff\xff\xff\xff'
         self.send(bytes(out), length_prefixed=False, header=header)
-        log.info('sb %s:%d: %s list, %d of %d hosted games%s', self.peer[0], self.peer[1], req.for_game, len(hosts),
-                 len(self.registry.listed(req.for_game)), ' (filter: %s)' % req.filter if req.filter else '')
+        log.info('sb %s:%d: %s list, %d of %d hosted games%s', self.peer[0], self.peer[1], access.safe(req.for_game), len(hosts),
+                 len(self.registry.listed(req.for_game)), ' (filter: %s)' % access.safe(req.filter) if req.filter else '')
         if not self.filter.ok:
-            log.warning("sb: couldn't read the filter %r; listing everything", req.filter)
+            log.info("sb: couldn't read the filter %s; listing everything", access.safe(req.filter))
 
     # ---- push updates (Registry watcher)
 
@@ -226,12 +234,17 @@ class Session:
 
     def handle(self, body):
         rtype, body = body[0], body[1:]
+        if rtype in (LIST_REQUEST, INFO_REQUEST) and not self.limits.allow(self.limits.browser_requests, self.peer[0]):
+            log.info('sb %s:%d: too many requests; closed', self.peer[0], self.peer[1])
+            self.closed = True
+            return
         if rtype == LIST_REQUEST:
             req = ListRequest(body)
             game = games.find(req.from_game)
             for_game = games.find(req.for_game)
             if game is None or for_game is None:
-                self.send_error('\\error\\Unknown game name: %s\\final\\' % (req.from_game if game is None else req.for_game))
+                self.send_error('\\error\\Unknown game name: %s\\final\\' %
+                                access.safe(req.from_game if game is None else req.for_game, 30))
                 return
             log.debug('sb %s:%d: list request for %s from %s, fields %s, filter %r, options %#x', self.peer[0], self.peer[1],
                       req.for_game, req.from_game, req.fields, req.filter, req.options)
@@ -254,14 +267,20 @@ class Session:
             if host:
                 self.send(bytes([PUSH_SERVER_MESSAGE]) + self.encode_server(host, [], full_rules=True))
         elif rtype == SEND_MESSAGE_REQUEST:
-            if len(body) < 6:
+            # Players have the server send hosts the messages that start NAT negotiation: small, and only
+            # from a connection that has asked for a list. Otherwise this would send what a stranger likes
+            # (several times over) to any address a game was listed at.
+            if len(body) < 6 or len(body) - 6 > MAX_MESSAGE or self.cipher is None:
+                return
+            if not self.limits.allow(self.limits.host_messages, self.peer[0]):
+                log.info('sb %s:%d: too many messages to hosts', self.peer[0], self.peer[1])
                 return
             ip, port = socket.inet_ntoa(body[:4]), struct.unpack_from('>H', body, 4)[0]
             host = self.registry.find(ip, port)
             if host is None:
                 log.info('sb %s:%d: message for %s:%d, which is not hosting', self.peer[0], self.peer[1], ip, port)
                 return
-            log.debug('sb %s:%d: message for %s (%d bytes)', self.peer[0], self.peer[1], host.name(), len(body) - 6)
+            log.debug('sb %s:%d: message for %s (%d bytes)', self.peer[0], self.peer[1], access.safe(host.name()), len(body) - 6)
             self.browser.master.send_client_message(host, body[6:])
         elif rtype == KEEPALIVE_REPLY:
             pass
@@ -274,7 +293,11 @@ class Session:
         self._ka = ka
         try:
             while not self.closed:
-                data = await self.reader.read(4096)
+                timeout = IDLE_TIMEOUT if self.cipher is not None else FIRST_REQUEST_TIMEOUT
+                try:
+                    data = await asyncio.wait_for(self.reader.read(4096), access.patience(self.peer[0], timeout))
+                except asyncio.TimeoutError:
+                    break
                 if not data:
                     break
                 buf += data
@@ -291,9 +314,14 @@ class Session:
                         self.handle(body)
                     except (ValueError, IndexError, struct.error) as e:
                         log.info('sb %s:%d: bad request (%s): %s', self.peer[0], self.peer[1], e, body[:64].hex())
+                    if self.closed:
+                        break
                 await self.writer.drain()
         except (ConnectionError, OSError):
             pass
+        except Exception:
+            log.warning('sb %s:%d: a request was not handled; closed', self.peer[0], self.peer[1],
+                        exc_info=log.isEnabledFor(logging.DEBUG))
         finally:
             self.closed = True
             self._ka.cancel()
@@ -316,6 +344,7 @@ class ServerBrowser:
         self.registry = registry
         self.master = master
         self.reach = reach
+        self.limits = registry.limits
 
     async def handle(self, reader, writer):
         await Session(self, reader, writer).run()

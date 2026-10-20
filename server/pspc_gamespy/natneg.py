@@ -17,6 +17,8 @@ import socket
 import struct
 import time
 
+from . import access
+
 log = logging.getLogger('gamespy')
 
 MAGIC = b'\xfd\xfc\x1e\x66\x6a\xb2'
@@ -63,8 +65,9 @@ class Session:
 
 
 class NatNegServer(asyncio.DatagramProtocol):
-    def __init__(self, reach):
+    def __init__(self, reach, limits=None):
         self.reach = reach
+        self.limits = limits or access.Limits.none()
         self.transport = None
         self.sessions = {}              # cookie -> Session
 
@@ -76,10 +79,12 @@ class NatNegServer(asyncio.DatagramProtocol):
             self.transport.sendto(packet, addr)
 
     def datagram_received(self, data, addr):
+        if not self.limits.allow(self.limits.natneg_packets, addr[0]):
+            return
         try:
             self._handle(data, addr)
         except Exception:
-            log.exception('natneg: bad packet from %s:%d: %s', addr[0], addr[1], data[:64].hex())
+            log.debug('natneg: bad packet from %s:%d: %s', addr[0], addr[1], data[:64].hex(), exc_info=True)
 
     @staticmethod
     def header(version, ptype, cookie):
@@ -112,10 +117,12 @@ class NatNegServer(asyncio.DatagramProtocol):
             if len(body) >= 3:
                 gamename = body[11:61].split(b'\0')[0].decode('latin-1', 'replace') if len(body) > 11 else ''
                 log.info('natneg %08x: client %d reports %s%s', cookie, body[1],
-                         'success' if body[2] else 'failure', ' (%s)' % gamename if gamename else '')
-            self.send(self.header(version, REPORT_ACK, cookie) + body[:61].ljust(61, b'\0'), addr)
+                         'success' if body[2] else 'failure', ' (%s)' % access.safe(gamename, 40) if gamename else '')
+            self.send(self.header(version, REPORT_ACK, cookie) + body[:61], addr)     # never longer than the report
         elif ptype == PREINIT:
             index = body[0] if body else 0
+            if cookie not in self.sessions and len(self.sessions) >= self.limits.max_natneg_sessions and self.limits.enabled:
+                return
             s = self.sessions.setdefault(cookie, Session(cookie))
             s.preinit.add(index)
             state = PREINIT_READY if len(s.preinit) >= 2 else PREINIT_WAITING_FOR_MATCHUP
@@ -124,14 +131,21 @@ class NatNegServer(asyncio.DatagramProtocol):
             log.debug('natneg %08x: packet type %d from %s:%d', cookie, ptype, addr[0], addr[1])
 
     def _init(self, version, cookie, body, addr):
+        if len(body) < 3 or (version > 1 and len(body) < 9):
+            return
         porttype, index, use_game_port = body[0], body[1], body[2]
         s = self.sessions.get(cookie)
         if s is None:
+            if len(self.sessions) >= self.limits.max_natneg_sessions and self.limits.enabled:
+                return
             s = self.sessions[cookie] = Session(cookie)
             log.info('natneg %08x: negotiation started from %s:%d', cookie, addr[0], addr[1])
         c = s.clients.get(index)
         if c is None:
+            if len(s.clients) >= 2:          # a negotiation is between two players
+                return
             c = s.clients[index] = Client(index)
+            log.info('natneg %08x: client %d joined from %s:%d', cookie, index, addr[0], addr[1])
         c.version = version
         c.use_game_port = bool(use_game_port)
         c.ports[porttype] = addr
@@ -188,5 +202,8 @@ class NatNegServer(asyncio.DatagramProtocol):
                 for c in s.clients.values():
                     if c.ready():
                         self._send_connect(s, c, FINISHED_ERROR_DEADBEAT_PARTNER)
-                log.info('natneg %08x: the partner never came', cookie)
+                here = ', '.join('client %d at %s:%d (port types sent: %s%s)' % (c.index, *next(iter(c.ports.values())), sorted(c.ports),
+                                                                                   '' if c.ready() else '; its address for the game is unknown')
+                                 for c in s.clients.values() if c.ports)
+                log.info('natneg %08x: the partner never came (here: %s)', cookie, here or 'nobody')
                 del self.sessions[cookie]

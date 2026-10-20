@@ -10,14 +10,24 @@ the other way round, which the client checks. Error codes are GP's (GPErrorCode 
 
 import asyncio
 import logging
-import random
+import secrets
 import string
 
+from . import access
 from . import crypt
 from . import kv
 from .store import StoreError
 
 log = logging.getLogger('gamespy')
+
+LOGIN_TIMEOUT = 60              # seconds of silence from a connection that hasn't logged in
+IDLE_TIMEOUT = 7200             # seconds of silence from a player who has (their game would have said something)
+SEARCH_TIMEOUT = 30
+MAX_SEARCH_REQUESTS = 50        # per search connection (a game asks one or two)
+MAX_NAME = 30                   # nicks, unique nicks, first and last names
+MAX_EMAIL = 100
+MAX_TEXT = 1024                 # a buddy message
+MAX_STATUS = 256                # a status or location string
 
 # Statuses (GPEnum).
 GP_OFFLINE, GP_ONLINE, GP_PLAYING, GP_STAGING, GP_CHATTING, GP_AWAY = 0, 1, 2, 3, 4, 5
@@ -29,7 +39,27 @@ SIG = 'd41d8cd98f00b204e9800998ecf8427e'
 
 
 def _challenge(n=10):
-    return ''.join(random.choice(string.ascii_uppercase) for _ in range(n))
+    return ''.join(secrets.choice(string.ascii_uppercase) for _ in range(n))
+
+
+def valid_name(text, limit=MAX_NAME):
+    """A nick, unique nick or name a player may have: printable, and none of the protocol's separator."""
+    return 0 < len(text) <= limit and text.isprintable() and '\\' not in text
+
+
+def valid_email(text):
+    return '@' in text[1:-1] and len(text) <= MAX_EMAIL and valid_name(text, MAX_EMAIL) and ' ' not in text
+
+
+def check_new_user(limits, ip, email, nick, uniquenick):
+    """The GP error code for a new account that may not be made (0: it may), and a message."""
+    if not valid_email(email):
+        return 513 if email else 259, 'The nick or e-mail address is invalid.'
+    if not valid_name(nick) or (uniquenick and not valid_name(uniquenick)):
+        return 259, 'The nick or e-mail address is invalid.'
+    if not limits.allow(limits.new_accounts, ip):
+        return 5, 'Too many accounts were made from this address. Try again later.'
+    return 0, ''
 
 
 def _error(code, message, op_id=None, fatal=False):
@@ -51,6 +81,8 @@ class Session:
         self.reader = reader
         self.writer = writer
         self.peer = writer.get_extra_info('peername') or ('?', 0)
+        self.ip = self.peer[0]
+        self.limits = presence.limits
         self.challenge = _challenge()
         self.profile = None
         self.sesskey = 0
@@ -66,10 +98,12 @@ class Session:
     def send(self, text):
         if self.closed:
             return
-        log.debug('gpcm %s <- %s', self.peer, text)
+        log.debug('gpcm %s <- %s', self.peer, access.safe(text, 300))
         try:
             self.writer.write(text.encode('utf-8', 'replace'))
         except Exception:
+            self.closed = True
+        if access.drop_if_backlogged(self.writer):
             self.closed = True
 
     async def run(self):
@@ -77,19 +111,33 @@ class Session:
         splitter = kv.Splitter()
         try:
             while not self.closed:
-                data = await self.reader.read(16384)
+                try:
+                    data = await asyncio.wait_for(self.reader.read(16384),
+                                                  access.patience(self.ip, IDLE_TIMEOUT if self.profile else LOGIN_TIMEOUT))
+                except asyncio.TimeoutError:
+                    log.info('gpcm %s: silent for too long; closed', self.peer)
+                    break
                 if not data:
                     break
                 for msg in splitter.feed(data.decode('utf-8', 'replace')):
                     log.debug('gpcm %s -> %s', self.peer, msg.pairs)
-                    handler = getattr(self, 'on_' + msg.command, None)
+                    if not self.limits.allow(self.limits.presence_messages, self.ip):
+                        log.info('gpcm %s: too many messages; closed', self.peer)
+                        return
+                    handler = getattr(self, 'on_' + msg.command, None) if msg.command.isidentifier() else None
                     if handler:
                         handler(msg)
                     else:
-                        log.info('gpcm %s: unhandled %s %s', self.peer, msg.command, msg.pairs)
+                        log.info('gpcm %s: unhandled %s', self.peer, access.safe(msg.command))
+                    if self.closed:
+                        break                   # the rest of what this connection sent is not read
                 await self.writer.drain()
+        except kv.TooLong as e:
+            log.info('gpcm %s: %s; closed', self.peer, e)
         except (ConnectionError, asyncio.IncompleteReadError, OSError):
             pass
+        except Exception:                   # a message this code can't handle ends this connection, nothing else
+            log.warning('gpcm %s: a message was not handled; closed', self.peer, exc_info=log.isEnabledFor(logging.DEBUG))
         finally:
             self.closed = True
             self.presence.logout(self)
@@ -109,19 +157,38 @@ class Session:
         else:
             password = m.get('password', '')
         op = m.get('id', 1)
-        if not email or '@' not in email or not nick or len(nick) > 30:
-            self.send(_error(513 if email else 259, 'The nick or e-mail address is invalid.', op))
+        code, message = check_new_user(self.limits, self.ip, email, nick, uniquenick)
+        if code:
+            log.info('gpcm %s: new account %s refused (%d: %s)', self.peer, access.safe(nick), code, message)
+            self.send(_error(code, message, op))
             return
         try:
             userid, profileid = self.store.new_user(email, crypt.md5hex(password), nick, uniquenick, m.int('namespaceid'))
         except StoreError as e:
+            log.info('gpcm %s: new account %s refused (%d: %s)', self.peer, access.safe(nick), e.code, e.message)
             self.send(_error(e.code, e.message, op))
             return
-        log.info('gpcm: new account %s (%s), profile %d', nick, email, profileid)
+        log.info('gpcm: new account %s (%s), profile %d, from %s', access.safe(nick), access.safe(email), profileid, self.ip)
         self.send(kv.build(('nur', ''), ('userid', userid), ('profileid', profileid), ('id', op)))
+
+    def refuse_login(self, code, message, op):
+        """A login that failed: the address pays for it (guesses are slowed down), and the connection ends."""
+        log.info('gpcm %s: login refused (%d: %s)', self.peer, code, message)
+        self.limits.spend(self.limits.failed_logins, self.ip)
+        self.send(_error(code, message, op, fatal=True))
+        self.closed = True
 
     def on_login(self, m):
         op = m.get('id', 1)
+        if self.profile:                    # a second login would leave the first profile "online" on a connection that is not its
+            self.send(_error(263, 'This connection is logged in already.', op, fatal=True))
+            self.closed = True
+            return
+        if not self.limits.available(self.limits.failed_logins, self.ip):
+            log.info('gpcm %s: login refused: too many failed logins from this address', self.peer)
+            self.send(_error(5, 'Too many failed logins from this address. Try again in a few minutes.', op, fatal=True))
+            self.closed = True
+            return
         client_challenge = m.get('challenge', '')
         response = m.get('response', '')[:32]
         if 'user' in m:
@@ -130,31 +197,32 @@ class Session:
             profile = self.store.profile_by_nick_email(nick, email)
             if not profile:
                 code = 258 if self.store.users_by_email(email) else 259
-                self.send(_error(code, 'There is no such profile.' if code == 258 else 'The e-mail address is incorrect.',
-                                 op, fatal=True))
+                self.refuse_login(code, 'There is no such profile.' if code == 258 else 'The e-mail address is incorrect.', op)
                 return
         elif 'uniquenick' in m:
             user = m['uniquenick']
             profile = self.store.profile_by_uniquenick(user, m.int('namespaceid'))
             if not profile:
-                self.send(_error(265, 'The unique nick is incorrect.', op, fatal=True))
+                self.refuse_login(265, 'The unique nick is incorrect.', op)
                 return
         else:
             self.send(_error(263, 'This login method is not supported.', op, fatal=True))
+            self.closed = True
             return
         if profile['banned']:
             self.send(_error(263, 'This account is banned.', op, fatal=True))
+            self.closed = True
             return
         pw = profile['password_md5']
         if response != crypt.login_hash(pw, user, client_challenge, self.challenge):
             if response == crypt.login_hash(pw, user, self.challenge, client_challenge):
                 log.warning('gpcm: login response with the challenges the other way round')
             else:
-                self.send(_error(260, 'The password is incorrect.', op, fatal=True))
+                self.refuse_login(260, 'The password is incorrect.', op)
                 return
         proof = crypt.login_hash(pw, user, self.challenge, client_challenge)
         self.profile = self.store.profile(profile['profileid'])
-        self.sesskey = random.randint(1, 0x7FFFFFFF)
+        self.sesskey = secrets.randbelow(0x7FFFFFFF) + 1
         self.game_port = m.int('port')
         self.status = (GP_ONLINE, '', '')
         self.store.touch_login(self.profileid)
@@ -167,7 +235,7 @@ class Session:
         self.presence.tickets[self.ticket] = self.profileid
         pairs += [('lt', self.ticket), ('id', op)]
         self.send(kv.build(*pairs))
-        log.info('gpcm: %s logged in (profile %d) from %s', self.profile['nick'], self.profileid, self.peer[0])
+        log.info('gpcm: %s logged in (profile %d) from %s', access.safe(self.profile['nick']), self.profileid, self.ip)
         self.send_lists()
 
     def send_lists(self):
@@ -204,7 +272,7 @@ class Session:
     def on_status(self, m):
         if self.needs_login(m):
             return
-        self.status = (m.int('status'), m.get('statstring', ''), m.get('locstring', ''))
+        self.status = (m.int('status'), m.get('statstring', '')[:MAX_STATUS], m.get('locstring', '')[:MAX_STATUS])
         self.presence.broadcast_status(self)
 
     # ---- profiles
@@ -234,8 +302,9 @@ class Session:
     def on_updatepro(self, m):
         if self.needs_login(m):
             return
-        self.store.update_profile(self.profileid, {k: v for k, v in m.items()
-                                                    if k in ('nick', 'firstname', 'lastname', 'countrycode')})
+        fields = {k: v for k, v in m.items() if k in ('nick', 'firstname', 'lastname', 'countrycode') and
+                  len(v) <= MAX_NAME and v.isprintable() and '\\' not in v and (v or k != 'nick')}
+        self.store.update_profile(self.profileid, fields)
         self.profile = self.store.profile(self.profileid)
 
     def on_updateui(self, m):
@@ -248,6 +317,9 @@ class Session:
         if self.needs_login(m):
             return
         op = m.get('id', 1)
+        if not valid_name(m.get('nick', '')):
+            self.send(_error(1025, 'The nick is invalid.', op))
+            return
         try:
             pid = self.store.new_profile(self.profile['userid'], m.get('nick', ''))
         except StoreError as e:
@@ -270,6 +342,8 @@ class Session:
             return
         op = m.get('id', 1)
         try:
+            if not valid_name(m.get('uniquenick', '')):
+                raise StoreError(4097, 'invalid')
             self.store.register_uniquenick(self.profileid, m.get('uniquenick', ''))
         except StoreError:
             self.send(_error(4097, 'That unique nick is taken.', op))
@@ -293,7 +367,7 @@ class Session:
         if to in self.store.buddies(self.profileid):
             self.send(_error(1539, 'That profile is already a buddy.', m.get('id')))
             return
-        reason = m.get('reason', '')
+        reason = m.get('reason', '')[:MAX_TEXT]
         other = self.presence.sessions.get(to)
         if self.profileid in self.store.buddies(to):
             # They have this player on their list already (their request was just accepted, and the
@@ -306,7 +380,11 @@ class Session:
                 other.send(self.presence.status_message(self.profileid))
             log.info('gpcm: %d and %d are on each other\'s lists', self.profileid, to)
             return
-        self.store.add_buddy_request(self.profileid, to, reason)
+        try:
+            self.store.add_buddy_request(self.profileid, to, reason)
+        except StoreError as e:
+            self.send(_error(e.code, e.message, m.get('id')))
+            return
         if other:
             other.send(kv.build(('bm', BM_REQUEST), ('f', self.profileid), ('msg', reason + '|signed|' + SIG)))
         log.info('gpcm: %d asks %d to be a buddy', self.profileid, to)
@@ -361,13 +439,15 @@ class Session:
             return
         mtype = m.int('bm')
         to = m.int('t')
-        text = m.get('msg', '')
+        text = m.get('msg', '')[:MAX_TEXT]
+        if mtype in (BM_MESSAGE, BM_UTM, BM_PING, BM_PONG, BM_INVITE) and self.profileid in self.store.blocks(to):
+            return                          # they blocked this player
         if mtype in (BM_MESSAGE, BM_UTM, BM_PING, BM_PONG, BM_INVITE):
             other = self.presence.sessions.get(to)
             if other:
                 other.send(kv.build(('bm', mtype), ('f', self.profileid), ('msg', text)))
-            elif mtype == BM_MESSAGE:
-                self.store.queue_message(self.profileid, to, mtype, text)
+            elif mtype == BM_MESSAGE and (to in self.store.buddies(self.profileid) or self.profileid in self.store.buddies(to)):
+                self.store.queue_message(self.profileid, to, mtype, text)       # friends' messages wait for their next login
 
     def on_pinvite(self, m):
         if self.needs_login(m):
@@ -381,8 +461,9 @@ class Session:
 class Presence:
     """The connection manager: who is logged in, and their statuses."""
 
-    def __init__(self, store):
+    def __init__(self, store, limits=None):
         self.store = store
+        self.limits = limits or access.Limits.none()
         self.sessions = {}  # profile id -> Session
         self.tickets = {}   # login ticket (lt) -> profile id: the stats server's authtoken sign-ins
 
@@ -402,9 +483,9 @@ class Presence:
         self.broadcast_status(session)
 
     def logout(self, session):
+        self.tickets.pop(session.ticket, None)
         if session.profileid and self.sessions.get(session.profileid) is session:
             del self.sessions[session.profileid]
-            self.tickets.pop(session.ticket, None)
             session.status = (GP_OFFLINE, '', '')
             self.broadcast_status(session)
             log.info('gpcm: profile %d logged out', session.profileid)
@@ -443,26 +524,39 @@ class Search:
     def __init__(self, store, presence):
         self.store = store
         self.presence = presence
+        self.limits = presence.limits
 
     async def handle(self, reader, writer):
         peer = writer.get_extra_info('peername')
+        ip = peer[0] if peer else ''
         splitter = kv.Splitter()
+        requests = 0
         try:
             while True:
-                data = await reader.read(16384)
+                try:
+                    data = await asyncio.wait_for(reader.read(16384), SEARCH_TIMEOUT)
+                except asyncio.TimeoutError:
+                    break
                 if not data:
                     break
                 for m in splitter.feed(data.decode('utf-8', 'replace')):
                     log.debug('gpsp %s -> %s', peer, m.pairs)
-                    reply = self.answer(m)
+                    requests += 1
+                    if requests > MAX_SEARCH_REQUESTS or not self.limits.allow(self.limits.searches, ip):
+                        return
+                    reply = self.answer(m, ip)
                     if reply is None:
-                        log.info('gpsp %s: unhandled %s %s', peer, m.command, m.pairs)
+                        log.info('gpsp %s: unhandled %s', peer, access.safe(m.command))
                         continue
-                    log.debug('gpsp %s <- %s', peer, reply)
+                    log.debug('gpsp %s <- %s', peer, access.safe(reply, 300))
                     writer.write(reply.encode('utf-8', 'replace'))
                 await writer.drain()
+        except kv.TooLong as e:
+            log.info('gpsp %s: %s; closed', peer, e)
         except (ConnectionError, OSError):
             pass
+        except Exception:
+            log.warning('gpsp %s: a request was not handled; closed', peer, exc_info=log.isEnabledFor(logging.DEBUG))
         finally:
             try:
                 writer.close()
@@ -474,21 +568,26 @@ class Search:
             return crypt.decode_password(m['passenc'])
         return m.get('pass', m.get('password', ''))
 
-    def _owned(self, email, password):
-        """The user with this e-mail and password: (user, error code)."""
+    def _owned(self, email, password, ip):
+        """The user with this e-mail and password: (user, error code). Like a login, a wrong
+        password is paid for by the address that tried it."""
+        if not self.limits.available(self.limits.failed_logins, ip):
+            return None, 'password'
         users = self.store.users_by_email(email)
         if not users:
             return None, 'email'
         pw = crypt.md5hex(password)
         user = next((u for u in users if u['password_md5'] == pw), None)
+        if user is None:
+            self.limits.spend(self.limits.failed_logins, ip)
         return (user, None) if user else (None, 'password')
 
-    def answer(self, m):
+    def answer(self, m, ip=''):
         c = m.command
         if c == 'valid':
             return kv.build(('vr', 1 if self.store.users_by_email(m.get('email', '')) else 0))
         if c == 'check':
-            user, err = self._owned(m.get('email', ''), self._password(m))
+            user, err = self._owned(m.get('email', ''), self._password(m), ip)
             if err:
                 return kv.build(('cur', 3585 if err == 'email' else 3587))
             prof = self.store.profile_by_nick_email(m.get('nick', ''), m.get('email', ''))
@@ -496,7 +595,7 @@ class Search:
                 return kv.build(('cur', 3586))
             return kv.build(('cur', 0), ('pid', prof['profileid']))
         if c == 'nicks':
-            user, err = self._owned(m.get('email', ''), self._password(m))
+            user, err = self._owned(m.get('email', ''), self._password(m), ip)
             if err:
                 return kv.build(('nr', 259 if err == 'email' else 260), ('ndone', ''))
             pairs = [('nr', 0)]
@@ -506,13 +605,17 @@ class Search:
             return kv.build(*pairs)
         if c == 'newuser':
             password = self._password(m)
+            code, _ = check_new_user(self.limits, ip, m.get('email', ''), m.get('nick', ''), m.get('uniquenick', ''))
+            if code:
+                return kv.build(('nur', code), ('pid', 0))
             try:
                 _, pid = self.store.new_user(m.get('email', ''), crypt.md5hex(password), m.get('nick', ''),
                                              m.get('uniquenick', ''), m.int('namespaceid'))
             except StoreError as e:
                 prof = self.store.profile_by_nick_email(m.get('nick', ''), m.get('email', ''))
                 return kv.build(('nur', e.code), ('pid', prof['profileid'] if prof else 0))
-            log.info('gpsp: new account %s (%s), profile %d', m.get('nick', ''), m.get('email', ''), pid)
+            log.info('gpsp: new account %s (%s), profile %d, from %s', access.safe(m.get('nick', '')),
+                     access.safe(m.get('email', '')), pid, ip)
             return kv.build(('nur', 0), ('pid', pid))
         if c == 'search':
             rows = self.store.search(nick=m.get('nick', ''), uniquenick=m.get('uniquenick', ''), email=m.get('email', ''),

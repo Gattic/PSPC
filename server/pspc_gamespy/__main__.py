@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 import getpass
+import ipaddress
 import json
 import logging
 import os
@@ -14,6 +15,7 @@ from . import __version__
 from . import crypt
 from . import sessions as sessions_mod
 from .games import GAMES, load as load_games
+from .tunnel import VIRTUAL_HOST
 from .gstats import decode_kv
 from .server import DEFAULT_MOTD, Config, GameSpyServer
 from .store import Store
@@ -38,11 +40,23 @@ def serve(args):
                      ' (%d accounts made)' % made if made else '')
             if entries:
                 sessions = sessions_mod.Sessions(entries, os.path.join(os.path.dirname(os.path.abspath(args.db)), 'sessions'))
-    config = Config(public_host=args.public_host, bind=args.bind, http_port=args.http_port, motd=args.motd,
-                    status_file=args.status_file, sessions=sessions)
-    server = GameSpyServer(config, store)
-    log.info('PSPC GameSpy server %s for %s; players on other PCs reach it at %s', __version__,
-             ', '.join(g.name for g in GAMES.values()), args.public_host)
+    if args.tunnel and args.bind != '0.0.0.0' and not ipaddress.ip_address(args.bind).is_loopback:
+        log.error('--tunnel connects to the services on this machine: --bind has to be 0.0.0.0 or a 127.x.y.z address, not %s', args.bind)
+        return 1
+    public_host = args.public_host or (VIRTUAL_HOST if args.tunnel else '127.0.0.1')
+    config = Config(public_host=public_host, bind=args.bind, http_port=args.http_port, motd=args.motd,
+                    status_file=args.status_file, sessions=sessions, tunnel=args.tunnel, behind_proxy=args.behind_proxy,
+                    local_hosts_only=args.local_hosts_only)
+    try:
+        server = GameSpyServer(config, store)
+    except OSError as e:
+        log.error("can't look up the public host %s: %s", public_host, e)
+        return 1
+    if args.local_hosts_only and not args.tunnel and ipaddress.ip_address(server.reach.public_ip).is_loopback:
+        log.error('a server for other PCs needs --public-host: the address or name they reach it at (games are listed with it)')
+        return 1
+    log.info('PSPC GameSpy server %s for %s; players on other PCs reach it at %s%s', __version__,
+             ', '.join(g.name for g in GAMES.values()), public_host, ' (through the tunnel)' if args.tunnel else '')
     try:
         asyncio.run(server.serve_forever())
     except KeyboardInterrupt:
@@ -114,15 +128,28 @@ def main(argv=None):
                     help='serve: more games, from a JSON file (default: %s beside the database, if there is one)' % GAMES_FILE)
     sub = ap.add_subparsers(dest='command', required=True)
     s = sub.add_parser('serve', help='run the servers')
-    s.add_argument('--public-host', default='127.0.0.1',
-                   help="the address players on other PCs reach this server at (default: %(default)s)")
+    s.add_argument('--public-host',
+                   help="the address or name players on other PCs reach this server at (default: 127.0.0.1; with --tunnel, %s). "
+                        "A name must lead to this server (not a Cloudflare-proxied one)" % VIRTUAL_HOST)
     s.add_argument('--bind', default='0.0.0.0', help='address to listen on (default: %(default)s)')
     s.add_argument('--http-port', type=int, default=80, help='the web pages\' port (default: %(default)s; games ask port 80)')
     s.add_argument('--motd', default=DEFAULT_MOTD, help='the message of the day')
     s.add_argument('--status-file', help='keep a JSON summary of online players and hosted games here')
+    s.add_argument('--local-hosts-only', action='store_true',
+                   help="list only games hosted on this machine (its dedicated servers): for a server on the internet, where "
+                        "UDP heartbeats can be forged")
+    s.add_argument('--tunnel', action='store_true',
+                   help='let players reach the server over WebSockets on the web port (/tunnel/), for a Cloudflare Tunnel')
+    s.add_argument('--behind-proxy', action='store_true',
+                   help="the web port's requests come through a proxy on this machine (cloudflared): take players' addresses from "
+                        "its CF-Connecting-IP or X-Forwarded-For header")
     s.add_argument('--sessions', metavar='FILE',
                    help='programs to run alongside, such as dedicated game servers (default: %s beside the '
                         'database, if there is one)' % sessions_mod.SESSIONS_FILE)
+    t = sub.add_parser('tunnel', help="run a player's relay to a public server (see relay.py)")
+    t.add_argument('url', help="the server's address, such as https://swss.pspc.online")
+    t.add_argument('--listen', default=VIRTUAL_HOST, help='the address to listen on for the game (default: %(default)s)')
+    t.add_argument('--parent-pid', type=int, help='end when this process does')
     sub.add_parser('accounts', help='list accounts (GameSpy profiles)')
     for name in ('ban', 'unban'):
         p = sub.add_parser(name, help='%s the account owning a profile' % name)
@@ -138,6 +165,9 @@ def main(argv=None):
         handlers.append(logging.FileHandler(args.log_file, encoding='utf-8'))
     logging.basicConfig(level=getattr(logging, args.log.upper()), handlers=handlers,
                         format='%(asctime)s %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+    if args.command == 'tunnel':
+        from . import relay
+        return relay.main(args)
     if args.command == 'serve':
         files = args.games or [os.path.join(os.path.dirname(os.path.abspath(args.db)), GAMES_FILE)]
         for f in files:

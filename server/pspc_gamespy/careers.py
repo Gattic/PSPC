@@ -15,6 +15,8 @@ games."""
 import logging
 import time
 
+from . import access
+
 log = logging.getLogger('gamespy')
 
 MAX_GAP = 90                # seconds between heartbeats counted as time online at most
@@ -141,4 +143,5 @@ class Careers:
             counted.append('%s %d/%d%s' % (name, e['score'], e['deaths'],
                                            '' if winner is None or e['team'] not in (0, 1) else ' won' if e['team'] == winner else ' lost'))
         if counted:
-            log.info('careers: %s on %s (%s): %s', r.host.keys.get('mapname', '?'), r.host.name(), why, ', '.join(counted))
+            log.info('careers: %s on %s (%s): %s', access.safe(r.host.keys.get('mapname', '?')), access.safe(r.host.name()), why,
+                     access.safe(', '.join(counted), 300))
