@@ -32,6 +32,11 @@
       "domains": {}
     },
     {
+      "name": "Star Wars Super Squadron",
+      "ids": ["ULUS99390"],
+      "domains": {"*.gamespy.com": "swss.pspc.online"}
+    },
+    {
       "name": "Star Wars Battlefront: Elite Squadron",
       "ids": ["ULUS10390"],
       "hosts": [
