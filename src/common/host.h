@@ -24,6 +24,9 @@ inline constexpr const char *ModuleSuffix = ".so";
 #endif
 // Runs an argv vector directly, never through a shell. Returns -1 on spawn/wait failure.
 int RunProcess(const std::vector<std::string> &args);
+// Starts a program without waiting for it: no input, its output appended to `log`, `workingDir` as
+// its current folder. args[0] is the program's path. False if it could not be started.
+bool StartProcess(const std::vector<std::string> &args, const std::filesystem::path &workingDir, const std::filesystem::path &log);
 void *OpenModule(const std::filesystem::path &path);
 void *ModuleSymbol(void *module, const char *name);
 void CloseModule(void *module);

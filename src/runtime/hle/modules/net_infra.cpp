@@ -14,6 +14,13 @@
 // target may be "*.other.net", which keeps the part "*" matched: "*.gamespy.com": "*.openspy.net"
 // sends gpcm.gamespy.com to gpcm.openspy.net.
 //
+// An entry may name a public server with "tunnel" (https://swss.pspc.online): the Cloudflare Tunnel in
+// front of it carries only HTTP, so PSPC starts a relay (net/relay_process.h) when the game connects to
+// the network, which listens where the entry's "domains" send the game (127.77.0.1) and passes the
+// game's TCP and UDP to the server over WebSockets. An infrastructure.json next to pspc.exe with an
+// entry for the game (the launcher writes one when it starts a server on this PC) replaces the shipped
+// entry, tunnel and all.
+//
 // Games resolve names three ways and all are covered: sceNetResolver, sceHttp, and DNS queries
 // they send themselves over UDP (SCE-RT / Medius games do), which the socket layer hands to
 // InfraAnswerDnsQuery. With a revival DNS server the access point also reports it as the DNS server.
@@ -29,6 +36,7 @@
 #include "common/json.h"
 #include "common/log.h"
 #include "net/dns.h"
+#include "net/relay_process.h"
 #include "runtime/hle/modules/net_internal.h"
 #include "runtime/media/disc.h"
 
@@ -42,6 +50,7 @@ struct GameEntry {
 	std::string name;
 	std::map<std::string, std::string> domains;  // lowercase host -> IPv4 literal or host name
 	std::string dns;                             // revival DNS server (IPv4 literal or host name)
+	std::string tunnel;                          // address of a public server, reached through a relay
 };
 
 std::mutex g_mu;
@@ -73,6 +82,7 @@ bool ReadTable(const fs::path &file, const std::string &discId, GameEntry *out) 
 		if (!match) continue;
 		out->name = g["name"].String(discId);
 		out->dns = g["dns"].String();
+		out->tunnel = g["tunnel"].String();
 		for (const auto &kv : g["domains"].Members()) out->domains[Lower(kv.first)] = kv.second.String();
 		LOGI(LOG, "%s: %s is %s (%zu host names%s%s)", PathToUtf8(file).c_str(), discId.c_str(), out->name.c_str(),
 		     out->domains.size(), out->dns.empty() ? "" : ", DNS ", out->dns.c_str());
@@ -120,6 +130,11 @@ void LoadLocked() {
 			g_haveEntry = true;
 			break;
 		}
+	}
+	if (g_haveEntry && !g_entry.tunnel.empty()) {
+		std::string why;
+		if (hostnet::StartRelay(g_entry.tunnel, &why)) LOGI(LOG, "Relay to %s started (servers/relay.log)", g_entry.tunnel.c_str());
+		else LOGW(LOG, "No relay to %s: %s", g_entry.tunnel.c_str(), why.c_str());
 	}
 	const std::string dns = !cfg.infraDns.empty() ? cfg.infraDns : g_haveEntry ? g_entry.dns : std::string();
 	if (!dns.empty()) {

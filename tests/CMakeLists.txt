@@ -13,6 +13,7 @@ if(NOT PSPC_BUILD_RUNTIME)
 		${CMAKE_SOURCE_DIR}/src/net/host_net.cpp
 		${CMAKE_SOURCE_DIR}/src/net/dns.cpp
 		${CMAKE_SOURCE_DIR}/src/net/adhoc_server.cpp
+		${CMAKE_SOURCE_DIR}/src/net/relay_process.cpp
 	)
 	if(WIN32)
 		target_link_libraries(pspc_unittests PRIVATE ws2_32 iphlpapi)

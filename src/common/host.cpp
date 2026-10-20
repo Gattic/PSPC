@@ -9,6 +9,7 @@
 #include <windows.h>
 #else
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <spawn.h>
 #include <unistd.h>
 #include <sys/wait.h>
@@ -58,9 +59,9 @@ TimeZone LocalTimeZone() {
 #endif
 	return out;
 }
-int RunProcess(const std::vector<std::string> &args) {
-	if (args.empty()) return -1;
 #ifdef _WIN32
+// A command line that CreateProcess hands to the program as exactly these arguments.
+static std::wstring CommandLine(const std::vector<std::string> &args) {
 	std::wstring cmd;
 	for (const auto &s : args) {
 		if (!cmd.empty()) cmd += L' ';
@@ -73,6 +74,13 @@ int RunProcess(const std::vector<std::string> &args) {
 		}
 		cmd.append(slashes * 2, L'\\'); cmd += L'"';
 	}
+	return cmd;
+}
+#endif
+int RunProcess(const std::vector<std::string> &args) {
+	if (args.empty()) return -1;
+#ifdef _WIN32
+	std::wstring cmd = CommandLine(args);
 	STARTUPINFOW si{}; si.cb = sizeof(si);
 	PROCESS_INFORMATION pi{};
 	if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi)) return -1;
@@ -90,6 +98,71 @@ int RunProcess(const std::vector<std::string> &args) {
 	int status;
 	while (waitpid(pid, &status, 0) < 0) if (errno != EINTR) return -1;
 	return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+#endif
+}
+bool StartProcess(const std::vector<std::string> &args, const fs::path &workingDir, const fs::path &log) {
+	if (args.empty()) return false;
+	std::error_code ec;
+	fs::create_directories(log.parent_path(), ec);
+#ifdef _WIN32
+	SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+	HANDLE out = CreateFileW(log.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, &sa, OPEN_ALWAYS,
+	                         FILE_ATTRIBUTE_NORMAL, nullptr);
+	HANDLE in = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, nullptr);
+	if (out == INVALID_HANDLE_VALUE || in == INVALID_HANDLE_VALUE) {
+		if (out != INVALID_HANDLE_VALUE) CloseHandle(out);
+		if (in != INVALID_HANDLE_VALUE) CloseHandle(in);
+		return false;
+	}
+	// Only these two handles go to the program: not this process's sockets, files or pipes.
+	HANDLE inherit[2] = {in, out};
+	SIZE_T attrSize = 0;
+	InitializeProcThreadAttributeList(nullptr, 1, 0, &attrSize);
+	std::vector<u8> attrBuf(attrSize);
+	auto *attrs = (LPPROC_THREAD_ATTRIBUTE_LIST)attrBuf.data();
+	const bool attrsOk = InitializeProcThreadAttributeList(attrs, 1, 0, &attrSize) &&
+	                     UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit, sizeof(inherit), nullptr, nullptr);
+	STARTUPINFOEXW si{};
+	si.StartupInfo.cb = sizeof(si);
+	si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+	si.StartupInfo.hStdInput = in;
+	si.StartupInfo.hStdOutput = out;
+	si.StartupInfo.hStdError = out;
+	si.lpAttributeList = attrsOk ? attrs : nullptr;
+	std::wstring cmd = CommandLine(args);
+	PROCESS_INFORMATION pi{};
+	const BOOL ok = CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE,
+	                               CREATE_NO_WINDOW | (attrsOk ? EXTENDED_STARTUPINFO_PRESENT : 0), nullptr,
+	                               workingDir.empty() ? nullptr : workingDir.c_str(), &si.StartupInfo, &pi);
+	if (attrsOk) DeleteProcThreadAttributeList(attrs);
+	CloseHandle(in);
+	CloseHandle(out);
+	if (!ok) return false;
+	CloseHandle(pi.hThread);
+	CloseHandle(pi.hProcess);
+	return true;
+#else
+	std::vector<char *> argv;
+	for (const auto &s : args) argv.push_back(const_cast<char *>(s.c_str()));
+	argv.push_back(nullptr);
+	posix_spawn_file_actions_t actions;
+	posix_spawn_file_actions_init(&actions);
+	posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+	posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, log.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
+	posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO);
+	// Only the standard streams go to the program: guest sockets and files here may not be close-on-exec.
+	std::vector<int> open;
+	for (fs::directory_iterator it("/proc/self/fd", ec); !ec && it != fs::directory_iterator(); it.increment(ec)) {
+		const int fd = atoi(it->path().filename().c_str());
+		if (fd > STDERR_FILENO) open.push_back(fd);
+	}
+	for (int fd : open)
+		if (fcntl(fd, F_GETFD) >= 0) posix_spawn_file_actions_addclose(&actions, fd);  // not the directory iterator's, closed by now
+	if (!workingDir.empty()) posix_spawn_file_actions_addchdir_np(&actions, workingDir.c_str());
+	pid_t pid;
+	const int error = posix_spawn(&pid, argv[0], &actions, nullptr, argv.data(), environ);
+	posix_spawn_file_actions_destroy(&actions);
+	return error == 0;
 #endif
 }
 void *OpenModule(const fs::path &path) {
