@@ -74,6 +74,12 @@ std::string g_aotDirForHints;
 void RecordAotMiss(u32 target) {
 	kernel::PspModule *m = kernel::ModuleByAddress(target);
 	if (!m || !m->aot) return;
+	// pspc-recomp drops hints that are misaligned or outside the executable sections (code a patch
+	// put into .eh_frame or padding): they would stay interpreted and be recorded on every run.
+	if (target & 3) return;
+	bool inCode = false;
+	for (const auto &r : m->image.codeRanges) inCode |= target >= r.first && target < r.second;
+	if (!inCode) return;
 	u32 delta = m->image.relocatable ? m->image.lowAddr - m->aotRecompileBase : 0;
 	g_aotMisses[HexString(m->sha1.data(), m->sha1.size())].insert(target - delta);
 }
@@ -81,7 +87,7 @@ void RecordAotMiss(u32 target) {
 void WriteAotHints() {
 	for (auto &kv : g_aotMisses) {
 		fs::path p = fs::u8path(g_aotDirForHints) / (kv.first + ".hints");
-		std::set<u32> all = kv.second;
+		std::set<u32> all;
 		std::vector<u8> old;
 		if (ReadWholeFile(p, old)) {
 			std::string text(old.begin(), old.end());
@@ -94,6 +100,11 @@ void WriteAotHints() {
 				pos = end + 1;
 			}
 		}
+		size_t known = all.size();
+		all.insert(kv.second.begin(), kv.second.end());
+		// A newer .hints file marks the DLL out of date in the launchers: rewriting the same list
+		// would ask for a rebuild after every run that changes nothing.
+		if (all.size() == known) continue;
 		std::string out = "# entry points the interpreter reached inside this AOT module\n";
 		char buf[16];
 		for (u32 a : all) {
@@ -101,7 +112,7 @@ void WriteAotHints() {
 			out += buf;
 		}
 		WriteTextFile(p, out);
-		LOGI("AOT", "%zu interpreter entries recorded in %s", kv.second.size(), p.string().c_str());
+		LOGI("AOT", "%zu new interpreter entries recorded in %s", all.size() - known, p.string().c_str());
 	}
 	g_aotMisses.clear();
 }

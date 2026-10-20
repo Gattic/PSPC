@@ -414,12 +414,16 @@ void Play(int idx, bool interp, bool offerBuild = true) {
 				return;
 			}
 		} else if (g.native.state == Native::None || g.native.state == Native::Stale) {
-			std::wstring what = g.native.state == Native::Stale
-			                        ? L"The native code of \"" + g.title + L"\" is out of date (PSPC changed since it was built)."
-			                        : L"\"" + g.title + L"\" has no native code yet.";
+			// Stale only through newer hints: the DLL still loads, a rebuild just compiles more of the game.
+			bool runsNative = g.native.state == Native::Stale && !g.native.pspcChanged;
+			std::wstring what = g.native.state == Native::None ? L"\"" + g.title + L"\" has no native code yet."
+			                    : runsNative ? L"\"" + g.title + L"\" ran code that its native build doesn't cover yet."
+			                                 : L"The native code of \"" + g.title +
+			                                       L"\" is out of date (PSPC changed since it was built).";
 			int r = MessageBoxW(g_main,
 			                    (what + L"\n\nBuild it now? That takes about a minute per disc; the game starts when "
-			                            L"it is done.\n\nNo: play now in the interpreter (slower).")
+			                            L"it is done.\n\nNo: play now " +
+			                     (runsNative ? L"with the native code it has." : L"in the interpreter (slower)."))
 			                        .c_str(),
 			                    L"PSPC", MB_YESNOCANCEL | MB_ICONQUESTION);
 			if (r == IDCANCEL) return;
@@ -755,7 +759,8 @@ void Status(const Game &game, DetailRects &d) {
 		d.buildLabel = L"Finish build";
 	} else if (n.state == Native::Stale) {
 		d.statusText = L"Native code out of date";
-		d.statusNote = L"PSPC changed since it was built. Play offers to rebuild it.";
+		d.statusNote = n.pspcChanged ? L"PSPC changed since it was built. Play offers to rebuild it."
+		                             : L"The last session ran code it doesn't cover yet. Play offers to rebuild it.";
 		d.statusColor = ui::kAmber;
 		d.buildLabel = L"Rebuild";
 	} else {

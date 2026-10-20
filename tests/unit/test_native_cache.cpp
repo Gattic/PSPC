@@ -31,13 +31,16 @@ TEST(native_cache_platform_stamp_hints_and_moved_image) {
 	put(dir / (sha + hostsys::ModuleSuffix), "synthetic module placeholder");
 	put(dir / (sha + ".semver"), "0x11111111\n");
 	CHECK(inspect().state == Native::Stale);
+	CHECK(inspect().pspcChanged);
 	put(dir / (sha + ".semver"), "0x12345678\n");
 	CHECK(inspect().state == Native::Built);
+	CHECK(!inspect().pspcChanged);
 	put(dir / (sha + ".hints"), "new entry points");
 	std::filesystem::last_write_time(dir / (sha + ".hints"),
 									 std::filesystem::last_write_time(dir / (sha + hostsys::ModuleSuffix)) +
 										 std::chrono::seconds(1));
 	CHECK(inspect().state == Native::Stale);
+	CHECK(!inspect().pspcChanged); // the DLL still loads; play found code it misses
 	std::filesystem::remove(dir / (sha + ".hints"));
 	index(",{\"ok\":false}");
 	CHECK(inspect().state == Native::Partial);

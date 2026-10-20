@@ -121,7 +121,10 @@ void F_088040AC(Ctx *PSPC_RESTRICT c) { B_088040AC(c, c->r[31], c->r[29]); }
 * `tools/run_autotests.py --aot` runs the pspautotests suite with AOT DLLs enabled; comparing it
   with the interpreter run is a differential test of the code generator.
 * Interpreter misses inside AOT modules are written to `<aot dir>/<sha1>.hints`; the next
-  `pspc_build.py` run adds them as strong entries.
+  `pspc_build.py` run adds them as strong entries. The file is rewritten only when a run adds new
+  entries, since a newer file makes the launchers offer a rebuild. Misaligned misses and misses
+  outside the module's executable sections are not recorded, because the recompiler ignores
+  them as hints: code a patch puts into `.eh_frame` or section padding stays interpreted.
 * `tools/guest_tests.py` runs PSPC's own guest programs in the interpreter and as native code
   built fresh for the run (no hints), the way a player's first build is.
 * `tools/smoke_games.py` checks that the games still reach their checkpoints

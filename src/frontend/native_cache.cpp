@@ -77,6 +77,7 @@ NativeInfo InspectNativeCache(const fs::path &cache, const GameInfo &game, u32 v
 			++result.built;
 		else
 			++stale;
+		result.pspcChanged |= stamp != wanted;
 	}
 	if (result.built && result.built == result.total && !result.failed)
 		result.state = Native::Built;

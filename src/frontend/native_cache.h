@@ -7,6 +7,9 @@ enum class Native { None, Partial, Stale, Built };
 struct NativeInfo {
 	Native state = Native::None;
 	int built = 0, total = 0, failed = 0;
+	// A stale module was built by another PSPC version and won't load. Otherwise stale only means
+	// play reached code its build missed (a newer .hints): the old DLL still runs.
+	bool pspcChanged = false;
 	std::string error;
 	bool operator==(const NativeInfo &) const = default;
 };
