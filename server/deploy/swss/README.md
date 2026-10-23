@@ -89,14 +89,23 @@ python3 server/tests/e2e_bridge.py --direct LAN_ADDRESS        # the whole flow,
 
 ## 3. Dedicated games
 
-The games on the server are hosted by dedicated PSPC instances, which the server starts and keeps running
-(`gamespy-sessions.json` beside the database; `gamespy-sessions.example.json` is an example). **Only the
-server's own machine may list games** (`--local-hosts-only`: players cannot host on this server). There is
-no GPU here, so each runs `--headless --renderer none`: the game's display lists run for their timing and
-nothing is drawn. Each needs:
+The games on the server's first list ("Select Dedicated Server") are hosted by dedicated PSPC instances, which the
+server starts and keeps running (`gamespy-sessions.json` beside the database; `gamespy-sessions.example.json` is an
+example). A game hosted from the server's own machine is listed there; the server marks it. **Players may host too, at
+most 5 at a time** (*R* on the Join screen; `--max-player-hosts 5`, `MAX_PLAYER_HOSTS` for `install.sh`; at most 2 from
+one address; the dedicated games take none of the 5). That is a trade-off the audit explains: the master server cannot yet
+check who a heartbeat really comes from.
 
-- a build of PSPC for this machine, its firmware, and the dedicated disc images - none of which are in this
-  repository (`private/` and `Games/` are not committed);
+The game has no server mode: `dedicated-host.sh NICK` is a headless PSPC (`--renderer none`, so no GPU, no window) that
+signs in as the sessions file's account NICK, creates a Conquest game and takes a team and a spawn point in it, driven by
+timed button presses. A round ends, the map is loaded again and the next one starts the same way. The script stops
+after `HOURS` (6) and the session starts it again 30 seconds later; the game is back on the list about 4 minutes after
+a start. Each needs:
+
+- a build of PSPC for this machine, the 4.01 firmware as a profile (`tools/pspc_install_fw.py --profile 4.01`,
+  docs/firmware-manager.md), and the SWSS disc image - none of which are in this repository (`private/` and `Games/`
+  are not committed). Native code for the game (`tools/pspc_build.py <iso>`, docs/RECOMPILER.md, about 6 minutes) is
+  what the dedicated game here runs on; a host without it was not tried;
 - a GameSpy account of its own: the `accounts` of the sessions file make it;
 - an `infrastructure.json` in its own configuration folder (`XDG_CONFIG_HOME`) that sends `*.gamespy.com` to
   127.0.0.1, so that it talks to the server directly and not through the internet:
@@ -105,7 +114,9 @@ nothing is drawn. Each needs:
 {"games": [{"name": "SWSS dedicated", "ids": ["ULUS99390"], "domains": {"*.gamespy.com": "127.0.0.1"}}]}
 ```
 
-- its own memory stick folder (`--memstick`), and a user of its own if you can;
+- its own folder for that, its memory stick and its data and cache: `dedicated-host.sh` reads `PSPC`, `ISO` and
+  `DEDICATED` (`xdg-config`, `xdg-data`, `xdg-cache` and `ms0` in it) from its environment, and the session's command sets
+  them, as the example does. The first start makes the game's profile on the memory stick;
 - **a UDP port the router forwards.** The first dedicated game binds the game's 3658 when it is free; PSPC gives
   any other a free port, which changes at each start, so start with one dedicated game and forward UDP 3658. What
   a game really has open: `ss -lunp | grep pspc` while it runs. What the server saw when it listed: `journalctl
@@ -142,8 +153,9 @@ this next to `pspc.exe` (Linux: `~/.config/pspc/infrastructure.json`), unless it
 ```
 
 In the game: *Multiplayer > Infrastructure*, the connection "PSPC 1", *Create New GameSpy ID* (once), log in, then *Friend List*,
-*Player Rankings* and *Join* (*R* switches to player-hosted servers). Games are only listed while a dedicated server (or an
-allowed host) is running; `--local-hosts-only` drops everyone else's heartbeats, and says so in the log.
+*Player Rankings* and *Join* (*R* switches to player-hosted servers). Games are listed while a dedicated server or one of at most 5
+players is hosting. A player's game that finds the room taken is not listed, and the log says so ("not listed"); a player behind a
+router needs the game's UDP port (3658) forwarded to their PC, or NAT negotiation to get through.
 
 **Before the game, on each network** (no disc needed): unzip a copy of `server/` and run
 `python3 tests/live_check.py --host swss.pspc.online --no-host --game swsspsp` (Windows: PSPC's `python\python.exe`). It makes

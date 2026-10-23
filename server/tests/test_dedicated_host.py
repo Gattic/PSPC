@@ -1,0 +1,108 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""deploy/swss/dedicated-host.sh starts pspc as a session: with the account typed on the game's keyboards, in order,
+a profile made first on a new memory stick, and nothing between the server and pspc (the server signals its child only)."""
+
+import json
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+import unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SCRIPT = os.path.join(HERE, '..', 'deploy', 'swss', 'dedicated-host.sh')
+
+# A pspc that writes down how it was started; the profile exists afterwards when SAVE_PROFILE is set, as the game saves one.
+STUB = """#!/bin/sh
+echo "$$ $XDG_CONFIG_HOME $*" >> "$DEDICATED/runs.txt"
+if [ -n "${SAVE_PROFILE:-}" ]; then
+	mkdir -p "$DEDICATED/ms0/PSP/SAVEDATA/ULUS993900000"
+	: > "$DEDICATED/ms0/PSP/SAVEDATA/ULUS993900000/DATA.BIN"
+fi
+exit 124
+"""
+
+
+@unittest.skipIf(sys.platform == 'win32', 'a shell script for the Linux server')
+class DedicatedHostTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = os.path.join(tmp.name, 'dedicated')
+        os.makedirs(self.dir)
+        pspc = os.path.join(tmp.name, 'pspc')
+        with open(pspc, 'w') as f:
+            f.write(STUB)
+        os.chmod(pspc, os.stat(pspc).st_mode | stat.S_IXUSR)
+        sessions = os.path.join(tmp.name, 'sessions.json')
+        with open(sessions, 'w') as f:
+            json.dump({'accounts': [
+                {'nick': 'Other', 'email': 'o@example.com', 'password': 'x', 'namespace': 1},
+                {'nick': 'Ded-Conquest', 'email': 'ded@example.com', 'password': 'pa ss|w', 'namespace': 1}]}, f)
+        self.env = dict(os.environ, PSPC=pspc, ISO='/games/SWSS.iso', DEDICATED=self.dir, SESSIONS=sessions, HOURS='1')
+        self.env.pop('SAVE_PROFILE', None)
+
+    def start(self, nick='Ded-Conquest'):
+        return subprocess.Popen(['sh', SCRIPT, nick], env=self.env, stderr=subprocess.PIPE, text=True)
+
+    def run_script(self, nick='Ded-Conquest'):
+        p = self.start(nick)
+        _, stderr = p.communicate(timeout=60)
+        return p, stderr
+
+    def runs(self):
+        """The pspc runs so far: pid, XDG_CONFIG_HOME, the rest of the command line."""
+        with open(os.path.join(self.dir, 'runs.txt')) as f:
+            return [line.split(' ', 2) for line in f.read().splitlines()]
+
+    def make_profile(self):
+        d = os.path.join(self.dir, 'ms0', 'PSP', 'SAVEDATA', 'ULUS993900000')
+        os.makedirs(d)
+        open(os.path.join(d, 'DATA.BIN'), 'w').close()
+
+    def test_the_account_goes_to_the_keyboards_in_order_and_the_game_runs_until_the_end(self):
+        self.make_profile()
+        p, stderr = self.run_script()
+        self.assertEqual(p.returncode, 124, stderr)
+        (_, config, args), = self.runs()
+        self.assertEqual(config, os.path.join(self.dir, 'xdg-config'))
+        self.assertIn('--headless --renderer none', args)
+        self.assertIn('--memstick %s/ms0' % self.dir, args)
+        self.assertIn('--osk-text Ded-Conquest|ded@example.com|pa ss|w|SWSS Conquest --exit-vblank 216000', args)
+        presses = [part.split()[0] for part in args.split(' --press ')[1:]]
+        self.assertEqual(presses[0], '2500:START:6')
+        self.assertIn('14200:START:6', presses)
+        self.assertEqual(presses[-1], '215900:CROSS:6')
+
+    def test_a_new_memory_stick_gets_its_profile_first(self):
+        self.env['SAVE_PROFILE'] = '1'
+        p, stderr = self.run_script()
+        self.assertEqual(p.returncode, 124, stderr)
+        (setup_pid, _, setup), (main_pid, _, main) = self.runs()
+        self.assertIn('--osk-text Dedicated --exit-vblank 7000', setup)
+        self.assertIn('--osk-text Ded-Conquest|ded@example.com|pa ss|w|SWSS Conquest', main)
+        self.assertNotEqual(setup_pid, main_pid)
+
+    def test_a_profile_that_was_not_saved_stops_the_script_before_the_game_starts(self):
+        p, stderr = self.run_script()
+        self.assertEqual(p.returncode, 1)
+        self.assertIn('profile was not saved', stderr)
+        self.assertEqual(len(self.runs()), 1)
+
+    def test_pspc_replaces_the_script(self):
+        # The server signals the process it started: a pspc left running by a shell would outlive the server's stop.
+        self.make_profile()
+        p, _ = self.run_script()
+        (pid, _, _), = self.runs()
+        self.assertEqual(int(pid), p.pid)
+
+    def test_an_account_the_sessions_file_does_not_have_is_refused(self):
+        self.make_profile()
+        p, stderr = self.run_script('Nobody')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, 'runs.txt')))
+
+
+if __name__ == '__main__':
+    unittest.main()

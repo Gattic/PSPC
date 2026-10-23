@@ -4,6 +4,7 @@
 #   server/deploy/swss/install.sh            # into ~/swss-server (PREFIX=/other/place to choose)
 #   MODE=tunnel server/deploy/swss/install.sh # behind a Cloudflare Tunnel instead of forwarded ports
 #   HOST=swss.example.org ...                 # the domain players use (default swss.pspc.online)
+#   MAX_PLAYER_HOSTS=5 ...                    # games players may host at once, direct mode (default 5)
 #
 # - $PREFIX/app/pspc_gamespy   the server's code (copied: the service doesn't run from the checkout)
 # - $PREFIX/data               its database, status file and logs: private to this user
@@ -20,8 +21,9 @@ set -eu
 PREFIX=${PREFIX:-$HOME/swss-server}
 MODE=${MODE:-direct}
 HOST=${HOST:-swss.pspc.online}
+MAX_PLAYER_HOSTS=${MAX_PLAYER_HOSTS:-5}
 case "$MODE" in
-	direct) SWSS_MODE="--bind 0.0.0.0 --public-host $HOST --local-hosts-only" ;;
+	direct) SWSS_MODE="--bind 0.0.0.0 --public-host $HOST --max-player-hosts $MAX_PLAYER_HOSTS" ;;
 	tunnel) SWSS_MODE="--bind 127.0.0.1 --tunnel --behind-proxy" ;;
 	*) echo "MODE is direct or tunnel, not $MODE." >&2; exit 1 ;;
 esac
@@ -60,6 +62,8 @@ cat > "$PREFIX/bin/swss-admin" <<ADMIN
 exec env PYTHONPATH="$PREFIX/app" "$PYTHON" -B -m pspc_gamespy --db "$PREFIX/data/gamespy.sqlite" "\$@"
 ADMIN
 chmod 755 "$PREFIX/bin/swss-admin"
+cp "$HERE/dedicated-host.sh" "$PREFIX/bin/dedicated-host.sh"
+chmod 755 "$PREFIX/bin/dedicated-host.sh"
 [ -e "$PREFIX/data/gamespy-sessions.json" ] || cp "$HERE/gamespy-sessions.example.json" "$PREFIX/data/gamespy-sessions.example.json"
 
 systemctl --user daemon-reload
