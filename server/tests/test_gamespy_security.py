@@ -937,6 +937,58 @@ class ServerTests(unittest.TestCase):
             for char in '\n\r\x1b\x00\x07':
                 self.assertNotIn(char, m, repr(m))
 
+    def search_request(self, source, *pairs):
+        c = self.conn(self.config.gpsp_port, source)
+        c.send(kv.build(*pairs))
+        return c.message()
+
+    def test_a_refused_account_says_why_in_the_log(self):
+        """A game that shows 'Account Creation Failed' with no reason leaves the server's log as the only place the reason can be."""
+        self.gp_login('Ivy', create=True)
+        mine = [('passenc', crypt.encode_password('x')), ('productid', 11878), ('gamename', 'swsspsp'), ('namespaceid', 1), ('id', 1)]
+        with self.assertLogs('gamespy', level='INFO') as logs:
+            invalid = self.search_request('127.64.0.21', ('newuser', ''), ('email', 'no-at-sign'), ('nick', 'Ivy2'), *mine)
+            taken = self.search_request('127.64.0.22', ('newuser', ''), ('email', 'ivy@example.com'), ('nick', 'Ivy'), *mine)
+            made = self.search_request('127.64.0.23', ('newuser', ''), ('email', 'ivy3@example.com'), ('nick', 'Ivy3'), *mine)
+            self.search_request('127.64.0.24', ('valid', ''), ('email', 'ivy@example.com'), ('partnerid', 0))
+        lines = [r.getMessage() for r in logs.records]
+        self.assertNotEqual(invalid['nur'], '0')
+        self.assertNotEqual(taken['nur'], '0')
+        self.assertEqual(made['nur'], '0')
+        self.assertTrue(any('new account Ivy2 refused (%s: ' % invalid['nur'] in m and '127.64.0.21' in m for m in lines), lines)
+        self.assertTrue(any('new account Ivy refused (%s: ' % taken['nur'] in m and '127.64.0.22' in m for m in lines), lines)
+        self.assertTrue(any('new account Ivy3' in m and 'refused' not in m for m in lines), lines)
+        self.assertTrue(any('valid answered vr=' in m and '127.64.0.24' in m for m in lines), lines)
+        self.assertFalse(any('ivy@example.com' in m for m in lines), lines)       # what a search answers is not for the log
+
+    def test_a_connection_that_says_nothing_is_logged_but_rarely(self):
+        """A game that connects, reads the greeting and goes away (or sends what can't be read) is otherwise invisible."""
+        with self.assertLogs('gamespy', level='INFO') as logs:
+            self.conn(self.config.gpcm_port, '127.0.0.1').close()                # this machine's own: not worth a line
+            for _ in range(4):                                                   # one address, over and over: one line
+                c = self.conn(self.config.gpcm_port, '127.64.0.31')
+                c.message()
+                c.close()
+                time.sleep(0.15)
+            c = self.conn(self.config.gpcm_port, '127.64.0.32')                  # something that is not a message
+            c.send(b'\x00\x01\x02 not a message')
+            c.message()
+            c.close()
+            self.conn(self.config.gpsp_port, '127.64.0.33').close()              # the same for the search manager
+            c = self.conn(self.config.gpsp_port, '127.64.0.34')                  # a request that never ends: its keys, not its values
+            c.send('\\newuser\\\\email\\someone@example.com\\nick\\Someone\\passwordenc\\hunter2hunter2')
+            c.close()
+            time.sleep(0.4)
+        lines = [r.getMessage() for r in logs.records if 'without a complete message' in r.getMessage()]
+        unfinished = [m for m in lines if '127.64.0.34' in m]
+        self.assertEqual(len(unfinished), 1, lines)
+        self.assertIn('keys newuser, email, nick, passwordenc', unfinished[0])
+        for secret in ('someone', 'Someone', 'hunter2'):
+            self.assertNotIn(secret, unfinished[0])
+        self.assertEqual(len([m for m in lines if '127.64.0.31' in m]), 1, lines)
+        self.assertEqual(len([m for m in lines if '127.64.0.33' in m and m.startswith('gpsp')]), 1, lines)
+        self.assertFalse(any("'127.0.0.1'" in m for m in lines), lines)
+
     def test_rare_log_counts_everything_and_allows_little(self):
         rare = access.RareLog(per_address_seconds=3600, burst=3, per_second=0.0001)
         said = [rare.allow('10.0.0.%d' % (i % 50)) for i in range(1000)]

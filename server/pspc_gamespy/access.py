@@ -225,6 +225,7 @@ class Limits:
         self.host_messages = RateLimiter(10, 0.5)               # messages players have the server send to hosts
         self.qr_packets = RateLimiter(60, 20.0)                 # UDP, per source address
         self.natneg_packets = RateLimiter(120, 40.0)
+        self.unheard_connections = RareLog()                    # Presence connections that ended without a message
         self.hosts_per_ip = 2                                   # hosted games listed per address (not the server's own)
         self.max_player_hosts = 512                             # games hosted by players listed at once (not the server's own)
         self.new_hosts = RateLimiter(10, 5.0)                   # heartbeats parsed, in all, from addresses with no game listed
