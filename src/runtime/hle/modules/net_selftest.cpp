@@ -4,6 +4,7 @@
 // sceNetResolver, sceNetInet over loopback) and "http" (sceHttp against a URL given as argument).
 #include "runtime/hle/modules/net_selftest.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdarg>
 #include <cstdio>
@@ -203,7 +204,7 @@ namespace {
 
 // pspnet / sceNetInet / sceNetApctl / sceNetResolver / sceHttp calls used below.
 constexpr const char *INET = "sceNetInet";
-constexpr int AF_INET_PSP = 2, STREAM = 1, DGRAM = 2;
+constexpr int AF_INET_PSP = 2, STREAM = 1, DGRAM = 2, RAW = 3;
 constexpr u32 SOL_SOCKET_PSP = 0xFFFF, SO_RCVTIMEO_PSP = 0x1006, SO_ERROR_PSP = 0x1007, SO_NBIO_PSP = 0x1009;
 
 int Socket(int type) { return (int)Call(INET, 0x8B7B220F, {AF_INET_PSP, (u32)type, 0}); }
@@ -238,6 +239,15 @@ u32 GetOpt(int s, u32 level, u32 name) {
 	GWrite32(len, 4);
 	Call(INET, 0x4A114C7C, {(u32)s, level, name, v, len});
 	return GRead32(v);
+}
+
+// The Internet checksum (RFC 1071), written out here so the replies are checked against something independent.
+u16 Checksum(const std::vector<u8> &bytes, size_t from) {
+	u32 sum = 0;
+	for (size_t i = from; i + 1 < bytes.size(); i += 2) sum += (u32)bytes[i] << 8 | bytes[i + 1];
+	if ((bytes.size() - from) & 1) sum += (u32)bytes.back() << 8;
+	while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+	return (u16)~sum;
 }
 
 std::string ApctlInfoStr(int code) {
@@ -434,6 +444,38 @@ int InetScenario(const std::vector<std::string> &) {
 	         aborted->first, aborted->second);
 	Close(ua);
 	Close(ub);
+
+	// ---- ICMP echo: what a game pings its server list with. The host's raw socket answers where it opens one; pspc
+	// answers where it won't (no CAP_NET_RAW), so the same reply is expected either way.
+	int ping = (int)Call(INET, 0x8B7B220F, {AF_INET_PSP, RAW, 1});
+	ck.Check(ping > 0, "socket(RAW, ICMP) -> %d", ping);
+	SetOpt(ping, SOL_SOCKET_PSP, SO_RCVTIMEO_PSP, 2000000);
+	std::vector<u8> echo = {8, 0, 0, 0, 0x12, 0x34, 0, 7, 'p', 'i', 'n', 'g'};
+	const u16 sum = Checksum(echo, 0);
+	echo[2] = (u8)(sum >> 8), echo[3] = (u8)sum;
+	u32 out = Alloc((u32)echo.size());
+	mem::WriteBytes(out, echo.data(), (u32)echo.size());
+	n = (int)Call(INET, 0x05038FC7, {(u32)ping, out, (u32)echo.size(), 0, Sockaddr(0x7F000001, 0), 16});
+	ck.Check(n == (int)echo.size(), "sendto(echo request) -> %d", n);
+	std::vector<u8> reply;
+	for (int tries = 0; tries < 5 && reply.empty(); tries++) {  // a real raw socket also sees the request itself
+		GWrite32(fromLen, 16);
+		n = (int)Call(INET, 0xC91142E4, {(u32)ping, buf, 64, 0, from, fromLen});
+		if (n < 0) break;
+		std::vector<u8> got((size_t)n);
+		mem::ReadBytes(got.data(), buf, (u32)n);
+		const size_t header = n ? (got[0] & 15) * 4u : 0;
+		if ((size_t)n >= header + 8 && got[header] == 0) reply.assign(got.begin(), got.end());
+	}
+	ck.Check(!reply.empty(), "recvfrom -> an echo reply (last result %d)", n);
+	if (!reply.empty()) {
+		const size_t header = (reply[0] & 15) * 4u;
+		ck.Check(reply[0] >> 4 == 4 && reply[9] == 1 && reply[12] == 127 && reply[15] == 1, "the reply is an IPv4 ICMP packet from 127.0.0.1");
+		ck.Check(reply.size() == header + echo.size() && std::equal(echo.begin() + 4, echo.end(), reply.begin() + header + 4),
+		         "the reply carries the request's identifier, sequence number and data");
+		ck.Check(Checksum(reply, header) == 0, "the reply's ICMP checksum is valid");
+	}
+	Close(ping);
 
 	events.clear();
 	NetDown(ck);

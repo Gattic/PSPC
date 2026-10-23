@@ -573,6 +573,7 @@ constexpr int INET_MIN_SOCKET = 1;
 constexpr int INET_MAX_SOCKETS = 64;
 constexpr int INET_AF_INET = 2;
 constexpr int INET_SOCK_STREAM = 1, INET_SOCK_DGRAM = 2, INET_SOCK_RAW = 3;
+constexpr int INET_IPPROTO_ICMP = 1;
 constexpr int INET_SOCK_NONBLOCK = 0x20000000;
 constexpr u32 INET_MSG_DONTWAIT = 0x80;
 constexpr int INET_SOMAXCONN = 128;
@@ -599,6 +600,9 @@ struct InetSocket {
 	// Datagrams pspc answered itself (DNS for redirected names, net_infra.cpp), received before
 	// anything from the host.
 	std::deque<std::pair<std::vector<u8>, sockaddr_in>> injected;
+	// A raw ICMP socket the host would not open (it needs CAP_NET_RAW on Linux, an administrator on Windows): `host` is an
+	// ordinary UDP socket then, and the echo requests sent are answered here (AnswerIcmpEcho).
+	bool icmpEcho = false;
 };
 
 bool g_inetInited = false;
@@ -731,6 +735,40 @@ int sceNetInetGetPspError() {
 	return e ? (int)(0x80010000u | (u32)e) : 0;
 }
 
+// The Internet checksum (RFC 1071) of `n` bytes.
+u16 InetChecksum(const u8 *p, size_t n) {
+	u32 sum = 0;
+	for (size_t i = 0; i + 1 < n; i += 2) sum += (u32)p[i] << 8 | p[i + 1];
+	if (n & 1) sum += (u32)p[n - 1] << 8;
+	while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+	return (u16)~sum;
+}
+
+// The game pings the servers in its list with ICMP echo requests on a raw socket and shows nothing for a server until the
+// reply comes. Where the host won't open that socket the request is answered here, as if the server replied at once (the
+// list's Ping column then reads 0): a reply as a raw socket receives it, the IPv4 header and the ICMP message.
+int AnswerIcmpEcho(InetSocket *sock, u32 buf, u32 len, const sockaddr_in &to) {
+	if (len > 65000 || (len && !mem::IsValidRange(buf, len))) return SetErrno(net::INET_EFAULT);
+	if (len < 8) return SetErrno(net::INET_EINVAL);
+	std::vector<u8> out(20 + len);
+	mem::ReadBytes(out.data() + 20, buf, len);
+	constexpr u8 ECHO_REQUEST = 8;
+	if (out[20] != ECHO_REQUEST) return (int)len;       // anything else goes nowhere
+	out[20] = 0;                                        // echo reply: the request's identifier, sequence number and data
+	out[22] = out[23] = 0;
+	const u16 icmp = InetChecksum(out.data() + 20, len);
+	out[22] = (u8)(icmp >> 8), out[23] = (u8)icmp;
+	const u32 total = (u32)out.size(), src = ntohl(to.sin_addr.s_addr), dst = 0x7F000001;
+	const u8 header[20] = {0x45, 0, (u8)(total >> 8), (u8)total, 0, 0, 0, 0, 64, 1, 0, 0,
+	                       (u8)(src >> 24), (u8)(src >> 16), (u8)(src >> 8), (u8)src,
+	                       (u8)(dst >> 24), (u8)(dst >> 16), (u8)(dst >> 8), (u8)dst};
+	std::copy(header, header + 20, out.begin());
+	const u16 ip = InetChecksum(out.data(), 20);
+	out[10] = (u8)(ip >> 8), out[11] = (u8)ip;
+	sock->injected.push_back({std::move(out), to});
+	return (int)len;
+}
+
 int sceNetInetSocket(int domain, int type, int protocol) {
 	if (domain != INET_AF_INET) return SetErrno(net::INET_EAFNOSUPPORT);
 	int baseType = type & 0xF;
@@ -750,6 +788,11 @@ int sceNetInetSocket(int domain, int type, int protocol) {
 		int hostType = baseType == INET_SOCK_STREAM ? SOCK_STREAM : baseType == INET_SOCK_DGRAM ? SOCK_DGRAM : SOCK_RAW;
 		int err = 0;
 		sock.host = hostnet::OpenSocket(AF_INET, hostType, protocol, &err);
+		if (!sock.host.Valid() && baseType == INET_SOCK_RAW && protocol == INET_IPPROTO_ICMP) {
+			LOGI(LOG, "sceNetInetSocket: the host won't open a raw ICMP socket (%d): echo requests are answered by pspc", err);
+			sock.host = hostnet::OpenSocket(AF_INET, SOCK_DGRAM, 0, &err);
+			sock.icmpEcho = sock.host.Valid();
+		}
 		if (!sock.host.Valid()) {
 			LOGW(LOG, "sceNetInetSocket(%d, %d, %d): host socket failed (%d)", domain, type, protocol, err);
 			return SetErrnoFromWsa(err);
@@ -1142,6 +1185,7 @@ int sceNetInetSendto(int s, u32 buf, u32 len, u32 flags, u32 toPtr, u32 toLen) {
 	if (!ReadSockaddr(toPtr, (int)toLen, &to, &err)) return SetErrno(err);
 	LOGD(LOG, "sceNetInetSendto(%d, %u bytes) to %s:%u", s, len, hostnet::Ipv4ToString(to.sin_addr.s_addr).c_str(),
 	     ntohs(to.sin_port));
+	if (sock->icmpEcho) return Reachable(to) ? AnswerIcmpEcho(sock, buf, len, to) : SetErrno(net::INET_ENETUNREACH);
 	if (sock->type == INET_SOCK_DGRAM && IsDnsServer(to)) {
 		const int r = TryAnswerDns(s, buf, len, to);
 		if (r >= 0) return r;

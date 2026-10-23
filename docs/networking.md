@@ -142,8 +142,12 @@ matching, PDP, PTP, game mode), `adhoc-dialog`, `adhoc-noserver`, `adhoc-offline
 ## Limits
 
 - One virtual access point; network configurations created in the XMB aren't stored.
-- IPv4 only. Raw sockets need administrator rights on Windows. Control messages of
+- IPv4 only. Raw sockets need administrator rights on Windows (CAP_NET_RAW on Linux). Control messages of
   sceNetInetSendmsg/Recvmsg aren't passed on.
+- Without that right, a raw ICMP socket still opens, and every echo request sent on it is answered at once by PSPC
+  (a reply from the address pinged, as a raw socket receives it), whether or not the address answers. Games that ping
+  the servers of their list (Star Wars Super Squadron) show a server only after its reply, so none would be listed
+  otherwise; the ping they show reads 0.
 - sceNetResolver's asynchronous calls complete before they return.
 - sceHttp: no HTTP cache (the browser's cache calls succeed and do nothing); cookies live in each
   request's WinHTTP session; auth/redirect/cookie callbacks are stored, never called; sceSsl
