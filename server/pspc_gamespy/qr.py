@@ -40,6 +40,9 @@ CLIENT_MESSAGE, CLIENT_MESSAGE_ACK, KEEPALIVE, AVAILABLE, CLIENT_REGISTERED = 6,
 
 STATE_CHANGED, STATE_EXITING, STATE_INITIAL = 1, 2, 3
 HOST_TIMEOUT = 180          # seconds without a heartbeat or keepalive before a host is dropped
+DEDICATED_LEVEL = 1 << 30   # the bit of a host's levelsettings that puts it on the game's list of dedicated servers (the list asks
+                            # levelsettings >= 1073741824, the other 'player-hosted' asks < that)
+PENDING_TIMEOUT = 30        # seconds a host has to answer the server's challenge before it gives up its place
 RESEND_INTERVAL = 2.0
 RESEND_COUNT = 5
 # What a hosted game may say about itself. A 64-player game's heartbeat is a few kilobytes.
@@ -120,7 +123,7 @@ class Host:
         self.validated = False
         self.challenge = ''
         self.created = time.time()
-        self.last_seen = time.monotonic()
+        self.born = self.last_seen = time.monotonic()
 
     @property
     def ip(self):
@@ -208,6 +211,13 @@ def parse_heartbeat(payload):
 GAME_WINDOW = 512           # how much of a heartbeat is looked at to find its game name (a game's keys start with it)
 
 
+def level_settings(keys):
+    try:
+        return int(keys.get('levelsettings') or 0)
+    except ValueError:
+        return 0
+
+
 def heartbeat_game(payload):
     """The game name in a heartbeat's keys ('' if it is not there), read from the first GAME_WINDOW bytes without parsing
     the rest. For a heartbeat the server will not list, where parse_heartbeat's work (the cost of the whole packet, which
@@ -239,13 +249,15 @@ class Registry:
         self.watchers = set()
 
     def has_room(self, addr):
-        """Whether a new host at this address may be added: only so many games are listed in all, and
-        so many from one address (the server's own machine hosts as many as it runs)."""
+        """Whether a new host at this address may be added: only so many games hosted by players (every address but the
+        server's own machine; games that have not answered the challenge yet count) and so many from one address. The
+        server's own machine hosts as many as it runs, and they take no place from the players'."""
         if not self.limits.enabled or access.is_local(addr[0]):
             return True                 # the server's own machine runs the games it was set up to run
-        if len(self.hosts) >= self.limits.max_hosts:
+        players = [a for a in self.hosts if not access.is_local(a[0])]
+        if len(players) >= self.limits.max_player_hosts:
             return False
-        return sum(1 for a in self.hosts if a[0] == addr[0]) < self.limits.hosts_per_ip
+        return sum(1 for a in players if a[0] == addr[0]) < self.limits.hosts_per_ip
 
     def listed(self, gamename=None):
         want = games.find(gamename).gamename if gamename and games.find(gamename) else gamename
@@ -294,6 +306,8 @@ class Registry:
         for h in list(self.hosts.values()):
             if now - h.last_seen > HOST_TIMEOUT:
                 self.remove(h, 'timed out')
+            elif not h.validated and now - h.born > PENDING_TIMEOUT:
+                self.remove(h, 'did not answer the challenge')
 
 
 class MasterServer(asyncio.DatagramProtocol):
@@ -302,9 +316,7 @@ class MasterServer(asyncio.DatagramProtocol):
         self.limits = registry.limits
         self.can_host = can_host or (lambda ip: True)     # who may list a game: see GameSpyServer
         self.transport = None
-        self.ignored_total = 0          # heartbeats dropped because their sender may not list games
-        self._ignored_by_address = access.RateLimiter(1, 1 / 60.0, max_keys=1000)       # who has been named in the log, lately
-        self._ignored_lines = access.RateLimiter(10, 0.1)                                 # and how much of it there is, in all
+        self.not_listed = access.RareLog()  # heartbeats for a game served here that are dropped: see _not_listed
         self._msg_keys = itertools.count(random.randrange(1, 1 << 30))
         self._pending = {}              # message key -> (host addr, packet, tries left)
 
@@ -351,23 +363,29 @@ class MasterServer(asyncio.DatagramProtocol):
         else:
             log.debug('qr: packet type %d from %s:%d: %s', ptype, addr[0], addr[1], payload[:64].hex())
 
-    def _ignored(self, addr, payload):
-        """A heartbeat from an address that may not list games (what a player who tries to host sends). Anyone can send these
-        from any address, so it costs next to nothing (no parsing) and its line in the log is rare: for a game this server
-        serves only (the internet sends the rest as noise), once a minute for each address and at most ten at once and then
-        one every ten seconds in all, with the number so far, whatever the number of addresses."""
-        self.ignored_total += 1
-        if not games.find(heartbeat_game(payload)) or not self._ignored_by_address.available(addr[0]):
-            return
-        if not self._ignored_lines.allow('all'):
-            return
-        self._ignored_by_address.spend(addr[0])
-        log.info('qr: heartbeat from %s:%d ignored: only this machine may list games on this server (%d such heartbeats so far)',
-                 addr[0], addr[1], self.ignored_total)
+    def _not_listed(self, addr, payload, how, why):
+        """A heartbeat that is dropped (`how`: 'ignored' or 'not listed'; `why`). Anyone can send these from any address, so
+        it costs next to nothing (no parsing) and its line in the log is rare: for a game this server serves only (the
+        internet sends the rest as noise), at the rate access.RareLog allows, with the number so far."""
+        if games.find(heartbeat_game(payload)) and self.not_listed.allow(addr[0]):
+            log.info('qr: heartbeat from %s:%d %s: %s (%d such heartbeats so far)', addr[0], addr[1], how, why, self.not_listed.count)
+
+    def _may_register(self, addr, payload):
+        """Whether a heartbeat from an address with no game listed is worth parsing: there is room for another game, and
+        not too many of these are being parsed (a forged flood would otherwise cost the whole packet's parsing each)."""
+        if not self.registry.has_room(addr):
+            self._not_listed(addr, payload, 'not listed', 'the games players host are full (or this address has its share)')
+            return False
+        if not access.is_local(addr[0]) and not self.limits.allow(self.limits.new_hosts, 'all'):
+            self._not_listed(addr, payload, 'not listed', 'too many new games are being registered at once')
+            return False
+        return True
 
     def _heartbeat(self, addr, instance, payload):
         if not self.can_host(addr[0]):
-            self._ignored(addr, payload)
+            self._not_listed(addr, payload, 'ignored', 'only this machine may list games on this server')
+            return
+        if addr not in self.registry.hosts and not self._may_register(addr, payload):
             return
         keys, players, teams = parse_heartbeat(payload)
         try:
@@ -384,12 +402,14 @@ class MasterServer(asyncio.DatagramProtocol):
             if host is not None:
                 self.registry.remove(host, 'registered again')
             if not self.registry.has_room(addr):
-                log.info('qr: %s:%d: too many hosted games; not listed', addr[0], addr[1])
+                self._not_listed(addr, payload, 'not listed', 'the games players host are full (or this address has its share)')
                 return
             host = Host(addr, instance)
             self.registry.hosts[addr] = host
         host.gamename = gamename or host.gamename
         host.keys = keys
+        if access.is_local(addr[0]):
+            keys['levelsettings'] = str(level_settings(keys) | DEDICATED_LEVEL)     # the games of the server's own machine are its dedicated servers
         host.players = players
         host.teams = teams
         if not games.find(host.gamename):

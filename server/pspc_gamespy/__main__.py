@@ -12,6 +12,7 @@ import sys
 import time
 
 from . import __version__
+from . import access
 from . import crypt
 from . import sessions as sessions_mod
 from .games import GAMES, load as load_games
@@ -44,9 +45,12 @@ def serve(args):
         log.error('--tunnel connects to the services on this machine: --bind has to be 0.0.0.0 or a 127.x.y.z address, not %s', args.bind)
         return 1
     public_host = args.public_host or (VIRTUAL_HOST if args.tunnel else '127.0.0.1')
+    limits = access.Limits()
+    if args.max_player_hosts is not None:
+        limits.max_player_hosts = args.max_player_hosts
     config = Config(public_host=public_host, bind=args.bind, http_port=args.http_port, motd=args.motd,
                     status_file=args.status_file, sessions=sessions, tunnel=args.tunnel, behind_proxy=args.behind_proxy,
-                    local_hosts_only=args.local_hosts_only)
+                    local_hosts_only=args.local_hosts_only, limits=limits)
     try:
         server = GameSpyServer(config, store)
     except OSError as e:
@@ -138,6 +142,9 @@ def main(argv=None):
     s.add_argument('--local-hosts-only', action='store_true',
                    help="list only games hosted on this machine (its dedicated servers): for a server on the internet, where "
                         "UDP heartbeats can be forged")
+    s.add_argument('--max-player-hosts', type=int, metavar='N', choices=range(0, 513),
+                   help="list at most N games hosted by players at once (default: %d). The games on this machine (its dedicated "
+                        "servers) don't count, and --local-hosts-only lists no others" % access.Limits().max_player_hosts)
     s.add_argument('--tunnel', action='store_true',
                    help='let players reach the server over WebSockets on the web port (/tunnel/), for a Cloudflare Tunnel')
     s.add_argument('--behind-proxy', action='store_true',

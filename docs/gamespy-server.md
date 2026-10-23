@@ -80,12 +80,13 @@ python -m pspc_gamespy --db gamespy.sqlite serve --public-host 203.0.113.7
 | `--games <file>` (before `serve`) | more games, from a games file (default: `gamespy-games.json` beside the database, if there is one; see below) |
 | `--sessions <file>` | programs to run alongside, such as dedicated game servers (default: `gamespy-sessions.json` beside the database, if there is one; see below) |
 | `--local-hosts-only` | list only the games hosted on this machine (its dedicated servers): for a server on the internet, where UDP heartbeats can be forged. Needs `--public-host` |
+| `--max-player-hosts <n>` | list at most *n* games hosted by players at once (default 512; at most 2 from one address). The games on this machine don't count towards it, and a heartbeat that finds the list full is dropped without being parsed. A server on the internet that lets players host should set it low (the public SWSS server: 5) |
 | `--tunnel` | let players reach the server over WebSockets on the web port, for a Cloudflare Tunnel (see [Public server](#public-server)) |
 | `--behind-proxy` | the web port's requests come through a proxy on this machine (cloudflared): take players' addresses from its `CF-Connecting-IP` / `X-Forwarded-For` header |
 
 Players redirect `*.gamespy.com` to the server's address, as above. **For the internet** see
-[Public server](#public-server): the server needs `--local-hosts-only` (or the tunnel), or anyone can list
-games that don't exist ([audit](gamespy-server-security.md)).
+[Public server](#public-server): the server needs `--local-hosts-only` (or the tunnel), or `--max-player-hosts` with a small number,
+or anyone can list games that don't exist ([audit](gamespy-server-security.md)).
 
 ### More games
 
@@ -216,14 +217,16 @@ game --TCP/UDP--> swss.pspc.online (the router's public address) --forwarded--> 
 
 ```sh
 python -m pspc_gamespy --db gamespy.sqlite serve --bind 0.0.0.0 --public-host swss.pspc.online \
-    --local-hosts-only --http-port 8080
+    --max-player-hosts 5 --http-port 8080
 ```
 
    `--public-host` is what players are told for the games on this machine: a name or an address (a name
-   is looked up at start, which fails if it has no address, and every five minutes). `--local-hosts-only`
-   lists only the games hosted on this machine: UDP heartbeats can be sent from any address,
-   including forged ones, and would otherwise fill the list with games that don't exist or point
-   players at a victim. The dedicated servers run here and talk to the server on 127.0.0.1, so they are unaffected.
+   is looked up at start, which fails if it has no address, and every five minutes). `--max-player-hosts 5`
+   lets players host, at most five games at once (two from one address), which bounds what they cost. UDP heartbeats can be
+   sent from any address, including forged ones, and the server cannot check them (the audit's #9): a flood of them can
+   hold the five places with games that don't exist, or point players at a victim, until it stops. Use `--local-hosts-only`
+   instead to list only the games hosted on this machine. The dedicated servers run here and talk to the server on
+   127.0.0.1, so neither option affects them.
    `server/deploy/swss/install.sh` does this as a user service.
 4. **PSPC** (a build with this change) needs nothing: `data/infrastructure.json` has an entry for Super
    Squadron that sends `*.gamespy.com` to `swss.pspc.online`, which PSPC looks up when the game connects.
@@ -384,7 +387,9 @@ maxplayers, gamemode, natneg, localip0/localport, levelsettings, ...) and a play
 section; a new host is challenged and listed once it answers. The server browser's list request
 names the keys the game wants and a filter (Elite Squadron: `gamever = 10901 and levelsettings >=
 1073741824` for dedicated servers, `< 1073741824` for player-hosted ones); the reply is encrypted
-with the game's secret key. When the joining player and the host are seen at the same address (one
+with the game's secret key. A game hosted from the stock menus does not set that bit, so the server sets it (bit 30 of `levelsettings`) for the
+games hosted on its own machine: they are its dedicated servers, and appear on the Join screen's first list; a
+player's game keeps what it says and appears under *R*. When the joining player and the host are seen at the same address (one
 PC, or one network behind a router), the game connects to the host's private address from the list.
 
 **Stats.** The stats connection is XORed with "GameSpy3D". The game authenticates with

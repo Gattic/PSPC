@@ -281,7 +281,7 @@ class UnitTests(unittest.TestCase):
         lines = [l for l in logs.output if 'ignored' in l]
         self.assertLessEqual(len(lines), 12, '%d lines for 3,000 packets' % len(lines))
         self.assertGreaterEqual(len(lines), 1)
-        self.assertEqual(master.ignored_total, 3000)                            # counted, though not each one said
+        self.assertEqual(master.not_listed.count, 3000)                           # counted, though not each one said
 
     def test_a_player_who_tries_to_host_is_told_once_in_the_log(self):
         master = self.master_that_drops_everyone()
@@ -428,12 +428,112 @@ class UnitTests(unittest.TestCase):
 
     def test_a_remote_address_cannot_fill_the_list_of_hosts_that_the_servers_own_machine_needs(self):
         limits = access.Limits()
-        limits.max_hosts = 2
+        limits.max_player_hosts = 2
         registry = qr.Registry(limits)
         registry.hosts[('203.0.113.1', 1)] = object()
         registry.hosts[('203.0.113.2', 1)] = object()
         self.assertFalse(registry.has_room(('203.0.113.3', 1)))
         self.assertTrue(registry.has_room(('127.0.0.1', 5000)))
+
+    # ---- players may host, a few at a time
+
+    class Wire:
+        """The master server's UDP socket: what it sends is kept."""
+
+        def __init__(self):
+            self.sent = []
+
+        def sendto(self, data, addr):
+            self.sent.append((data, addr))
+
+    @staticmethod
+    def open_master(max_player_hosts=5):
+        limits = access.Limits()
+        limits.max_player_hosts = max_player_hosts
+        master = qr.MasterServer(qr.Registry(limits), can_host=lambda ip: not access.is_tunnel(ip))
+        master.connection_made(UnitTests.Wire())
+        return master
+
+    @staticmethod
+    def host_a_game(master, ip, port=3658, answer=True):
+        """A host's heartbeat and, unless it stays silent, its answer to the challenge; whether the game is listed."""
+        addr, instance = (ip, port), b'abcd'
+        master.datagram_received(heartbeat(instance, {'gamename': GAMENAME, 'hostname': 'Game at %s' % ip}, statechanged=3), addr)
+        if answer and addr in master.registry.hosts:
+            challenge = next(d for d, a in reversed(master.transport.sent) if a == addr and d[2] == qr.CHALLENGE)
+            master.datagram_received(bytes([qr.CHALLENGE]) + instance + challenge[7:], addr)
+        host = master.registry.hosts.get(addr)
+        return bool(host and host.validated)
+
+    def test_players_can_host_up_to_the_limit_and_the_servers_own_games_take_none_of_the_places(self):
+        master = self.open_master(max_player_hosts=5)
+        self.assertTrue(all(self.host_a_game(master, '127.0.0.1', 40000 + i) for i in range(3)))      # the dedicated games
+        self.assertEqual([self.host_a_game(master, '198.51.100.%d' % i) for i in range(1, 8)],
+                         [True] * 5 + [False] * 2)                                  # five players, then no room
+        self.assertTrue(self.host_a_game(master, '127.0.0.1', 40010))               # the machine's own is never refused
+        self.assertEqual(len(master.registry.listed()), 9)
+        exiting = heartbeat(b'abcd', {'gamename': GAMENAME}, statechanged=qr.STATE_EXITING)
+        master.datagram_received(exiting, ('198.51.100.2', 3658))                   # a player closes their game
+        self.assertTrue(self.host_a_game(master, '198.51.100.9'))                   # and the place goes to the next
+        self.assertFalse(self.host_a_game(master, '198.51.100.10'))
+
+    def test_one_address_cannot_take_the_places_of_others(self):
+        master = self.open_master(max_player_hosts=5)
+        self.assertEqual([self.host_a_game(master, '198.51.100.1', 3658 + i) for i in range(4)], [True, True, False, False])
+        self.assertTrue(self.host_a_game(master, '198.51.100.2'))
+
+    def test_a_full_list_does_not_parse_the_heartbeats_it_refuses(self):
+        master = self.open_master(max_player_hosts=5)
+        for i in range(5):
+            self.host_a_game(master, '198.51.100.%d' % i)
+        packet = self.hostile_heartbeat()
+        with mock.patch.object(qr, 'parse_heartbeat', wraps=qr.parse_heartbeat) as parse, \
+                self.assertLogs('gamespy', level='INFO') as logs:
+            for i in range(200):
+                master.datagram_received(packet, ('203.0.%d.%d' % (i >> 8, i & 255), 5000))
+        self.assertEqual(parse.call_count, 0)
+        said = [l for l in logs.output if 'not listed' in l]
+        self.assertTrue(1 <= len(said) <= 12, '%d lines for 200 packets' % len(said))
+        self.assertEqual(len(master.registry.hosts), 5)
+
+    def test_forged_heartbeats_are_parsed_only_so_fast(self):
+        master = self.open_master(max_player_hosts=512)
+        packet = self.hostile_heartbeat(size=400)
+        with mock.patch.object(qr, 'parse_heartbeat', wraps=qr.parse_heartbeat) as parse:
+            for i in range(300):                                                    # 300 sources, none with a game listed
+                master.datagram_received(packet, ('203.0.%d.%d' % (i >> 8, i & 255), 5000))
+        self.assertLessEqual(parse.call_count, 12)                                  # the burst of ten, and what refilled meanwhile
+        self.assertGreaterEqual(parse.call_count, 10)
+        master.datagram_received(packet, ('127.0.0.1', 3658))                       # the server's own machine is not held to it
+        self.assertIn(('127.0.0.1', 3658), master.registry.hosts)
+
+    def test_the_games_of_the_servers_machine_are_listed_as_dedicated_and_players_are_not(self):
+        master = self.open_master()
+        for ip, port, level in (('127.0.0.1', 3658, '553648130'), ('127.0.0.1', 3659, ''), ('127.0.0.1', 3660, 'junk'),
+                                ('127.0.0.1', 3661, str(qr.DEDICATED_LEVEL + 2)), ('198.51.100.1', 3658, '553648130')):
+            master.datagram_received(heartbeat(b'abcd', {'gamename': GAMENAME, 'levelsettings': level}, statechanged=3), (ip, port))
+        level = {addr: int(host.keys['levelsettings']) for addr, host in master.registry.hosts.items()}
+        self.assertEqual(level[('127.0.0.1', 3658)], 553648130 | qr.DEDICATED_LEVEL)     # what the game said is kept
+        self.assertEqual(level[('127.0.0.1', 3659)], qr.DEDICATED_LEVEL)
+        self.assertEqual(level[('127.0.0.1', 3660)], qr.DEDICATED_LEVEL)
+        self.assertEqual(level[('127.0.0.1', 3661)], qr.DEDICATED_LEVEL + 2)             # a game that says it is dedicated stays so
+        self.assertEqual(level[('198.51.100.1', 3658)], 553648130)                       # a player's game is theirs to describe
+        dedicated, player_hosted = sqlfilter.Filter('levelsettings >= 1073741824'), sqlfilter.Filter('levelsettings < 1073741824')
+        self.assertEqual(sorted(a for a, h in master.registry.hosts.items() if dedicated.matches(h.keys)),
+                         [('127.0.0.1', 3658), ('127.0.0.1', 3659), ('127.0.0.1', 3660), ('127.0.0.1', 3661)])
+        self.assertEqual([a for a, h in master.registry.hosts.items() if player_hosted.matches(h.keys)], [('198.51.100.1', 3658)])
+
+    def test_a_host_that_never_answers_gives_up_its_place(self):
+        master = self.open_master(max_player_hosts=2)
+        self.host_a_game(master, '198.51.100.1', answer=False)
+        self.host_a_game(master, '198.51.100.2')
+        self.host_a_game(master, '198.51.100.3', answer=False)                      # refused: the silent one holds the second place
+        self.assertNotIn(('198.51.100.3', 3658), master.registry.hosts)
+        for host in master.registry.hosts.values():
+            host.born -= qr.PENDING_TIMEOUT + 1
+        master.registry.expire()
+        self.assertEqual(list(master.registry.hosts), [('198.51.100.2', 3658)])      # the one that answered stays
+        self.assertTrue(self.host_a_game(master, '198.51.100.3'))
 
     def test_only_the_servers_machine_may_host_when_asked(self):
         config = Config(local_hosts_only=True, tunnel=False, limits=access.Limits(), bind='127.0.0.1', public_host='127.0.0.1')
@@ -466,6 +566,18 @@ class UnitTests(unittest.TestCase):
             with mock.patch('socket.getaddrinfo', side_effect=socket.gaierror('no such name')):
                 self.assertEqual(cli.main(['--db', os.path.join(tmp, 'x.sqlite'), 'serve', '--public-host', 'no.such.name']), 1)
             serving.assert_not_called()
+
+    def test_the_limit_of_player_hosted_games_is_an_option(self):
+        from pspc_gamespy import __main__ as cli
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        serve = ['--db', os.path.join(tmp, 'x.sqlite'), 'serve', '--public-host', '203.0.113.5']
+        for extra, want in (([], access.Limits().max_player_hosts), (['--max-player-hosts', '5'], 5), (['--max-player-hosts', '0'], 0)):
+            with mock.patch.object(cli.asyncio, 'run'), mock.patch.object(cli, 'GameSpyServer') as server:
+                cli.main(serve + extra)
+            self.assertEqual(server.call_args[0][0].limits.max_player_hosts, want, extra)
+        with mock.patch.object(cli.asyncio, 'run'), mock.patch('sys.stderr'), self.assertRaises(SystemExit):
+            cli.main(serve + ['--max-player-hosts', '-1'])
 
     def test_the_public_host_may_be_a_name(self):
         looked_up = []
@@ -824,6 +936,14 @@ class ServerTests(unittest.TestCase):
         for m in messages:
             for char in '\n\r\x1b\x00\x07':
                 self.assertNotIn(char, m, repr(m))
+
+    def test_rare_log_counts_everything_and_allows_little(self):
+        rare = access.RareLog(per_address_seconds=3600, burst=3, per_second=0.0001)
+        said = [rare.allow('10.0.0.%d' % (i % 50)) for i in range(1000)]
+        self.assertEqual(rare.count, 1000)
+        self.assertEqual(said.count(True), 3)                                    # the burst, whoever asks
+        again = access.RareLog(per_address_seconds=3600, burst=100, per_second=0.0001)
+        self.assertEqual([again.allow('10.0.0.1') for _ in range(5)], [True, False, False, False, False])   # one address: once
 
     def test_who_may_host(self):
         self.assertFalse(self.register(self.udp(STRANGER), b'\x01\x01\x01\x01', 'Tunnelled'))   # tunnelled players can't

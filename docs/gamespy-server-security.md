@@ -49,7 +49,7 @@ bounded harm; Low is hygiene.
 | 6 | High | **The server browser relayed messages to hosts** for anyone: from a connection that never asked for a list, 4 KB each, resent five times, to any address a game was listed at - a reflection tool (about 1000x) when hosts can be listed from forged UDP addresses (#9). | Only after a list request, 256 bytes, rate limited, at most 1,024 messages waiting. |
 | 7 | Medium | **Guessing passwords was free** - at Presence login and, with no login at all, with the search manager's `check` and `nicks`. | Ten wrong passwords per address, then one every 30 seconds, for both; the connection is closed after a failure. |
 | 8 | Medium | **Account creation was free and unchecked**: unbounded growth, control characters and 10 MB nicks in logs and leaderboards. | Ten accounts per address, then ten an hour; nicks 30 and e-mail addresses 100 printable characters; 16 profiles per account. |
-| 9 | Medium | **Anyone can list a game anywhere.** The master server never checks a host's answer to its challenge (GameSpy's validation of it isn't implemented), and UDP addresses can be forged: fake games, games "hosted" at a victim's address, career numbers invented in heartbeats (the leaderboards count what hosts report). | `--local-hosts-only`: only the server's own machine (its dedicated servers) can list games; heartbeats from any other address, forged or not, are dropped without an answer. With the tunnel, players' heartbeats are refused too. Without either: 8 games per address, 512 in all. Verifying the challenge remains open (see below). |
+| 9 | Medium | **Anyone can list a game anywhere.** The master server never checks a host's answer to its challenge (GameSpy's validation of it isn't implemented), and UDP addresses can be forged: fake games, games "hosted" at a victim's address, career numbers invented in heartbeats (the leaderboards count what hosts report). | `--local-hosts-only`: only the server's own machine (its dedicated servers) can list games; heartbeats from any other address, forged or not, are dropped without an answer. With the tunnel, players' heartbeats are refused too. Without either: `--max-player-hosts` games in all (default 512; **5 on the public SWSS server, which lets players host**) and 2 per address. Verifying the challenge remains open (see below): with player hosting, forged heartbeats can still take the places (see "What is left"). |
 | 10 | Medium | **Randomness from `random`** (a Mersenne Twister, predictable from its output) for Presence challenges, session keys, the QR2 challenge and login tickets (which are bearer tokens for the stats server). | `secrets`. |
 | 11 | Medium | **The database was world-readable** (e-mail addresses, password MD5s). | Created with mode 0600 (existing files changed to it); the deployment's folders are 0700. |
 | 12 | Medium | **Unbounded storage** by one player: offline messages (to profiles that don't exist, from non-friends), buddy requests, persistent records (any number of 1 MB records), reported games; leaderboard pages ran one query per player per request. | Messages only to real profiles that haven't blocked the sender (blocks were never honored), stored only between friends, 200 waiting per profile; 100 requests; 32 records of 64 KiB; 16 games per connection; old rows are pruned (games 90 days, messages 60, requests 180); the rankings are one query, kept until the stats change. |
@@ -60,7 +60,7 @@ bounded harm; Low is hygiene.
 | 17 | High | **A number too big for SQLite ended the connection with an unhandled exception**: `\getprofile\profileid\99999999999999999999...` (and the same in `addbuddy`, `bm`, the stats server's `pid` and `dindex`). Cheap for an attacker, and each one put a traceback in the log. | Numbers beyond 2^62 are not numbers (`kv.Message.int`); a message the code can't handle ends that connection only, with a one-line warning. |
 | 18 | High | **A server-browser list request could ask for 2,000 keys**: 512 games times 2,000 keys of work on the thread that serves everyone, one request after another from one connection. | 64 keys at most; 20 list or info requests at once, then 4 a second, per address. |
 | 19 | High | **`--public-host` as a name gave players the name as the game's address** (the lists and NAT negotiation carry 4-byte addresses: players got 0.0.0.0). | The name is looked up (failing to start if it has no address) and again every five minutes, keeping the last good answer. |
-| 20 | Medium | **Remote addresses could fill the list of hosted games** so that the server's own dedicated games could not be listed: the total limit was checked before the machine's own games were exempted. | The server's own machine is always allowed; with `--local-hosts-only` nothing else lists a game. |
+| 20 | Medium | **Remote addresses could fill the list of hosted games** so that the server's own dedicated games could not be listed: the total limit was checked before the machine's own games were exempted. | The server's own machine is always allowed, and its games are not counted against the players' limit (`max_player_hosts` counts the games of other addresses only, including ones that have not answered the challenge yet); with `--local-hosts-only` nothing else lists a game. |
 | 21 | Medium | **No limit on Presence messages** (the stats server had one): one account could flood another player's connection, and make the server drop the victim when it fell behind. | 100 messages at once, then 20 a second, per address; the connection is closed beyond it. |
 | 22 | Medium | **A connection could log in twice**, as a second profile: the first stayed "online" on a connection that was no longer its own. | One login per connection. |
 | 23 | Medium | **A tunnel could be opened inside a tunnel**: a player's connection to the web pages, through the relay, could ask the gateway for another tunnel, with an address and limits of its own. | The gateway refuses requests that come from a tunnelled address. |
@@ -81,7 +81,7 @@ What the router forwards is the server's own attack surface, with no front door 
 | TCP 28910 browser | anyone | lists of the games on this machine at 20 requests then 4 a second; 256-byte messages to a listed game, 10 then one every 2 seconds |
 | TCP 29920 stats | players logged in to Presence from the same address | records of 64 KiB, 32 a profile |
 | TCP 80 (8080) web | anyone | the message of the day and the rankings, 60 requests then 20 a second, no bodies over 64 KiB |
-| UDP 27900 master | anyone | an "available" answer of 7 bytes and a keepalive answer of 11, 60 packets then 20 a second per address; **heartbeats from any address but this machine are dropped without an answer** |
+| UDP 27900 master | anyone | an "available" answer of 7 bytes and a keepalive answer of 11, 60 packets then 20 a second per address; **without `--local-hosts-only`, a heartbeat from an address with no game listed is parsed only while there is room (`--max-player-hosts`, 2 per address) and then at most 5 a second in all (a burst of 10); every other is dropped unparsed and unanswered: 30 to 75 microseconds each, on average, when 3,000 forged 60 KB ones were measured, against 11,700 before #28's fix**; a game that does not answer the challenge within 30 seconds gives up its place |
 | UDP 27901 NAT negotiation | anyone | answers no larger than 21 bytes to a request of 12 or more, 4,096 sessions, 40 packets a second per address |
 | UDP 3658 (a dedicated game) | anyone | **not covered by this audit**: it reaches the dedicated PSPC's own network code (the game's sockets), not this server. Nothing listens on it until a dedicated game runs, and then everything the game's networking does with a datagram is exposed to the internet |
 
@@ -122,11 +122,19 @@ A Cloudflare Tunnel carries HTTP(S) only, so the public server's TCP and UDP go 
 ## What is left
 
 - **The master server's challenge isn't verified** (#9). With `--local-hosts-only` (and in the tunnel
-  deployment) nothing outside the machine can list games, so it doesn't matter; **without it, a server with
-  UDP 27900 open to the internet has a real hole**, and a player-hosted public server would need GameSpy's
-  challenge check (`gsseckey`, which this server does not implement and which can't be verified without the
-  game). Until then a public server hosts its games itself.
-- **Players cannot host games on the public server** for the same reason; the dedicated servers do.
+  deployment) nothing outside the machine can list games, so it doesn't matter. **The public SWSS server
+  has been opened to player hosting (`--max-player-hosts 5`) without it, on the owner's decision, and has the
+  hole:** anyone who can send UDP to port 27900 can fill the five places with forged heartbeats from any source
+  address and answers (the server doesn't check the answer), so that real players can't list a game until
+  the forger stops (they have to repeat it at least every 3 minutes, and every 30 seconds for the places to stay
+  taken by games that don't answer), and can make the list show games at a victim's address (players who join
+  one send it traffic). What the limits do bound is the cost: five games at most, parsing capped, a refused heartbeat
+  almost free, so a forger can take the places and nothing else. Closing it needs GameSpy's challenge check
+  (`gsseckey` with the game's key), which this server does not implement and which can only be written correctly
+  against a real game's answers: the dedicated game's, once one runs here. Until then, `--local-hosts-only`
+  is the safe setting, and the dedicated servers are the games that can be relied on.
+- **Player-hosted games are the players' machines.** The server only lists them and introduces players (NAT
+  negotiation); what a joining player's game receives from a host is up to that host.
 - **Passwords are MD5 of the password** and always will be: GameSpy's login proves knowledge of that
   value, so the server has to keep it. A copy of the database lets its holder log in to this server as
   anyone (and nowhere else, if players don't reuse passwords). Keep the database private and backed up.
@@ -158,7 +166,7 @@ A Cloudflare Tunnel carries HTTP(S) only, so the public server's TCP and UDP go 
 
 The deployment in `server/deploy/swss/` follows from this. With forwarded ports: the service runs as an
 ordinary user (port 80 is mapped to 8080 by the router, so it needs no privileges) with a private data
-folder, `--local-hosts-only`, and the router forwards exactly the ports of the table above and the UDP
+folder, `--max-player-hosts 5`, and the router forwards exactly the ports of the table above and the UDP
 ports of the dedicated games. Through the tunnel: the services listen on 127.0.0.1 (so nothing but
 cloudflared, on this machine, reaches them), no port is forwarded and the firewall can refuse everything
 incoming, and the tunnel's token is readable by that user only. With the tunnel, in Cloudflare: leave WebSockets on, keep Access
