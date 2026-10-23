@@ -68,3 +68,12 @@ class Splitter:
             msg, self.buf = self.buf[:i], self.buf[i + 7:]
             if msg.strip():
                 yield parse(msg)
+
+    def pending(self, limit=12):
+        """What the client sent that never became a message, for a log: the keys of an unfinished message (not their
+        values: a password is one of them), or the first characters of something that is not one."""
+        if not self.buf:
+            return 'nothing'
+        if self.buf.startswith('\\'):
+            return 'unfinished message with the keys ' + ', '.join(self.buf.split('\\')[1:2 * limit + 1:2])
+        return 'something that does not start with a backslash: ' + self.buf[:16]

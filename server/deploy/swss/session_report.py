@@ -33,6 +33,7 @@ EVENTS = [
     ('rate limited', r'.*: too many connections \((\d+\.\d+\.\d+\.\d+) has'),
     ('game available?', r'qr: ' + ADDR + r'.* asks whether (\S+) is available'),
     ('host ignored', r'qr: heartbeat from ' + ADDR + r'.* ignored'),
+    ('host not listed', r'qr: heartbeat from ' + ADDR + r'.* not listed'),
     ('game listed', r'qr: \S+ hosts .* on ' + ADDR + r'.*UDP ports'),
     ('game unlisted', r'qr: .* \(' + ADDR + r'.*is no longer listed'),
     ('unknown game', r'qr: heartbeat from ' + ADDR + r'.* no key for'),
@@ -60,6 +61,8 @@ PROBLEMS = {
     'login refused': 'a login was refused: a wrong password or unknown account (see the code in the line); a game that shows "cannot log in" ends here',
     'rate limited': 'this address hit a limit (failed logins, messages or connections): wait a few minutes, or look for a program retrying in a loop',
     'host ignored': 'this address tried to list a game and the server ignored it: only this machine (its dedicated servers) may host on this server',
+    'host not listed': 'this address tried to host a game and the server had no room for it: the games players host are full, or this address '
+                       'already has its share (see the line for which)',
     'unknown game': 'a game name this server has no key for: the disc is not the SWSS build the server expects, or it is a different game',
     'stats refused': 'the stats sign-in was refused: the player must be logged in to Presence from the same address; a client behind carrier-grade NAT '
                      'or two internet connections can reach the two servers from different addresses',

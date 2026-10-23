@@ -12,6 +12,7 @@ import asyncio
 import logging
 import secrets
 import string
+import time
 
 from . import access
 from . import crypt
@@ -40,6 +41,15 @@ SIG = 'd41d8cd98f00b204e9800998ecf8427e'
 
 def _challenge(n=10):
     return ''.join(secrets.choice(string.ascii_uppercase) for _ in range(n))
+
+
+def note_unheard(limits, who, peer, started, received, splitter):
+    """Says (rarely: anyone can cause it) that a connection ended without one complete message. A game that connects, reads
+    the greeting and goes away, or sends something this server cannot read, leaves nothing else in the log."""
+    if peer and not access.is_local(peer[0]) and limits.unheard_connections.allow(peer[0]):
+        log.info('%s %s: connection ended after %.1f s without a complete message (%d bytes received: %s; %d such connections so far)',
+                 who, peer, time.monotonic() - started, received, access.safe(splitter.pending(), 200),
+                 limits.unheard_connections.count)
 
 
 def valid_name(text, limit=MAX_NAME):
@@ -109,6 +119,7 @@ class Session:
     async def run(self):
         self.send(kv.build(('lc', 1), ('challenge', self.challenge), ('id', 1)))
         splitter = kv.Splitter()
+        started, received, heard = time.monotonic(), 0, 0
         try:
             while not self.closed:
                 try:
@@ -119,7 +130,9 @@ class Session:
                     break
                 if not data:
                     break
+                received += len(data)
                 for msg in splitter.feed(data.decode('utf-8', 'replace')):
+                    heard += 1
                     log.debug('gpcm %s -> %s', self.peer, msg.pairs)
                     if not self.limits.allow(self.limits.presence_messages, self.ip):
                         log.info('gpcm %s: too many messages; closed', self.peer)
@@ -141,6 +154,8 @@ class Session:
         finally:
             self.closed = True
             self.presence.logout(self)
+            if not heard:
+                note_unheard(self.limits, 'gpcm', self.peer, started, received, splitter)
             try:
                 self.writer.close()
             except Exception:
@@ -530,7 +545,7 @@ class Search:
         peer = writer.get_extra_info('peername')
         ip = peer[0] if peer else ''
         splitter = kv.Splitter()
-        requests = 0
+        requests, started, received = 0, time.monotonic(), 0
         try:
             while True:
                 try:
@@ -539,6 +554,7 @@ class Search:
                     break
                 if not data:
                     break
+                received += len(data)
                 for m in splitter.feed(data.decode('utf-8', 'replace')):
                     log.debug('gpsp %s -> %s', peer, m.pairs)
                     requests += 1
@@ -548,6 +564,7 @@ class Search:
                     if reply is None:
                         log.info('gpsp %s: unhandled %s', peer, access.safe(m.command))
                         continue
+                    log.info('gpsp %s: %s answered %s', peer, access.safe(m.command, 20), self.outcome(reply))
                     log.debug('gpsp %s <- %s', peer, access.safe(reply, 300))
                     writer.write(reply.encode('utf-8', 'replace'))
                 await writer.drain()
@@ -558,10 +575,18 @@ class Search:
         except Exception:
             log.warning('gpsp %s: a request was not handled; closed', peer, exc_info=log.isEnabledFor(logging.DEBUG))
         finally:
+            if not requests:
+                note_unheard(self.limits, 'gpsp', peer, started, received, splitter)
             try:
                 writer.close()
             except Exception:
                 pass
+
+    @staticmethod
+    def outcome(reply):
+        """The first key and value of a reply (vr=0, cur=3585, nur=513, bsrdone=): the result, never the e-mail address or nick."""
+        pairs = kv.parse(reply).pairs
+        return '%s=%s' % (access.safe(pairs[0][0], 12), access.safe(pairs[0][1], 12)) if pairs else '(nothing)'
 
     def _password(self, m):
         if 'passenc' in m:
@@ -605,13 +630,15 @@ class Search:
             return kv.build(*pairs)
         if c == 'newuser':
             password = self._password(m)
-            code, _ = check_new_user(self.limits, ip, m.get('email', ''), m.get('nick', ''), m.get('uniquenick', ''))
+            code, why = check_new_user(self.limits, ip, m.get('email', ''), m.get('nick', ''), m.get('uniquenick', ''))
             if code:
+                log.info('gpsp: new account %s refused (%d: %s), from %s', access.safe(m.get('nick', '')), code, why, ip)
                 return kv.build(('nur', code), ('pid', 0))
             try:
                 _, pid = self.store.new_user(m.get('email', ''), crypt.md5hex(password), m.get('nick', ''),
                                              m.get('uniquenick', ''), m.int('namespaceid'))
             except StoreError as e:
+                log.info('gpsp: new account %s refused (%d: %s), from %s', access.safe(m.get('nick', '')), e.code, e.message, ip)
                 prof = self.store.profile_by_nick_email(m.get('nick', ''), m.get('email', ''))
                 return kv.build(('nur', e.code), ('pid', prof['profileid'] if prof else 0))
             log.info('gpsp: new account %s (%s), profile %d, from %s', access.safe(m.get('nick', '')),

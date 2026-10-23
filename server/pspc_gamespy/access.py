@@ -143,6 +143,24 @@ class RateLimiter:
             b[0] = max(-self.burst, b[0] - cost)
 
 
+class RareLog:
+    """Permission to write a log line about something that anyone can cause from any address (a forged heartbeat, a
+    connection that says nothing): once a minute for each address (a table of at most `max_keys`), at most `burst` lines at
+    once and then `per_second` in all, whatever the number of addresses. `count` is how often it happened, said or not."""
+
+    def __init__(self, per_address_seconds=60.0, burst=10, per_second=0.1, max_keys=1000):
+        self._by_address = RateLimiter(1, 1.0 / per_address_seconds, max_keys=max_keys)
+        self._overall = RateLimiter(burst, per_second)
+        self.count = 0
+
+    def allow(self, address):
+        self.count += 1
+        if not self._by_address.available(address) or not self._overall.allow('all'):
+            return False
+        self._by_address.spend(address)
+        return True
+
+
 class ConnectionLimit:
     """At most `per_ip` simultaneous connections from one address and `total` in all, for one
     service. guard() wraps a connection handler; a connection over the limit is closed at once."""
@@ -207,8 +225,10 @@ class Limits:
         self.host_messages = RateLimiter(10, 0.5)               # messages players have the server send to hosts
         self.qr_packets = RateLimiter(60, 20.0)                 # UDP, per source address
         self.natneg_packets = RateLimiter(120, 40.0)
-        self.hosts_per_ip = 8                                   # hosted games listed per address (not the server's own)
-        self.max_hosts = 512
+        self.unheard_connections = RareLog()                    # Presence connections that ended without a message
+        self.hosts_per_ip = 2                                   # hosted games listed per address (not the server's own)
+        self.max_player_hosts = 512                             # games hosted by players listed at once (not the server's own)
+        self.new_hosts = RateLimiter(10, 5.0)                   # heartbeats parsed, in all, from addresses with no game listed
         self.max_natneg_sessions = 4096
 
     def guard(self, service, handler):

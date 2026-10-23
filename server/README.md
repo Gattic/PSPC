@@ -142,7 +142,7 @@ python -m pspc_gamespy --db gamespy.sqlite serve --public-host 203.0.113.7
 ```
 
 It also serves Star Wars Super Squadron. On the internet it runs with `--bind 0.0.0.0 --public-host
-swss.pspc.online --local-hosts-only` behind forwarded ports, or with `--tunnel --behind-proxy` behind a
+swss.pspc.online --max-player-hosts 5` behind forwarded ports, or with `--tunnel --behind-proxy` behind a
 Cloudflare Tunnel (players then reach it through a relay PSPC starts: `python -m pspc_gamespy tunnel
 https://swss.pspc.online`); `server/deploy/swss/` sets either up and
 [docs/gamespy-server-security.md](../docs/gamespy-server-security.md) says why.
