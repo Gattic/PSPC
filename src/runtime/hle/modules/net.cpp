@@ -865,6 +865,14 @@ int BindHost(InetSocket *sock, sockaddr_in a) {
 		if (InterfaceAddress() == htonl(INADDR_LOOPBACK)) a.sin_addr.s_addr = InterfaceAddress();
 		else sock->wildcard = true;
 	}
+	// A dedicated game server has to keep the port the router forwards from one start to the next, but
+	// the game asks for its own (3658 for Star Wars Super Squadron): game_port binds the game's UDP
+	// socket to that port here instead. getsockname reports it, so the game tells the master server, and
+	// players, where it really is.
+	const u16 asked = ntohs(a.sin_port);
+	const int gamePort = net::CurrentConfig().gamePort;
+	const bool remapped = gamePort != 0 && sock->type == INET_SOCK_DGRAM && asked != 0;
+	if (remapped) a.sin_port = htons((u16)gamePort);
 	if (bind(sock->host.s, (const sockaddr *)&a, sizeof(a)) != 0) {
 		const int e = hostnet::LastSocketError();
 		const u16 port = ntohs(a.sin_port);
@@ -885,7 +893,11 @@ int BindHost(InetSocket *sock, sockaddr_in a) {
 			sockaddr_in got{};
 			int len = sizeof(got);
 			hostnet::GetSockName(sock->host.s, (sockaddr *)&got, &len);
-			LOGI(LOG, "  UDP port %u is in use on this PC: using %u instead", port, ntohs(got.sin_port));
+			if (remapped)
+				LOGW(LOG, "  game_port %u (the game asked for %u) is in use on this PC: using %u instead", port, asked,
+				     ntohs(got.sin_port));
+			else
+				LOGI(LOG, "  UDP port %u is in use on this PC: using %u instead", port, ntohs(got.sin_port));
 		}
 	}
 	sock->bound = true;
