@@ -237,7 +237,9 @@ python -m pspc_gamespy --db gamespy.sqlite serve --bind 0.0.0.0 --public-host sw
 {"games": [{"name": "Star Wars Super Squadron", "ids": ["ULUS99390"], "domains": {"*.gamespy.com": "swss.pspc.online"}}]}
 ```
 
-   Everyone who plays needs the same SWSS disc build as the dedicated servers.
+   Everyone who plays needs the same SWSS disc build as the dedicated servers: the image of 2026-10-24, 2333759488
+   bytes, sha256 `fe4913f2100e581f781a3e7d817efe0c712c94e7666c3f2366716c852d4e8a80` (a client with another build is a
+   different game). `server/deploy/swss/README.md`, section 3, says what changing the disc involves.
 
 A server on your own PC overrides it: an `infrastructure.json` next to pspc.exe (Linux:
 `~/.config/pspc/`) with an entry for the game replaces the shipped one. The launcher's *Online* page

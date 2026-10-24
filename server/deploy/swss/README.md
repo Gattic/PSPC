@@ -123,6 +123,13 @@ a start. Each needs:
   --user -u swss-server | grep "UDP ports players use"`, and `"udp_ports"` for each game in `status.json`. Forward
   all of them. Players are told the server's address (from `swss.pspc.online`) and the heartbeat's port.
 
+**A new disc.** Stop the server first: a running game keeps the old image open. Replace `$ISO`, then check whether the
+native code is still valid. It is keyed by the SHA-1 of the disc's `EBOOT.BIN` as a plain ELF (the `sha1` of `modules` in
+the AOT cache's `games.json`; `pspc-iso modules <iso> <dir>` and `pspc-decrypt prx` produce it). While that hash is the
+same, only `size` in `games.json` needs updating; if it changed, rebuild (`tools/pspc_build.py "$ISO"`, about 6 minutes).
+The disc of 2026-10-24 has the same executable as the one before it, so only its data changed. Players need this same
+image: 2333759488 bytes, sha256 `fe4913f2100e581f781a3e7d817efe0c712c94e7666c3f2366716c852d4e8a80`.
+
 Edit the sessions file, then `systemctl --user restart swss-server`. The sessions' output is in
 `~/swss-server/data/sessions/<name>.log`; `status.json` lists them.
 
@@ -145,7 +152,8 @@ are listed but can't be joined: the dedicated game's UDP port isn't forwarded.
 
 ## 5. Testing with real clients on other networks
 
-What a client PC needs: PSPC, its firmware, the SWSS disc (ULUS99390, the same build as the dedicated servers), and
+What a client PC needs: PSPC, its firmware, the SWSS disc (ULUS99390, the same build as the dedicated servers: 2333759488
+bytes, sha256 `fe4913f2100e581f781a3e7d817efe0c712c94e7666c3f2366716c852d4e8a80`), and
 this next to `pspc.exe` (Linux: `~/.config/pspc/infrastructure.json`), unless its PSPC already ships the entry:
 
 ```json
