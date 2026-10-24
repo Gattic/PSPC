@@ -56,7 +56,7 @@ players' PSPC looks it up when the game connects).
 | TCP | **80** | **8080** | the web pages (rankings, message of the day): see below |
 | UDP | 27900 | 27900 | the master server (games ask whether the service is up) |
 | UDP | 27901 | 27901 | NAT negotiation |
-| UDP | **3658** | **3658** | the first dedicated game's matches; any other dedicated game: the port the server prints (see 3) |
+| UDP | **3658-3661** | **3658-3661** | the dedicated games' matches: one port each (`UDP_PORT`, see 3) |
 
 **Port 80 is the one that goes wrong.** The game asks for port 80 and the server answers on 8080, so the rule is
 *external 80 -> this machine's LAN address, internal 8080* (TCP). Entered the other way round (external 8080 -> internal 80) it
@@ -117,11 +117,13 @@ a start. Each needs:
 - its own folder for that, its memory stick and its data and cache: `dedicated-host.sh` reads `PSPC`, `ISO` and
   `DEDICATED` (`xdg-config`, `xdg-data`, `xdg-cache` and `ms0` in it) from its environment, and the session's command sets
   them, as the example does. The first start makes the game's profile on the memory stick;
-- **a UDP port the router forwards.** The first dedicated game binds the game's 3658 when it is free; PSPC gives
-  any other a free port, which changes at each start, so start with one dedicated game and forward UDP 3658. What
-  a game really has open: `ss -lunp | grep pspc` while it runs. What the server saw when it listed: `journalctl
-  --user -u swss-server | grep "UDP ports players use"`, and `"udp_ports"` for each game in `status.json`. Forward
-  all of them. Players are told the server's address (from `swss.pspc.online`) and the heartbeat's port.
+- **a UDP port the router forwards, fixed for each session.** `UDP_PORT` (3658, 3659, 3660 and 3661 for four
+  games) makes pspc bind the game's own UDP port (3658, the only one it opens) to that port instead, so it is the
+  same at every start; forward each one. Without it, a game that can't have 3658 takes a free port that changes at
+  each start; if the fixed port is taken pspc says so and uses another (the game stays up, the forward won't reach
+  it). What a game really has open: `ss -lunp | grep pspc` while it runs. What the server saw when it listed:
+  `journalctl --user -u swss-server | grep "UDP ports players use"`, and `"udp_ports"` for each game in
+  `status.json`. Players are told the server's address (from `swss.pspc.online`) and the heartbeat's port.
 
 **A new disc.** Stop the server first: a running game keeps the old image open. Replace `$ISO`, then check whether the
 native code is still valid. It is keyed by the SHA-1 of the disc's `EBOOT.BIN` as a plain ELF (the `sha1` of `modules` in

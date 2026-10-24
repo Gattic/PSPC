@@ -12,6 +12,8 @@
 #   DEDICATED the folder with the instance's own xdg-config, xdg-data, xdg-cache and ms0 (default ~/swss-server/dedicated)
 #   SESSIONS  the sessions file the account NICK is read from (default ~/swss-server/data/gamespy-sessions.json)
 #   GAME_NAME the name the game is listed under (default "SWSS Conquest")
+#   UDP_PORT  the UDP port the game binds its own (3658) to instead, so the router can forward it (default: 3658
+#             while it is free, otherwise a port that changes at each start)
 #   HOURS     how long to run (default 6)
 set -eu
 NICK=${1:?usage: dedicated-host.sh NICK}
@@ -19,7 +21,14 @@ NICK=${1:?usage: dedicated-host.sh NICK}
 DEDICATED=${DEDICATED:-$HOME/swss-server/dedicated}
 SESSIONS=${SESSIONS:-$HOME/swss-server/data/gamespy-sessions.json}
 GAME_NAME=${GAME_NAME:-SWSS Conquest}
+UDP_PORT=${UDP_PORT:-}
 HOURS=${HOURS:-6}
+case $UDP_PORT in
+''|*[!0-9]*) [ -z "$UDP_PORT" ] || { echo "UDP_PORT must be a port number, not '$UDP_PORT'" >&2; exit 1; } ;;
+esac
+if [ -n "$UDP_PORT" ] && { [ "$UDP_PORT" -lt 1 ] || [ "$UDP_PORT" -gt 65535 ]; }; then
+	echo "UDP_PORT must be 1-65535, not '$UDP_PORT'" >&2; exit 1
+fi
 PROFILE=$DEDICATED/ms0/PSP/SAVEDATA/ULUS993900000/DATA.BIN
 
 # run_pspc VBLANKS OSK PRESS...: pspc until that VBlank, its keyboards returning the OSK text (a|b|c: one for each in turn),
@@ -28,6 +37,7 @@ run_pspc() {
 	vblanks=$1 osk=$2
 	shift 2
 	for press in "$@"; do shift; set -- "$@" --press "$press:6"; done
+	if [ -n "$UDP_PORT" ]; then set -- --set "game_port=$UDP_PORT" "$@"; fi
 	exec env XDG_CONFIG_HOME="$DEDICATED/xdg-config" XDG_DATA_HOME="$DEDICATED/xdg-data" XDG_CACHE_HOME="$DEDICATED/xdg-cache" \
 		"$PSPC" "$ISO" --headless --renderer none --memstick "$DEDICATED/ms0" --set firmware=4.01 \
 		--osk-text "$osk" --exit-vblank "$vblanks" --log info "$@"

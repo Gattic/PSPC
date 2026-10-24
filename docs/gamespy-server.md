@@ -124,6 +124,12 @@ launcher stops it): on Windows they run in a job object that ends them when the 
 it closes, on Linux with a parent-death signal. A session's output goes to `sessions/<name>.log`
 beside the database; the status file lists the sessions (running, starts).
 
+A session that hosts a game needs a fixed UDP port the router can forward: `dedicated-host.sh` takes
+`UDP_PORT` and passes it to PSPC as the `game_port` setting (`--set game_port=3659`). PSPC binds the
+UDP port the game asks for (3658, the only one it opens) to that port instead, and the game's
+heartbeat advertises it; if the port is taken PSPC says so and uses a free one, so the game stays up
+but the forward does not reach it. Four games can have 3658, 3659, 3660 and 3661.
+
 ### Ports
 
 | Port | | |
@@ -181,14 +187,16 @@ game --TCP/UDP--> swss.pspc.online (the router's public address) --forwarded--> 
    | UDP | 27901 | 27901 | NAT negotiation |
    | UDP | the **game port** of each dedicated game | the same | the matches themselves |
 
-   **The UDP port(s) of each dedicated game** are the ones its process has open: ask the machine, not the
-   router: `ss -lunp | grep pspc` while it runs. PSPC binds the port the game asks for (3658 is the game's
-   default) and takes another free one when that is taken (`UDP port 3658 is in use on this PC: using N instead`
-   in its log), so the first dedicated game is the simple case: forward UDP 3658 and check it against `ss`. The
-   server also reports what it observes when a game is listed: `qr: swsspsp hosts ... UDP ports players use: 3658`
-   in its log and `"udp_ports"` for each game in `status.json`: the port the heartbeats come from (what the server
-   list gives players) and the game's own `localport`. Forward all of them. Players on the same network as the
-   server need *NAT loopback* (hairpin) on the router to use the public address.
+   **Each dedicated game's UDP port is fixed by its session**: `UDP_PORT` (3658, 3659, 3660 and 3661 for
+   four games) makes PSPC bind the game's own UDP port (3658, the only one it opens) to that port instead,
+   the same at every start. Forward each one and check them against `ss -lunp | grep pspc`. Without a fixed
+   port, a game that can't have 3658 takes a free one that changes at each start; if the fixed port is
+   taken PSPC warns (`game_port 3659 (the game asked for 3658) is in use on this PC: using N instead`) and
+   uses another, so the game stays up but the forward won't reach it. The server also reports what it
+   observes when a game is listed: `qr: swsspsp hosts ... UDP ports players use: 3658` in its log and
+   `"udp_ports"` for each game in `status.json`: the port the heartbeats come from (what the server list
+   gives players) and the game's own `localport`. Players on the same network as the server need *NAT
+   loopback* (hairpin) on the router to use the public address.
 
    **If port 80 hangs, look at the rule's direction first.** The game asks for the web pages on port 80, which the
    server answers on 8080: the rule is *external 80 -> internal 8080*. Entered the other way round (external 8080 ->
@@ -279,10 +287,11 @@ gateway meets with a real connection or socket on the server, from an address of
   (as through a NAT that keeps its mappings), **but can't start with a player whose game hasn't sent
   anything yet.** NAT negotiation between a player and a dedicated game works (checked with
   `e2e_bridge.py`); with the real game it hasn't been tried.
-- **A dedicated game must not use UDP port 3658**, the game's default: the player's own game binds
-  3658 for itself, and then the relay can't listen on the same port for the dedicated game's (on Linux
-  the second bind fails whichever comes first, checked; Windows binds differently). Give the
-  dedicated games other ports, or have a program on the server hold 3658 so that they pick others.
+- **A dedicated game must not use UDP port 3658 in tunnel mode**, the game's default: the player's own
+  game binds 3658 for itself, and then the relay can't listen on the same port for the dedicated game's (on
+  Linux the second bind fails whichever comes first, checked; Windows binds differently). Give the
+  dedicated games other ports (`UDP_PORT`/`game_port`, e.g. 3659 upwards), or have a program on the server
+  hold 3658 so that they pick others.
 - **Port 80**: on Linux the relay can't listen on it (below 1024) unless allowed
   (`sysctl net.ipv4.ip_unprivileged_port_start=80`): the *Player Rankings* page, which the game asks for
   there, isn't reachable until then. Everything else is. (A Cloudflare Tunnel can't carry the page to the

@@ -1,13 +1,22 @@
 {
-  "comment": "Dedicated game servers the server runs alongside itself: copy to gamespy-sessions.json beside the database and edit (docs/gamespy-server.md, 'Sessions'). This machine has no GPU: dedicated-host.sh (installed in the server's bin folder) runs a headless PSPC without a renderer and hosts a Conquest game (server/deploy/swss/README.md, section 3). Each needs a GameSpy account, made from 'accounts', and the folder DEDICATED with its xdg-config (an infrastructure.json that sends *.gamespy.com to 127.0.0.1, so that it does not go through the tunnel), xdg-data (the firmware), xdg-cache and ms0. The paths here are an example: the pspc binary, the disc and the folder are yours.",
+  "comment": "Dedicated game servers the server runs alongside itself: copy to gamespy-sessions.json beside the database and edit (docs/gamespy-server.md, 'Sessions'). This machine has no GPU: dedicated-host.sh (installed in the server's bin folder) runs a headless PSPC without a renderer and hosts a Conquest game (server/deploy/swss/README.md, section 3). Each needs a GameSpy account of its own, made from 'accounts', the folder DEDICATED with its xdg-config (an infrastructure.json that sends *.gamespy.com to 127.0.0.1, so that it does not go through the tunnel), xdg-data (the firmware), xdg-cache and ms0, and a UDP port the router forwards: UDP_PORT makes pspc bind the game's own port (3658) to it instead, the same at every start, so four games can have 3658, 3659, 3660 and 3661. The paths here are an example: the pspc binary, the disc and the folder are yours.",
   "accounts": [
-    {"nick": "Ded-Conquest", "email": "ded-conquest@swss.pspc.online", "password": "CHANGE-ME-LONG-AND-RANDOM", "namespace": 1}
+    {"nick": "Ded-Conquest", "email": "ded-conquest@swss.pspc.online", "password": "CHANGE-ME-LONG-AND-RANDOM", "namespace": 1},
+    {"nick": "Ded-Conquest-2", "email": "ded-conquest-2@swss.pspc.online", "password": "CHANGE-ME-TOO-LONG-AND-RANDOM", "namespace": 1}
   ],
   "sessions": [
     {
       "name": "Conquest",
       "command": ["env", "PSPC=/home/swss/pspc/pspc", "ISO=/home/swss/Games/SWSS.iso", "DEDICATED=/home/swss/dedicated",
+                  "UDP_PORT=3658", "GAME_NAME=SWSS Conquest",
                   "/home/swss/swss-server/bin/dedicated-host.sh", "Ded-Conquest"],
+      "restart_after": 30
+    },
+    {
+      "name": "Conquest 2",
+      "command": ["env", "PSPC=/home/swss/pspc/pspc", "ISO=/home/swss/Games/SWSS.iso", "DEDICATED=/home/swss/dedicated-2",
+                  "UDP_PORT=3659", "GAME_NAME=SWSS Conquest 2",
+                  "/home/swss/swss-server/bin/dedicated-host.sh", "Ded-Conquest-2"],
       "restart_after": 30
     }
   ]

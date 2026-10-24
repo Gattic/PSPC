@@ -42,6 +42,7 @@ class DedicatedHostTest(unittest.TestCase):
                 {'nick': 'Ded-Conquest', 'email': 'ded@example.com', 'password': 'pa ss|w', 'namespace': 1}]}, f)
         self.env = dict(os.environ, PSPC=pspc, ISO='/games/SWSS.iso', DEDICATED=self.dir, SESSIONS=sessions, HOURS='1')
         self.env.pop('SAVE_PROFILE', None)
+        self.env.pop('UDP_PORT', None)
 
     def start(self, nick='Ded-Conquest'):
         return subprocess.Popen(['sh', SCRIPT, nick], env=self.env, stderr=subprocess.PIPE, text=True)
@@ -83,6 +84,33 @@ class DedicatedHostTest(unittest.TestCase):
         self.assertIn('--osk-text Dedicated --exit-vblank 7000', setup)
         self.assertIn('--osk-text Ded-Conquest|ded@example.com|pa ss|w|SWSS Conquest', main)
         self.assertNotEqual(setup_pid, main_pid)
+
+    def test_a_given_udp_port_is_bound_instead_of_the_games_own(self):
+        # The game asks for 3658: a session that forwards another port has pspc bind that one instead.
+        self.make_profile()
+        self.env['UDP_PORT'] = '3659'
+        p, stderr = self.run_script()
+        self.assertEqual(p.returncode, 124, stderr)
+        (_, _, args), = self.runs()
+        self.assertIn('--set game_port=3659', args)
+        self.assertIn('--set firmware=4.01', args)
+
+    def test_without_a_udp_port_the_game_keeps_the_port_it_asks_for(self):
+        self.make_profile()
+        p, stderr = self.run_script()
+        self.assertEqual(p.returncode, 124, stderr)
+        (_, _, args), = self.runs()
+        self.assertNotIn('game_port', args)
+
+    def test_a_udp_port_that_is_not_a_port_is_refused(self):
+        self.make_profile()
+        for port in ('abc', '0', '65536'):
+            with self.subTest(port=port):
+                self.env['UDP_PORT'] = port
+                p, stderr = self.run_script()
+                self.assertEqual(p.returncode, 1, stderr)
+                self.assertIn('UDP_PORT must be', stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, 'runs.txt')))
 
     def test_a_profile_that_was_not_saved_stops_the_script_before_the_game_starts(self):
         p, stderr = self.run_script()
