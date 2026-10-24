@@ -83,6 +83,9 @@ struct Options {
 	// PSPC Network (pspc.ini np_server=, np_online_id=, np_token=) and online-service redirects
 	// (infra_dns=, data/infrastructure.json).
 	std::string npServer, npOnlineId, npToken, infraDns;
+	// Bind the game's own UDP port to this port on the host (0: the port the game asks for), so a
+	// dedicated game server keeps the port the router forwards from one start to the next.
+	int gamePort = 0;
 	// Run a network selftest scenario ("name[:args]", hle/modules/net_selftest.h) instead of a file.
 	std::string netSelftest;
 };

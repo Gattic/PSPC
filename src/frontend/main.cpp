@@ -172,6 +172,7 @@ static void ApplySettings(const settings::Settings &s, runtime::Options &o) {
 	o.npOnlineId = s.npOnlineId;
 	o.npToken = s.npToken;
 	o.infraDns = s.infraDns;
+	o.gamePort = s.gamePort;
 }
 
 // The effective settings (after command-line overrides), at info level.

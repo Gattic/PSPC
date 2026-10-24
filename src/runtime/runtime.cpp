@@ -455,6 +455,7 @@ int RunOnce(const Options &o, BootTarget bt) {
 	netConfig.npOnlineId = o.npOnlineId;
 	netConfig.npToken = o.npToken;
 	netConfig.infraDns = o.infraDns;
+	netConfig.gamePort = o.gamePort;
 	netConfig.dataDir = o.dataDir;
 	net::Configure(netConfig);
 	if (o.rtcBase) rtc::SetBootTime(o.rtcBase);

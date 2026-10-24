@@ -125,6 +125,7 @@ std::vector<std::string> Keys() {
 	                              "renderer", "render_scale", "texture_filter", "texture_upscale", "games_dir", "plugins",
 	                              "plugins_dir", "volume", "mute",
 	                              "network", "adhoc_server", "np_server", "np_online_id", "np_token", "infra_dns",
+	                              "game_port",
 	                              "host_network", "host_network_port", "host_network_lan", "host_sfco", "host_sfco_address",
 	                              "host_sfco_allow_local", "host_gamespy", "host_gamespy_address", "host_adhoc"};
 	for (size_t i = 0; i < kNumControls; i++) k.push_back(std::string("key.") + kControls[i].name);
@@ -189,6 +190,10 @@ bool Set(Settings &s, const std::string &rawKey, const std::string &rawValue, st
 		s.npToken = v;
 	} else if (key == "infra_dns") {
 		s.infraDns = v;
+	} else if (key == "game_port") {
+		if (v.empty()) s.gamePort = 0;
+		else if (ParseInt(v, 1, 65535, n)) s.gamePort = n;
+		else return fail("want a port, 1-65535");
 	} else if (key == "plugins_dir") {
 		s.pluginsDir = v;
 	} else if (key == "plugins") {
@@ -255,6 +260,7 @@ std::string Get(const Settings &s, const std::string &key) {
 	if (key == "np_online_id") return s.npOnlineId;
 	if (key == "np_token") return s.npToken;
 	if (key == "infra_dns") return s.infraDns;
+	if (key == "game_port") return s.gamePort ? std::to_string(s.gamePort) : "";
 	if (key == "host_network") return B(s.hostNetwork);
 	if (key == "host_network_port") return std::to_string(s.hostNetworkPort);
 	if (key == "host_network_lan") return B(s.hostNetworkLan);
@@ -344,6 +350,10 @@ std::string Template(const Settings &s) {
 	put("np_online_id");
 	put("np_token");
 	put("infra_dns");
+	t += "\n# game_port: a game's own UDP port, bound to this port on this PC instead of the one it asks\n"
+	     "# for (empty: as asked). A dedicated game server sets it to the port the router forwards, so\n"
+	     "# players reach it at the same port after every start.\n";
+	put("game_port");
 	t += "\n# Servers the launcher runs on this PC (its Online page), 1 = start with the launcher:\n"
 	     "# host_network: the PSPC Network server on port host_network_port (host_network_lan=0: this PC\n"
 	     "# only); host_sfco: the Syphon Filter: Combat Ops server, reached at host_sfco_address (empty =\n"

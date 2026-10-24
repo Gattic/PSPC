@@ -445,6 +445,16 @@ int InetScenario(const std::vector<std::string> &) {
 	Close(ua);
 	Close(ub);
 
+	// ---- game_port: the game's own UDP port (3658) lands on the port this run was given instead.
+	const int gamePort = net::CurrentConfig().gamePort;
+	if (gamePort != 0) {
+		int ug = Socket(DGRAM);
+		ck.Check(ug > 0, "socket(DGRAM) for the game port -> %d", ug);
+		ck.Check(Call(INET, 0x1A33F9AE, {(u32)ug, Sockaddr(0x7F000001, 3658), 16}) == 0, "bind 3658 (the game's port)");
+		ck.Check(LocalPort(ug) == (u16)gamePort, "getsockname port %u (game_port %d)", LocalPort(ug), gamePort);
+		Close(ug);
+	}
+
 	// ---- ICMP echo: what a game pings its server list with. The host's raw socket answers where it opens one; pspc
 	// answers where it won't (no CAP_NET_RAW), so the same reply is expected either way.
 	int ping = (int)Call(INET, 0x8B7B220F, {AF_INET_PSP, RAW, 1});

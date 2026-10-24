@@ -19,7 +19,14 @@ default) and:
 ```ini
 network=1                 # 0 = offline (the WLAN switch is off)
 adhoc_server=localhost    # ad hoc server: host name or address, optionally :port (default 27312)
+game_port=                # a game's own UDP port, bound here instead of the one it asks for
 ```
+
+**A fixed game port.** A game picks its own UDP port (Star Wars Super Squadron asks for 3658), so a
+dedicated game server's port changes whenever that port is taken. `game_port` binds the game's own
+UDP socket to the given port instead (1-65535, empty = as asked); `getsockname` reports it, so the
+game tells the master server and players where it really is. If that port is in use too, the game
+warns and falls back to a free one instead of failing to start.
 
 **Infrastructure games.** When a game asks to connect (its own menu or the system's network
 dialog), pick the connection "PSPC 1". A PSN sign-in goes to PSPC Network, PSPC's PlayStation

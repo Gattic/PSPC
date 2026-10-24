@@ -56,6 +56,7 @@ struct Settings {
 	std::string npOnlineId;  // the online ID: the account's (set by the launcher) or the local one
 	std::string npToken;     // the server's sign-in token for that account (the launcher's Network dialog)
 	std::string infraDns;    // DNS server for every game's online services ("" = per-game table)
+	int gamePort = 0;        // bind the game's own UDP port to this port (0: the port the game asks for)
 	// Servers the launcher runs on this PC (its Online page): start them when it opens.
 	bool hostNetwork = false;       // the PSPC Network server
 	int hostNetworkPort = 8423;

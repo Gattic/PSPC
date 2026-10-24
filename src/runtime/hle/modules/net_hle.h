@@ -16,6 +16,7 @@ struct Config {
 	std::string adhocServer = "localhost";  // host[:port] of the ad hoc server
 	std::string npServer, npOnlineId, npToken;  // PSPC Network (net_np.cpp)
 	std::string infraDns;                       // online-service redirects (net_infra.cpp)
+	int gamePort = 0;                           // bind the game's own UDP port to this port (0: as asked)
 	std::string dataDir;                        // data/: infrastructure.json
 };
 // Called once per run, before the program boots (runtime.cpp).
