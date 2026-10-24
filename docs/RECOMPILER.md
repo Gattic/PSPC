@@ -125,6 +125,9 @@ void F_088040AC(Ctx *PSPC_RESTRICT c) { B_088040AC(c, c->r[31], c->r[29]); }
   entries, since a newer file makes the launchers offer a rebuild. Misaligned misses and misses
   outside the module's executable sections are not recorded, because the recompiler ignores
   them as hints: code a patch puts into `.eh_frame` or section padding stays interpreted.
+  `pspc-recomp module.elf --info --hints <sha1>.hints` says how many of a file's entries a rebuild
+  can use ("new code") and how many it cannot (already native, or unusable); a file written by an
+  older pspc.exe may hold only unusable ones, which still mark the game REBUILD until it is built.
 * `tools/guest_tests.py` runs PSPC's own guest programs in the interpreter and as native code
   built fresh for the run (no hints), the way a player's first build is.
 * `tools/smoke_games.py` checks that the games still reach their checkpoints

@@ -68,6 +68,22 @@ static int Main(int argc, char **argv) {
 		}
 	}
 	aopts.gapEntries = gaps;
+	if (infoOnly && !aopts.hints.empty()) {
+		// Which of the runtime's recorded hints a rebuild can use: a hint the module already has a
+		// function for, or one outside the executable sections, changes nothing.
+		recomp::AnalysisOptions plain = aopts;
+		plain.hints.clear();
+		std::set<u32> entries;
+		for (const auto &f : recomp::Analyze(img, plain).functions) entries.insert(f.entry);
+		size_t fresh = 0, known = 0, unusable = 0;
+		for (u32 h : aopts.hints) {
+			if ((h & 3) || !img.InCode(h)) unusable++;
+			else if (entries.count(h)) known++;
+			else fresh++;
+		}
+		printf("  hints: %zu new code, %zu already native, %zu unusable (misaligned or outside code)\n", fresh, known,
+		       unusable);
+	}
 	recomp::Analysis an = recomp::Analyze(img, aopts);
 	printf("module %s sha1 %s\n", img.name.c_str(), HexString(img.sha1.data(), 20).c_str());
 	printf("  image %08x-%08x (%s), %zu code ranges, %zu relocations\n", img.low, img.high,
