@@ -1,14 +1,17 @@
 #!/bin/sh
 # A dedicated SWSS game: PSPC without a window, a screen or a GPU, logged in to the server as one of the sessions file's
-# accounts, hosting a Conquest match. The game has no server mode, so the menus are driven by timed button presses (the
-# menus' timing is in VBlanks, which pspc counts itself, so a slow machine doesn't change it). The server runs this as a
-# session (gamespy-sessions.json, see gamespy-sessions.example.json); it stops after HOURS hours, the session starts it again.
+# accounts, hosting a Conquest match (or what PLAYLIST pins). The retail game has no server mode, so the menus are driven
+# by timed button presses (the menus' timing is in VBlanks, which pspc counts itself, so a slow machine doesn't change it).
+# On the playable disc the host plays too: the presses after the first map takes a team and a spawn point. On the dedicated
+# disc (README.md, "A host without a player") it has no player, and the same presses only click through the round-end screens.
+# The server runs this as a session (gamespy-sessions.json, see gamespy-sessions.example.json); it stops after HOURS hours,
+# the session starts it again.
 #
 #   dedicated-host.sh NICK
 #
 # Environment:
 #   PSPC      the pspc binary (required)
-#   ISO       the SWSS disc image (required)
+#   ISO       the SWSS disc image (required): the playable one, or the dedicated one for a host without a player
 #   DEDICATED the folder with the instance's own xdg-config, xdg-data, xdg-cache and ms0 (default ~/swss-server/dedicated)
 #   SESSIONS  the sessions file the account NICK is read from (default ~/swss-server/data/gamespy-sessions.json)
 #   GAME_NAME the name the game is listed under (default "SWSS Conquest")

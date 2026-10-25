@@ -96,11 +96,12 @@ most 5 at a time** (*R* on the Join screen; `--max-player-hosts 5`, `MAX_PLAYER_
 one address; the dedicated games take none of the 5). That is a trade-off the audit explains: the master server cannot yet
 check who a heartbeat really comes from.
 
-The game has no server mode: `dedicated-host.sh NICK` is a headless PSPC (`--renderer none`, so no GPU, no window) that
-signs in as the sessions file's account NICK, creates a Conquest game and takes a team and a spawn point in it, driven by
-timed button presses. A round ends, the map is loaded again and the next one starts the same way. The script stops
-after `HOURS` (6) and the session starts it again 30 seconds later; the game is back on the list about 4 minutes after
-a start. Each needs:
+The retail game has no server mode: `dedicated-host.sh NICK` is a headless PSPC (`--renderer none`, so no GPU, no window) that
+signs in as the sessions file's account NICK and creates a game, driven by timed button presses. A round ends, the map is
+loaded again and the next one starts the same way. On the playable disc the host also plays - it takes a team and a spawn
+point - so the server browser shows `numplayers=1` for a game nobody has joined; on the **dedicated disc** (below) it has no
+player and the game lists with 0. The script stops after `HOURS` (6) and the session starts it again 30 seconds later; the
+game is back on the list about 4 minutes after a start. Each needs:
 
 - a build of PSPC for this machine, the 4.01 firmware as a profile (`tools/pspc_install_fw.py --profile 4.01`,
   docs/firmware-manager.md), and the SWSS disc image - none of which are in this repository (`private/` and `Games/`
@@ -139,6 +140,26 @@ a start. Each needs:
   the game heartbeats. `mapname` does not tell ground from space on one planet - both read `Hoth prequel` - so compare
   `levelsettings`: for the same planet, mode and era its low bits are 2 for ground and 4 for space (measured on Hoth
   prequel Conquest, `12.0.0.0` and `12.0.0.1`).
+
+**A host without a player.** The dedicated disc is the playable one with another `PSP_GAME/SYSDIR/EBOOT.BIN`: the session
+start makes the host's local players 0 (the engine already runs dedicated servers; the menus never set one up) and sets
+bit 30 of `levelsettings`, which is how the server browser's dedicated list picks a game. The executable is the same size
+(27 bytes differ) and is not in this repository; it comes from the machine that has the SWSS build, with its sha256.
+`swss-dedicated-iso.py` makes the image from the playable disc in seconds, rewriting only the executable's sectors and
+checking both hashes (the playable disc's executable is `efdb4423055514fcf7808c31ac036b394331e22cb71b1886f535e19c6d4f1471`,
+the dedicated one `155a7a7fc84da335f38cf01d578e7aa258ae01480685d006cb3dbaf9d7f61fcf`):
+
+```sh
+python3 server/deploy/swss/swss-dedicated-iso.py Games/SWSS.iso Games/SWSS-dedicated.iso EBOOT.BIN \
+  --expect-old efdb4423055514fcf7808c31ac036b394331e22cb71b1886f535e19c6d4f1471 \
+  --expect-new 155a7a7fc84da335f38cf01d578e7aa258ae01480685d006cb3dbaf9d7f61fcf
+tools/pspc_build.py Games/SWSS-dedicated.iso      # its executable changed, so it needs its own native code
+```
+
+Then set `ISO=` of the sessions that should host without a player to `Games/SWSS-dedicated.iso` and restart the server.
+The presses are the same as for the playable disc (the dedicated disc's menus are the retail ones; the game never shows
+its `DED_*` screens). The image is for the sessions only: **players keep the playable disc.** The check is the server
+browser (TCP 28910): `numplayers=0`, and the `mapname`/`gametype` the session pins.
 
 **A new disc.** Stop the server first: a running game keeps the old image open. Replace `$ISO`, then check whether the
 native code is still valid. It is keyed by the SHA-1 of the disc's `EBOOT.BIN` as a plain ELF (the `sha1` of `modules` in

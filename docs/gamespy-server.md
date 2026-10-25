@@ -321,7 +321,8 @@ folder, and an `infrastructure.json` of its own, in its own configuration folder
 (`XDG_CONFIG_HOME`), that sends `*.gamespy.com` to 127.0.0.1: it talks to the server directly,
 not through the tunnel. `server/deploy/swss/gamespy-sessions.example.json` is an example, and
 `server/deploy/swss/dedicated-host.sh` is the command for Star Wars Super Squadron (it drives the game's menus with
-timed button presses until its game is created and joined; `server/deploy/swss/README.md`, section 3). Each
+timed button presses until its game is created and joined; on the playable disc the host plays, on the dedicated one it
+has no player and lists with 0; `server/deploy/swss/README.md`, section 3). Each
 dedicated game is one UDP port: the first takes the game's 3658, the others ones the system chooses (PSPC
 falls back to a free port when 3658 is taken, and tells the server in its heartbeat). With forwarded ports
 the router has to forward them, so start with one dedicated game and forward the ports it uses (above);
