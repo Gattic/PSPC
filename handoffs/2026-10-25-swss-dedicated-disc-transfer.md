@@ -207,3 +207,40 @@ Working directory `/home/rob/dev/PSPC`; the deployment is `~/swss-server/`. Noth
   the browser through the game's heartbeat, so it can only change if the game stops spawning a player.
 - Open question, answered by the Windows side in Part 1: whether `dedicated.txt` is a text patch applied by a tool, and
   whether the EBOOT stayed the same size. Both determine whether the Linux side reproduces the patch or copies the file.
+
+## Windows side: Part 1 done, and Part 2 step 6 is not needed (2026-10-25, later session)
+
+The bundle is `build/swss-dedicated-disc/swss-dedicated-disc-2026-10-25.zip` (2,220,179 bytes, sha256
+`02da79dfed07971a8e4a2d7e7209a8074c5eae2cd442fb76f80c2dd81a75a1bc`, next to it a `.sha256`; `build/` is git-ignored). Its
+`NOTES.txt` answers Part 1 and carries the Linux steps. Contents: `EBOOT.BIN` (dedicated, 6,162,040 bytes, sha256
+`155a7a7fc84da335f38cf01d578e7aa258ae01480685d006cb3dbaf9d7f61fcf`), `swss-dedicated-iso.py`, `dedicated-host.sh`,
+`dedicated.txt`, `elfpatch.py`, `SHA256SUMS`, `NOTES.txt`. No code was changed for Part 1 itself; the tool below is new.
+
+- **Same size, same extent.** Both EBOOTs are 6,162,040 bytes at sector 168; 27 bytes differ. The two whole discs differ in
+  exactly three sectors (1095, 1129, 2715), all inside that extent, so Part 2 step 3's plain overwrite works.
+- **The patch reproduces the executable.** `elfpatch.py <playable EBOOT> out dedicated.txt` ("8 words patched") gives a file
+  identical to the dedicated EBOOT. The Windows disc is made by `python tools/dedicated.py build swss` (hard links of the
+  playable tree, that patch, `isobuild.py`).
+- **A tool for step 3.** `server/deploy/swss/swss-dedicated-iso.py PLAYABLE DEDICATED EBOOT.BIN [--expect-old SHA --expect-new SHA]`
+  copies the playable image, overwrites the executable's sectors, reads the executable back and renames the copy into place.
+  Run on `Games/SWSS.iso` with the bundle's EBOOT it produced a file `cmp` calls identical to
+  `private/swss/dedicated/SWSS.iso`. Nine tests in `server/tests/test_swss_dedicated_iso.py`; the whole server suite passes
+  (192 tests, 12 skipped, the shell-script tests among them: they are Linux-only).
+- **Part 2 step 6 (re-derive the presses) is obsolete.** The dedicated disc shows the retail menus; `dedicated-host.sh`, with
+  none of its presses changed, ran on it under Git Bash against a throwaway local `pspc_gamespy` (native code built for the
+  dedicated executable, sha1 `7a0eb8ad3e423c9bd22029768bb54c9779a48ee9`, 41 seconds here). Server-browser query:
+
+  | PLAYLIST | mapname | gametype | numplayers | levelsettings |
+  |---|---|---|---|---|
+  | `22.4.0.0` | MSTR prequel | HANV | 0 | 1610874882 |
+  | `12.0.0.1` | Hoth prequel | CQST | 0 | 1610612740 (0x60000004: space) |
+  | none (random) | TTNE classic | CTF1 | 0 | 1627455490 |
+
+  Dedicated bit 30 was set on all three and each was listed within 4 to 6 minutes of its start. Not covered: a round ending
+  on the dedicated disc with this script's CROSS every 500 VBlanks. The Heroes game stayed listed with `numplayers=0` for
+  30 minutes of its first round and the Space game for 20, with no warning in their logs beyond the loader's
+  `Asura: 12 bad relocations` (printed at every start); neither round ended in that time. Watch the first round end on
+  the Linux box. (The Windows driver `dedicated.py` presses CROSS every 1800 VBlanks and took a round to its end on this
+  disc on 2026-10-19; if the 500-VBlank presses ever stall a round end, lengthen them for the dedicated disc.)
+- **What is left is the Linux side:** Part 2 steps 1-5 and 7-8 (unzip, `swss-dedicated-iso.py`, `pspc_build.py`, `ISO=` in the
+  sessions file, restart, query). `README.md` §3 of `server/deploy/swss/` now documents this ("A host without a player").

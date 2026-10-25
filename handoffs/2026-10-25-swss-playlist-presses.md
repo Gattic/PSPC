@@ -129,3 +129,13 @@ None.
   `11600:SQUARE` random playlist, `14200:START`, then `CROSS` every 500 VBlanks; a first run of 7000 VBlanks makes the profile.
 - The Linux box has only the public repository; everything under `private/` and `Games/` exists only on this machine, so any
   index must be generated here and carried over as data, not recomputed there.
+
+## Update (2026-10-25, later session)
+
+The port in Next Actions 3 is in the tree (commit 2e4f60d), and the "verify on this machine" step was done for the **dedicated**
+disc: `dedicated-host.sh` unchanged, `PLAYLIST=22.4.0.0` -> `MSTR prequel`/`HANV`, `PLAYLIST=12.0.0.1` -> `Hoth prequel`/`CQST`
+with `levelsettings` low bits 4 (space), both `numplayers=0`; the random fill still works. So the pinned entries land as
+intended on a fresh profile with the script's timeline (consistent with hypothesis 1; hypotheses 2 and 3 were not tested
+separately). What remains is on the Linux box, and is
+the dedicated-disc work in `handoffs/2026-10-25-swss-dedicated-disc-transfer.md` (section "Windows side" and the bundle
+`build/swss-dedicated-disc/swss-dedicated-disc-2026-10-25.zip`).

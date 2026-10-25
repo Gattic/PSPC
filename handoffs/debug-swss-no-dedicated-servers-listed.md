@@ -51,3 +51,14 @@ they are on before changing the server.
 
 Not tried, and deliberately not: changing `qr.py`'s `DEDICATED_LEVEL` marking. It is what puts the sessions on the
 dedicated list, and the tests pin it.
+
+### Attempt 3 (Windows side, 2026-10-25): the player-less host works with the Linux script's presses
+
+Not the symptom itself (the empty list was the filter, attempt 2) but its follow-up: the four sessions list `numplayers=1`
+because the Linux box hosts from the playable disc. On the Windows PC the dedicated disc (the same disc with a patched
+`EBOOT.BIN`, 27 bytes) was built from the playable one with `server/deploy/swss/swss-dedicated-iso.py` (byte-identical to
+`private/swss/dedicated/SWSS.iso`) and `dedicated-host.sh` was run on it unchanged under Git Bash against a local
+`pspc_gamespy`. Server-browser query: `22.4.0.0` -> `MSTR prequel`/`HANV`, `12.0.0.1` -> `Hoth prequel`/`CQST` (space),
+random fill -> `TTNE classic`/`CTF1`; **`numplayers=0` on all three**, dedicated bit set. Details and the Linux steps:
+`handoffs/2026-10-25-swss-dedicated-disc-transfer.md` (section "Windows side") and the bundle it names. The Linux before/after
+is still to do.
