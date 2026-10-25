@@ -62,3 +62,43 @@ because the Linux box hosts from the playable disc. On the Windows PC the dedica
 random fill -> `TTNE classic`/`CTF1`; **`numplayers=0` on all three**, dedicated bit set. Details and the Linux steps:
 `handoffs/2026-10-25-swss-dedicated-disc-transfer.md` (section "Windows side") and the bundle it names. The Linux before/after
 is still to do.
+
+### Attempt 4 (Linux side, 2026-10-25): the four sessions host without a player
+
+The follow-up in attempt 3 is done here. The bundle `swss-dedicated-disc-2026-10-25.zip` (sha256 `02da79df…`, every member
+checked) held the dedicated `EBOOT.BIN`, and `server/deploy/swss/swss-dedicated-iso.py` made `Games/SWSS-dedicated.iso` from
+the playable disc in 10 seconds; the result is 2,333,759,488 bytes with sha256
+`d225b9b8f8b87d286f773fe919bcc716c4573e02c0a21b1a5b64d3b379a5ee82`, byte-identical to the Windows disc. Its executable's
+plain-ELF sha1 is `7a0eb8ad3e423c9bd22029768bb54c9779a48ee9` (the playable one's is `c5f57033…`), so it needed its own native
+code: `tools/pspc_build.py Games/SWSS-dedicated.iso --build-dir .worktrees/swss-dedicated/build/LinuxRuntime --cache
+~/swss-server/dedicated/xdg-cache/pspc/aot --compiler gcc` (7 min 26 s; `--compiler gcc` is required here, there is no
+`clang++`). The `.so`, its `.semver` and the merged `games.json` were copied into the other three sessions' caches
+(`dedicated-2`, `dedicated-space`, `dedicated-heroes`), each of which reads its own `xdg-cache`.
+
+The sessions file was backed up (`gamespy-sessions.json.bak-20261025-pre-dedicated`, 0600) and only the `ISO=` item changed in
+all four sessions, atomically; `PLAYLIST` stayed `12.0.1.0`, `22.1.0.0`, `12.0.0.1`, `22.4.0.0`. `swss-server` restarted
+15:39:22, each session rebuilt its profile (15:43) and the games were listed at 15:50.
+
+Server browser (TCP 28910), before and after:
+
+| Session | mapname | gametype | numplayers before | numplayers after | levelsettings |
+|---|---|---|---|---|---|
+| SWSS Conquest | Hoth classic | CQST | 1 | **0** | 1627389954 (low bits 2) |
+| SWSS Space | Hoth prequel | CQST | 1 | **0** | 1610612740 (low bits 4 = space) |
+| SWSS Conquest 2 | MSTR prequel | CTF1 | 1 | **0** | 1610678274 (low bits 2) |
+| SWSS Heroes vs | MSTR prequel | HANV | 1 | **0** | 1610874882 (low bits 2) |
+
+`levelsettings` is unchanged because `qr.py` already ORs bit 30 for hosts on this machine, which masks the disc's own bit;
+`numplayers` is the observable that moved. The maps and gametypes are exactly the pinned ones, so the playlist presses and
+indices carried over to the dedicated disc unchanged.
+
+Rounds end without anyone pressing anything: the first round of each host started 15:46 (games 261-264, one per host) and the
+next round for each host started later - DedConquest at 16:36:26 (50 min), DedSpace 16:46:24, DedConquest2 16:46:31,
+DedHeroes 16:46:34 (the 60-minute limit). The pspc processes never restarted, `status.json` kept `since` at 15:46 with
+`players=0`, and the browser kept listing all four with `numplayers=0` through the transition. **One difference from the
+playable disc:** with 0 players the game sends no final stats report, so there is no `game N finished` journal line and the
+`games` row keeps `finished=NULL`, where the playable-disc rows had it set; the round end shows as a new game id for the same
+host instead.
+
+Not covered: a real client joining one of these sessions (the client keeps the playable disc) - the game counts it as a
+player then.

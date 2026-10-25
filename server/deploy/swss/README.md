@@ -156,6 +156,13 @@ python3 server/deploy/swss/swss-dedicated-iso.py Games/SWSS.iso Games/SWSS-dedic
 tools/pspc_build.py Games/SWSS-dedicated.iso      # its executable changed, so it needs its own native code
 ```
 
+A session that `dedicated-host.sh` starts runs with its own `XDG_CACHE_HOME` (`$DEDICATED/xdg-cache`), so it reads the AOT
+cache in `$DEDICATED/xdg-cache/pspc/aot`, not the one beside the build: build into that cache with `--cache <that folder>`
+(and `--build-dir` of the tree the pspc binary came from). Each session has its own, so the `.so`, its `.semver` and the
+`games.json` entry have to be in every one; copying them over after one build is enough. On a machine without `clang++`,
+`--compiler gcc` is needed (the build takes about 7 minutes for this game). The playable disc's entry stays in `games.json`,
+so pointing `ISO=` back is all a rollback needs.
+
 Then set `ISO=` of the sessions that should host without a player to `Games/SWSS-dedicated.iso` and restart the server.
 The presses are the same as for the playable disc (the dedicated disc's menus are the retail ones; the game never shows
 its `DED_*` screens). The image is for the sessions only: **players keep the playable disc.** The check is the server
