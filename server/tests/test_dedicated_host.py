@@ -43,6 +43,7 @@ class DedicatedHostTest(unittest.TestCase):
         self.env = dict(os.environ, PSPC=pspc, ISO='/games/SWSS.iso', DEDICATED=self.dir, SESSIONS=sessions, HOURS='1')
         self.env.pop('SAVE_PROFILE', None)
         self.env.pop('UDP_PORT', None)
+        self.env.pop('PLAYLIST', None)
 
     def start(self, nick='Ded-Conquest'):
         return subprocess.Popen(['sh', SCRIPT, nick], env=self.env, stderr=subprocess.PIPE, text=True)
@@ -117,6 +118,65 @@ class DedicatedHostTest(unittest.TestCase):
         self.assertEqual(p.returncode, 1)
         self.assertIn('profile was not saved', stderr)
         self.assertEqual(len(self.runs()), 1)
+
+    def presses(self, args):
+        return [part.split()[0] for part in args.split(' --press ')[1:]]
+
+    def test_a_playlist_replaces_the_random_button_and_starts_after_it(self):
+        # The game's driver adds an entry with four CROSS steps (location, mode, era, area) on the Game Type screen, which
+        # is ready 1400 VBlanks after Continue (11000); 0.0.0.0 is the first planet, its first mode, prequel, ground.
+        self.make_profile()
+        self.env['PLAYLIST'] = '0.0.0.0'
+        self.env['SAVE_PROFILE'] = '1'
+        p, stderr = self.run_script()
+        self.assertEqual(p.returncode, 124, stderr)
+        _, _, args = self.runs()[-1]
+        presses = self.presses(args)
+        self.assertNotIn('11600:SQUARE:6', presses)
+        self.assertEqual([x for x in presses if x.startswith(('13300:', '14000:', '14800:', '15600:'))],
+                         ['13300:CROSS:6', '14000:CROSS:6', '14800:CROSS:6', '15600:CROSS:6'])
+        self.assertIn('16400:START:6', presses)
+        self.assertIn('18600:CROSS:6', presses)
+        self.assertEqual(presses[-1], '215600:CROSS:6')
+
+    def test_a_playlist_entry_presses_down_to_its_location_mode_era_and_area(self):
+        # 22.4.0.0: Mustafar (the 23rd planet code), Heroes vs Villains (its fifth mode), prequel, ground. Each step is a
+        # DOWN and then a CROSS, the location's DOWNs 40 VBlanks apart and the mode's 60, as the game's driver does.
+        self.make_profile()
+        self.env['PLAYLIST'] = '22.4.0.0'
+        self.env['SAVE_PROFILE'] = '1'
+        p, stderr = self.run_script()
+        self.assertEqual(p.returncode, 124, stderr)
+        _, _, args = self.runs()[-1]
+        presses = self.presses(args)
+        self.assertEqual([x for x in presses if x.endswith('DOWN:6') and int(x.split(':')[0]) >= 13000],
+                         ['%d:DOWN:6' % (13000 + 40 * i) for i in range(22)]
+                         + ['%d:DOWN:6' % (14680 + 60 * i) for i in range(4)])
+        self.assertEqual([x for x in presses if x.startswith(('14180:', '15120:', '15920:', '16720:', '17520:'))],
+                         ['14180:CROSS:6', '15120:CROSS:6', '15920:CROSS:6', '16720:CROSS:6', '17520:START:6'])
+
+    def test_a_playlist_makes_a_new_profile_so_the_playlist_starts_empty(self):
+        # The game keeps its playlist in the profile: a session that is given one deletes the profile and the game makes
+        # a new one, whose playlist is empty, before the run that fills it.
+        self.make_profile()
+        self.env['PLAYLIST'] = '0.0.0.0'
+        self.env['SAVE_PROFILE'] = '1'
+        p, stderr = self.run_script()
+        self.assertEqual(p.returncode, 124, stderr)
+        (setup_pid, _, setup), (main_pid, _, main) = self.runs()
+        self.assertIn('--exit-vblank 7000', setup)
+        self.assertIn('--osk-text Ded-Conquest|ded@example.com|pa ss|w|SWSS Conquest', main)
+        self.assertNotEqual(setup_pid, main_pid)
+
+    def test_a_playlist_that_is_not_indices_is_refused(self):
+        self.make_profile()
+        for playlist in ('35.0.0.0', '0.5.0.0', '0.0.3.0', '0.0.0.2', '0.0.0', '22.4.0.0.x', 'x', '22.04.0.0'):
+            with self.subTest(playlist=playlist):
+                self.env['PLAYLIST'] = playlist
+                p, stderr = self.run_script()
+                self.assertEqual(p.returncode, 1, stderr)
+                self.assertIn('PLAYLIST', stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, 'runs.txt')))
 
     def test_pspc_replaces_the_script(self):
         # The server signals the process it started: a pspc left running by a shell would outlive the server's stop.

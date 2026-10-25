@@ -124,6 +124,21 @@ a start. Each needs:
   it). What a game really has open: `ss -lunp | grep pspc` while it runs. What the server saw when it listed:
   `journalctl --user -u swss-server | grep "UDP ports players use"`, and `"udp_ports"` for each game in
   `status.json`. Players are told the server's address (from `swss.pspc.online`) and the heartbeat's port.
+- **the map and mode it hosts.** Without more, the script presses square and the game fills the playlist at random, so
+  what a session hosts differs at every start (the Conquest sessions are meant to rotate like that). `PLAYLIST` pins it:
+  `LOCATION.MODE.ERA.AREA`, comma separated, in the game's own indices. Location is the planet's place among the disc's
+  planet codes in sorted order (35 on the disc of 2026-10-24: 0 ALDR, 5 CRSS, 9 ENDR, 10 ENDS, 12 HOTH, 22 MSTR,
+  31 VJUN, 34 YAVS); mode counts the planet's allowed game types (0 Conquest, 1 one-flag CTF, 2 two-flag CTF, 3 hero CTF,
+  4 Heroes vs Villains); era is 0 prequel, 1 classic, 2 campaign; and area is the place among the areas offered, ground
+  first, so 1 is space where the planet offers both (never assume 1: BSPN and CATO prequel offer space alone, area 0).
+  For example `PLAYLIST=22.4.0.0` hosts Heroes vs Villains on Mustafar, prequel, ground, and `PLAYLIST=12.0.0.1` hosts
+  Conquest on Hoth, prequel, in space. The game keeps its playlist in the profile, so a session with `PLAYLIST` deletes
+  the profile and makes a new one (whose playlist is empty) before the run that adds the entries; that costs about two
+  minutes at every start, and `HOURS` should be well above it. What a game really advertises: the server browser
+  (TCP 28910) shows its `mapname` (`<PLANET CODE> <era>`) and `gametype`; `status.json` shows the same, but only while
+  the game heartbeats. `mapname` does not tell ground from space on one planet - both read `Hoth prequel` - so compare
+  `levelsettings`: for the same planet, mode and era its low bits are 2 for ground and 4 for space (measured on Hoth
+  prequel Conquest, `12.0.0.0` and `12.0.0.1`).
 
 **A new disc.** Stop the server first: a running game keeps the old image open. Replace `$ISO`, then check whether the
 native code is still valid. It is keyed by the SHA-1 of the disc's `EBOOT.BIN` as a plain ELF (the `sha1` of `modules` in
